@@ -1,0 +1,339 @@
+row 25   OpenHFT/Chronicle-Bytes#673
+============================================================================
+CONTRACT net.openhft.chronicle.bytes.internal.HasUncheckedRandomDataInput   members=1.0 implementers=14.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       24  @FunctionalInterface
+       25  public interface HasUncheckedRandomDataInput {
+       26  
+       27      /**
+       28       * @return a view for random reads with minimal bounds checking
+       29       */
+       30      @NotNull
+       31      UncheckedRandomDataInput acquireUncheckedInput();
+       32  
+       33  }
+
+---------- IMPLEMENTER net.openhft.chronicle.bytes.AbstractBytes  stubs=0/1 ----------
+       53  @SuppressWarnings("rawtypes")
+       54  public abstract class AbstractBytes<U>
+       55          extends AbstractReferenceCounted
+       56          implements Bytes<U>,
+       57          HasUncheckedRandomDataInput,
+       58          DecimalAppender {
+       59      /**
+       60       * System flag (<em>bytes.bounds.unchecked</em>) that disables bounds
+       61       * checking for reads and writes when set to {@code true}. Use only in
+       62       * trusted environments as incorrect offsets can corrupt memory.
+       63       */
+       64      private static final boolean BYTES_BOUNDS_UNCHECKED =
+       65              Jvm.getBoolean("bytes.bounds.unchecked", false);
+       66  
+       67      /**
+       68       * Cached ISO-8859-1 representation of {@link Long#MIN_VALUE} used when
+       69       * appending long values.
+       70       */
+       71      private static final byte[] MIN_VALUE_TEXT =
+       72              ("" + Long.MIN_VALUE).getBytes(ISO_8859_1);
+       73  
+       74      /**
+       75       * Deprecated flag (<em>bytes.append.0</em>) controlling whether whole
+       76       * floating point numbers were suffixed with ".0". Removal planned in x.28.
+       77       */
+       78      @Deprecated(/* to remove in x.28 */)
+       79      private static final boolean APPEND_0 = Jvm.getBoolean("bytes.append.0", true);
+       80  
+       81      /** Optional name for debugging only. */
+       82      @UsedViaReflection
+       83      private final String name;
+       84  
+       85      private final UncheckedRandomDataInput uncheckedRandomDataInput = new UncheckedRandomDataInputHolder();
+       86      @NotNull
+       87      protected BytesStore<?, U> bytesStore;
+       88      /** Offset, from {@link #start()}, of the next byte to read. */
+       89      protected long readPosition;
+       90      /** Highest byte index that may be written. */
+       91      protected long writeLimit;
+       92      /** Whether the underlying store is open. */
+       93      protected boolean isPresent;
+       94      /** Offset for the next byte to write. */
+       95      private long writePosition;
+       96      /** Number of decimal places of the last appended floating point value. */
+       97      private int lastDecimalPlaces = 0;
+       98      /** Lenient mode suppresses {@link BufferUnderflowException} on some reads. */
+       99      private boolean lenient = false;
+      100      /** Tracks whether the last parsed number contained digits. */
+      101      private boolean lastNumberHadDigits = false;
+      102      /** Strategy used when appending decimal numbers. */
+      103      private Decimaliser decimaliser = StandardDecimaliser.STANDARD;
+      104      /** Whether to append the ".0" suffix for whole numbers. */
+      105      private boolean append0 = APPEND_0;
+      106  
+      107      /**
+      108       * Creates a bytes view over the provided store.
+      109       *
+      110       * @param bytesStore   the underlying store
+      111       * @param writePosition initial {@link #writePosition()} relative to {@link #start()}
+      112       * @param writeLimit    initial {@link #writeLimit()}
+      113       * @throws ClosedIllegalStateException    if the store is closed
+      114       * @throws ThreadingIllegalStateException if accessed from a thread that does not own the store
+      115       */
+      116      AbstractBytes(@NotNull BytesStore<Bytes<U>, U> bytesStore,
+      117                    @NonNegative long writePosition,
+      118                    @NonNegative long writeLimit)
+      119              throws ClosedIllegalStateException, ThreadingIllegalStateException {
+      120          this(bytesStore, writePosition, writeLimit, "");
+      121      }
+      122  
+      123      /**
+      124       * Implementation detail constructor allowing a debug name.
+      125       */
+      126      AbstractBytes(@NotNull BytesStore<Bytes<U>, U> bytesStore,
+      127                    @NonNegative long writePosition,
+      128                    @NonNegative long writeLimit,
+      129                    String name)
+      130              throws ClosedIllegalStateException, ThreadingIllegalStateException {
+      131          super(bytesStore.isDirectMemory());
+      132          this.bytesStore(bytesStore);
+      133          bytesStore.reserve(this);
+      134          readPosition = bytesStore.readPosition();
+      135          this.uncheckedWritePosition(writePosition);
+      136          this.writeLimit = writeLimit;
+      137          // used for debugging
+      138          this.name = name;
+      139      }
+      140  
+      141      @Override
+      142      public boolean isDirectMemory() {
+      143          // delegate to the underlying store
+      144          return bytesStore.isDirectMemory();
+      145      }
+      146  
+      147      @Override
+      148      public boolean canReadDirect(@NonNegative long length) {
+      149          long remaining = writePosition() - readPosition;
+      150          return bytesStore.isDirectMemory() && remaining >= length;
+      151      }
+      152  
+      153      @Override
+      154      public void move(@NonNegative long from, @NonNegative long to, @NonNegative long length)
+      155              throws BufferUnderflowException, ClosedIllegalStateException, ArithmeticException, ThreadingIllegalStateException {
+      156          if (from < 0 || to < 0) throw new IllegalArgumentException();
+      157          if (length == 0) return;
+      158          assert DISABLE_SINGLE_THREADED_CHECK || threadSafetyCheck(true);
+      159          long start = start();
+      160          ensureCapacity(to + length);
+      161          bytesStore.move(from - start, to - start, length);
+      162      }
+      163  
+      164      /**
+      165       * Moves unread data to the start of the buffer so that new writes can reuse
+      166       * space before {@link #readPosition()}.
+      167       */
+      168      @NotNull
+      169      @Override
+      170      public Bytes<U> compact()
+      171              throws ClosedIllegalStateException, ThreadingIllegalStateException {
+      172  
+      173          // Asserts that the current method is thread-safe or that single-threaded checks are disabled
+      174          assert DISABLE_SINGLE_THREADED_CHECK || threadSafetyCheck(true);
+      175  
+      176          // Get the start position of the buffer
+      177          long start = start();
+      178  
+      179          // Get the number of unread bytes in the buffer, ensuring that it is not set to a negative value
+      180          long readRemaining = Math.max(0, readRemaining());
+      181  
+      182          // if the space freed is less a than 1/4 the data that would be moved, leave it.
+      183          if ((readPosition - start) < readRemaining / 4)
+      184              return this;
+      185  
+      186          // Check if there are unread bytes and if they're not already at the start of the buffer
+      187          if (readRemaining > 0 && start < readPosition) {
+      188              // Move the unread bytes to the start of the buffer
+      189              bytesStore.move(readPosition, start, readRemaining);
+      190          }
+      191  
+      192          // Reset the read position to the start of the buffer
+      193          readPosition = start;
+      194  
+      195          // Set the write position to be after the unread bytes
+      196          uncheckedWritePosition(start + readRemaining);
+      197  
+      198          // Return this Bytes object to allow for method chaining
+      199          return this;
+      200      }
+      201  
+      202      /**
+      203       * Resets read and write positions to {@link #start()} and sets the
+      204       * {@link #writeLimit()} to {@link #capacity()}.
+      205       */
+      206      @Override
+      207      @NotNull
+      208      public Bytes<U> clear()
+      209              throws ClosedIllegalStateException, ThreadingIllegalStateException {
+      210          final long start = start();
+      211          final long capacity = capacity();
+      212          if (readPosition == start && writePosition() == start && writeLimit == capacity)
+
+---------- IMPLEMENTER net.openhft.chronicle.bytes.UncheckedNativeBytes  stubs=0/1 ----------
+       50  @SuppressWarnings("rawtypes")
+       51  public class UncheckedNativeBytes<U>
+       52          extends AbstractReferenceCounted
+       53          implements Bytes<U>, HasUncheckedRandomDataInput, DecimalAppender {
+       54      private static final byte[] MIN_VALUE_TEXT = ("" + Long.MIN_VALUE).getBytes(ISO_8859_1);
+       55      @Deprecated(/* to remove in x.28 */)
+       56      private static final boolean APPEND_0 = Jvm.getBoolean("bytes.append.0", true);
+       57  
+       58      // The real capacity of the BytesStore this UncheckedNativeBytes operates on
+       59      protected final long capacity;
+       60      // An instance of UncheckedRandomDataInput for accessing data without bounds checking
+       61      private final UncheckedRandomDataInput uncheckedRandomDataInput = new UncheckedRandomDataInputHolder();
+       62      // The Bytes instance this UncheckedNativeBytes operates on
+       63      @NotNull
+       64      private final Bytes<U> underlyingBytes;
+       65      // The BytesStore that the underlying Bytes operates on
+       66      @NotNull
+       67      protected BytesStore<?, U> bytesStore;
+       68      // The position of the next byte to be read
+       69      protected long readPosition;
+       70      // The position of the next byte to be written
+       71      protected long writePosition;
+       72      // The limit of the write buffer
+       73      protected long writeLimit;
+       74      // Tracks the number of decimal places in the last number read
+       75      private int lastDecimalPlaces = 0;
+       76      // Tracks if the last number read had any digits
+       77      private boolean lastNumberHadDigits = false;
+       78      private Decimaliser decimaliser = StandardDecimaliser.STANDARD;
+       79      private boolean append0 = APPEND_0;
+       80  
+       81      /**
+       82       * Creates an unchecked wrapper over the native store of {@code underlyingBytes}.
+       83       * The wrapper retains a reference to the given bytes and adopts its current
+       84       * read and write positions and limits.
+       85       *
+       86       * @param underlyingBytes the bytes to operate on
+       87       * @throws ClosedIllegalStateException    if the resource has been released or closed
+       88       * @throws ThreadingIllegalStateException if accessed by multiple threads in an unsafe way
+       89       */
+       90      @SuppressWarnings({"unchecked", "this-escape"})
+       91      public UncheckedNativeBytes(@NotNull Bytes<U> underlyingBytes)
+       92              throws IllegalStateException {
+       93          this.underlyingBytes = underlyingBytes;
+       94          underlyingBytes.reserve(this);
+       95          this.bytesStore = BytesInternal.failIfBytesOnBytes(underlyingBytes.bytesStore());
+       96          assert bytesStore.start() == 0;
+       97          writePosition = underlyingBytes.writePosition();
+       98          readPosition = underlyingBytes.readPosition();
+       99          capacity = bytesStore.realCapacity();
+      100          writeLimit = Math.min(capacity, underlyingBytes.writeLimit());
+      101      }
+      102  
+      103      @Override
+      104      /**
+      105       * Delegates capacity expansion to the wrapped bytes and updates this view
+      106       * if the underlying store changes.
+      107       */
+      108      public void ensureCapacity(@NonNegative long desiredCapacity)
+      109              throws IllegalArgumentException, IllegalStateException {
+      110          if (desiredCapacity > realCapacity()) {
+      111              underlyingBytes.ensureCapacity(desiredCapacity);
+      112              bytesStore = uncheckedCast(underlyingBytes.bytesStore());
+      113          }
+      114      }
+      115  
+      116      @Override
+      117      /**
+      118       * Indicates that this bytes instance performs no bounds checks.
+      119       */
+      120      public boolean unchecked() {
+      121          return true;
+      122      }
+      123  
+      124      @Override
+      125      /**
+      126       * Returns {@code true} as this bytes instance operates on native memory.
+      127       */
+      128      public boolean isDirectMemory() {
+      129          return true;
+      130      }
+      131  
+      132      @Override
+      133      @NotNull
+      134      public Bytes<U> unchecked(boolean unchecked) {
+      135          throwExceptionIfReleased();
+      136          return this;
+      137      }
+      138  
+      139      @Override
+      140      public void move(@NonNegative long from, @NonNegative long to, @NonNegative long length)
+      141              throws IllegalStateException, BufferUnderflowException {
+      142          ensureCapacity(to + length);
+      143          bytesStore.move(from - start(), to - start(), length);
+      144      }
+      145  
+      146      @NotNull
+      147      @Override
+      148      public Bytes<U> compact()
+      149              throws ClosedIllegalStateException, ThreadingIllegalStateException {
+      150  
+      151          // Get the start position of the buffer
+      152          long start = start();
+      153  
+      154          // Get the number of unread bytes in the buffer, ensuring that it is not set to a negative value
+      155          long readRemaining = Math.max(0, readRemaining());
+      156  
+      157          // if the space freed is less a than 1/4 the data that would be moved, leave it.
+      158          if ((readPosition - start) < readRemaining / 4)
+      159              return this;
+      160  
+      161          // Check if there are unread bytes and if they're not already at the start of the buffer
+      162          if (readRemaining > 0 && start < readPosition) {
+      163              // Move the unread bytes to the start of the buffer
+      164              bytesStore.move(readPosition, start, readRemaining);
+      165          }
+      166  
+      167          // Reset the read position to the start of the buffer
+      168          readPosition = start;
+      169  
+      170          // Set the write position to be after the unread bytes
+      171          writePosition = start + readRemaining;
+      172  
+      173          // Return this Bytes object to allow for method chaining
+      174          return this;
+      175      }
+      176      @NotNull
+      177      @Override
+      178      public Bytes<U> readPosition(@NonNegative long position) {
+      179          assert position <= bytesStore.capacity();
+      180          readPosition = position;
+      181          return this;
+      182      }
+      183  
+      184      @NotNull
+      185      @Override
+      186      public Bytes<U> readLimit(@NonNegative long limit) {
+      187          assert limit <= bytesStore.capacity();
+      188          writePosition = limit;
+      189          return this;
+      190      }
+      191  
+      192      @NotNull
+      193      @Override
+      194      public Bytes<U> writePosition(@NonNegative long position) {
+      195          assert position <= bytesStore.capacity();
+      196          writePosition = requireNonNegative(position);
+      197          return this;
+      198      }
+      199  
+      200      @NotNull
+      201      @Override
+      202      public Bytes<U> readSkip(long bytesToSkip) {
+      203          readPosition += bytesToSkip;
+      204          assert readPosition <= readLimit();
+      205          return this;
+      206      }
+      207  
+      208      @Override
+      209      public byte readVolatileByte(@NonNegative long offset)

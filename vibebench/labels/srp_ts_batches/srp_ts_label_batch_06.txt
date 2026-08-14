@@ -1,0 +1,4003 @@
+### Agent  (Devin  drivly/ai#812  sdks/agents.do/src/index.ts)
+metrics: loc=5.0 methods=1.0 wmc=1.0 lcom=nan c3=nan rubric_flag=False
+```ts
+export class Agent<Env = any, State = any> extends CloudflareAgent<Env, State> {
+  constructor(config: any, state: any = {}) {
+    super(config, state)
+  }
+}
+```
+
+
+### FasterDEMA  (Copilot  bennycode/trading-signals#806  src/DEMA/DEMA.ts)
+metrics: loc=24.0 methods=4.0 wmc=4.0 lcom=0.0 c3=0.0538403379635429 rubric_flag=False
+```ts
+export class FasterDEMA extends NumberIndicatorSeries {
+  private readonly inner: FasterEMA;
+  private readonly outer: FasterEMA;
+
+  constructor(public readonly interval: number) {
+    super();
+    this.inner = new FasterEMA(interval);
+    this.outer = new FasterEMA(interval);
+  }
+
+  override getRequiredInputs() {
+    return this.outer.getRequiredInputs();
+  }
+
+  update(price: number, replace: boolean): number {
+    const innerResult = this.inner.update(price, replace);
+    const outerResult = this.outer.update(innerResult, replace);
+    return this.setResult(innerResult * 2 - outerResult, replace);
+  }
+
+  override get isStable(): boolean {
+    return this.outer.isStable;
+  }
+}
+```
+
+
+### Evaluator  (OpenAI_Codex  promptfoo/promptfoo#4516  src/evaluator.ts)
+metrics: loc=1007.0 methods=2.0 wmc=103.0 lcom=nan c3=nan rubric_flag=True
+```ts
+class Evaluator {
+  evalRecord: Eval;
+  testSuite: TestSuite;
+  options: EvaluateOptions;
+  stats: EvaluateStats;
+  conversations: EvalConversations;
+  registers: EvalRegisters;
+  fileWriters: JsonlFileWriter[];
+  constructor(testSuite: TestSuite, evalRecord: Eval, options: EvaluateOptions) {
+    this.testSuite = testSuite;
+    this.evalRecord = evalRecord;
+    this.options = options;
+    this.stats = {
+      successes: 0,
+      failures: 0,
+      errors: 0,
+      tokenUsage: newTokenUsage(),
+    };
+    this.conversations = {};
+    this.registers = {};
+
+    const jsonlFiles = Array.isArray(evalRecord.config.outputPath)
+      ? evalRecord.config.outputPath.filter((p) => p.endsWith('.jsonl'))
+      : evalRecord.config.outputPath?.endsWith('.jsonl')
+        ? [evalRecord.config.outputPath]
+        : [];
+
+    this.fileWriters = jsonlFiles.map((p) => new JsonlFileWriter(p));
+  }
+
+  async evaluate(): Promise<Eval> {
+    const { options } = this;
+    let { testSuite } = this;
+
+    const startTime = Date.now();
+    const maxEvalTimeMs = options.maxEvalTimeMs ?? getMaxEvalTimeMs();
+    let evalTimedOut = false;
+    let globalTimeout: NodeJS.Timeout | undefined;
+    let globalAbortController: AbortController | undefined;
+    const processedIndices = new Set<number>();
+
+    if (maxEvalTimeMs > 0) {
+      globalAbortController = new AbortController();
+      options.abortSignal = options.abortSignal
+        ? AbortSignal.any([options.abortSignal, globalAbortController.signal])
+        : globalAbortController.signal;
+      globalTimeout = setTimeout(() => {
+        evalTimedOut = true;
+        globalAbortController?.abort();
+      }, maxEvalTimeMs);
+    }
+
+    const vars = new Set<string>();
+    const checkAbort = () => {
+      if (options.abortSignal?.aborted) {
+        throw new Error('Operation cancelled');
+      }
+    };
+
+    logger.info(`Starting evaluation ${this.evalRecord.id}`);
+
+    // Add abort checks at key points
+    checkAbort();
+
+    const prompts: CompletedPrompt[] = [];
+    const assertionTypes = new Set<string>();
+    const rowsWithSelectBestAssertion = new Set<number>();
+
+    const beforeAllOut = await runExtensionHook(testSuite.extensions, 'beforeAll', {
+      suite: testSuite,
+    });
+    testSuite = beforeAllOut.suite;
+
+    if (options.generateSuggestions) {
+      // TODO(ian): Move this into its own command/file
+      logger.info(`Generating prompt variations...`);
+      const { prompts: newPrompts, error } = await generatePrompts(testSuite.prompts[0].raw, 1);
+      if (error || !newPrompts) {
+        throw new Error(`Failed to generate prompts: ${error}`);
+      }
+
+      logger.info(chalk.blue('Generated prompts:'));
+      let numAdded = 0;
+      for (const prompt of newPrompts) {
+        logger.info('--------------------------------------------------------');
+        logger.info(`${prompt}`);
+        logger.info('--------------------------------------------------------');
+
+        // Ask the user if they want to continue
+        const shouldTest = await promptYesNo('Do you want to test this prompt?', false);
+        if (shouldTest) {
+          testSuite.prompts.push({ raw: prompt, label: prompt });
+          numAdded++;
+        } else {
+          logger.info('Skipping this prompt.');
+        }
+      }
+
+      if (numAdded < 1) {
+        logger.info(chalk.red('No prompts selected. Aborting.'));
+        process.exitCode = 1;
+        return this.evalRecord;
+      }
+    }
+
+    // Split prompts by provider
+    // Order matters - keep provider in outer loop to reduce need to swap models during local inference.
+    for (const provider of testSuite.providers) {
+      for (const prompt of testSuite.prompts) {
+        // Check if providerPromptMap exists and if it contains the current prompt's label
+        const providerKey = provider.label || provider.id();
+        if (!isAllowedPrompt(prompt, testSuite.providerPromptMap?.[providerKey])) {
+          continue;
+        }
+        const completedPrompt = {
+          ...prompt,
+          id: generateIdFromPrompt(prompt),
+          provider: providerKey,
+          label: prompt.label,
+          metrics: {
+            score: 0,
+            testPassCount: 0,
+            testFailCount: 0,
+            testErrorCount: 0,
+            assertPassCount: 0,
+            assertFailCount: 0,
+            totalLatencyMs: 0,
+            tokenUsage: {
+              total: 0,
+              prompt: 0,
+              completion: 0,
+              cached: 0,
+              numRequests: 0,
+              completionDetails: {
+                reasoning: 0,
+                acceptedPrediction: 0,
+                rejectedPrediction: 0,
+              },
+              assertions: {
+                total: 0,
+                prompt: 0,
+                completion: 0,
+                cached: 0,
+              },
+            },
+            namedScores: {},
+            namedScoresCount: {},
+            cost: 0,
+          },
+        };
+        prompts.push(completedPrompt);
+      }
+    }
+
+    this.evalRecord.addPrompts(prompts);
+
+    // Aggregate all vars across test cases
+    let tests =
+      testSuite.tests && testSuite.tests.length > 0
+        ? testSuite.tests
+        : testSuite.scenarios
+          ? []
+          : [
+              {
+                // Dummy test for cases when we're only comparing raw prompts.
+              },
+            ];
+
+    // Build scenarios and add to tests
+    if (testSuite.scenarios && testSuite.scenarios.length > 0) {
+      telemetry.recordAndSendOnce('feature_used', {
+        feature: 'scenarios',
+      });
+      for (const scenario of testSuite.scenarios) {
+        for (const data of scenario.config) {
+          // Merge defaultTest with scenario config
+          const scenarioTests = (
+            scenario.tests || [
+              {
+                // Dummy test for cases when we're only comparing raw prompts.
+              },
+            ]
+          ).map((test) => {
+            return {
+              ...testSuite.defaultTest,
+              ...data,
+              ...test,
+              vars: {
+                ...testSuite.defaultTest?.vars,
+                ...data.vars,
+                ...test.vars,
+              },
+              options: {
+                ...testSuite.defaultTest?.options,
+                ...test.options,
+              },
+              assert: [
+                // defaultTest.assert is omitted because it will be added to each test case later
+                ...(data.assert || []),
+                ...(test.assert || []),
+              ],
+              metadata: {
+                ...testSuite.defaultTest?.metadata,
+                ...data.metadata,
+                ...test.metadata,
+              },
+            };
+          });
+          // Add scenario tests to tests
+          tests = tests.concat(scenarioTests);
+        }
+      }
+    }
+
+    maybeEmitAzureOpenAiWarning(testSuite, tests);
+
+    // Prepare vars
+    const varNames: Set<string> = new Set();
+    const varsWithSpecialColsRemoved: Vars[] = [];
+    const inputTransformDefault = testSuite?.defaultTest?.options?.transformVars;
+    for (const testCase of tests) {
+      testCase.vars = { ...testSuite.defaultTest?.vars, ...testCase?.vars };
+
+      if (testCase.vars) {
+        const varWithSpecialColsRemoved: Vars = {};
+        const inputTransformForIndividualTest = testCase.options?.transformVars;
+        const inputTransform = inputTransformForIndividualTest || inputTransformDefault;
+        if (inputTransform) {
+          const transformContext: TransformContext = {
+            prompt: {},
+            uuid: randomUUID(),
+          };
+          const transformedVars: Vars = await transform(
+            inputTransform,
+            testCase.vars,
+            transformContext,
+            true,
+            TransformInputType.VARS,
+          );
+          invariant(
+            typeof transformedVars === 'object',
+            'Transform function did not return a valid object',
+          );
+          testCase.vars = { ...testCase.vars, ...transformedVars };
+        }
+        for (const varName of Object.keys(testCase.vars)) {
+          varNames.add(varName);
+          varWithSpecialColsRemoved[varName] = testCase.vars[varName];
+        }
+        varsWithSpecialColsRemoved.push(varWithSpecialColsRemoved);
+      }
+    }
+
+    // Set up eval cases
+    const runEvalOptions: RunEvalOptions[] = [];
+    let testIdx = 0;
+    let concurrency = options.maxConcurrency || DEFAULT_MAX_CONCURRENCY;
+    for (let index = 0; index < tests.length; index++) {
+      const testCase = tests[index];
+      invariant(
+        Array.isArray(testSuite.defaultTest?.assert || []),
+        `defaultTest.assert is not an array in test case #${index + 1}`,
+      );
+      invariant(
+        Array.isArray(testCase.assert || []),
+        `testCase.assert is not an array in test case #${index + 1}`,
+      );
+      // Handle default properties
+      testCase.assert = [...(testSuite.defaultTest?.assert || []), ...(testCase.assert || [])];
+      testCase.threshold = testCase.threshold ?? testSuite.defaultTest?.threshold;
+      testCase.options = { ...testSuite.defaultTest?.options, ...testCase.options };
+      testCase.metadata = { ...testSuite.defaultTest?.metadata, ...testCase.metadata };
+      testCase.provider = testCase.provider || testSuite.defaultTest?.provider;
+      testCase.assertScoringFunction =
+        testCase.assertScoringFunction || testSuite.defaultTest?.assertScoringFunction;
+
+      if (typeof testCase.assertScoringFunction === 'string') {
+        const { filePath: resolvedPath, functionName } = parseFileUrl(
+          testCase.assertScoringFunction,
+        );
+        testCase.assertScoringFunction = await loadFunction<ScoringFunction>({
+          filePath: resolvedPath,
+          functionName,
+        });
+      }
+      const prependToPrompt =
+        testCase.options?.prefix || testSuite.defaultTest?.options?.prefix || '';
+      const appendToPrompt =
+        testCase.options?.suffix || testSuite.defaultTest?.options?.suffix || '';
+
+      // Finalize test case eval
+      const varCombinations =
+        getEnvBool('PROMPTFOO_DISABLE_VAR_EXPANSION') || testCase.options.disableVarExpansion
+          ? [testCase.vars]
+          : generateVarCombinations(testCase.vars || {});
+
+      const numRepeat = this.options.repeat || 1;
+      for (let repeatIndex = 0; repeatIndex < numRepeat; repeatIndex++) {
+        for (const vars of varCombinations) {
+          let promptIdx = 0;
+          // Order matters - keep provider in outer loop to reduce need to swap models during local inference.
+          for (const provider of testSuite.providers) {
+            for (const prompt of testSuite.prompts) {
+              const providerKey = provider.label || provider.id();
+              if (!isAllowedPrompt(prompt, testSuite.providerPromptMap?.[providerKey])) {
+                continue;
+              }
+              runEvalOptions.push({
+                delay: options.delay || 0,
+                provider,
+                prompt: {
+                  ...prompt,
+                  raw: prependToPrompt + prompt.raw + appendToPrompt,
+                },
+                test: { ...testCase, vars, options: testCase.options },
+                nunjucksFilters: testSuite.nunjucksFilters,
+                testIdx,
+                promptIdx,
+                repeatIndex,
+                evaluateOptions: options,
+                conversations: this.conversations,
+                registers: this.registers,
+                isRedteam: testSuite.redteam != null,
+                allTests: runEvalOptions,
+                concurrency,
+                abortSignal: options.abortSignal,
+              });
+              promptIdx++;
+            }
+          }
+          testIdx++;
+        }
+      }
+    }
+    // Determine run parameters
+
+    if (concurrency > 1) {
+      const usesConversation = prompts.some((p) => p.raw.includes('_conversation'));
+      const usesStoreOutputAs = tests.some((t) => t.options?.storeOutputAs);
+      if (usesConversation) {
+        logger.info(
+          `Setting concurrency to 1 because the ${chalk.cyan('_conversation')} variable is used.`,
+        );
+        concurrency = 1;
+      } else if (usesStoreOutputAs) {
+        logger.info(`Setting concurrency to 1 because storeOutputAs is used.`);
+        concurrency = 1;
+      }
+    }
+
+    // Actually run the eval
+    let numComplete = 0;
+
+    const processEvalStep = async (evalStep: RunEvalOptions, index: number | string) => {
+      if (typeof index !== 'number') {
+        throw new Error('Expected index to be a number');
+      }
+
+      const beforeEachOut = await runExtensionHook(testSuite.extensions, 'beforeEach', {
+        test: evalStep.test,
+      });
+      evalStep.test = beforeEachOut.test;
+
+      const rows = await runEval(evalStep);
+
+      for (const row of rows) {
+        for (const varName of Object.keys(row.vars)) {
+          vars.add(varName);
+        }
+        // Print token usage for model-graded assertions and add to stats
+        if (row.gradingResult?.tokensUsed && row.testCase?.assert) {
+          for (const assertion of row.testCase.assert) {
+            if (MODEL_GRADED_ASSERTION_TYPES.has(assertion.type as AssertionType)) {
+              const tokensUsed = row.gradingResult.tokensUsed;
+
+              if (!this.stats.tokenUsage.assertions) {
+                this.stats.tokenUsage.assertions = {
+                  total: 0,
+                  prompt: 0,
+                  completion: 0,
+                  cached: 0,
+                };
+              }
+
+              const assertions = this.stats.tokenUsage.assertions;
+              assertions.total = (assertions.total ?? 0) + (tokensUsed.total ?? 0);
+              assertions.prompt = (assertions.prompt ?? 0) + (tokensUsed.prompt ?? 0);
+              assertions.completion = (assertions.completion ?? 0) + (tokensUsed.completion ?? 0);
+              assertions.cached = (assertions.cached ?? 0) + (tokensUsed.cached ?? 0);
+
+              break;
+            }
+          }
+        }
+
+        // capture metrics
+        if (row.success) {
+          this.stats.successes++;
+        } else if (row.failureReason === ResultFailureReason.ERROR) {
+          this.stats.errors++;
+        } else {
+          this.stats.failures++;
+        }
+
+        if (row.tokenUsage) {
+          this.stats.tokenUsage.total += row.tokenUsage.total || 0;
+          this.stats.tokenUsage.prompt += row.tokenUsage.prompt || 0;
+          this.stats.tokenUsage.completion += row.tokenUsage.completion || 0;
+          this.stats.tokenUsage.cached += row.tokenUsage.cached || 0;
+          this.stats.tokenUsage.numRequests += row.tokenUsage.numRequests || 1;
+          if (row.tokenUsage.completionDetails) {
+            this.stats.tokenUsage.completionDetails.reasoning! +=
+              row.tokenUsage.completionDetails.reasoning || 0;
+            this.stats.tokenUsage.completionDetails.acceptedPrediction! +=
+              row.tokenUsage.completionDetails.acceptedPrediction || 0;
+            this.stats.tokenUsage.completionDetails.rejectedPrediction! +=
+              row.tokenUsage.completionDetails.rejectedPrediction || 0;
+          }
+        }
+
+        if (evalStep.test.assert?.some((a) => a.type === 'select-best')) {
+          rowsWithSelectBestAssertion.add(row.testIdx);
+        }
+        for (const assert of evalStep.test.assert || []) {
+          if (assert.type) {
+            assertionTypes.add(assert.type);
+          }
+        }
+
+        numComplete++;
+
+        try {
+          await this.evalRecord.addResult(row);
+        } catch (error) {
+          const resultSummary = summarizeEvaluateResultForLogging(row);
+          logger.error(`Error saving result: ${error} ${safeJsonStringify(resultSummary)}`);
+        }
+
+        for (const writer of this.fileWriters) {
+          await writer.write(row);
+        }
+
+        const { promptIdx } = row;
+        const metrics = prompts[promptIdx].metrics;
+        invariant(metrics, 'Expected prompt.metrics to be set');
+        metrics.score += row.score;
+        for (const [key, value] of Object.entries(row.namedScores)) {
+          // Update named score value
+          metrics.namedScores[key] = (metrics.namedScores[key] || 0) + value;
+
+          // Count assertions contributing to this named score
+          let contributingAssertions = 0;
+          row.gradingResult?.componentResults?.forEach((result) => {
+            if (result.assertion?.metric === key) {
+              contributingAssertions++;
+            }
+          });
+
+          metrics.namedScoresCount[key] =
+            (metrics.namedScoresCount[key] || 0) + (contributingAssertions || 1);
+        }
+
+        if (testSuite.derivedMetrics) {
+          const math = await import('mathjs');
+          for (const metric of testSuite.derivedMetrics) {
+            if (metrics.namedScores[metric.name] === undefined) {
+              metrics.namedScores[metric.name] = 0;
+            }
+            try {
+              if (typeof metric.value === 'function') {
+                metrics.namedScores[metric.name] = metric.value(metrics.namedScores, evalStep);
+              } else {
+                const evaluatedValue = math.evaluate(metric.value, metrics.namedScores);
+                metrics.namedScores[metric.name] = evaluatedValue;
+              }
+            } catch (error) {
+              logger.debug(
+                `Could not evaluate derived metric '${metric.name}': ${(error as Error).message}`,
+              );
+            }
+          }
+        }
+        metrics.testPassCount += row.success ? 1 : 0;
+        if (!row.success) {
+          if (row.failureReason === ResultFailureReason.ERROR) {
+            metrics.testErrorCount += 1;
+          } else {
+            metrics.testFailCount += 1;
+          }
+        }
+        metrics.assertPassCount +=
+          row.gradingResult?.componentResults?.filter((r) => r.pass).length || 0;
+        metrics.assertFailCount +=
+          row.gradingResult?.componentResults?.filter((r) => !r.pass).length || 0;
+        metrics.totalLatencyMs += row.latencyMs || 0;
+        metrics.tokenUsage.cached =
+          (metrics.tokenUsage.cached || 0) + (row.response?.tokenUsage?.cached || 0);
+        metrics.tokenUsage.completion =
+          (metrics.tokenUsage.completion || 0) + (row.response?.tokenUsage?.completion || 0);
+        metrics.tokenUsage.prompt =
+          (metrics.tokenUsage.prompt || 0) + (row.response?.tokenUsage?.prompt || 0);
+        metrics.tokenUsage.total =
+          (metrics.tokenUsage.total || 0) + (row.response?.tokenUsage?.total || 0);
+        metrics.tokenUsage.numRequests =
+          (metrics.tokenUsage.numRequests || 0) + (row.response?.tokenUsage?.numRequests || 1);
+        metrics.tokenUsage.completionDetails = {
+          reasoning:
+            (metrics.tokenUsage.completionDetails?.reasoning || 0) +
+            (row.response?.tokenUsage?.completionDetails?.reasoning || 0),
+          acceptedPrediction:
+            (metrics.tokenUsage.completionDetails?.acceptedPrediction || 0) +
+            (row.response?.tokenUsage?.completionDetails?.acceptedPrediction || 0),
+          rejectedPrediction:
+            (metrics.tokenUsage.completionDetails?.rejectedPrediction || 0) +
+            (row.response?.tokenUsage?.completionDetails?.rejectedPrediction || 0),
+        };
+
+        // Add assertion token usage to the metrics
+        if (row.gradingResult?.tokensUsed) {
+          updateAssertionMetrics(metrics, row.gradingResult.tokensUsed);
+        }
+
+        metrics.cost += row.cost || 0;
+
+        await runExtensionHook(testSuite.extensions, 'afterEach', {
+          test: evalStep.test,
+          result: row,
+        });
+
+        if (options.progressCallback) {
+          options.progressCallback(numComplete, runEvalOptions.length, index, evalStep, metrics);
+        }
+      }
+    };
+
+    // Add a wrapper function that implements timeout
+    const processEvalStepWithTimeout = async (evalStep: RunEvalOptions, index: number | string) => {
+      // Get timeout value from options or environment, defaults to 0 (no timeout)
+      const timeoutMs = options.timeoutMs || getEvalTimeoutMs();
+
+      if (timeoutMs <= 0) {
+        // No timeout, process normally
+        return processEvalStep(evalStep, index);
+      }
+
+      // Create an AbortController to cancel the request if it times out
+      const abortController = new AbortController();
+      const { signal } = abortController;
+
+      // Add the abort signal to the evalStep
+      const evalStepWithSignal = {
+        ...evalStep,
+        abortSignal: signal,
+      };
+
+      try {
+        return await Promise.race([
+          processEvalStep(evalStepWithSignal, index),
+          new Promise<void>((_, reject) => {
+            const timeoutId = setTimeout(() => {
+              // Abort any ongoing requests
+              abortController.abort();
+
+              // If the provider has a cleanup method, call it
+              if (typeof evalStep.provider.cleanup === 'function') {
+                try {
+                  evalStep.provider.cleanup();
+                } catch (cleanupErr) {
+                  logger.warn(`Error during provider cleanup: ${cleanupErr}`);
+                }
+              }
+
+              reject(new Error(`Evaluation timed out after ${timeoutMs}ms`));
+
+              // Clear the timeout to prevent memory leaks
+              clearTimeout(timeoutId);
+            }, timeoutMs);
+          }),
+        ]);
+      } catch (error) {
+        // Create and add an error result for timeout
+        const timeoutResult = {
+          provider: {
+            id: evalStep.provider.id(),
+            label: evalStep.provider.label,
+            config: evalStep.provider.config,
+          },
+          prompt: {
+            raw: evalStep.prompt.raw,
+            label: evalStep.prompt.label,
+            config: evalStep.prompt.config,
+          },
+          vars: evalStep.test.vars || {},
+          error: `Evaluation timed out after ${timeoutMs}ms: ${String(error)}`,
+          success: false,
+          failureReason: ResultFailureReason.ERROR, // Using ERROR for timeouts
+          score: 0,
+          namedScores: {},
+          latencyMs: timeoutMs,
+          promptIdx: evalStep.promptIdx,
+          testIdx: evalStep.testIdx,
+          testCase: evalStep.test,
+          promptId: evalStep.prompt.id || '',
+        };
+
+        // Add the timeout result to the evaluation record
+        await this.evalRecord.addResult(timeoutResult);
+
+        // Update stats
+        this.stats.errors++;
+
+        // Update prompt metrics
+        const { metrics } = prompts[evalStep.promptIdx];
+        if (metrics) {
+          metrics.testErrorCount += 1;
+          metrics.totalLatencyMs += timeoutMs;
+        }
+
+        // Progress callback
+        if (options.progressCallback) {
+          options.progressCallback(
+            numComplete,
+            runEvalOptions.length,
+            typeof index === 'number' ? index : 0,
+            evalStep,
+            metrics || {
+              score: 0,
+              testPassCount: 0,
+              testFailCount: 0,
+              testErrorCount: 1,
+              assertPassCount: 0,
+              assertFailCount: 0,
+              totalLatencyMs: timeoutMs,
+              tokenUsage: {
+                total: 0,
+                prompt: 0,
+                completion: 0,
+                cached: 0,
+                numRequests: 0,
+              },
+              namedScores: {},
+              namedScoresCount: {},
+              cost: 0,
+            },
+          );
+        }
+      }
+    };
+
+    // Set up main progress bars
+    let multibar: MultiBar | undefined;
+    let multiProgressBars: SingleBar[] = [];
+    const originalProgressCallback = this.options.progressCallback;
+    const isWebUI = Boolean(cliState.webUI);
+
+    this.options.progressCallback = (completed, total, index, evalStep, metrics) => {
+      if (originalProgressCallback) {
+        originalProgressCallback(completed, total, index, evalStep, metrics);
+      }
+
+      if (isWebUI) {
+        const provider = evalStep.provider.label || evalStep.provider.id();
+        const vars = Object.entries(evalStep.test.vars || {})
+          .map(([k, v]) => `${k}=${v}`)
+          .join(' ')
+          .slice(0, 50)
+          .replace(/\n/g, ' ');
+        logger.info(`[${numComplete}/${total}] Running ${provider} with vars: ${vars}`);
+      } else if (multibar && evalStep) {
+        const numProgressBars = Math.min(concurrency, 20);
+
+        // Calculate which progress bar to use
+        const progressBarIndex = index % numProgressBars;
+        const progressbar = multiProgressBars[progressBarIndex];
+
+        // Calculate how many threads are assigned to this progress bar
+        const threadsForThisBar = calculateThreadsPerBar(
+          concurrency,
+          numProgressBars,
+          progressBarIndex,
+        );
+
+        progressbar.increment({
+          provider: evalStep.provider.label || evalStep.provider.id(),
+          prompt: evalStep.prompt.raw.slice(0, 10).replace(/\n/g, ' '),
+          vars: Object.entries(evalStep.test.vars || {})
+            .map(([k, v]) => `${k}=${v}`)
+            .join(' ')
+            .slice(0, 10)
+            .replace(/\n/g, ' '),
+          activeThreads: threadsForThisBar,
+        });
+      } else {
+        logger.debug(`Eval #${index + 1} complete (${numComplete} of ${runEvalOptions.length})`);
+      }
+    };
+
+    const createMultiBars = async (evalOptions: RunEvalOptions[]) => {
+      // Only create progress bars if not in web UI mode
+      if (isWebUI) {
+        return;
+      }
+
+      const numProgressBars = Math.min(concurrency, 20);
+
+      const showThreadCounts = concurrency > numProgressBars;
+
+      multibar = new cliProgress.MultiBar(
+        {
+          format: showThreadCounts
+            ? 'Group {groupId} [{bar}] {percentage}% | {value}/{total} | {activeThreads}/{maxThreads} threads | {provider} "{prompt}" {vars}'
+            : 'Group {groupId} [{bar}] {percentage}% | {value}/{total} | {provider} "{prompt}" {vars}',
+          hideCursor: true,
+          gracefulExit: true,
+        },
+        cliProgress.Presets.shades_classic,
+      );
+
+      if (!multibar) {
+        return;
+      }
+
+      const stepsPerProgressBar = Math.floor(evalOptions.length / numProgressBars);
+      const remainingSteps = evalOptions.length % numProgressBars;
+      multiProgressBars = [];
+
+      for (let i = 0; i < numProgressBars; i++) {
+        const totalSteps = i < remainingSteps ? stepsPerProgressBar + 1 : stepsPerProgressBar;
+        if (totalSteps > 0) {
+          // Calculate how many threads are assigned to this progress bar
+          const threadsForThisBar = calculateThreadsPerBar(concurrency, numProgressBars, i);
+
+          const progressbar = multibar.create(totalSteps, 0, {
+            groupId: `${i + 1}/${numProgressBars}`,
+            provider: '',
+            prompt: '',
+            vars: '',
+            activeThreads: 0,
+            maxThreads: threadsForThisBar,
+          });
+          multiProgressBars.push(progressbar);
+        }
+      }
+    };
+
+    // Run the evals
+    if (this.options.showProgressBar) {
+      await createMultiBars(runEvalOptions);
+    }
+
+    // Separate serial and concurrent eval options
+    const serialRunEvalOptions: RunEvalOptions[] = [];
+    const concurrentRunEvalOptions: RunEvalOptions[] = [];
+
+    for (const evalOption of runEvalOptions) {
+      if (evalOption.test.options?.runSerially) {
+        serialRunEvalOptions.push(evalOption);
+      } else {
+        concurrentRunEvalOptions.push(evalOption);
+      }
+    }
+
+    try {
+      if (serialRunEvalOptions.length > 0) {
+        // Run serial evaluations first
+        logger.info(`Running ${serialRunEvalOptions.length} serial evaluations...`);
+        for (const evalStep of serialRunEvalOptions) {
+          if (isWebUI) {
+            const provider = evalStep.provider.label || evalStep.provider.id();
+            const vars = Object.entries(evalStep.test.vars || {})
+              .map(([k, v]) => `${k}=${v}`)
+              .join(' ')
+              .slice(0, 50)
+              .replace(/\n/g, ' ');
+            logger.info(
+              `[${numComplete}/${serialRunEvalOptions.length}] Running ${provider} with vars: ${vars}`,
+            );
+          }
+          const idx = runEvalOptions.indexOf(evalStep);
+          await processEvalStepWithTimeout(evalStep, idx);
+          processedIndices.add(idx);
+        }
+      }
+
+      // Then run concurrent evaluations
+      logger.info(
+        `Running ${concurrentRunEvalOptions.length} concurrent evaluations with up to ${concurrency} threads...`,
+      );
+      await async.forEachOfLimit(concurrentRunEvalOptions, concurrency, async (evalStep) => {
+        checkAbort();
+        const idx = runEvalOptions.indexOf(evalStep);
+        await processEvalStepWithTimeout(evalStep, idx);
+        processedIndices.add(idx);
+        await this.evalRecord.addPrompts(prompts);
+      });
+    } catch (err) {
+      if (options.abortSignal?.aborted) {
+        evalTimedOut = evalTimedOut || maxEvalTimeMs > 0;
+        logger.warn(`Evaluation aborted: ${String(err)}`);
+      } else {
+        throw err;
+      }
+    }
+
+    // Do we have to run comparisons between row outputs?
+    const compareRowsCount = rowsWithSelectBestAssertion.size;
+
+    let progressBar;
+    if (compareRowsCount > 0 && multibar && !isWebUI) {
+      progressBar = multibar.create(compareRowsCount, 0, {
+        provider: 'Running model-graded comparisons',
+        prompt: '',
+        vars: '',
+      });
+    }
+    let compareCount = 0;
+    for (const testIdx of rowsWithSelectBestAssertion) {
+      compareCount++;
+
+      if (isWebUI) {
+        logger.info(`Running model-graded comparison ${compareCount} of ${compareRowsCount}...`);
+      }
+
+      const resultsToCompare = this.evalRecord.persisted
+        ? await this.evalRecord.fetchResultsByTestIdx(testIdx)
+        : this.evalRecord.results.filter((r) => r.testIdx === testIdx);
+      if (resultsToCompare.length === 0) {
+        logger.warn(`Expected results to be found for test index ${testIdx}`);
+        continue;
+      }
+
+      const compareAssertion = resultsToCompare[0].testCase.assert?.find(
+        (a) => a.type === 'select-best',
+      ) as Assertion;
+      if (compareAssertion) {
+        const outputs = resultsToCompare.map((r) => r.response?.output || '');
+        const gradingResults = await runCompareAssertion(
+          resultsToCompare[0].testCase,
+          compareAssertion,
+          outputs,
+        );
+        for (let index = 0; index < resultsToCompare.length; index++) {
+          const result = resultsToCompare[index];
+          const gradingResult = gradingResults[index];
+          if (result.gradingResult) {
+            result.gradingResult.tokensUsed = result.gradingResult.tokensUsed || {
+              total: 0,
+              prompt: 0,
+              completion: 0,
+            };
+
+            // Use the helper function instead of direct updates
+            if (gradingResult.tokensUsed) {
+              if (!result.gradingResult.tokensUsed) {
+                result.gradingResult.tokensUsed = {
+                  total: 0,
+                  prompt: 0,
+                  completion: 0,
+                };
+              }
+
+              // Update the metrics using the helper function
+              updateAssertionMetrics(
+                { tokenUsage: { assertions: result.gradingResult.tokensUsed } },
+                gradingResult.tokensUsed,
+              );
+
+              // Also update the metrics for the eval
+              if (gradingResult.tokensUsed && result.testCase?.assert) {
+                for (const assertion of result.testCase.assert) {
+                  if (MODEL_GRADED_ASSERTION_TYPES.has(assertion.type as AssertionType)) {
+                    updateAssertionMetrics(
+                      { tokenUsage: this.stats.tokenUsage },
+                      gradingResult.tokensUsed,
+                    );
+                    break;
+                  }
+                }
+              }
+            }
+
+            result.success = result.gradingResult.pass =
+              result.gradingResult.pass && gradingResult.pass;
+            if (!gradingResult.pass) {
+              // Failure overrides the reason and the score
+              result.gradingResult.reason = gradingResult.reason;
+              result.score = result.gradingResult.score = gradingResult.score;
+            }
+            if (!result.gradingResult.componentResults) {
+              result.gradingResult.componentResults = [];
+            }
+            result.gradingResult.componentResults.push(gradingResult);
+          } else {
+            result.gradingResult = gradingResult;
+          }
+          if (this.evalRecord.persisted) {
+            await result.save();
+          }
+        }
+        if (progressBar) {
+          progressBar.increment({
+            prompt: resultsToCompare[0].prompt.raw.slice(0, 10).replace(/\n/g, ''),
+          });
+        } else if (!isWebUI) {
+          logger.debug(`Model-graded comparison #${compareCount} of ${compareRowsCount} complete`);
+        }
+      }
+    }
+
+    await this.evalRecord.addPrompts(prompts);
+
+    // Finish up
+    if (multibar) {
+      multibar.stop();
+    }
+    if (progressBar) {
+      progressBar.stop();
+    }
+
+    if (globalTimeout) {
+      clearTimeout(globalTimeout);
+    }
+
+    if (evalTimedOut) {
+      for (let i = 0; i < runEvalOptions.length; i++) {
+        if (!processedIndices.has(i)) {
+          const evalStep = runEvalOptions[i];
+          const timeoutResult = {
+            provider: {
+              id: evalStep.provider.id(),
+              label: evalStep.provider.label,
+              config: evalStep.provider.config,
+            },
+            prompt: {
+              raw: evalStep.prompt.raw,
+              label: evalStep.prompt.label,
+              config: evalStep.prompt.config,
+            },
+            vars: evalStep.test.vars || {},
+            error: `Evaluation exceeded max duration of ${maxEvalTimeMs}ms`,
+            success: false,
+            failureReason: ResultFailureReason.ERROR,
+            score: 0,
+            namedScores: {},
+            latencyMs: Date.now() - startTime,
+            promptIdx: evalStep.promptIdx,
+            testIdx: evalStep.testIdx,
+            testCase: evalStep.test,
+            promptId: evalStep.prompt.id || '',
+          } as EvaluateResult;
+
+          await this.evalRecord.addResult(timeoutResult);
+          this.stats.errors++;
+          const { metrics } = prompts[evalStep.promptIdx];
+          if (metrics) {
+            metrics.testErrorCount += 1;
+            metrics.totalLatencyMs += timeoutResult.latencyMs;
+          }
+        }
+      }
+    }
+
+    this.evalRecord.setVars(Array.from(vars));
+
+    await runExtensionHook(testSuite.extensions, 'afterAll', {
+      prompts: this.evalRecord.prompts,
+      results: this.evalRecord.results,
+      suite: testSuite,
+    });
+
+    telemetry.record('eval_ran', {
+      numPrompts: prompts.length,
+      numTests: prompts.reduce(
+        (acc, p) =>
+          acc +
+          (p.metrics?.testPassCount || 0) +
+          (p.metrics?.testFailCount || 0) +
+          (p.metrics?.testErrorCount || 0),
+        0,
+      ),
+      numVars: varNames.size,
+      numProviders: testSuite.providers.length,
+      numRepeat: options.repeat || 1,
+      providerPrefixes: Array.from(
+        new Set(
+          testSuite.providers.map((p) => {
+            const idParts = p.id().split(':');
+            return idParts.length > 1 ? idParts[0] : 'unknown';
+          }),
+        ),
+      ).sort(),
+      assertionTypes: Array.from(assertionTypes).sort(),
+      eventSource: options.eventSource || 'default',
+      ci: isCI(),
+      hasAnyPass: this.evalRecord.prompts.some(
+        (p) => p.metrics?.testPassCount && p.metrics.testPassCount > 0,
+      ),
+      // FIXME(ian): Does this work?  I think redteam is only on the config, not testSuite.
+      // isRedteam: Boolean(testSuite.redteam),
+    });
+
+    // Update database signal file after all results are written
+    updateSignalFile();
+
+    return this.evalRecord;
+  }
+}
+```
+
+
+### SLIP39SegwitP2SHWallet  (Cursor  BlueWallet/BlueWallet#7989  class/wallets/slip39-wallets.ts)
+metrics: loc=14.0 methods=0.0 wmc=0.0 lcom=nan c3=nan rubric_flag=False
+```ts
+export class SLIP39SegwitP2SHWallet extends HDSegwitP2SHWallet {
+  static readonly type = 'SLIP39segwitP2SH';
+  static readonly typeReadable = 'SLIP39 SegWit (P2SH)';
+  // @ts-ignore: override
+  public readonly type = SLIP39SegwitP2SHWallet.type;
+  // @ts-ignore: override
+  public readonly typeReadable = SLIP39SegwitP2SHWallet.typeReadable;
+
+  _getSeed = SLIP39Mixin._getSeed;
+  validateMnemonic = SLIP39Mixin.validateMnemonic;
+  // @ts-ignore: this type mismatch
+  setSecret = SLIP39Mixin.setSecret;
+  getID = SLIP39Mixin.getID;
+}
+```
+
+
+### NxCloudFixComponent  (Cursor  nrwl/nx-console#2616  libs/shared/cloud-fix-webview/src/nx-cloud-fix-component.ts)
+metrics: loc=577.0 methods=16.0 wmc=61.0 lcom=0.1428571428571428 c3=0.1553129890476248 rubric_flag=True
+```ts
+@customElement('nx-cloud-fix-component')
+export class NxCloudFixComponent extends EditorContext(LitElement) {
+  constructor() {
+    super();
+
+    if (this.editor === 'vscode') {
+      // Add codicons CSS
+      if (!document.querySelector('link[href*="codicon.css"]')) {
+        const codiconsLink = document.createElement('link');
+        codiconsLink.rel = 'stylesheet';
+        codiconsLink.href =
+          'https://unpkg.com/@vscode/codicons@0.0.36/dist/codicon.css';
+        document.head.appendChild(codiconsLink);
+      }
+    }
+  }
+
+  protected override createRenderRoot(): Element | ShadowRoot {
+    return this;
+  }
+
+  @property({ type: Object })
+  details: NxCloudFixDetails | undefined;
+
+  @property({ type: Function })
+  onApply: ((details: NxCloudFixDetails) => void) | undefined;
+
+  @property({ type: Function })
+  onReject: ((details: NxCloudFixDetails) => void) | undefined;
+
+  @property({ type: Function })
+  onApplyLocally: ((details: NxCloudFixDetails) => void) | undefined;
+
+  @property({ type: Function })
+  onShowDiff: (() => void) | undefined;
+
+  @property({ type: Function })
+  onOpenExternalLink: ((url: string) => void) | undefined;
+
+  @state()
+  private isTerminalExpanded = true;
+
+  override render(): TemplateResult {
+    if (!this.details) {
+      return html`<div
+        class="text-foreground flex h-[200px] items-center justify-center text-xl"
+      >
+        Loading...
+      </div>`;
+    }
+
+    const { cipe, runGroup, terminalOutput } = this.details;
+    const aiFix = runGroup.aiFix;
+
+    if (!aiFix) {
+      return html`<div class="mx-auto flex w-full flex-col pb-6">
+        No AI fix available
+      </div>`;
+    }
+
+    return html`
+      <div class="mx-auto flex w-full flex-col pb-6">
+        ${this.renderHeader(cipe, runGroup)}
+
+        <div class="flex flex-col px-3">
+          <div class="px-3 py-2 pb-9">
+            <p class="text-foreground m-0 leading-relaxed opacity-90">
+              Nx Cloud AI analyzes your failing CI tasks and automatically
+              generates fixes whenever possible. The AI examines the error
+              output, identifies the root cause, and suggests minimal code
+              changes to resolve the issue. Once generated, the fix is verified
+              by running the same task on Nx Cloud to ensure it resolves the
+              error.
+            </p>
+            <p class="text-foreground m-0 mt-2 leading-relaxed opacity-90">
+              You can
+              <span
+                class="text-primary hover:text-primary cursor-pointer underline"
+                @click="${() => this.handleShowDiff()}"
+              >
+                review the resulting git diff of the suggested changes</span
+              >&nbsp;and choose to apply or reject them.
+            </p>
+          </div>
+          ${aiFix.suggestedFix ? this.getFixSection(aiFix) : ''}
+          ${aiFix.suggestedFix
+            ? html`<div class="pointer-events-none relative m-0 h-9">
+                <div
+                  class="bg-border absolute left-1/2 top-0 h-full w-0.5 -translate-x-1/2"
+                ></div>
+                <div
+                  class="border-b-border absolute left-1/2 top-0 h-0 w-0 -translate-x-1/2 border-b-[10px] border-l-[8px] border-r-[8px] border-l-transparent border-r-transparent"
+                ></div>
+              </div>`
+            : ''}
+          ${this.getStatusSection(aiFix)}
+          <div class="pointer-events-none relative m-0 h-9">
+            <div
+              class="bg-border absolute left-1/2 top-0 h-full w-0.5 -translate-x-1/2"
+            ></div>
+            <div
+              class="border-b-border absolute left-1/2 top-0 h-0 w-0 -translate-x-1/2 border-b-[10px] border-l-[8px] border-r-[8px] border-l-transparent border-r-transparent"
+            ></div>
+          </div>
+          ${this.getTerminalSection(aiFix.taskIds[0], terminalOutput)}
+        </div>
+
+        <!-- Hidden pill-element to ensure Codicons CSS is loaded -->
+        <pill-element style="display: none"></pill-element>
+      </div>
+    `;
+  }
+
+  private renderHeader(cipe: CIPEInfo, runGroup: CIPERunGroup): TemplateResult {
+    return html`
+      <div class="bg-background mx-3 flex justify-between p-3">
+        <div class="flex w-full flex-col">
+          <div class="flex w-full items-center justify-between">
+            <h1
+              class="text-foreground m-0 flex items-center gap-2 text-2xl font-semibold"
+            >
+              <svg
+                role="img"
+                xmlns="http://www.w3.org/2000/svg"
+                stroke="currentColor"
+                fill="transparent"
+                viewBox="0 0 24 24"
+                id="nx-cloud-header-logo"
+                class="stroke-foreground h-6 w-6 flex-shrink-0 fill-transparent"
+              >
+                <path
+                  d="M22.167 7.167v-2.5a2.5 2.5 0 0 0-2.5-2.5h-15a2.5 2.5 0 0 0-2.5 2.5v15a2.5 2.5 0 0 0 2.5 2.5h2.5m15-15c-2.76 0-5 2.24-5 5s-2.24 5-5 5-5 2.24-5 5m15-15V19.59a2.577 2.577 0 0 1-2.576 2.576H7.167"
+                  stroke-width="2"
+                ></path>
+              </svg>
+              Nx Cloud AI Fix
+              ${this.editor === 'intellij' && this.onOpenExternalLink
+                ? html`<span
+                    class="text-primary cursor-pointer hover:opacity-80"
+                    @click="${() => this.onOpenExternalLink!(cipe.cipeUrl)}"
+                    title="View CI Pipeline Execution"
+                  >
+                    <icon-element icon="link-external"></icon-element>
+                  </span>`
+                : html`<a
+                    class="text-primary cursor-pointer hover:opacity-80"
+                    target="_blank"
+                    href="${cipe.cipeUrl}"
+                    title="View CI Pipeline Execution"
+                  >
+                    <icon-element icon="link-external"></icon-element>
+                  </a>`}
+            </h1>
+            <div
+              class="bg-secondary text-secondaryForeground flex items-center gap-1.5 rounded-[18px] px-4 py-2 text-sm font-semibold"
+            >
+              <icon-element icon="git-branch"></icon-element>
+              ${this.editor === 'intellij' &&
+              this.onOpenExternalLink &&
+              cipe.commitUrl
+                ? html`<span
+                    @click="${() => this.onOpenExternalLink!(cipe.commitUrl!)}"
+                    class="cursor-pointer text-inherit no-underline hover:underline"
+                  >
+                    ${cipe.branch}
+                  </span>`
+                : html`<a
+                    href="${cipe.commitUrl}"
+                    target="_blank"
+                    class="cursor-pointer text-inherit no-underline hover:underline"
+                  >
+                    ${cipe.branch}
+                  </a>`}
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private handleApply() {
+    if (this.details && this.onApply) {
+      this.onApply(this.details);
+    }
+  }
+
+  private handleApplyLocally() {
+    if (this.details && this.onApplyLocally) {
+      this.onApplyLocally(this.details);
+    }
+  }
+
+  private handleReject() {
+    if (this.details && this.onReject) {
+      this.onReject(this.details);
+    }
+  }
+
+  private handleShowDiff() {
+    if (this.onShowDiff) {
+      this.onShowDiff();
+    }
+  }
+
+  private renderFormattedText(text: string): TemplateResult {
+    // Regular expression to match text between backticks
+    // This handles single backticks for inline code
+    const parts = text.split(/(`[^`]*`)/g);
+
+    return html`${parts.map((part) => {
+      // Check if this part is code (wrapped in backticks)
+      if (part.startsWith('`') && part.endsWith('`') && part.length > 1) {
+        // Remove the backticks and render as code
+        const code = part.slice(1, -1);
+        // Handle empty code blocks
+        if (code.length === 0) {
+          return html`<code
+            class="bg-fieldBackground rounded px-1 py-0.5 font-mono text-xs"
+            >&nbsp;</code
+          >`;
+        }
+        return html`<code
+          class="bg-fieldBackground rounded px-1 py-0.5 font-mono text-xs"
+          >${code}</code
+        >`;
+      }
+      // Otherwise, render as regular text
+      return part;
+    })}`;
+  }
+
+  private getTerminalSection(
+    taskId: string,
+    terminalOutput: string,
+  ): TemplateResult {
+    return html`
+      <div
+        class="bg-background border-border ${this.isTerminalExpanded
+          ? 'expanded'
+          : ''} relative m-0 flex flex-col overflow-hidden rounded-none border"
+      >
+        <div
+          class="${this.isTerminalExpanded
+            ? 'border-b border-border'
+            : 'border-b border-transparent transition-colors duration-200'} flex cursor-pointer select-none items-center gap-3 p-4 px-5"
+          @click="${() => (this.isTerminalExpanded = !this.isTerminalExpanded)}"
+        >
+          <icon-element
+            icon="${this.isTerminalExpanded ? 'chevron-down' : 'chevron-right'}"
+            class="inline-flex h-4 w-4 flex-shrink-0 items-center justify-center"
+          ></icon-element>
+          <h2 class="m-0 flex items-center gap-2 text-base font-semibold">
+            Original failing task output:
+            <span class="font-mono">nx run ${taskId}</span>
+          </h2>
+        </div>
+        ${this.isTerminalExpanded
+          ? html`
+              <div
+                class="flex h-[400px] min-h-[300px] flex-col overflow-hidden pb-5 pl-0 pr-5 pt-0"
+              >
+                <terminal-component
+                  .content="${terminalOutput}"
+                ></terminal-component>
+              </div>
+            `
+          : ''}
+      </div>
+    `;
+  }
+
+  private createCreatingFixSection(): TemplateResult {
+    return html`
+      <div
+        class="border-border bg-background relative m-0 border p-6 text-center"
+      >
+        <div class="mx-auto mb-4 flex h-16 w-16 items-center justify-center">
+          <icon-element
+            icon="loading"
+            class="animate-spin-slow leading-none"
+          ></icon-element>
+        </div>
+        <h2 class="text-foreground m-0 mb-2 text-lg font-semibold">
+          Creating Fix<span
+            class="loading-dots inline-block w-6 text-left"
+          ></span>
+        </h2>
+        <p class="text-foreground m-0 text-sm opacity-80">
+          Nx Cloud AI is analyzing the error and generating a fix.
+        </p>
+      </div>
+    `;
+  }
+
+  private getFixSection(aiFix: NxAiFix): TemplateResult {
+    // If fix was rejected, show the rejected state
+    if (aiFix.userAction === 'REJECTED') {
+      return html`
+        <div
+          class="border-border bg-background relative m-0 border p-6 text-center"
+        >
+          <div class="mx-auto mb-4 flex h-16 w-16 items-center justify-center">
+            <icon-element
+              icon="circle-slash"
+              class="text-foreground leading-none opacity-70"
+            ></icon-element>
+          </div>
+          <h2 class="text-foreground m-0 mb-2 text-lg font-semibold">
+            Fix Rejected
+          </h2>
+          <p class="text-foreground m-0 text-sm opacity-80">
+            You chose not to apply the suggested fix.
+          </p>
+        </div>
+      `;
+    }
+
+    // If fix was applied, show the applied state
+    if (aiFix.userAction === 'APPLIED') {
+      return html`
+        <div
+          class="border-border bg-background relative m-0 border p-6 text-center"
+        >
+          <div
+            class="mx-auto mb-4 flex h-16 w-16 flex-col items-center justify-center"
+          >
+            <icon-element
+              icon="git-branch"
+              class="text-success leading-none"
+            ></icon-element>
+          </div>
+          <h2 class="text-foreground m-0 mb-2 text-lg font-semibold">
+            Fix Applied
+          </h2>
+          <p class="text-foreground m-0 text-sm opacity-80">
+            The suggested fix has been committed to your branch.
+          </p>
+        </div>
+      `;
+    }
+
+    const showActions = true;
+
+    return html`
+      <div class="border-border bg-background relative m-0 border">
+        <div
+          class="border-border relative flex items-start justify-between border-b p-4 px-5"
+        >
+          <div class="flex-1">
+            <h2 class="m-0 flex items-center gap-3 text-base font-semibold">
+              <icon-element icon="sparkle"></icon-element>
+              Apply Suggested Fix
+            </h2>
+          </div>
+        </div>
+        <div class="px-4 py-1 pb-4">
+          ${aiFix.suggestedFixReasoning
+            ? html`<p class="text-foreground m-0 mb-3 text-sm opacity-90">
+                ${this.renderFormattedText(aiFix.suggestedFixReasoning)}
+              </p>`
+            : ''}
+          <form-group-element variant="vertical">
+            <label-element for="commit-message">Commit message</label-element>
+            <textarea-element
+              value="${aiFix.suggestedFixDescription ||
+              'fix: nx cloud AI suggested fix'}"
+              disabled
+              rows="3"
+            ></textarea-element>
+          </form-group-element>
+          ${showActions
+            ? html`
+                <div class="mt-4 flex justify-end gap-2">
+                  <button-element
+                    text="Apply Fix"
+                    appearance="primary"
+                    @click="${() => this.handleApply()}"
+                  ></button-element>
+                  <button-element
+                    text="Apply Fix Locally"
+                    appearance="secondary"
+                    ?disabled=${this.details?.hasUncommittedChanges}
+                    title=${this.details?.hasUncommittedChanges
+                      ? 'You have uncommitted changes. Please commit or stash them before applying the fix locally.'
+                      : ''}
+                    @click="${() => this.handleApplyLocally()}"
+                  ></button-element>
+                  <button-element
+                    text="Reject"
+                    appearance="secondary"
+                    @click="${() => this.handleReject()}"
+                  ></button-element>
+                </div>
+              `
+            : ''}
+        </div>
+      </div>
+    `;
+  }
+
+  private getStatusSection(aiFix: NxAiFix): TemplateResult {
+    const hasAiFix = !!aiFix.suggestedFix;
+    // TODO: Remove this once all environments have been migrated after deployment
+    // Fall back to original validationStatus field for backwards compatibility
+    const verificationStatus =
+      aiFix.verificationStatus || (aiFix as any).validationStatus;
+
+    const suggestedFixStatus = aiFix.suggestedFixStatus;
+
+    if (suggestedFixStatus) {
+      if (suggestedFixStatus === 'NOT_STARTED') {
+        return this.createWaitingForFixSection();
+      } else if (suggestedFixStatus === 'IN_PROGRESS') {
+        return this.createCreatingFixSection();
+      } else if (suggestedFixStatus === 'FAILED') {
+        return this.createFixCreationFailedSection();
+      } else if (suggestedFixStatus === 'NOT_EXECUTABLE') {
+        return this.createCancelledFixSection();
+      } else if (suggestedFixStatus === 'COMPLETED' && hasAiFix) {
+        // Fix has been created, now check verification status
+        // Continue to the verification status check below
+      }
+    } else {
+      // todo: remove this once all environments have been updated
+      if (!hasAiFix && verificationStatus === 'NOT_STARTED') {
+        // Show creating fix state
+        return this.createCreatingFixSection();
+      }
+
+      // if the fix creation failed, show the proper error state
+      if (!hasAiFix && verificationStatus == 'FAILED') {
+        return this.createFixCreationFailedSection();
+      }
+    }
+
+    // Fix exists, show verification status
+    // If there's no verification status but we have a fix, it means verification hasn't started yet
+    if (!verificationStatus && hasAiFix) {
+      return html``; // Don't show any status section if fix is ready but no verification info
+    }
+
+    switch (verificationStatus) {
+      case 'IN_PROGRESS':
+        return html`
+          <div
+            class="border-border bg-background relative m-0 border p-6 text-center"
+          >
+            <div class="mb-2 flex flex-col items-center justify-center gap-3">
+              <icon-element
+                icon="loading"
+                class="animate-spin-slow leading-none"
+              ></icon-element>
+              <h2 class="text-foreground m-0 text-lg font-semibold">
+                Verifying Fix<span
+                  class="loading-dots inline-block w-6 text-left"
+                ></span>
+              </h2>
+            </div>
+            <p class="text-foreground m-0 text-sm opacity-80">
+              Nx Cloud is verifying the fix. You can wait for verification to
+              complete or apply the fix now if you're confident it's correct.
+            </p>
+          </div>
+        `;
+      case 'COMPLETED':
+        return html`
+          <div
+            class="border-border bg-background relative m-0 border p-6 text-center"
+          >
+            <div class="mb-2 flex flex-col items-center justify-center gap-3">
+              <icon-element
+                icon="verified"
+                class="text-success leading-none"
+              ></icon-element>
+              <h2 class="text-foreground m-0 text-lg font-semibold">
+                Fix Verified on Nx Cloud
+              </h2>
+            </div>
+            <p class="text-foreground m-0 text-sm opacity-80">
+              <span class="font-mono">${aiFix.taskIds[0]}</span> has been
+              successfully re-run on Nx Cloud after applying the suggested
+              changes. You can now commit the fix to your branch using the
+              controls above.
+            </p>
+          </div>
+        `;
+      case 'FAILED':
+        return html`
+          <div
+            class="border-border bg-background relative m-0 border p-6 text-center"
+          >
+            <div class="mb-2 flex items-center justify-center gap-3">
+              <icon-element
+                icon="error"
+                class="text-error leading-none"
+              ></icon-element>
+              <h2 class="text-foreground m-0 text-lg font-semibold">
+                Fix Verification Failed
+              </h2>
+            </div>
+            <p class="text-foreground m-0 text-sm opacity-80">
+              The fix verification failed on Nx Cloud. You may still apply it if
+              you believe it's correct/useful.
+            </p>
+          </div>
+        `;
+      default:
+        // NOT_STARTED or other states
+        return html``;
+    }
+  }
+  createCancelledFixSection(): TemplateResult {
+    return html`
+      <div
+        class="border-border bg-background relative m-0 border p-6 text-center"
+      >
+        <div class="mb-2 flex flex-col items-center justify-center gap-3">
+          <icon-element
+            icon="circle-slash"
+            class="text-foreground leading-none opacity-70"
+          ></icon-element>
+          <h2 class="text-foreground m-0 text-lg font-semibold">
+            Fix Creation Cancelled
+          </h2>
+        </div>
+        <p class="text-foreground m-0 text-sm opacity-80">
+          There were no fixes that were generated for this error.
+        </p>
+      </div>
+    `;
+  }
+
+  createWaitingForFixSection(): TemplateResult {
+    return html`
+      <div
+        class="border-border bg-background relative m-0 border p-6 text-center"
+      >
+        <div class="mb-2 flex flex-col items-center justify-center gap-3">
+          <icon-element
+            icon="info"
+            class="text-primary leading-none"
+          ></icon-element>
+          <h2 class="text-foreground m-0 text-lg font-semibold">
+            Nx Cloud is preparing to generate a fix
+          </h2>
+        </div>
+        <p class="text-foreground m-0 text-sm opacity-80">
+          Nx Cloud is analyzing this run to see if a fix can be generated. This
+          may take a moment. Please wait.
+        </p>
+      </div>
+    `;
+  }
+
+  private createFixCreationFailedSection(): TemplateResult {
+    return html`
+      <div
+        class="border-border bg-background relative m-0 border p-6 text-center"
+      >
+        <div class="mb-2 flex flex-col items-center justify-center gap-3">
+          <icon-element
+            icon="error"
+            class="text-error leading-none"
+          ></icon-element>
+          <h2 class="text-foreground m-0 text-lg font-semibold">
+            Fix Creation Failed
+          </h2>
+        </div>
+        <p class="text-foreground m-0 text-sm opacity-80">
+          Nx Cloud was unable to generate a fix for the error. You can try
+          running the task again or investigate the issue manually on the Nx
+          Cloud UI
+        </p>
+      </div>
+    `;
+  }
+}
+```
+
+
+### OpenGatePlugin  (OpenAI_Codex  nguyenvanduocit/obsidian-open-gate#91  src/main.ts)
+metrics: loc=196.0 methods=13.0 wmc=28.0 lcom=0.0 c3=0.1989712837245695 rubric_flag=False
+```ts
+export default class OpenGatePlugin extends Plugin {
+    settings: PluginSetting
+
+    async onload() {
+        await this.loadSettings()
+        await this.mayShowOnboardingDialog()
+        await this.initGates()
+        this.addSettingTab(new SettingTab(this.app, this))
+        this.registerCommands()
+        this.registerProtocol()
+        setupLinkConvertMenu(this)
+        setupInsertLinkMenu(this)
+        registerCodeBlockProcessor(this)
+    }
+
+    async mayShowOnboardingDialog() {
+        // Check if the UUID in the settings is empty
+        if (this.settings.uuid === '') {
+            // Generate a new UUID and assign it to the settings
+            this.settings.uuid = this.generateUuid()
+            // Save the updated settings
+            await this.saveSettings()
+
+            // Check if there are no gates in the settings
+            if (Object.keys(this.settings.gates).length === 0) {
+                // Open the onboarding modal to create a new gate
+                new ModalOnBoarding(this.app, createEmptyGateOption(), async (gate: GateFrameOption) => {
+                    // Add the created gate to the settings
+                    await this.addGate(gate)
+                }).open()
+            }
+        }
+    }
+
+    private async initGates() {
+        // Iterate over all the gates in the settings
+        for (const gateId in this.settings.gates) {
+            // Get the gate with the current ID
+            const gate = this.settings.gates[gateId]
+            // Register the gate
+            registerGate(this, gate)
+        }
+
+        // this view is used to open gates from the protocol handler
+        registerGate(
+            this,
+            normalizeGateOption({
+                id: 'temp-gate',
+                title: 'Temp Gate',
+                icon: 'globe',
+                url: 'about:blank'
+            })
+        )
+    }
+
+    private registerCommands() {
+        this.addCommand({
+            id: `open-gate-create-new`,
+            name: `Create new gate`,
+            callback: async () => {
+                new ModalEditGate(this.app, createEmptyGateOption(), async (gate: GateFrameOption) => {
+                    await this.addGate(gate)
+                }).open()
+            }
+        })
+
+        this.addCommand({
+            id: `open-list-gates-modal`,
+            name: `List Gates`,
+            hotkeys: [{ modifiers: ['Mod', 'Shift'], key: 'g' }],
+            callback: async () => {
+                new ModalListGates(this.app, this.settings.gates, async (gate: GateFrameOption) => {
+                    await this.addGate(gate)
+                }).open()
+            }
+        })
+    }
+
+    /**
+     * Register the "opengate" action to Obsidian.
+     *
+     * We will attempt to open a gate based on the provided title and navigate to the provided URL
+     */
+    private registerProtocol() {
+        this.registerObsidianProtocolHandler('opengate', this.handleCustomProtocol.bind(this))
+    }
+
+    getGateOptionFromProtocolData(data: ObsidianProtocolData): GateFrameOption | undefined {
+        const { title, url, id, position } = data
+
+        // Initialize targetGate as undefined
+        let targetGate: GateFrameOption | undefined
+
+        // Search for the gate by id first
+        if (id && this.settings.gates[id]) {
+            targetGate = this.settings.gates[id]
+        } else {
+            // Search for the gate by title or url if id is not found
+            targetGate = Object.values(this.settings.gates).find(
+                (gate) => (title && gate.title.toLowerCase() === title.toLowerCase()) || (url && gate.url.toLowerCase() === url.toLowerCase())
+            )
+        }
+
+        // If no gate is found, create a new empty gate option
+        if (!targetGate) {
+            targetGate = createEmptyGateOption()
+        }
+
+        // Update the url and position if needed
+        if (url) {
+            targetGate.url = url
+        }
+
+        if (position) {
+            targetGate.position = position as GateFrameOptionType
+        }
+
+        return targetGate
+    }
+
+    findGateBy(field: 'title' | 'url', value: string): GateFrameOption | undefined {
+        return Object.values(this.settings.gates).find((gate) => gate[field].toLowerCase() === value.toLowerCase())
+    }
+
+    async handleCustomProtocol(data: ObsidianProtocolData) {
+        let targetGate = this.getGateOptionFromProtocolData(data)
+        if (targetGate === undefined) {
+            if (!data.url) {
+                new Notice('Missing url parameter')
+                return
+            }
+        }
+
+        console.log(targetGate)
+
+        const gate = await openView(this.app.workspace, targetGate?.id || 'temp-gate', targetGate?.position)
+        const gateView = gate.view as GateView
+        gateView?.onFrameReady(() => {
+            gateView.setUrl(data.url)
+        })
+    }
+
+    async addGate(gate: GateFrameOption) {
+        const normalizedGate = normalizeGateOption(gate)
+
+        if (!this.settings.gates.hasOwnProperty(normalizedGate.id)) {
+            registerGate(this, normalizedGate)
+        } else {
+            new Notice('This change will take effect after you reload Obsidian.')
+        }
+
+        this.settings.gates[normalizedGate.id] = normalizedGate
+
+        await this.saveSettings()
+    }
+
+    async removeGate(gateId: string) {
+        if (!this.settings.gates[gateId]) {
+            new Notice('Gate not found')
+            return // Early exit if gate doesn't exist
+        }
+
+        const gate = this.settings.gates[gateId]
+
+        await unloadView(this.app.workspace, gate)
+        delete this.settings.gates[gateId]
+        await this.saveSettings()
+        new Notice('This change will take effect after you reload Obsidian.')
+    }
+
+    async loadSettings() {
+        this.settings = await this.loadData()
+        // merge default settings
+        this.settings = {
+            ...DEFAULT_SETTINGS,
+            ...this.settings
+        }
+
+        if (!this.settings.gates) {
+            this.settings.gates = {}
+        }
+
+        for (const gateId in this.settings.gates) {
+            this.settings.gates[gateId] = normalizeGateOption(this.settings.gates[gateId])
+        }
+    }
+
+    async saveSettings() {
+        await this.saveData(this.settings)
+    }
+
+    private generateUuid() {
+        // generate uuid
+        return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15)
+    }
+}
+```
+
+
+### SimulationCodeSearchChunkSearchService  (Copilot  microsoft/vscode-copilot-chat#365  test/base/simuliationWorkspaceChunkSearch.ts)
+metrics: loc=67.0 methods=6.0 wmc=10.0 lcom=1.0 c3=0.195416657736855 rubric_flag=True
+```ts
+export class SimulationCodeSearchChunkSearchService extends Disposable implements IWorkspaceChunkSearchService {
+	declare readonly _serviceBrand: undefined;
+
+	private readonly _fullworkspaceChunkSearch: FullWorkspaceChunkSearch;
+	private readonly _githubCodeSearchService: IGithubCodeSearchService;
+
+	constructor(
+		@IInstantiationService instantiationService: IInstantiationService
+	) {
+		super();
+
+		this._fullworkspaceChunkSearch = instantiationService.createInstance(FullWorkspaceChunkSearch);
+		this._githubCodeSearchService = instantiationService.createInstance(SimulationGithubCodeSearchService);
+	}
+
+	readonly onDidChangeIndexState = Event.None;
+
+	getIndexState(): Promise<WorkspaceIndexState> {
+		throw new Error('Method not implemented.');
+	}
+
+	async hasFastSearch(_sizing: StrategySearchSizing): Promise<boolean> {
+		return true;
+	}
+
+	async searchFileChunks(sizing: WorkspaceChunkSearchSizing, query: WorkspaceChunkQuery, options: WorkspaceChunkSearchOptions, telemetryInfo: TelemetryCorrelationId, progress: Progress<ChatResponsePart> | undefined, token: CancellationToken): Promise<WorkspaceChunkSearchResult> {
+		const fullResults = await this._fullworkspaceChunkSearch.searchWorkspace({
+			endpoint: sizing.endpoint,
+			tokenBudget: sizing.tokenBudget,
+			maxResultCountHint: sizing.maxResults ?? 128
+		}, query, options, telemetryInfo, token);
+		if (fullResults) {
+			return {
+				chunks: fullResults.chunks,
+				isFullWorkspace: true
+			};
+		}
+
+		const repo = new GithubRepoId('test-org', 'test-repo');
+		try {
+			const results = await this._githubCodeSearchService.searchRepo('', EmbeddingType.text3small_512, {
+				githubRepoId: repo,
+				indexedCommit: undefined,
+				localRepoRoot: undefined,
+			}, await query.resolveQuery(token), sizing.maxResults ?? 128, options, telemetryInfo, token);
+			return {
+				chunks: results.chunks,
+				isFullWorkspace: false
+			};
+		} catch (error) {
+			console.error('Error searching repo:', error);
+		}
+
+		return {
+			chunks: [],
+			isFullWorkspace: false
+		};
+	}
+
+	triggerLocalIndexing(trigger: BuildIndexTriggerReason): Promise<Result<true, TriggerIndexingError>> {
+		throw new Error('Method not implemented.');
+	}
+
+	triggerRemoteIndexing(trigger: BuildIndexTriggerReason): Promise<Result<true, TriggerIndexingError>> {
+		throw new Error('Method not implemented.');
+	}
+}
+```
+
+
+### FasterVWAP  (Copilot  bennycode/trading-signals#806  src/VWAP/VWAP.ts)
+metrics: loc=41.0 methods=4.0 wmc=7.0 lcom=0.5 c3=0.1156502740480759 rubric_flag=False
+```ts
+export class FasterVWAP extends NumberIndicatorSeries<HighLowCloseVolume<number>> {
+  private cumulativeTypicalPriceVolume: number = 0;
+  private cumulativeVolume: number = 0;
+  private lastCandle: HighLowCloseVolume<number> | null = null;
+
+  constructor() {
+    super();
+  }
+
+  private calculateTypicalPriceVolume(data: HighLowCloseVolume<number>) {
+    const hlc3 = (data.high + data.low + data.close) / 3;
+    return hlc3 * data.volume;
+  }
+
+  override getRequiredInputs() {
+    return 2;
+  }
+
+  override update(candle: HighLowCloseVolume<number>, replace: boolean) {
+    // Only calculate VWAP if we have volume data
+    if (candle.volume === 0) {
+      return null;
+    }
+
+    if (replace && this.lastCandle !== null) {
+      const lastTypicalPriceVolume = this.calculateTypicalPriceVolume(this.lastCandle);
+      this.cumulativeTypicalPriceVolume = this.cumulativeTypicalPriceVolume - lastTypicalPriceVolume;
+      this.cumulativeVolume = this.cumulativeVolume - this.lastCandle.volume;
+    }
+
+    // Cache the latest values for potential future replacement
+    this.lastCandle = candle;
+
+    const typicalPriceVolume = this.calculateTypicalPriceVolume(candle);
+    this.cumulativeTypicalPriceVolume = this.cumulativeTypicalPriceVolume + typicalPriceVolume;
+    this.cumulativeVolume = this.cumulativeVolume + candle.volume;
+
+    const vwap = this.cumulativeTypicalPriceVolume / this.cumulativeVolume;
+    return this.setResult(vwap, replace);
+  }
+}
+```
+
+
+### ClaudeChat  (OpenAI_Codex  CitizensFoundation/policy-synth#119  agents/src/aiModels/claudeChat.ts)
+metrics: loc=224.0 methods=4.0 wmc=40.0 lcom=0.5 c3=0.1622626203067324 rubric_flag=True
+```ts
+export class ClaudeChat extends BaseChatModel {
+  private client: Anthropic;
+  private maxThinkingTokens?: number;
+  config: PsAiModelConfig;
+
+  constructor(config: PsAiModelConfig) {
+    const {
+      apiKey,
+      modelName = "claude-3-opus-20240229",
+      maxTokensOut = 4096,
+    } = config;
+    super(config, modelName, maxTokensOut);
+    this.maxThinkingTokens = config.maxThinkingTokens;
+    this.client = new Anthropic({ apiKey });
+    this.config = config;
+  }
+
+  async generate(
+    messages: PsModelMessage[],
+    streaming?: boolean,
+    streamingCallback?: Function,
+    media?: { mimeType: string; data: string }[],
+    tools?: ChatCompletionTool[],
+    toolChoice: ChatCompletionToolChoiceOption | "auto" = "auto",
+    allowedTools?: string[]
+  ): Promise<PsBaseModelReturnParameters | undefined> {
+    this.logger.debug(
+      `Model config: type=${this.config.modelType}, size=${this.config.modelSize}, ` +
+        `effort=${this.config.reasoningEffort}, maxtemp=${this.config.temperature}, ` +
+        `maxTokens=${this.config.maxTokensOut}, maxThinkingTokens=${this.config.maxThinkingTokens}`
+    );
+    let systemMessage: string | undefined;
+    const formattedMessages = messages
+      .filter((msg) => {
+        if (msg.role === "system") {
+          systemMessage = msg.message;
+          return false;
+        }
+        return true;
+      })
+      .map((msg) => ({
+        role: msg.role as "user" | "assistant",
+        content: msg.message,
+      }));
+
+    if (process.env.PS_DEBUG_PROMPT_MESSAGES) {
+      this.logger.debug(
+        `Messages:\n${this.prettyPrintPromptMessages(formattedMessages)}`
+      );
+    }
+
+    const requestOptions: Anthropic.MessageCreateParams = {
+      max_tokens: this.maxTokensOut,
+      messages: formattedMessages,
+      model: this.modelName,
+      thinking: this.maxThinkingTokens
+        ? {
+            type: "enabled",
+            budget_tokens: this.maxThinkingTokens!,
+          }
+        : undefined,
+    };
+
+    if (tools && tools.length) {
+      const filteredTools = allowedTools && allowedTools.length
+        ? tools.filter((t) => allowedTools.includes(t.function.name))
+        : tools;
+      if (filteredTools.length) {
+        requestOptions.tools = filteredTools.map(
+          (t) =>
+            ({
+              name: t.function.name,
+              description: t.function.description,
+              input_schema: {
+                type: "object",
+                ...(t.function.parameters || {}),
+              },
+            }) as Tool
+        );
+
+        const choice: ToolChoice | undefined =
+          toolChoice === "auto"
+            ? { type: "auto" }
+            : toolChoice === "none"
+            ? { type: "none" }
+            : (toolChoice as any).type === "function"
+            ? { type: "tool", name: (toolChoice as any).function.name }
+            : undefined;
+        if (choice) {
+          requestOptions.tool_choice = choice;
+        }
+      }
+    }
+
+    if (systemMessage) {
+      requestOptions.system = [
+        {
+          type: "text",
+          text: systemMessage,
+          cache_control: { type: "ephemeral" },
+        },
+      ] as any[];
+
+      if (process.env.PS_PROMPT_DEBUG) {
+        this.logger.debug(
+          `--------------> Using system message with cache control: ${JSON.stringify(
+            requestOptions.system,
+            null,
+            2
+          )}`
+        );
+      }
+    }
+
+    if (streaming) {
+      const stream = await this.client.messages.stream({
+        ...requestOptions,
+      });
+
+      let aggregated = "";
+      const toolCalls: { name: string; arguments: any }[] = [];
+
+      for await (const messageStreamEvent of stream) {
+        if (streamingCallback) {
+          streamingCallback(messageStreamEvent);
+        }
+
+        if (messageStreamEvent.type === "content_block_start") {
+          if (messageStreamEvent.content_block.type === "text") {
+            aggregated += messageStreamEvent.content_block.text;
+          } else if (messageStreamEvent.content_block.type === "tool_use") {
+            toolCalls.push({
+              name: messageStreamEvent.content_block.name ?? "unknown",
+              arguments: messageStreamEvent.content_block.input ?? {},
+            });
+          }
+        } else if (
+          messageStreamEvent.type === "content_block_delta" &&
+          messageStreamEvent.delta.type === "text_delta"
+        ) {
+          aggregated += messageStreamEvent.delta.text;
+        }
+      }
+
+      const finalMessage = await stream.finalMessage();
+      let tokensIn = finalMessage.usage.input_tokens;
+      let tokensOut = finalMessage.usage.output_tokens;
+      let cachedInTokens = finalMessage.usage.cache_creation_input_tokens;
+
+      if ((finalMessage.usage as any).cache_creation_input_tokens) {
+        tokensIn += (finalMessage.usage as any).cache_creation_input_tokens * 1.25;
+      }
+
+      if ((finalMessage.usage as any).cache_read_input_tokens) {
+        tokensIn += (finalMessage.usage as any).cache_read_input_tokens * 0.1;
+      }
+
+      return {
+        tokensIn,
+        tokensOut,
+        cachedInTokens: cachedInTokens ?? 0,
+        content: aggregated || this.getTextTypeFromContent(finalMessage.content),
+        toolCalls,
+      };
+    } else {
+      let response;
+      response = await this.client.messages.create(requestOptions);
+      this.logger.debug(`Generated response: ${JSON.stringify(response, null, 2)}`);
+      let tokensIn = response.usage.input_tokens;
+      let tokensOut = response.usage.output_tokens;
+      let cachedInTokens = response.usage.cache_creation_input_tokens;
+
+      //TODO: Fix this properly
+      if ((response.usage as any).cache_creation_input_tokens) {
+        tokensIn += (response.usage as any).cache_creation_input_tokens * 1.25;
+      }
+
+      if ((response.usage as any).cache_read_input_tokens) {
+        tokensIn += (response.usage as any).cache_read_input_tokens * 0.1;
+      }
+      const toolCalls: { name: string; arguments: any }[] = [];
+      for (const block of response.content) {
+        if (block.type === "tool_use") {
+          toolCalls.push({
+            name: block.name ?? "unknown",
+            arguments: block.input ?? {},
+          });
+        }
+      }
+      return {
+        tokensIn: tokensIn,
+        tokensOut: tokensOut,
+        cachedInTokens: cachedInTokens ?? 0,
+        content: this.getTextTypeFromContent(response.content),
+        toolCalls,
+      };
+    }
+  }
+
+  getTextTypeFromContent(content: ContentBlock[]): string {
+    for (const block of content) {
+      if (block.type === "text") {
+        return block.text;
+      }
+    }
+
+    this.logger.warn(
+      `Unknown content type: ${JSON.stringify(content, null, 2)}`
+    );
+    return "unknown";
+  }
+
+  async getEstimatedNumTokensFromMessages(
+    messages: PsModelMessage[]
+  ): Promise<number> {
+    //TODO: Get the right encoding
+    const encoding = encoding_for_model(
+      /*this.modelName*/ "gpt-4o" as TiktokenModel
+    );
+    const formattedMessages = messages.map((msg) => msg.message).join(" ");
+    const tokenCount = encoding.encode(formattedMessages).length;
+    return Promise.resolve(tokenCount);
+  }
+}
+```
+
+
+### LoopDetectionService  (Claude_Code  google-gemini/gemini-cli#3417  packages/core/src/services/loopDetectionService.ts)
+metrics: loc=226.0 methods=11.0 wmc=30.0 lcom=0.0 c3=0.1968223624676374 rubric_flag=False
+```ts
+export class LoopDetectionService {
+  private readonly config: Config;
+
+  // Tool call tracking
+  private lastToolCallKey: string | null = null;
+  private toolCallRepetitionCount: number = 0;
+
+  // Content streaming tracking
+  private lastRepeatedSentence: string = '';
+  private sentenceRepetitionCount: number = 0;
+  private partialContent: string = '';
+
+  // LLM loop track tracking
+  private turnsInCurrentPrompt = 0;
+  private llmCheckInterval = DEFAULT_LLM_CHECK_INTERVAL;
+  private lastCheckTurn = 0;
+
+  constructor(config: Config) {
+    this.config = config;
+  }
+
+  private getToolCallKey(toolCall: { name: string; args: object }): string {
+    const argsString = JSON.stringify(toolCall.args);
+    const keyString = `${toolCall.name}:${argsString}`;
+    return createHash('sha256').update(keyString).digest('hex');
+  }
+
+  /**
+   * Processes a stream event and checks for loop conditions.
+   * @param event - The stream event to process
+   * @returns true if a loop is detected, false otherwise
+   */
+  addAndCheck(event: ServerGeminiStreamEvent): boolean {
+    switch (event.type) {
+      case GeminiEventType.ToolCallRequest:
+        // content chanting only happens in one single stream, reset if there
+        // is a tool call in between
+        this.resetSentenceCount();
+        return this.checkToolCallLoop(event.value);
+      case GeminiEventType.Content:
+        return this.checkContentLoop(event.value);
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * Signals the start of a new turn in the conversation.
+   *
+   * This method increments the turn counter and, if specific conditions are met,
+   * triggers an LLM-based check to detect potential conversation loops. The check
+   * is performed periodically based on the `llmCheckInterval`.
+   *
+   * @param signal - An AbortSignal to allow for cancellation of the asynchronous LLM check.
+   * @returns A promise that resolves to `true` if a loop is detected, and `false` otherwise.
+   */
+  async turnStarted(signal: AbortSignal) {
+    this.turnsInCurrentPrompt++;
+
+    if (
+      this.turnsInCurrentPrompt >= LLM_CHECK_AFTER_TURNS &&
+      this.turnsInCurrentPrompt - this.lastCheckTurn >= this.llmCheckInterval
+    ) {
+      this.lastCheckTurn = this.turnsInCurrentPrompt;
+      return await this.checkForLoopWithLLM(signal);
+    }
+
+    return false;
+  }
+
+  private checkToolCallLoop(toolCall: { name: string; args: object }): boolean {
+    const key = this.getToolCallKey(toolCall);
+    if (this.lastToolCallKey === key) {
+      this.toolCallRepetitionCount++;
+    } else {
+      this.lastToolCallKey = key;
+      this.toolCallRepetitionCount = 1;
+    }
+    if (this.toolCallRepetitionCount >= TOOL_CALL_LOOP_THRESHOLD) {
+      logLoopDetected(
+        this.config,
+        new LoopDetectedEvent(LoopType.CONSECUTIVE_IDENTICAL_TOOL_CALLS),
+      );
+      return true;
+    }
+    return false;
+  }
+
+  private checkContentLoop(content: string): boolean {
+    this.partialContent += content;
+
+    if (!SENTENCE_ENDING_PUNCTUATION_REGEX.test(this.partialContent)) {
+      return false;
+    }
+
+    const completeSentences =
+      this.partialContent.match(/[^.!?]+[.!?]+(?=\s|$)/g) || [];
+    if (completeSentences.length === 0) {
+      return false;
+    }
+
+    const lastSentence = completeSentences[completeSentences.length - 1];
+    const lastCompleteIndex = this.partialContent.lastIndexOf(lastSentence);
+    const endOfLastSentence = lastCompleteIndex + lastSentence.length;
+    this.partialContent = this.partialContent.slice(endOfLastSentence);
+
+    for (const sentence of completeSentences) {
+      const trimmedSentence = sentence.trim();
+      if (trimmedSentence === '') {
+        continue;
+      }
+
+      if (this.lastRepeatedSentence === trimmedSentence) {
+        this.sentenceRepetitionCount++;
+      } else {
+        this.lastRepeatedSentence = trimmedSentence;
+        this.sentenceRepetitionCount = 1;
+      }
+
+      if (this.sentenceRepetitionCount >= CONTENT_LOOP_THRESHOLD) {
+        logLoopDetected(
+          this.config,
+          new LoopDetectedEvent(LoopType.CHANTING_IDENTICAL_SENTENCES),
+        );
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private async checkForLoopWithLLM(signal: AbortSignal) {
+    const recentHistory = this.config
+      .getGeminiClient()
+      .getHistory()
+      .slice(-LLM_LOOP_CHECK_HISTORY_COUNT);
+
+    const prompt = `You are a sophisticated AI diagnostic agent specializing in identifying when a conversational AI is stuck in an unproductive state. Your task is to analyze the provided conversation history and determine if the assistant has ceased to make meaningful progress.
+
+An unproductive state is characterized by one or more of the following patterns over the last 5 or more assistant turns:
+
+Repetitive Actions: The assistant repeats the same tool calls or conversational responses a decent number of times. This includes simple loops (e.g., tool_A, tool_A, tool_A) and alternating patterns (e.g., tool_A, tool_B, tool_A, tool_B, ...).
+
+Cognitive Loop: The assistant seems unable to determine the next logical step. It might express confusion, repeatedly ask the same questions, or generate responses that don't logically follow from the previous turns, indicating it's stuck and not advancing the task.
+
+Crucially, differentiate between a true unproductive state and legitimate, incremental progress.
+For example, a series of 'tool_A' or 'tool_B' tool calls that make small, distinct changes to the same file (like adding docstrings to functions one by one) is considered forward progress and is NOT a loop. A loop would be repeatedly replacing the same text with the same content, or cycling between a small set of files with no net change.
+
+Please analyze the conversation history to determine the possibility that the conversation is stuck in a repetitive, non-productive state.`;
+    const contents = [
+      ...recentHistory,
+      { role: 'user', parts: [{ text: prompt }] },
+    ];
+    const schema: SchemaUnion = {
+      type: Type.OBJECT,
+      properties: {
+        reasoning: {
+          type: Type.STRING,
+          description:
+            'Your reasoning on if the conversation is looping without forward progress.',
+        },
+        confidence: {
+          type: Type.NUMBER,
+          description:
+            'A number between 0.0 and 1.0 representing your confidence that the conversation is in an unproductive state.',
+        },
+      },
+      required: ['reasoning', 'confidence'],
+    };
+    let result;
+    try {
+      result = await this.config
+        .getGeminiClient()
+        .generateJson(contents, schema, signal, DEFAULT_GEMINI_FLASH_MODEL);
+    } catch (e) {
+      // Do nothing, treat it as a non-loop.
+      this.config.getDebugMode() ? console.error(e) : console.debug(e);
+      return false;
+    }
+
+    if (typeof result.confidence === 'number') {
+      if (result.confidence > 0.9) {
+        if (typeof result.reasoning === 'string' && result.reasoning) {
+          console.warn(result.reasoning);
+        }
+        logLoopDetected(
+          this.config,
+          new LoopDetectedEvent(LoopType.LLM_DETECTED_LOOP),
+        );
+        return true;
+      } else {
+        this.llmCheckInterval = Math.round(
+          MIN_LLM_CHECK_INTERVAL +
+            (MAX_LLM_CHECK_INTERVAL - MIN_LLM_CHECK_INTERVAL) *
+              (1 - result.confidence),
+        );
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Resets all loop detection state.
+   */
+  reset(): void {
+    this.resetToolCallCount();
+    this.resetSentenceCount();
+    this.resetLlmCheckTracking();
+  }
+
+  private resetToolCallCount(): void {
+    this.lastToolCallKey = null;
+    this.toolCallRepetitionCount = 0;
+  }
+
+  private resetSentenceCount(): void {
+    this.lastRepeatedSentence = '';
+    this.sentenceRepetitionCount = 0;
+    this.partialContent = '';
+  }
+
+  private resetLlmCheckTracking(): void {
+    this.turnsInCurrentPrompt = 0;
+    this.llmCheckInterval = DEFAULT_LLM_CHECK_INTERVAL;
+    this.lastCheckTurn = 0;
+  }
+}
+```
+
+
+### MockStorageEventApi  (Cursor  TanStack/db#203  packages/db-collections/tests/local-storage.test.ts)
+metrics: loc=25.0 methods=3.0 wmc=4.0 lcom=0.0 c3=0.3659017486866857 rubric_flag=False
+```ts
+class MockStorageEventApi implements StorageEventApi {
+  private listeners: Array<(event: StorageEvent) => void> = []
+
+  addEventListener(
+    type: `storage`,
+    listener: (event: StorageEvent) => void
+  ): void {
+    this.listeners.push(listener)
+  }
+
+  removeEventListener(
+    type: `storage`,
+    listener: (event: StorageEvent) => void
+  ): void {
+    const index = this.listeners.indexOf(listener)
+    if (index > -1) {
+      this.listeners.splice(index, 1)
+    }
+  }
+
+  // Helper method for tests to trigger storage events
+  triggerStorageEvent(event: StorageEvent): void {
+    this.listeners.forEach((listener) => listener(event))
+  }
+}
+```
+
+
+### CommandBar  (Claude_Code  jefago/tiny-markdown-editor#100  src/TinyMDECommandBar.ts)
+metrics: loc=224.0 methods=6.0 wmc=50.0 lcom=0.0 c3=0.2245920230223219 rubric_flag=True
+```ts
+export class CommandBar {
+  public e: HTMLDivElement | null = null;
+  public editor: Editor | null = null;
+  public commands: Record<string, CommandDefinition> = {};
+  public buttons: Record<string, HTMLDivElement> = {};
+  public state: Record<string, boolean | null> = {};
+  private hotkeys: Hotkey[] = [];
+
+  constructor(props: CommandBarProps) {
+    this.e = null;
+    this.editor = null;
+    this.commands = {};
+    this.buttons = {};
+    this.state = {};
+    this.hotkeys = [];
+
+    let element: HTMLElement | null = null;
+    if (typeof props.element === 'string') {
+      element = document.getElementById(props.element);
+    } else if (props.element) {
+      element = props.element;
+    }
+    
+    if (!element) {
+      element = document.body;
+    }
+
+    this.createCommandBarElement(
+      element,
+      props.commands || [
+        "bold",
+        "italic",
+        "strikethrough",
+        "|",
+        "code",
+        "|",
+        "h1",
+        "h2",
+        "|",
+        "ul",
+        "ol",
+        "|",
+        "blockquote",
+        "hr",
+        "|",
+        "undo",
+        "redo",
+        "|",
+        "insertLink",
+        "insertImage",
+      ]
+    );
+    document.addEventListener("keydown", (e) => this.handleKeydown(e));
+    if (props.editor) this.setEditor(props.editor);
+  }
+
+  private createCommandBarElement(parentElement: HTMLElement, commands: (string | CommandDefinition)[]): void {
+    this.e = document.createElement("div");
+    this.e.className = "TMCommandBar";
+
+    for (let command of commands) {
+      if (command === "|") {
+        let el = document.createElement("div");
+        el.className = "TMCommandDivider";
+        this.e.appendChild(el);
+      } else {
+        let commandName: string;
+        if (typeof command === "string") {
+          if (DefaultCommands[command]) {
+            commandName = command;
+            this.commands[commandName] = DefaultCommands[commandName];
+          } else {
+            continue;
+          }
+        } else if (typeof command === "object" && command.name) {
+          commandName = command.name;
+          this.commands[commandName] = {} as CommandDefinition;
+          if (DefaultCommands[commandName]) {
+            Object.assign(this.commands[commandName], DefaultCommands[commandName]);
+          }
+          Object.assign(this.commands[commandName], command);
+        } else {
+          continue;
+        }
+
+        let title = this.commands[commandName].title || commandName;
+
+        if (this.commands[commandName].hotkey) {
+          const keys = this.commands[commandName].hotkey!.split("-");
+          let modifiers: string[] = [];
+          let modifierexplanation: string[] = [];
+          
+          for (let i = 0; i < keys.length - 1; i++) {
+            switch (keys[i]) {
+              case "Ctrl":
+                modifiers.push("ctrlKey");
+                modifierexplanation.push("Ctrl");
+                break;
+              case "Cmd":
+                modifiers.push("metaKey");
+                modifierexplanation.push("⌘");
+                break;
+              case "Alt":
+                modifiers.push("altKey");
+                modifierexplanation.push("Alt");
+                break;
+              case "Option":
+                modifiers.push("altKey");
+                modifierexplanation.push("⌥");
+                break;
+              case "Win":
+                modifiers.push("metaKey");
+                modifierexplanation.push("⊞ Win");
+                break;
+              case "Shift":
+                modifiers.push("shiftKey");
+                modifierexplanation.push("⇧");
+                break;
+              case "Mod":
+                if (isMacLike) {
+                  modifiers.push("metaKey");
+                  modifierexplanation.push("⌘");
+                } else {
+                  modifiers.push("ctrlKey");
+                  modifierexplanation.push("Ctrl");
+                }
+                break;
+              case "Mod2":
+                modifiers.push("altKey");
+                if (isMacLike) modifierexplanation.push("⌥");
+                else modifierexplanation.push("Alt");
+                break;
+            }
+          }
+          
+          modifierexplanation.push(keys[keys.length - 1]);
+          let hotkey: Hotkey = {
+            modifiers: modifiers,
+            command: commandName,
+          };
+          
+          if (keys[keys.length - 1].match(/^[0-9]$/)) {
+            hotkey.code = `Digit${keys[keys.length - 1]}`;
+          } else {
+            hotkey.key = keys[keys.length - 1].toLowerCase();
+          }
+          this.hotkeys.push(hotkey);
+          title = title.concat(` (${modifierexplanation.join("+")})`);
+        }
+
+        this.buttons[commandName] = document.createElement("div");
+        this.buttons[commandName].className = "TMCommandButton TMCommandButton_Disabled";
+        this.buttons[commandName].title = title;
+        this.buttons[commandName].innerHTML = this.commands[commandName].innerHTML;
+
+        this.buttons[commandName].addEventListener("mousedown", (e) =>
+          this.handleClick(commandName, e)
+        );
+        this.e.appendChild(this.buttons[commandName]);
+      }
+    }
+    parentElement.appendChild(this.e);
+  }
+
+  private handleClick(commandName: string, event: Event): void {
+    if (!this.editor) return;
+    event.preventDefault();
+    if (typeof this.commands[commandName].action === "string") {
+      if (this.state[commandName] === false)
+        (this.editor as any).setCommandState(commandName, true);
+      else (this.editor as any).setCommandState(commandName, false);
+    } else if (typeof this.commands[commandName].action === "function") {
+      (this.commands[commandName].action as CommandAction)(this.editor);
+    }
+  }
+
+  public setEditor(editor: Editor): void {
+    this.editor = editor;
+    editor.addEventListener("selection", (e) => this.handleSelection(e));
+  }
+
+  private handleSelection(event: SelectionEvent): void {
+    if (event.commandState) {
+      for (let command in this.commands) {
+        if (event.commandState[command] === undefined) {
+          if (this.commands[command].enabled) {
+            this.state[command] = this.commands[command].enabled!(
+              this.editor!,
+              event.focus,
+              event.anchor
+            );
+          } else {
+            this.state[command] = event.focus ? false : null;
+          }
+        } else {
+          this.state[command] = event.commandState[command];
+        }
+
+        if (this.state[command] === true) {
+          this.buttons[command].className = "TMCommandButton TMCommandButton_Active";
+        } else if (this.state[command] === false) {
+          this.buttons[command].className = "TMCommandButton TMCommandButton_Inactive";
+        } else {
+          this.buttons[command].className = "TMCommandButton TMCommandButton_Disabled";
+        }
+      }
+    }
+  }
+
+  private handleKeydown(event: KeyboardEvent): void {
+    outer: for (let hotkey of this.hotkeys) {
+      if (
+        (hotkey.key && event.key.toLowerCase() === hotkey.key) ||
+        (hotkey.code && event.code === hotkey.code)
+      ) {
+        for (let modifier of hotkey.modifiers) {
+          if (!(event as any)[modifier]) continue outer;
+        }
+        this.handleClick(hotkey.command, event);
+        return;
+      }
+    }
+  }
+}
+```
+
+
+### Nip90PublishError  (Claude_Code  OpenAgentsInc/openagents#1008  packages/nostr/src/nip90/Nip90Service.ts)
+metrics: loc=4.0 methods=0.0 wmc=0.0 lcom=nan c3=nan rubric_flag=False
+```ts
+export class Nip90PublishError extends Data.TaggedError("Nip90PublishError")<{
+  message: string
+  cause?: unknown
+}> {}
+```
+
+
+### AgentServer  (Claude_Code  elizaOS/eliza#5565  packages/server/src/index.ts)
+metrics: loc=1191.0 methods=31.0 wmc=83.0 lcom=0.1034482758620689 c3=0.1638662763991336 rubric_flag=True
+```ts
+export class AgentServer {
+  public app!: express.Application;
+  private agents: Map<UUID, IAgentRuntime>;
+  public server!: http.Server;
+  public socketIO!: SocketIOServer;
+  public isInitialized: boolean = false; // Flag to prevent double initialization
+  private isWebUIEnabled: boolean = true; // Default to enabled until initialized
+  private clientPath?: string; // Optional path to client dist files
+
+  public database!: DatabaseAdapter;
+
+  public startAgent!: (character: Character) => Promise<IAgentRuntime>;
+  public stopAgent!: (runtime: IAgentRuntime) => void;
+  public loadCharacterTryPath!: (characterPath: string) => Promise<Character>;
+  public jsonToCharacter!: (character: unknown) => Promise<Character>;
+
+  /**
+   * Constructor for AgentServer class.
+   *
+   * @constructor
+   */
+  constructor() {
+    try {
+      logger.debug('Initializing AgentServer (constructor)...');
+      this.agents = new Map();
+
+      // Initialize character loading functions
+      this.loadCharacterTryPath = loadCharacterTryPath;
+      this.jsonToCharacter = jsonToCharacter;
+
+      // Register signal handlers once in constructor to prevent accumulation
+      this.registerSignalHandlers();
+    } catch (error) {
+      logger.error('Failed to initialize AgentServer (constructor):', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Initializes the database and server.
+   *
+   * @param {ServerOptions} [options] - Optional server options.
+   * @returns {Promise<void>} A promise that resolves when initialization is complete.
+   */
+  public async initialize(options?: ServerOptions): Promise<void> {
+    if (this.isInitialized) {
+      logger.warn('AgentServer is already initialized, skipping initialization');
+      return;
+    }
+
+    try {
+      logger.debug('Initializing AgentServer (async operations)...');
+
+      const agentDataDir = resolvePgliteDir(options?.dataDir);
+      logger.info(`[INIT] Database Dir for SQL plugin: ${agentDataDir}`);
+      this.database = createDatabaseAdapter(
+        {
+          dataDir: agentDataDir,
+          postgresUrl: options?.postgresUrl,
+        },
+        '00000000-0000-0000-0000-000000000002'
+      ) as DatabaseAdapter;
+      await this.database.init();
+      logger.success('Consolidated database initialized successfully');
+
+      // Run migrations for the SQL plugin schema
+      logger.info('[INIT] Running database migrations for messaging tables...');
+      try {
+        const migrationService = new DatabaseMigrationService();
+
+        // Get the underlying database instance
+        const db = (this.database as any).getDatabase();
+        await migrationService.initializeWithDatabase(db);
+
+        // Register the SQL plugin schema
+        migrationService.discoverAndRegisterPluginSchemas([sqlPlugin]);
+
+        // Run the migrations
+        await migrationService.runAllPluginMigrations();
+
+        logger.success('[INIT] Database migrations completed successfully');
+      } catch (migrationError) {
+        logger.error('[INIT] Failed to run database migrations:', migrationError);
+        throw new Error(
+          `Database migration failed: ${migrationError instanceof Error ? migrationError.message : String(migrationError)}`
+        );
+      }
+
+      // Add a small delay to ensure database is fully ready
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // Ensure default server exists
+      logger.info('[INIT] Ensuring default server exists...');
+      await this.ensureDefaultServer();
+      logger.success('[INIT] Default server setup complete');
+
+      await this.initializeServer(options);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      this.isInitialized = true;
+    } catch (error) {
+      logger.error('Failed to initialize AgentServer (async operations):', error);
+      console.trace(error);
+      throw error;
+    }
+  }
+
+  private async ensureDefaultServer(): Promise<void> {
+    try {
+      // Check if the default server exists
+      logger.info('[AgentServer] Checking for default server...');
+      const servers = await (this.database as any).getMessageServers();
+      logger.debug(`[AgentServer] Found ${servers.length} existing servers`);
+
+      // Log all existing servers for debugging
+      servers.forEach((s: any) => {
+        logger.debug(`[AgentServer] Existing server: ID=${s.id}, Name=${s.name}`);
+      });
+
+      const defaultServer = servers.find(
+        (s: any) => s.id === '00000000-0000-0000-0000-000000000000'
+      );
+
+      if (!defaultServer) {
+        logger.info(
+          '[AgentServer] Creating default server with UUID 00000000-0000-0000-0000-000000000000...'
+        );
+
+        // Use raw SQL to ensure the server is created with the exact ID
+        try {
+          await (this.database as any).db.execute(`
+            INSERT INTO message_servers (id, name, source_type, created_at, updated_at)
+            VALUES ('00000000-0000-0000-0000-000000000000', 'Default Server', 'eliza_default', NOW(), NOW())
+            ON CONFLICT (id) DO NOTHING
+          `);
+          logger.success('[AgentServer] Default server created via raw SQL');
+
+          // Immediately check if it was created
+          const checkResult = await (this.database as any).db.execute(
+            "SELECT id, name FROM message_servers WHERE id = '00000000-0000-0000-0000-000000000000'"
+          );
+          logger.debug('[AgentServer] Raw SQL check result:', checkResult);
+        } catch (sqlError: any) {
+          logger.error('[AgentServer] Raw SQL insert failed:', sqlError);
+
+          // Try creating with ORM as fallback
+          try {
+            const server = await (this.database as any).createMessageServer({
+              id: '00000000-0000-0000-0000-000000000000' as UUID,
+              name: 'Default Server',
+              sourceType: 'eliza_default',
+            });
+            logger.success('[AgentServer] Default server created via ORM with ID:', server.id);
+          } catch (ormError: any) {
+            logger.error('[AgentServer] Both SQL and ORM creation failed:', ormError);
+            throw new Error(`Failed to create default server: ${ormError.message}`);
+          }
+        }
+
+        // Verify it was created
+        const verifyServers = await (this.database as any).getMessageServers();
+        logger.debug(`[AgentServer] After creation attempt, found ${verifyServers.length} servers`);
+        verifyServers.forEach((s: any) => {
+          logger.debug(`[AgentServer] Server after creation: ID=${s.id}, Name=${s.name}`);
+        });
+
+        const verifyDefault = verifyServers.find(
+          (s: any) => s.id === '00000000-0000-0000-0000-000000000000'
+        );
+        if (!verifyDefault) {
+          throw new Error(`Failed to create or verify default server with ID ${DEFAULT_SERVER_ID}`);
+        } else {
+          logger.success('[AgentServer] Default server creation verified successfully');
+        }
+      } else {
+        logger.info('[AgentServer] Default server already exists with ID:', defaultServer.id);
+      }
+    } catch (error) {
+      logger.error('[AgentServer] Error ensuring default server:', error);
+      throw error; // Re-throw to prevent startup if default server can't be created
+    }
+  }
+
+  /**
+   * Initializes the server with the provided options.
+   *
+   * @param {ServerOptions} [options] - Optional server options.
+   * @returns {Promise<void>} - A promise that resolves once the server is initialized.
+   */
+  private async initializeServer(options?: ServerOptions) {
+    try {
+      // Store the client path if provided
+      if (options?.clientPath) {
+        this.clientPath = options.clientPath;
+      }
+
+      // Initialize middleware and database
+      this.app = express();
+
+      // Security headers first - before any other middleware
+      const isProd = process.env.NODE_ENV === 'production';
+      logger.debug('Setting up security headers...');
+      if (!isProd) {
+        logger.debug(`NODE_ENV: ${process.env.NODE_ENV}`);
+        logger.debug(`CSP will be: ${isProd ? 'ENABLED' : 'MINIMAL_DEV'}`);
+      }
+      this.app.use(
+        helmet({
+          // Content Security Policy - environment-aware configuration
+          contentSecurityPolicy: isProd
+            ? {
+                // Production CSP - includes upgrade-insecure-requests
+                directives: {
+                  defaultSrc: ["'self'"],
+                  styleSrc: ["'self'", "'unsafe-inline'", 'https:'],
+                  scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+                  imgSrc: ["'self'", 'data:', 'blob:', 'https:', 'http:'],
+                  fontSrc: ["'self'", 'https:', 'data:'],
+                  connectSrc: ["'self'", 'ws:', 'wss:', 'https:', 'http:'],
+                  mediaSrc: ["'self'", 'blob:', 'data:'],
+                  objectSrc: ["'none'"],
+                  frameSrc: ["'none'"],
+                  baseUri: ["'self'"],
+                  formAction: ["'self'"],
+                  // upgrade-insecure-requests is added by helmet automatically
+                },
+                useDefaults: true,
+              }
+            : {
+                // Development CSP - minimal policy without upgrade-insecure-requests
+                directives: {
+                  defaultSrc: ["'self'"],
+                  styleSrc: ["'self'", "'unsafe-inline'", 'https:', 'http:'],
+                  scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+                  imgSrc: ["'self'", 'data:', 'blob:', 'https:', 'http:'],
+                  fontSrc: ["'self'", 'https:', 'http:', 'data:'],
+                  connectSrc: ["'self'", 'ws:', 'wss:', 'https:', 'http:'],
+                  mediaSrc: ["'self'", 'blob:', 'data:'],
+                  objectSrc: ["'none'"],
+                  frameSrc: ["'self'", 'data:'],
+                  baseUri: ["'self'"],
+                  formAction: ["'self'"],
+                  // Note: upgrade-insecure-requests is intentionally omitted for Safari compatibility
+                },
+                useDefaults: false,
+              },
+          // Cross-Origin Embedder Policy - disabled for compatibility
+          crossOriginEmbedderPolicy: false,
+          // Cross-Origin Resource Policy
+          crossOriginResourcePolicy: { policy: 'cross-origin' },
+          // Frame Options - allow same-origin iframes to align with frameSrc CSP
+          frameguard: { action: 'sameorigin' },
+          // Hide Powered-By header
+          hidePoweredBy: true,
+          // HTTP Strict Transport Security - only in production
+          hsts: isProd
+            ? {
+                maxAge: 31536000, // 1 year
+                includeSubDomains: true,
+                preload: true,
+              }
+            : false,
+          // No Sniff
+          noSniff: true,
+          // Referrer Policy
+          referrerPolicy: { policy: 'no-referrer-when-downgrade' },
+          // X-XSS-Protection
+          xssFilter: true,
+        })
+      );
+
+      // Apply custom middlewares if provided
+      if (options?.middlewares) {
+        logger.debug('Applying custom middlewares...');
+        for (const middleware of options.middlewares) {
+          this.app.use(middleware);
+        }
+      }
+
+      // Setup middleware for all requests
+      logger.debug('Setting up standard middlewares...');
+      this.app.use(
+        cors({
+          origin: process.env.CORS_ORIGIN || true,
+          credentials: true,
+          methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+          allowedHeaders: ['Content-Type', 'Authorization', 'X-API-KEY'],
+        })
+      ); // Enable CORS
+      this.app.use(
+        express.json({
+          limit: process.env.EXPRESS_MAX_PAYLOAD || '2mb',
+        })
+      ); // Parse JSON bodies with 2MB limit to support large character files
+
+      // File uploads are now handled by individual routes using multer
+      // No global file upload middleware needed
+
+      // Optional Authentication Middleware
+      const serverAuthToken = process.env.ELIZA_SERVER_AUTH_TOKEN;
+      if (serverAuthToken) {
+        logger.info('Server authentication enabled. Requires X-API-KEY header for /api routes.');
+        // Apply middleware only to /api paths
+        this.app.use('/api', (req, res, next) => {
+          apiKeyAuthMiddleware(req, res, next);
+        });
+      } else {
+        logger.warn(
+          'Server authentication is disabled. Set ELIZA_SERVER_AUTH_TOKEN environment variable to enable.'
+        );
+      }
+
+      // Determine if web UI should be enabled
+      this.isWebUIEnabled = isWebUIEnabled();
+
+      if (this.isWebUIEnabled) {
+        logger.info('Web UI enabled');
+      } else {
+        // Determine the reason for UI being disabled
+        const uiEnabledEnv = process.env.ELIZA_UI_ENABLE;
+        if (uiEnabledEnv !== undefined && uiEnabledEnv.trim() !== '') {
+          logger.info(`Web UI disabled by environment variable (ELIZA_UI_ENABLE=${uiEnabledEnv})`);
+        } else {
+          logger.info('Web UI disabled for security (production mode)');
+        }
+      }
+
+      const uploadsBasePath = path.join(process.cwd(), '.eliza', 'data', 'uploads', 'agents');
+      const generatedBasePath = path.join(process.cwd(), '.eliza', 'data', 'generated');
+      fs.mkdirSync(uploadsBasePath, { recursive: true });
+      fs.mkdirSync(generatedBasePath, { recursive: true });
+
+      // Agent-specific media serving - only serve files from agent-specific directories
+      this.app.get(
+        '/media/uploads/agents/:agentId/:filename',
+        (req: express.Request, res: express.Response): void => {
+          const agentId = req.params.agentId as string;
+          const filename = req.params.filename as string;
+          const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+          if (!uuidRegex.test(agentId)) {
+            res.status(400).json({ error: 'Invalid agent ID format' });
+            return;
+          }
+          const sanitizedFilename = basename(filename);
+          const agentUploadsPath = join(uploadsBasePath, agentId);
+          const filePath = join(agentUploadsPath, sanitizedFilename);
+          if (!filePath.startsWith(agentUploadsPath)) {
+            res.status(403).json({ error: 'Access denied' });
+            return;
+          }
+
+          if (!fs.existsSync(filePath)) {
+            res.status(404).json({ error: 'File does not exist!!!!!!!' });
+            return;
+          }
+
+          res.sendFile(sanitizedFilename, { root: agentUploadsPath }, (err) => {
+            if (err) {
+              if (err.message === 'Request aborted') {
+                logger.warn(`[MEDIA] Download aborted: ${req.originalUrl}`);
+              } else if (!res.headersSent) {
+                logger.warn(`[MEDIA] File not found: ${agentUploadsPath}/${sanitizedFilename}`);
+                res.status(404).json({ error: 'File not found' });
+              }
+            } else {
+              logger.debug(`[MEDIA] Successfully served: ${sanitizedFilename}`);
+            }
+          });
+        }
+      );
+
+      this.app.get(
+        '/media/generated/:agentId/:filename',
+        (
+          req: express.Request<{ agentId: string; filename: string }>,
+          res: express.Response
+        ): void => {
+          const agentId = req.params.agentId;
+          const filename = req.params.filename;
+          const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+          if (!uuidRegex.test(agentId)) {
+            res.status(400).json({ error: 'Invalid agent ID format' });
+            return;
+          }
+          const sanitizedFilename = basename(filename);
+          const agentGeneratedPath = join(generatedBasePath, agentId);
+          const filePath = join(agentGeneratedPath, sanitizedFilename);
+          if (!filePath.startsWith(agentGeneratedPath)) {
+            res.status(403).json({ error: 'Access denied' });
+            return;
+          }
+          res.sendFile(filePath, (err) => {
+            if (err) {
+              res.status(404).json({ error: 'File not found' });
+            }
+          });
+        }
+      );
+
+      // Channel-specific media serving
+      this.app.get(
+        '/media/uploads/channels/:channelId/:filename',
+        (req: express.Request<{ channelId: string; filename: string }>, res: express.Response) => {
+          const channelId = req.params.channelId as string;
+          const filename = req.params.filename as string;
+          const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+          if (!uuidRegex.test(channelId)) {
+            res.status(400).json({ error: 'Invalid channel ID format' });
+            return;
+          }
+
+          const sanitizedFilename = basename(filename);
+          const channelUploadsPath = join(uploadsBasePath, 'channels', channelId);
+          const filePath = join(channelUploadsPath, sanitizedFilename);
+
+          if (!filePath.startsWith(channelUploadsPath)) {
+            res.status(403).json({ error: 'Access denied' });
+            return;
+          }
+
+          res.sendFile(filePath, (err) => {
+            if (err) {
+              logger.warn(`[STATIC] Channel media file not found: ${filePath}`, err);
+              if (!res.headersSent) {
+                res.status(404).json({ error: 'File not found' });
+              }
+            } else {
+              logger.debug(`[STATIC] Served channel media file: ${filePath}`);
+            }
+          });
+        }
+      );
+
+      // Add specific middleware to handle portal assets
+      this.app.use((req, res, next) => {
+        // Automatically detect and handle static assets based on file extension
+        const ext = extname(req.path).toLowerCase();
+
+        // Set correct content type based on file extension
+        if (ext === '.js' || ext === '.mjs') {
+          res.setHeader('Content-Type', 'application/javascript');
+        } else if (ext === '.css') {
+          res.setHeader('Content-Type', 'text/css');
+        } else if (ext === '.svg') {
+          res.setHeader('Content-Type', 'image/svg+xml');
+        } else if (ext === '.png') {
+          res.setHeader('Content-Type', 'image/png');
+        } else if (ext === '.jpg' || ext === '.jpeg') {
+          res.setHeader('Content-Type', 'image/jpeg');
+        }
+
+        // Continue processing
+        next();
+      });
+
+      // Setup static file serving with proper MIME types
+      const staticOptions = {
+        etag: true,
+        lastModified: true,
+        fallthrough: true, // Allow non-existent files to pass through to the catch-all route
+        setHeaders: (res: express.Response, filePath: string) => {
+          // Set the correct content type for different file extensions
+          const ext = extname(filePath).toLowerCase();
+          if (ext === '.css') {
+            res.setHeader('Content-Type', 'text/css');
+          } else if (ext === '.js') {
+            res.setHeader('Content-Type', 'application/javascript');
+          } else if (ext === '.html') {
+            res.setHeader('Content-Type', 'text/html');
+          } else if (ext === '.png') {
+            res.setHeader('Content-Type', 'image/png');
+          } else if (ext === '.jpg' || ext === '.jpeg') {
+            res.setHeader('Content-Type', 'image/jpeg');
+          } else if (ext === '.svg') {
+            res.setHeader('Content-Type', 'image/svg+xml');
+          }
+        },
+      };
+
+      // Resolve client path for both static serving and SPA fallback
+      let clientPath: string | null = null;
+
+      // Conditionally serve static assets from the client dist path
+      // Client files are built into the server package's dist/client directory
+      if (this.isWebUIEnabled) {
+        // Try multiple locations to find the client dist files
+        const possiblePaths = [
+          // First priority: explicitly provided client path
+          this.clientPath,
+          // Primary location: server's own dist/client directory
+          path.resolve(__dirname, 'client'),
+          // Development: relative to server package (monorepo) - direct client build
+          path.resolve(__dirname, '../../client/dist'),
+          // Fallback: using require.resolve to find client package (if installed as dependency)
+          (() => {
+            try {
+              return path.resolve(
+                path.dirname(require.resolve('@elizaos/client/package.json')),
+                'dist'
+              );
+            } catch {
+              return null;
+            }
+          })(),
+          // Check if running from global CLI - look for client files in the same directory as the running process
+          (() => {
+            try {
+              // When running from server, check for client files relative to the server dist
+              if (process.argv[1]) {
+                const serverPath = path.dirname(process.argv[1]);
+                const possibleClientPath = path.join(serverPath, 'client');
+                if (existsSync(path.join(possibleClientPath, 'index.html'))) {
+                  return possibleClientPath;
+                }
+                // Also check in the same directory (for backwards compatibility)
+                if (existsSync(path.join(serverPath, 'index.html'))) {
+                  return serverPath;
+                }
+              }
+            } catch {
+              // Ignore errors
+            }
+            return null;
+          })(),
+          // Global bun install: check global node_modules locations
+          (() => {
+            try {
+              // Try to find the global server installation via bun
+              // Bun stores global packages in ~/.bun/install/global/node_modules
+              const bunGlobalPath = path.join(
+                os.homedir(),
+                '.bun/install/global/node_modules/@elizaos/server/dist/client'
+              );
+              if (existsSync(path.join(bunGlobalPath, 'index.html'))) {
+                return bunGlobalPath;
+              }
+              // Also try npm root as fallback (some users might use npm)
+              try {
+                const proc = Bun.spawnSync(['npm', 'root', '-g'], {
+                  stdout: 'pipe',
+                  stderr: 'pipe',
+                });
+                if (proc.exitCode === 0 && proc.stdout) {
+                  const npmRoot = new TextDecoder().decode(proc.stdout).trim();
+                  const globalServerPath = path.join(npmRoot, '@elizaos/server/dist/client');
+                  if (existsSync(path.join(globalServerPath, 'index.html'))) {
+                    return globalServerPath;
+                  }
+                }
+              } catch {
+                // npm might not be installed
+              }
+            } catch {
+              // Ignore errors
+            }
+            return null;
+          })(),
+          // Alternative global locations (common paths)
+          ...[
+            '/usr/local/lib/node_modules/@elizaos/server/dist/client',
+            '/usr/lib/node_modules/@elizaos/server/dist/client',
+            path.join(os.homedir(), '.npm-global/lib/node_modules/@elizaos/server/dist/client'),
+            // Check nvm installations
+            (() => {
+              try {
+                const nvmPath = path.join(os.homedir(), '.nvm/versions/node');
+                if (existsSync(nvmPath)) {
+                  const versions = fs.readdirSync(nvmPath);
+                  for (const version of versions) {
+                    const cliPath = path.join(
+                      nvmPath,
+                      version,
+                      'lib/node_modules/@elizaos/server/dist/client'
+                    );
+                    if (existsSync(path.join(cliPath, 'index.html'))) {
+                      return cliPath;
+                    }
+                  }
+                }
+              } catch {
+                // Ignore errors
+              }
+              return null;
+            })(),
+          ].filter(Boolean),
+        ].filter(Boolean);
+
+        // Log process information for debugging
+        logger.debug(`[STATIC] process.argv[0]: ${process.argv[0]}`);
+        logger.debug(`[STATIC] process.argv[1]: ${process.argv[1]}`);
+        logger.debug(`[STATIC] __dirname: ${__dirname}`);
+
+        for (const possiblePath of possiblePaths) {
+          if (possiblePath && existsSync(path.join(possiblePath, 'index.html'))) {
+            clientPath = possiblePath;
+            logger.info(`[STATIC] Found client files at: ${clientPath}`);
+            break;
+          }
+        }
+
+        if (clientPath) {
+          // Store the resolved client path on the instance for use in the SPA fallback
+          this.clientPath = clientPath;
+          this.app.use(express.static(clientPath, staticOptions));
+          logger.info(`[STATIC] Serving static files from: ${clientPath}`);
+        } else {
+          logger.warn('[STATIC] Client dist path not found. Searched locations:');
+          possiblePaths.forEach((p) => {
+            if (p) logger.warn(`[STATIC]   - ${p}`);
+          });
+          logger.warn('[STATIC] The web UI will not be available.');
+          logger.warn(
+            '[STATIC] To fix this, ensure the client is built: cd packages/client && bun run build'
+          );
+          logger.warn('[STATIC] Then rebuild the server: cd packages/server && bun run build');
+        }
+      }
+
+      // *** NEW: Mount the plugin route handler BEFORE static serving ***
+      const pluginRouteHandler = createPluginRouteHandler(this.agents);
+      this.app.use(pluginRouteHandler);
+
+      // Mount the core API router under /api
+      // This router handles all API endpoints including:
+      // - /api/agents/* - Agent management and interactions
+      // - /api/messaging/* - Message handling and channels
+      // - /api/media/* - File uploads and media serving
+      // - /api/memory/* - Memory management and retrieval
+      // - /api/audio/* - Audio processing and transcription
+      // - /api/server/* - Runtime and server management
+      // - /api/tee/* - TEE (Trusted Execution Environment) operations
+      // - /api/system/* - System configuration and health checks
+      const apiRouter = createApiRouter(this.agents, this);
+      this.app.use(
+        '/api',
+        (req: express.Request, _res: express.Response, next: express.NextFunction) => {
+          if (req.path !== '/ping') {
+            logger.debug(`API request: ${req.method} ${req.path}`);
+          }
+          next();
+        },
+        apiRouter,
+        (err: any, req: Request, res: Response, _next: express.NextFunction) => {
+          logger.error(`API error: ${req.method} ${req.path}`, err);
+          res.status(500).json({
+            success: false,
+            error: {
+              message: err.message || 'Internal Server Error',
+              code: err.code || 500,
+            },
+          });
+        }
+      );
+
+      // Add a catch-all route for API 404s
+      this.app.use((req, res, next) => {
+        // Check if this is an API route that wasn't handled
+        if (req.path.startsWith('/api/')) {
+          // worms are going to hitting it all the time, use a reverse proxy if you need this type of logging
+          //logger.warn(`API 404: ${req.method} ${req.path}`);
+          res.status(404).json({
+            success: false,
+            error: {
+              message: 'API endpoint not found',
+              code: 404,
+            },
+          });
+        } else {
+          // Not an API route, continue to next middleware
+          next();
+        }
+      });
+
+      // Main fallback for the SPA - must be registered after all other routes
+      // Use a final middleware that handles all unmatched routes
+      if (this.isWebUIEnabled) {
+        (this.app as any).use((req: express.Request, res: express.Response) => {
+          // For JavaScript requests that weren't handled by static middleware,
+          // return a JavaScript response instead of HTML
+          if (
+            req.path.endsWith('.js') ||
+            req.path.includes('.js?') ||
+            req.path.match(/\/[a-zA-Z0-9_-]+-[A-Za-z0-9]{8}\.js/)
+          ) {
+            res.setHeader('Content-Type', 'application/javascript');
+            return res.status(404).send(`// JavaScript module not found: ${req.path}`);
+          }
+
+          // For all other routes, serve the SPA's index.html
+          // Use the resolved clientPath (prefer local variable, fallback to instance variable)
+          const resolvedClientPath = clientPath || this.clientPath;
+
+          if (resolvedClientPath) {
+            const indexFilePath = path.join(resolvedClientPath, 'index.html');
+
+            // Verify the file exists before attempting to serve it
+            if (!existsSync(indexFilePath)) {
+              logger.error(`[STATIC] index.html not found at expected path: ${indexFilePath}`);
+              logger.error(`[STATIC] Client path was: ${resolvedClientPath}`);
+              res.status(404).send('Client application not found');
+              return;
+            }
+
+            // Use sendFile with the directory as root and filename separately
+            // This approach is more reliable for Express
+            res.sendFile('index.html', { root: resolvedClientPath }, (err) => {
+              if (err) {
+                logger.warn(`[STATIC] Failed to serve index.html: ${err.message}`);
+                logger.warn(`[STATIC] Attempted root: ${resolvedClientPath}`);
+                logger.warn(`[STATIC] Full path was: ${indexFilePath}`);
+                logger.warn(`[STATIC] Error code: ${(err as any).code || 'unknown'}`);
+                if (!res.headersSent) {
+                  res.status(404).send('Client application not found');
+                }
+              } else {
+                logger.debug(`[STATIC] Successfully served index.html for route: ${req.path}`);
+              }
+            });
+          } else {
+            logger.warn('[STATIC] Client dist path not found in SPA fallback');
+            logger.warn('[STATIC] Neither local nor instance clientPath variables are set');
+            res.status(404).send('Client application not found');
+          }
+        });
+      } else {
+        // Return 403 Forbidden for non-API routes when UI is disabled
+        (this.app as any).use((_req: express.Request, res: express.Response) => {
+          res.sendStatus(403); // Standard HTTP 403 Forbidden
+        });
+      }
+
+      // Create HTTP server for Socket.io
+      this.server = http.createServer(this.app);
+
+      // Initialize Socket.io, passing the AgentServer instance
+      this.socketIO = setupSocketIO(this.server, this.agents, this);
+
+      logger.success('AgentServer HTTP server and Socket.IO initialized');
+    } catch (error) {
+      logger.error('Failed to complete server initialization:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Registers an agent with the provided runtime.
+   *
+   * @param {IAgentRuntime} runtime - The runtime object containing agent information.
+   * @throws {Error} if the runtime is null/undefined, if agentId is missing, if character configuration is missing,
+   * or if there are any errors during registration.
+   */
+  public async registerAgent(runtime: IAgentRuntime) {
+    try {
+      if (!runtime) {
+        throw new Error('Attempted to register null/undefined runtime');
+      }
+      if (!runtime.agentId) {
+        throw new Error('Runtime missing agentId');
+      }
+      if (!runtime.character) {
+        throw new Error('Runtime missing character configuration');
+      }
+
+      this.agents.set(runtime.agentId, runtime);
+      logger.debug(`Agent ${runtime.character.name} (${runtime.agentId}) added to agents map`);
+
+      // Auto-register the MessageBusConnector plugin
+      try {
+        if (messageBusConnectorPlugin) {
+          await runtime.registerPlugin(messageBusConnectorPlugin);
+          logger.info(
+            `[AgentServer] Automatically registered MessageBusConnector for agent ${runtime.character.name}`
+          );
+        } else {
+          logger.error(`[AgentServer] CRITICAL: MessageBusConnector plugin definition not found.`);
+        }
+      } catch (e) {
+        logger.error(
+          `[AgentServer] CRITICAL: Failed to register MessageBusConnector for agent ${runtime.character.name}`,
+          e
+        );
+        // Decide if this is a fatal error for the agent.
+      }
+
+      // Register TEE plugin if present
+      const teePlugin = runtime.plugins.find((p) => p.name === 'phala-tee-plugin');
+      if (teePlugin) {
+        logger.debug(`Found TEE plugin for agent ${runtime.agentId}`);
+        if (teePlugin.providers) {
+          for (const provider of teePlugin.providers) {
+            runtime.registerProvider(provider);
+            logger.debug(`Registered TEE provider: ${provider.name}`);
+          }
+        }
+        if (teePlugin.actions) {
+          for (const action of teePlugin.actions) {
+            runtime.registerAction(action);
+            logger.debug(`Registered TEE action: ${action.name}`);
+          }
+        }
+      }
+
+      logger.success(
+        `Successfully registered agent ${runtime.character.name} (${runtime.agentId}) with core services.`
+      );
+
+      await this.addAgentToServer(DEFAULT_SERVER_ID, runtime.agentId);
+      logger.info(
+        `[AgentServer] Auto-associated agent ${runtime.character.name} with server ID: ${DEFAULT_SERVER_ID}`
+      );
+    } catch (error) {
+      logger.error('Failed to register agent:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Unregisters an agent from the system.
+   *
+   * @param {UUID} agentId - The unique identifier of the agent to unregister.
+   * @returns {void}
+   */
+  public unregisterAgent(agentId: UUID) {
+    if (!agentId) {
+      logger.warn('[AGENT UNREGISTER] Attempted to unregister undefined or invalid agent runtime');
+      return;
+    }
+
+    try {
+      // Retrieve the agent before deleting it from the map
+      const agent = this.agents.get(agentId);
+
+      if (agent) {
+        // Stop all services of the agent before unregistering it
+        try {
+          agent.stop().catch((stopError) => {
+            logger.error(
+              `[AGENT UNREGISTER] Error stopping agent services for ${agentId}:`,
+              stopError
+            );
+          });
+          logger.debug(`[AGENT UNREGISTER] Stopping services for agent ${agentId}`);
+        } catch (stopError) {
+          logger.error(`[AGENT UNREGISTER] Error initiating stop for agent ${agentId}:`, stopError);
+        }
+      }
+
+      // Delete the agent from the map
+      this.agents.delete(agentId);
+      logger.debug(`Agent ${agentId} removed from agents map`);
+    } catch (error) {
+      logger.error(`Error removing agent ${agentId}:`, error);
+    }
+  }
+
+  /**
+   * Add middleware to the server's request handling pipeline
+   * @param {ServerMiddleware} middleware - The middleware function to be registered
+   */
+  public registerMiddleware(middleware: ServerMiddleware) {
+    this.app.use(middleware);
+  }
+
+  /**
+   * Starts the server on the specified port.
+   *
+   * @param {number} port - The port number on which the server should listen.
+   * @returns {Promise<void>} A promise that resolves when the server is listening.
+   * @throws {Error} If the port is invalid or if there is an error while starting the server.
+   */
+  public start(port: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      try {
+        if (!port || typeof port !== 'number') {
+          throw new Error(`Invalid port number: ${port}`);
+        }
+
+        logger.debug(`Starting server on port ${port}...`);
+        logger.debug(`Current agents count: ${this.agents.size}`);
+        logger.debug(`Environment: ${process.env.NODE_ENV}`);
+
+        // Use http server instead of app.listen with explicit host binding and error handling
+        // For tests and macOS compatibility, prefer 127.0.0.1 when specified
+        const host = process.env.SERVER_HOST || '0.0.0.0';
+
+        this.server
+          .listen(port, host, () => {
+            // Only show the dashboard URL if UI is enabled
+            if (this.isWebUIEnabled && process.env.NODE_ENV !== 'development') {
+              // Display the dashboard URL with the correct port after the server is actually listening
+              console.log(
+                `\x1b[32mStartup successful!\nGo to the dashboard at \x1b[1mhttp://localhost:${port}\x1b[22m\x1b[0m`
+              );
+            } else if (!this.isWebUIEnabled) {
+              // Use actual host or localhost
+              const actualHost = host === '0.0.0.0' ? 'localhost' : host;
+              const baseUrl = `http://${actualHost}:${port}`;
+
+              console.log(
+                `\x1b[32mStartup successful!\x1b[0m\n` +
+                  `\x1b[33mWeb UI disabled.\x1b[0m \x1b[32mAPI endpoints available at:\x1b[0m\n` +
+                  `  \x1b[1m${baseUrl}/api/server/ping\x1b[22m\x1b[0m\n` +
+                  `  \x1b[1m${baseUrl}/api/agents\x1b[22m\x1b[0m\n` +
+                  `  \x1b[1m${baseUrl}/api/messaging\x1b[22m\x1b[0m`
+              );
+            }
+
+            // Add log for test readiness
+            console.log(`AgentServer is listening on port ${port}`);
+
+            logger.success(
+              `REST API bound to ${host}:${port}. If running locally, access it at http://localhost:${port}.`
+            );
+            logger.debug(`Active agents: ${this.agents.size}`);
+            this.agents.forEach((agent, id) => {
+              logger.debug(`- Agent ${id}: ${agent.character.name}`);
+            });
+
+            // Resolve the promise now that the server is actually listening
+            resolve();
+          })
+          .on('error', (error: any) => {
+            logger.error(`Failed to bind server to ${host}:${port}:`, error);
+
+            // Provide helpful error messages for common issues
+            if (error.code === 'EADDRINUSE') {
+              logger.error(
+                `Port ${port} is already in use. Please try a different port or stop the process using that port.`
+              );
+            } else if (error.code === 'EACCES') {
+              logger.error(
+                `Permission denied to bind to port ${port}. Try using a port above 1024 or running with appropriate permissions.`
+              );
+            } else if (error.code === 'EADDRNOTAVAIL') {
+              logger.error(
+                `Cannot bind to ${host}:${port} - address not available. Check if the host address is correct.`
+              );
+            }
+
+            // Reject the promise on error
+            reject(error);
+          });
+
+        // Server is now listening successfully
+      } catch (error) {
+        logger.error('Failed to start server:', error);
+        reject(error);
+      }
+    });
+  }
+
+  /**
+   * Stops the server if it is running. Closes the server connection,
+   * stops the database connection, and logs a success message.
+   */
+  public async stop(): Promise<void> {
+    if (this.server) {
+      this.server.close(() => {
+        logger.success('Server stopped');
+      });
+    }
+  }
+
+  // Central DB Data Access Methods
+  async createServer(
+    data: Omit<MessageServer, 'id' | 'createdAt' | 'updatedAt'>
+  ): Promise<MessageServer> {
+    return (this.database as any).createMessageServer(data);
+  }
+
+  async getServers(): Promise<MessageServer[]> {
+    return (this.database as any).getMessageServers();
+  }
+
+  async getServerById(serverId: UUID): Promise<MessageServer | null> {
+    return (this.database as any).getMessageServerById(serverId);
+  }
+
+  async getServerBySourceType(sourceType: string): Promise<MessageServer | null> {
+    const servers = await (this.database as any).getMessageServers();
+    const filtered = servers.filter((s: MessageServer) => s.sourceType === sourceType);
+    return filtered.length > 0 ? filtered[0] : null;
+  }
+
+  async createChannel(
+    data: Omit<MessageChannel, 'id' | 'createdAt' | 'updatedAt'> & { id?: UUID },
+    participantIds?: UUID[]
+  ): Promise<MessageChannel> {
+    return (this.database as any).createChannel(data, participantIds);
+  }
+
+  async addParticipantsToChannel(channelId: UUID, userIds: UUID[]): Promise<void> {
+    return (this.database as any).addChannelParticipants(channelId, userIds);
+  }
+
+  async getChannelsForServer(serverId: UUID): Promise<MessageChannel[]> {
+    return (this.database as any).getChannelsForServer(serverId);
+  }
+
+  async getChannelDetails(channelId: UUID): Promise<MessageChannel | null> {
+    return (this.database as any).getChannelDetails(channelId);
+  }
+
+  async getChannelParticipants(channelId: UUID): Promise<UUID[]> {
+    return (this.database as any).getChannelParticipants(channelId);
+  }
+
+  async deleteMessage(messageId: UUID): Promise<void> {
+    return (this.database as any).deleteMessage(messageId);
+  }
+
+  async updateChannel(
+    channelId: UUID,
+    updates: { name?: string; participantCentralUserIds?: UUID[]; metadata?: any }
+  ): Promise<MessageChannel> {
+    return (this.database as any).updateChannel(channelId, updates);
+  }
+
+  async deleteChannel(channelId: UUID): Promise<void> {
+    return (this.database as any).deleteChannel(channelId);
+  }
+
+  async clearChannelMessages(channelId: UUID): Promise<void> {
+    // Get all messages for the channel and delete them one by one
+    const messages = await (this.database as any).getMessagesForChannel(channelId, 1000);
+    for (const message of messages) {
+      await (this.database as any).deleteMessage(message.id);
+    }
+    logger.info(`[AgentServer] Cleared all messages for central channel: ${channelId}`);
+  }
+
+  async findOrCreateCentralDmChannel(
+    user1Id: UUID,
+    user2Id: UUID,
+    messageServerId: UUID
+  ): Promise<MessageChannel> {
+    return (this.database as any).findOrCreateDmChannel(user1Id, user2Id, messageServerId);
+  }
+
+  async createMessage(
+    data: Omit<CentralRootMessage, 'id' | 'createdAt' | 'updatedAt'>
+  ): Promise<CentralRootMessage> {
+    const createdMessage = await (this.database as any).createMessage(data);
+
+    // Get the channel details to find the server ID
+    const channel = await this.getChannelDetails(createdMessage.channelId);
+    if (channel) {
+      // Emit to internal message bus for agent consumption
+      const messageForBus: MessageServiceStructure = {
+        id: createdMessage.id,
+        channel_id: createdMessage.channelId,
+        server_id: channel.messageServerId,
+        author_id: createdMessage.authorId,
+        content: createdMessage.content,
+        raw_message: createdMessage.rawMessage,
+        source_id: createdMessage.sourceId,
+        source_type: createdMessage.sourceType,
+        in_reply_to_message_id: createdMessage.inReplyToRootMessageId,
+        created_at: createdMessage.createdAt.getTime(),
+        metadata: createdMessage.metadata,
+      };
+
+      internalMessageBus.emit('new_message', messageForBus);
+      logger.info(`[AgentServer] Published message ${createdMessage.id} to internal message bus`);
+    }
+
+    return createdMessage;
+  }
+
+  async getMessagesForChannel(
+    channelId: UUID,
+    limit: number = 50,
+    beforeTimestamp?: Date
+  ): Promise<CentralRootMessage[]> {
+    return (this.database as any).getMessagesForChannel(channelId, limit, beforeTimestamp);
+  }
+
+  // Optional: Method to remove a participant
+  async removeParticipantFromChannel(): Promise<void> {
+    // Since we don't have a direct method for this, we'll need to handle it at the channel level
+    logger.warn(
+      `[AgentServer] Remove participant operation not directly supported in database adapter`
+    );
+  }
+
+  // ===============================
+  // Server-Agent Association Methods
+  // ===============================
+
+  /**
+   * Add an agent to a server
+   * @param {UUID} serverId - The server ID
+   * @param {UUID} agentId - The agent ID to add
+   */
+  async addAgentToServer(serverId: UUID, agentId: UUID): Promise<void> {
+    // First, verify the server exists
+    const server = await this.getServerById(serverId);
+    if (!server) {
+      throw new Error(`Server ${serverId} not found`);
+    }
+
+    return (this.database as any).addAgentToServer(serverId, agentId);
+  }
+
+  /**
+   * Remove an agent from a server
+   * @param {UUID} serverId - The server ID
+   * @param {UUID} agentId - The agent ID to remove
+   */
+  async removeAgentFromServer(serverId: UUID, agentId: UUID): Promise<void> {
+    return (this.database as any).removeAgentFromServer(serverId, agentId);
+  }
+
+  /**
+   * Get all agents associated with a server
+   * @param {UUID} serverId - The server ID
+   * @returns {Promise<UUID[]>} Array of agent IDs
+   */
+  async getAgentsForServer(serverId: UUID): Promise<UUID[]> {
+    return (this.database as any).getAgentsForServer(serverId);
+  }
+
+  /**
+   * Get all servers an agent belongs to
+   * @param {UUID} agentId - The agent ID
+   * @returns {Promise<UUID[]>} Array of server IDs
+   */
+  async getServersForAgent(agentId: UUID): Promise<UUID[]> {
+    // This method isn't directly supported in the adapter, so we need to implement it differently
+    const servers = await (this.database as any).getMessageServers();
+    const serverIds = [];
+    for (const server of servers) {
+      const agents = await (this.database as any).getAgentsForServer(server.id);
+      if (agents.includes(agentId)) {
+        serverIds.push(server.id as never);
+      }
+    }
+    return serverIds;
+  }
+
+  /**
+   * Registers signal handlers for graceful shutdown.
+   * This is called once in the constructor to prevent handler accumulation.
+   */
+  private registerSignalHandlers(): void {
+    const gracefulShutdown = async () => {
+      logger.info('Received shutdown signal, initiating graceful shutdown...');
+
+      // Stop all agents first
+      logger.debug('Stopping all agents...');
+      for (const [id, agent] of this.agents.entries()) {
+        try {
+          await agent.stop();
+          logger.debug(`Stopped agent ${id}`);
+        } catch (error) {
+          logger.error(`Error stopping agent ${id}:`, error);
+        }
+      }
+
+      // Close database
+      if (this.database) {
+        try {
+          await this.database.close();
+          logger.info('Database closed.');
+        } catch (error) {
+          logger.error('Error closing database:', error);
+        }
+      }
+
+      // Close server
+      if (this.server) {
+        this.server.close(() => {
+          logger.success('Server closed successfully');
+          process.exit(0);
+        });
+
+        // Force close after timeout
+        setTimeout(() => {
+          logger.error('Could not close connections in time, forcing shutdown');
+          process.exit(1);
+        }, 5000);
+      } else {
+        process.exit(0);
+      }
+    };
+
+    process.on('SIGTERM', gracefulShutdown);
+    process.on('SIGINT', gracefulShutdown);
+    logger.debug('Shutdown handlers registered');
+  }
+}
+```
+
+
+### NatsConfigStore  (OpenAI_Codex  puristajs/purista#211  packages/nats-config-store/src/NatsConfigStore.impl.ts)
+metrics: loc=90.0 methods=6.0 wmc=15.0 lcom=0.0 c3=0.2997985407446084 rubric_flag=False
+```ts
+export class NatsConfigStore extends ConfigStoreBaseClass<NatsConfigStoreConfig> {
+	public connection: NatsConnection | undefined
+
+	sc = JSONCodec()
+	kv: KV | undefined
+
+	constructor(config?: StoreBaseConfig<Partial<NatsConfigStoreConfig>>) {
+		const conf = {
+			keyValueStoreName: 'purista-config-store',
+			...config,
+		}
+		super('NatsConfigStore', { ...conf })
+	}
+
+	async getStore() {
+		if (this.kv) {
+			return this.kv
+		}
+
+		try {
+			this.connection = await connect({ ...this.config, name: this.name })
+		} catch (error) {
+			this.connection = undefined
+			const err = UnhandledError.fromError(error)
+			this.logger.error({ err }, err.message)
+			throw err
+		}
+
+		if (!this.connection.info?.jetstream) {
+			const err = new UnhandledError(StatusCode.BadGateway, 'JetStream is not enabled on NATS server')
+			this.logger.error({ err }, err.message)
+			await this.connection.close()
+			this.connection = undefined
+			throw err
+		}
+
+		const js = this.connection.jetstream()
+		this.kv = await js.views.kv(this.config.keyValueStoreName, this.config)
+
+		return this.kv
+	}
+
+	protected async getConfigImpl<ConfigNames extends string[]>(
+		...stateNames: ConfigNames
+	): Promise<ObjectWithKeysFromStringArray<ConfigNames>> {
+		const store = await this.getStore()
+
+		const result: Record<string, unknown> = {}
+		for await (const name of stateNames) {
+			try {
+				const entry = await store.get(name)
+				result[name] = entry?.value && entry?.value.length > 0 ? this.sc.decode(entry.value) : undefined
+			} catch (err) {
+				const msg = `error in state store getting value ${name}`
+				this.logger.error({ err }, msg)
+				throw new UnhandledError(StatusCode.InternalServerError, msg)
+			}
+		}
+		return result as ObjectWithKeysFromStringArray<ConfigNames>
+	}
+
+	protected async removeConfigImpl(stateName: string) {
+		const store = await this.getStore()
+
+		try {
+			await store.delete(stateName)
+		} catch (err) {
+			const msg = `error in state store removing value ${stateName}`
+			this.logger.error({ err }, msg)
+			throw new UnhandledError(StatusCode.InternalServerError, msg)
+		}
+	}
+
+	protected async setConfigImpl(stateName: string, stateValue: unknown) {
+		const store = await this.getStore()
+
+		try {
+			await store.put(stateName, this.sc.encode(stateValue))
+		} catch (err) {
+			const msg = `error in state store setting value ${stateName}`
+			this.logger.error({ err }, msg)
+			throw new UnhandledError(StatusCode.InternalServerError, msg)
+		}
+	}
+
+	async destroy() {
+		await this.connection?.drain()
+		await this.connection?.close()
+	}
+}
+```

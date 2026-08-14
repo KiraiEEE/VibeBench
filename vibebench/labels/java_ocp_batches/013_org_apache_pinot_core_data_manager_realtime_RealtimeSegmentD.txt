@@ -1,0 +1,246 @@
+row 13   apache/pinot#16030
+============================================================================
+CHAIN in org.apache.pinot.core.data.manager.realtime.RealtimeSegmentDataManager.PartitionConsumer.run()   kind=value_switch subject='_state' branches=2 closed_set=False
+cases: State.INITIAL_CONSUMING;State.CATCHING_UP
+QUESTION: is the set of variants OPEN (a new one is expected, and
+          would force editing this chain) or CLOSED by nature?
+SHOWING THE WHOLE ENCLOSING METHOD -- a branch count alone cannot answer this.
+>>> marks the dispatch chain itself.
+
+      732      public void run() {
+      733        long initialConsumptionEnd = 0L;
+      734        long lastCatchUpStart = 0L;
+      735        long catchUpTimeMillis = 0L;
+      736        _startTimeMs = now();
+      737        try {
+      738          if (!_isReadyToConsumeData.getAsBoolean()) {
+      739            do {
+      740              //noinspection BusyWait
+      741              Thread.sleep(RealtimeTableDataManager.READY_TO_CONSUME_DATA_CHECK_INTERVAL_MS);
+      742            } while (!_shouldStop && !_isReadyToConsumeData.getAsBoolean());
+      743          }
+      744  
+      745          // Acquire semaphore before consuming data
+      746          try {
+      747            _consumerCoordinator.acquire(_llcSegmentName);
+      748          } catch (ConsumerCoordinator.ShouldNotConsumeException e) {
+      749            _segmentLogger.info("Skipping consumption because: {}", e.getMessage());
+      750            return;
+      751          }
+      752          _consumerSemaphoreAcquired.set(true);
+      753          _consumerCoordinator.register(_llcSegmentName);
+      754  
+      755          _segmentLogger.info("Acquired consumer semaphore.");
+      756  
+      757          _consumeStartTime = now();
+      758          _segmentLogger.info("Starting consumption on segment: {}, maxRowCount: {}, maxEndTime: {}.", _llcSegmentName,
+      759              _segmentMaxRowCount, new DateTime(_consumeEndTime, DateTimeZone.UTC));
+      760  
+      761          // TODO:
+      762          //   When reaching here, the current consuming segment has already acquired the consumer semaphore, but there is
+      763          //   no guarantee that the previous consuming segment is already persisted (replaced with immutable segment). It
+      764          //   can potentially cause the following problems:
+      765          //   1. The snapshot for the previous consuming segment might not be taken since it is not persisted yet
+      766          //   2. If the previous consuming segment is dropped but immutable segment is not downloaded and replaced yet,
+      767          //      it might cause inconsistency (especially for partial upsert because events are not consumed in sequence)
+      768          //   To address this problem, we should consider releasing the consumer semaphore after the consuming segment is
+      769          //   persisted.
+      770          // Take upsert snapshot before starting consuming events
+      771          if (_partitionUpsertMetadataManager != null) {
+      772            if (_partitionUpsertMetadataManager.getContext().getMetadataTTL() > 0) {
+      773              // If upsertMetadataTTL is enabled, we will remove expired primary keys from upsertMetadata
+      774              // AFTER taking a snapshot. Taking the snapshot first is crucial to capture the final
+      775              // state of each key before it exits the TTL window. Out-of-TTL segments are skipped in
+      776              // the doAddSegment flow, and the snapshot is used to enableUpsert on the immutable out-of-TTL segment.
+      777              // If no snapshot is found, the entire segment is marked as valid and queryable.
+      778              _partitionUpsertMetadataManager.takeSnapshot();
+      779              _partitionUpsertMetadataManager.removeExpiredPrimaryKeys();
+      780            } else {
+      781              // We should remove deleted-keys first and then take a snapshot. This is because the deletedKeysTTL
+      782              // flow removes keys from the map and updates to remove valid doc IDs. By taking the snapshot immediately
+      783              // after this process, we save one commit cycle, ensuring that the deletion of valid doc IDs is reflected
+      784              // immediately
+      785              _partitionUpsertMetadataManager.removeExpiredPrimaryKeys();
+      786              _partitionUpsertMetadataManager.takeSnapshot();
+      787            }
+      788          }
+      789  
+      790          if (_partitionDedupMetadataManager != null
+      791              && _partitionDedupMetadataManager.getContext().getMetadataTTL() > 0) {
+      792            _partitionDedupMetadataManager.removeExpiredPrimaryKeys();
+      793          }
+      794  
+      795          while (!_state.isFinal()) {
+      796            if (_state.shouldConsume()) {
+      797              consumeLoop();  // Consume until we reached the end criteria, or we are stopped.
+      798            }
+      799            _serverMetrics.setValueOfTableGauge(_clientId, ServerGauge.LLC_PARTITION_CONSUMING, 0);
+      800            if (_shouldStop) {
+      801              break;
+      802            }
+      803  
+>>>   804            if (_state == State.INITIAL_CONSUMING) {
+      805              initialConsumptionEnd = now();
+      806              _serverMetrics.setValueOfTableGauge(_clientId,
+      807                  ServerGauge.LAST_REALTIME_SEGMENT_INITIAL_CONSUMPTION_DURATION_SECONDS,
+      808                  TimeUnit.MILLISECONDS.toSeconds(initialConsumptionEnd - _startTimeMs));
+      809            } else if (_state == State.CATCHING_UP) {
+      810              catchUpTimeMillis += now() - lastCatchUpStart;
+      811              _serverMetrics
+      812                  .setValueOfTableGauge(_clientId, ServerGauge.LAST_REALTIME_SEGMENT_CATCHUP_DURATION_SECONDS,
+      813                      TimeUnit.MILLISECONDS.toSeconds(catchUpTimeMillis));
+      814            }
+      815  
+      816            // If we are sending segmentConsumed() to the controller, we are in HOLDING state.
+      817            _state = State.HOLDING;
+      818            SegmentCompletionProtocol.Response response = postSegmentConsumedMsg();
+      819            SegmentCompletionProtocol.ControllerResponseStatus status = response.getStatus();
+      820            switch (status) {
+      821              case NOT_LEADER:
+      822                // Retain the same state
+      823                _segmentLogger.warn("Got not leader response");
+      824                hold();
+      825                break;
+      826              case CATCH_UP:
+      827                StreamPartitionMsgOffset rspOffset = extractOffset(response);
+      828                if (rspOffset.compareTo(_currentOffset) <= 0) {
+      829                  // Something wrong with the controller. Back off and try again.
+      830                  _segmentLogger.error("Invalid catchup offset {} in controller response, current offset {}", rspOffset,
+      831                      _currentOffset);
+      832                  hold();
+      833                } else {
+      834                  _state = State.CATCHING_UP;
+      835                  _finalOffset = rspOffset;
+      836                  lastCatchUpStart = now();
+      837                  // We will restart consumption when we loop back above.
+      838                }
+      839                break;
+      840              case HOLD:
+      841                hold();
+      842                break;
+      843              case DISCARD:
+      844                // Keep this in memory, but wait for the online transition, and download when it comes in.
+      845                _state = State.DISCARDED;
+      846                break;
+      847              case KEEP: {
+      848                if (_segmentCompletionMode == CompletionMode.DOWNLOAD) {
+      849                  _state = State.DISCARDED;
+      850                  break;
+      851                }
+      852                _state = State.RETAINING;
+      853                // Lock the segment to avoid multiple threads touching the same segment.
+      854                Lock segmentLock = _realtimeTableDataManager.getSegmentLock(_segmentNameStr);
+      855                // NOTE: We need to lock interruptibly because the lock might already be held by the Helix thread for the
+      856                //       CONSUMING -> ONLINE state transition.
+      857                segmentLock.lockInterruptibly();
+      858                try {
+      859                  if (buildSegmentAndReplace()) {
+      860                    _state = State.RETAINED;
+      861                  } else {
+      862                    // Could not build segment for some reason. We can only download it.
+      863                    _state = State.ERROR;
+      864                    _segmentLogger.error("Could not build segment for {}", _segmentNameStr);
+      865                  }
+      866                } finally {
+      867                  segmentLock.unlock();
+      868                }
+      869                break;
+      870              }
+      871              case COMMIT: {
+      872                _state = State.COMMITTING;
+      873                _currentOffset = _partitionGroupConsumer.checkpoint(_currentOffset);
+      874                // Lock the segment to avoid multiple threads touching the same segment.
+      875                Lock segmentLock = _realtimeTableDataManager.getSegmentLock(_segmentNameStr);
+      876                // NOTE: We need to lock interruptibly because the lock might already be held by the Helix thread for the
+      877                //       CONSUMING -> ONLINE state transition.
+      878                segmentLock.lockInterruptibly();
+      879                try {
+      880                  // For tables with pauseless consumption enabled we want to start the commit protocol that
+      881                  // 1. Updates the endOffset in the ZK metadata for the committing segment
+      882                  // 2. Creates ZK metadata for the new consuming segment
+      883                  // 3. Updates the IdealState for committing and new consuming segment to ONLINE and CONSUMING
+      884                  // respectively.
+      885                  // Refer to the PR for the new commit protocol: https://github.com/apache/pinot/pull/14741
+      886                  if (PauselessConsumptionUtils.isPauselessEnabled(_tableConfig)) {
+      887                    _serverMetrics.setValueOfTableGauge(_clientId, ServerGauge.PAUSELESS_CONSUMPTION_ENABLED, 1);
+      888                    if (!startSegmentCommit()) {
+      889                      // If for any reason commit failed, we don't want to be in COMMITTING state when we hold.
+      890                      // Change the state to HOLDING before looping around.
+      891                      _state = State.HOLDING;
+      892                      _segmentLogger.info("Could not commit segment: {}. Retrying after hold", _segmentNameStr);
+      893                      hold();
+      894                      break;
+      895                    }
+      896                  } else {
+      897                    _serverMetrics.setValueOfTableGauge(_clientId, ServerGauge.PAUSELESS_CONSUMPTION_ENABLED, 0);
+      898                  }
+      899                  long buildTimeSeconds = response.getBuildTimeSeconds();
+      900                  try {
+      901                    buildSegmentForCommit(buildTimeSeconds * 1000L);
+      902                  } catch (SegmentBuildFailureException e) {
+      903                    handleSegmentBuildFailure();
+      904                    break;
+      905                  }
+      906                  if (_segmentBuildDescriptor == null) {
+      907                    // This can happen if Table data manager is already shut down.
+      908                    handleSegmentBuildFailure();
+      909                    break;
+      910                  }
+      911                  if (commitSegment(response.getControllerVipUrl())) {
+      912                    _state = State.COMMITTED;
+      913                    break;
+      914                  }
+      915                } finally {
+      916                  segmentLock.unlock();
+      917                }
+      918                // If for any reason commit failed, we don't want to be in COMMITTING state when we hold.
+      919                // Change the state to HOLDING before looping around.
+      920                _state = State.HOLDING;
+      921                _segmentLogger.info("Could not commit segment. Retrying after hold");
+      922                hold();
+      923                break;
+      924              }
+      925              default:
+      926                _segmentLogger.error("Holding after response from Controller: {}", response.toJsonString());
+      927                hold();
+      928                break;
+      929            }
+      930          }
+      931        } catch (Throwable e) {
+      932          if (_shouldStop) {
+      933            if (_segmentLogger.isDebugEnabled()) {
+      934              _segmentLogger.debug("Caught exception in consumer thread after stop() is invoked, ignoring the exception",
+      935                  e);
+      936            } else {
+      937              _segmentLogger.info(
+      938                  "Caught exception in consumer thread after stop() is invoked: {}, ignoring the exception",
+      939                  e.getMessage());
+      940            }
+      941          } else {
+      942            String errorMessage = "Exception while in work";
+      943            _segmentLogger.error(errorMessage, e);
+      944            _state = State.ERROR;
+      945            _realtimeTableDataManager.addSegmentError(_segmentNameStr, new SegmentErrorInfo(now(), errorMessage, e));
+      946            _serverMetrics.setValueOfTableGauge(_clientId, ServerGauge.LLC_PARTITION_CONSUMING, 0);
+      947            postStopConsumedMsg(e.getClass().getName());
+      948            return;
+      949          }
+      950        }
+      951  
+      952        removeSegmentFile();
+      953  
+      954        if (initialConsumptionEnd != 0L) {
+      955          _serverMetrics
+      956              .setValueOfTableGauge(_clientId, ServerGauge.LAST_REALTIME_SEGMENT_COMPLETION_DURATION_SECONDS,
+      957                  TimeUnit.MILLISECONDS.toSeconds(now() - initialConsumptionEnd));
+      958        }
+      959        // There is a race condition that the destroy() method can be called which ends up calling stop on the consumer.
+      960        // The destroy() method does not wait for the thread to terminate (and reasonably so, we dont want to wait
+      961        // forever).
+      962        // Since the _shouldStop variable is set to true only in stop() method, we know that the metric will be destroyed,
+      963        // so it is ok not to mark it non-consuming, as the main thread will clean up this metric in destroy() method
+      964        // as the final step.
+      965        if (!_shouldStop) {
+      966          _serverMetrics.setValueOfTableGauge(_clientId, ServerGauge.LLC_PARTITION_CONSUMING, 0);
+      967        }
+      968      }

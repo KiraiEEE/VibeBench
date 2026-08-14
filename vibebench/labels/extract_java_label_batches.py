@@ -1,0 +1,231 @@
+"""
+Dump the source a judge needs to label a Java sample -- one batch file per row.
+
+The rule the earlier ports established the hard way: you cannot judge a
+principle from the flagged entity alone.
+  * LSP is a RELATION -- show the override AND its base method side by side.
+  * OCP is open-vs-closed -- a branch COUNT says nothing; show the chain inside
+    its enclosing method so the judge can see whether the variant set is open.
+  * ISP needs the contract AND its implementers, to see who is forced to stub.
+  * DIP needs the NEW import edges with each target marked abstract or CONCRETE.
+  * SRP needs the whole class body.
+
+Run:
+  python vibebench/labels/extract_java_label_batches.py --principle lsp \
+      --file java_lsp_labeling_sample.csv [--out-dir DIR]
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+_HERE = Path(__file__).resolve()
+sys.path.insert(0, str(_HERE.parents[1]))
+sys.path.insert(0, str(_HERE.parents[1] / "03_principles"))
+import config as C            # noqa: E402
+import gitsnap                # noqa: E402
+from java_bridge import analyze_tree  # noqa: E402
+sys.path.insert(0, str(_HERE.parents[1] / "03_principles" / "java_lang"))
+import detectors as D         # noqa: E402
+
+PR_RESULTS = C.CORPUS_DIR / "java_pr_results.parquet"
+
+
+def tree_for(full_name: str, pr_number: int) -> dict | None:
+    prs = pd.read_parquet(PR_RESULTS)
+    row = prs[(prs.full_name == full_name) & (prs.pr_number == pr_number)]
+    if not len(row):
+        return None
+    gold = pd.read_parquet(C.GOLD_SET_JAVA)
+    g = gold[(gold.full_name == full_name) & (gold.pr_number == pr_number)]
+    if not len(g):
+        return None
+    pr = g.iloc[0]
+    d = gitsnap.ensure_repo(full_name)
+    with gitsnap.repo_lock(full_name):
+        pair = gitsnap.delta_pair(d, pr)
+        if pair is None:
+            return None
+        return gitsnap.src_tree(d, pair[1], C.JAVA_SOURCE_EXTENSIONS,
+                                C.JAVA_EXCLUDED_PATH_PARTS, full_name)
+
+
+def span(files: dict, path: str, lineno: int, loc: int, pad: int = 0,
+         mark: int | None = None, cap: int = 400) -> str:
+    """Print [lineno, lineno+loc) with 1-based numbering.
+
+    `mark` gets a ">>>" gutter -- for OCP the judge must find the dispatch chain
+    inside a method that can run to hundreds of lines, and hunting for it by eye
+    is how a batch gets judged on the header alone.
+
+    A sanity check guards the window: if `lineno` is past the end of the file, or
+    the marked line falls outside the window, the batch says so loudly instead of
+    printing plausible-looking but WRONG code. That is exactly how the CRLF
+    line-doubling bug hid -- the extractor happily printed a different method.
+    """
+    src = files.get(path)
+    if src is None:
+        return f"<file not in tree: {path}>"
+    lines = src.splitlines()
+    if lineno < 1 or lineno > len(lines):
+        return (f"<BAD WINDOW: lineno {lineno} outside {path} "
+                f"({len(lines)} lines) -- do not judge this row>")
+    a = max(0, lineno - 1 - pad)
+    b = min(len(lines), lineno - 1 + max(loc, 1) + pad)
+    if mark is not None and not (a < mark <= b):
+        # widen rather than silently show a window without the thing being judged
+        a, b = max(0, mark - 1 - 40), min(len(lines), mark + 40)
+    out = []
+    for i in range(a, b):
+        gutter = ">>>" if mark is not None and i + 1 == mark else "   "
+        out.append(f"{gutter}{i+1:>6}  {lines[i]}")
+        if len(out) >= cap:
+            out.append(f"       ... truncated at {cap} lines ...")
+            break
+    return "\n".join(out)
+
+
+def find_method(ix, type_id: str, sig: str):
+    t = ix.types.get(type_id)
+    if not t:
+        return None, None
+    for m in t["methods"]:
+        if m["signature"] == sig:
+            return t, m
+    return t, None
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--principle", required=True, choices=["srp", "ocp", "lsp", "isp", "dip"])
+    ap.add_argument("--file", required=True)
+    ap.add_argument("--out-dir")
+    ap.add_argument("--show-verdict", action="store_true",
+                    help="print the rubric's own flag in each batch header. OFF BY DEFAULT: "
+                         "showing the tool's answer before the judge reads the code is an "
+                         "anchoring bias, and it inflates agreement in the tool's direction.")
+    a = ap.parse_args()
+
+    f = C.LABELS_DIR / a.file if not Path(a.file).exists() else Path(a.file)
+    df = pd.read_csv(f)
+    out = Path(a.out_dir) if a.out_dir else (C.LABELS_DIR / f"java_{a.principle}_batches")
+    out.mkdir(parents=True, exist_ok=True)
+
+    cache: dict[tuple, tuple] = {}
+    for i, r in df.iterrows():
+        key = (r.full_name, int(r.pr_number))
+        if key not in cache:
+            tr = tree_for(*key)
+            ix = D.build_index(analyze_tree(tr)) if tr else None
+            cache[key] = (tr, ix)
+        tree, ix = cache[key]
+        if tree is None or ix is None:
+            (out / f"{i:03d}_UNAVAILABLE.txt").write_text(
+                f"tree unavailable for {r.full_name}#{r.pr_number}", encoding="utf-8")
+            continue
+
+        head = [f"row {i}   {r.full_name}#{int(r.pr_number)}", "=" * 76]
+        body: list[str] = []
+
+        if a.principle == "srp":
+            t = ix.types.get(r.type_id)
+            head.append(f"CLASS {r.type_id}   loc={r.get('class_loc')} "
+                        f"methods={r.get('method_count')} wmc={r.get('wmc')} "
+                        f"lcom={r.get('lcom')} c3={r.get('c3')}"
+                        + (f" hits={r.get('hits')}" if a.show_verdict else ""))
+            head.append("QUESTION: does this class have MORE THAN ONE reason to change?")
+            if t:
+                body.append(span(tree, t["file"], t["lineno"], t["loc"]))
+
+        elif a.principle == "ocp":
+            t, m = find_method(ix, r.type_id, r.method)
+            head.append(f"CHAIN in {r.type_id}.{r.method}   kind={r.kind} "
+                        f"subject={r.subject!r} branches={r.n_branches} "
+                        f"closed_set={r.get('closed_set')}")
+            head.append(f"cases: {r.get('type_names')}")
+            head.append("QUESTION: is the set of variants OPEN (a new one is expected, and")
+            head.append("          would force editing this chain) or CLOSED by nature?")
+            head.append("SHOWING THE WHOLE ENCLOSING METHOD -- a branch count alone cannot answer this.")
+            head.append(">>> marks the dispatch chain itself.")
+            if m:
+                chain_line = int(r.lineno) if pd.notna(r.get("lineno")) else None
+                body.append(span(tree, t["file"], m["lineno"], m["loc"],
+                                 mark=chain_line))
+            else:
+                body.append(f"<method {r.method} not found in {r.type_id} "
+                            f"-- do not judge this row>")
+
+        elif a.principle == "lsp":
+            t, m = find_method(ix, r.type_id, r.method)
+            bt, bm = find_method(ix, r.base_id, r.method)
+            head.append(f"OVERRIDE  {r.type_id}.{r.method}")
+            head.append(f"BASE      {r.base_id}.{r.method}")
+            if a.show_verdict:
+                head.append(f"signals   {r.signals}")
+            head.append("QUESTION: can an instance of the SUBCLASS be used anywhere the BASE")
+            head.append("          is expected, without breaking the caller?")
+            if bm:
+                body.append("---------------- BASE METHOD ----------------")
+                body.append(span(tree, bt["file"], bm["lineno"], bm["loc"]))
+            body.append("\n---------------- OVERRIDE ----------------")
+            if m:
+                body.append(span(tree, t["file"], m["lineno"], m["loc"]))
+
+        elif a.principle == "isp":
+            t = ix.types.get(r.iface_id)
+            head.append(f"CONTRACT {r.iface_id}   members={r.n_members} "
+                        f"implementers={r.get('n_implementers')}")
+            head.append("QUESTION: are clients FORCED to depend on members they do not use?")
+            if t:
+                body.append(span(tree, t["file"], t["lineno"], t["loc"]))
+            _, irows = D.contracts(ix, {"fat_members": 6, "min_stubs": 2, "stub_ratio": 0.5})
+            for im in [x for x in irows if x["iface_id"] == r.iface_id][:6]:
+                it = ix.types.get(im["type_id"])
+                body.append(f"\n---------- IMPLEMENTER {im['type_id']}  "
+                            f"stubs={im['n_stubs']}/{im['n_implemented']} ----------")
+                if it:
+                    body.append(span(tree, it["file"], it["lineno"], min(it["loc"], 160)))
+
+        elif a.principle == "dip":
+            head.append(f"PR {r.full_name}#{int(r.pr_number)}"
+                        + (f"   hits={r.get('dip_risk_hits')}" if a.show_verdict else ""))
+            head.append(f"cycles before={r.get('before_touched_cycles')} "
+                        f"after={r.get('after_touched_cycles')} "
+                        f"new_cycle={r.get('new_cycle')}  "
+                        f"mean_D {r.get('before_mean_d')} -> {r.get('after_mean_d')}")
+            head.append("QUESTION: does this PR make a high-level module depend on a CONCRETE")
+            head.append("          low-level one (or close an import cycle)?")
+            mods = D.dip_modules(ix)
+            import graph as dipgraph  # noqa
+            for c in dipgraph.find_cycles(mods):
+                body.append("CYCLE: " + " -> ".join(sorted(c)))
+            body.append("\nNEW IMPORT EDGES (target marked abstract or CONCRETE):")
+            for mn, mi in sorted(mods.items()):
+                for tgt in sorted(mi.imports):
+                    tm = mods.get(tgt)
+                    if tm is None:
+                        continue
+                    kind = "abstract" if tm.n_abstract_classes else "CONCRETE"
+                    body.append(f"  {mn} -> {tgt}   [{kind}]")
+
+        # The slug must be filename-safe AND unique. DIP rows have no `type_id`,
+        # so it falls back to `full_name` -- which contains "/" and silently
+        # created a nested path that does not exist. The row index keeps names
+        # unique even when two rows share a type (which OCP rows do).
+        raw = str(r.get("type_id", r.full_name) or r.full_name)
+        slug = re.sub(r"[^0-9A-Za-z_.-]", "_", raw).replace(".", "_")[:60]
+        (out / f"{i:03d}_{slug}.txt").write_text(
+            "\n".join(head + [""] + body), encoding="utf-8")
+
+    print(f"wrote {len(df)} batches to {out}")
+    print(f"fill the judge column in {f}, then:")
+    print(f"  python vibebench/labels/score_labels.py --file {f.name} "
+          f"--pred-col <pred> --label-col llm_{a.principle}_risk")
+
+
+if __name__ == "__main__":
+    main()
