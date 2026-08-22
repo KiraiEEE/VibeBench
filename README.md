@@ -8,6 +8,8 @@
   <b>  A code quality benchmark on coding agents real merged pull requests.</b><br>
 </p>
 
+</hr>
+
 Every benchmark for coding agents asks *"does the code work?"* — SWE-bench, HumanEval,
 LiveCodeBench all measure functional correctness. This one asks whether the code is worth
 maintaining, by measuring adherence to the five SOLID design principles on pull requests that
