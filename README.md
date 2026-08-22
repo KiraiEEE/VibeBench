@@ -5,8 +5,7 @@
 <h1 align="center">VibeBench</h1>
 
 <p align="center">
-  <b>Do AI coding agents write code worth maintaining?</b><br>
-  A design-quality benchmark on real merged pull requests.
+  <b>  A code quality benchmark on coding agents real merged pull requests.</b><br>
 </p>
 
 Every benchmark for coding agents asks *"does the code work?"* — SWE-bench, HumanEval,
