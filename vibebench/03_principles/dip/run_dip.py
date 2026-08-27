@@ -33,6 +33,7 @@ import argparse
 import io
 import json
 import subprocess
+import pathlib
 import sys
 import tarfile
 from pathlib import Path
@@ -54,6 +55,22 @@ from graph import (
 # (status repo_too_large) to bound runtime; recorded, not silently dropped.
 MAX_PY_FILES = 10_000
 
+
+
+def _atomic_parquet(df, path):
+    """Write a checkpoint so a power cut can never leave a CORRUPT file.
+
+    `to_parquet(path)` overwrites in place, so a crash mid-write truncates the
+    file. Writing to a sibling temp and then `os.replace` (atomic on NTFS and
+    POSIX) means a reader always sees either the previous complete checkpoint or
+    the new one -- never a half-written one. Matters most for the long overnight
+    delta runs, which checkpoint every 25 PRs and so have many more write windows
+    than a single end-of-run write.
+    """
+    import os
+    tmp = pathlib.Path(str(path) + ".tmp")
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
 
 def run_git(args: list[str], cwd: Path, binary: bool = False):
     try:
@@ -186,8 +203,24 @@ def main() -> None:
     for i, pr in enumerate(gold.itertuples(index=False), 1):
         if pr.pr_id in done_ids:
             continue
+        # V2: `outcome` and `rejection_stratum` ride on EVERY row of EVERY
+        # parquet (REDESIGN_V2.md 3), so any report can split on them without a
+        # join and no analysis can accidentally pair results with the wrong
+        # gold set. Defaulted, because this harness must also read a pre-V2
+        # gold set.
+        #
+        # `merge_sha` is normalised here rather than left as `pr.merge_sha or
+        # ""`: a NOT-MERGED PR has no merge SHA, the parquet stores that as a
+        # float NaN, and `nan or ""` evaluates to NaN (NaN is truthy), so the
+        # old expression put a float into a string column for every rejected
+        # and open PR. gitsnap.delta_pair already type-checks it, but the
+        # column itself would have been unusable.
+        _ms = getattr(pr, "merge_sha", None)
         base = {"pr_id": pr.pr_id, "agent": pr.agent, "full_name": pr.full_name,
-                "pr_number": pr.pr_number, "merge_sha": pr.merge_sha or ""}
+                "pr_number": pr.pr_number,
+                "merge_sha": _ms if isinstance(_ms, str) else "",
+                "outcome": getattr(pr, "outcome", "merged"),
+                "rejection_stratum": getattr(pr, "rejection_stratum", "merged")}
 
         def emit(status: str, **extra) -> None:
             rows.append({**base, "status": status, **extra})
@@ -258,8 +291,23 @@ def main() -> None:
             reasons = []
             if len(new_cycles) > C.DIP_THRESHOLDS["new_touched_cycles"]:
                 reasons.append("new_cycle")
+            # mean_d_worse is COMPUTED AND STORED but no longer drives dip_risk
+            # (2026-08-17). It validated at precision 0.000 in BOTH languages
+            # (Python 0/7, TypeScript 0/10 -- 17 flags, zero true positives), and
+            # 4 of 7 Python FPs had ZERO new dependencies: it fires on graph
+            # RECOMPOSITION, not on real inversion. Keeping it in the composite
+            # dragged Python DIP to 13/20 = 0.650 precision when `new_cycle`
+            # alone is 13/13 = 1.000 -- i.e. the composite UNDERSTATED the
+            # project's own best detector. Dropping it loses no recall: the 7
+            # were not violations at all.
+            # It is still recorded as a descriptor so the finding stays auditable
+            # and the decision is reversible from the parquet alone.
             if d_mean_d is not None and d_mean_d > C.DIP_THRESHOLDS["delta_mean_d"]:
-                reasons.append("mean_d_worse")
+                row["mean_d_worse"] = True
+                if C.DIP_MEAN_D_COUNTS_AS_RISK:
+                    reasons.append("mean_d_worse")
+            else:
+                row["mean_d_worse"] = False
             row["dip_risk_hits"] = reasons
             row["dip_risk"] = bool(reasons)
             rows.append(row)
@@ -268,10 +316,10 @@ def main() -> None:
             emit("error")
 
         if i % 25 == 0:
-            pd.DataFrame(rows).to_parquet(C.DIP_RESULTS, index=False)
+            _atomic_parquet(pd.DataFrame(rows), C.DIP_RESULTS)
 
     results = pd.DataFrame(rows)
-    results.to_parquet(C.DIP_RESULTS, index=False)
+    _atomic_parquet(results, C.DIP_RESULTS)
     print(f"\n[dip] results written to {C.DIP_RESULTS}")
     print(results["status"].value_counts().to_string())
     ok = results[results.status == "ok"]

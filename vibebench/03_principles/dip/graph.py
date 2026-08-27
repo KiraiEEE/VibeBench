@@ -228,6 +228,49 @@ def find_cycles(modules: dict[str, ModuleInfo]) -> list[frozenset[str]]:
     return sccs
 
 
+
+def cross_package_only(modules: dict[str, ModuleInfo],
+                       package_of=None) -> dict[str, ModuleInfo]:
+    """A copy of `modules` keeping ONLY imports that cross a package boundary.
+
+    WHY THIS EXISTS -- a cross-language comparability defect, found 2026-08-25.
+
+    The three languages do not build their module graphs from the same evidence:
+
+      Python     an import statement is REQUIRED even between two modules of the
+                 same package, so `build_module_graph` sees intra-package edges.
+      Java       an import statement is FORBIDDEN (pointless) within a package,
+                 so the Java extractor sees a same-package edge only when it is
+                 an inheritance edge. Intra-package USE is structurally invisible
+                 to it, and no amount of care in the extractor changes that
+                 without a full symbol-resolution pass whose success rate on this
+                 corpus is 25-95%.
+
+    Consequence: Java's compilation-unit cycles are effectively CROSS-PACKAGE
+    cycles while Python's include intra-package ones, so the two languages' raw
+    `new_cycle` counts are NOT comparable, and V1 compared them anyway.
+
+    Restricting BOTH languages to cross-package edges puts them on the same
+    footing. It is also the architecturally meaningful scope: Martin's DIP and
+    the Acyclic Dependencies Principle are statements about components, and a
+    cycle between two classes in one folder is not an architectural cycle.
+
+    `package_of` maps a module name to its package; defaults to `top_package`
+    (correct for Python/TypeScript `pkg.mod` names). Java must pass its own,
+    because `top_package` returns the first dotted segment and reverse-DNS names
+    would collapse the whole corpus into `com` / `org` / `net`.
+    """
+    pk = package_of or top_package
+    return {
+        m: ModuleInfo(
+            name=i.name, n_classes=i.n_classes,
+            n_abstract_classes=i.n_abstract_classes,
+            imports={t for t in i.imports if pk(t) != pk(m)},
+            parse_ok=i.parse_ok,
+        )
+        for m, i in modules.items()
+    }
+
 def module_abstractness(info: ModuleInfo) -> float | None:
     if info.n_classes == 0:
         return None
@@ -330,6 +373,22 @@ if __name__ == "__main__":
     assert r == 0.5, r   # db->interfaces (abstract), a->b (concrete)
     mm = martin_metrics(g)
     assert mm["app"]["Ce"] == 0 and mm["app"]["Ca"] == 0
+
+    # cross_package_only: the matched-scope filter for the cross-language DIP
+    # comparison. app.a <-> app.b is an INTRA-package cycle (both in `app`), so
+    # under a cross-package scope it disappears -- which is exactly the scope the
+    # Java extractor is structurally limited to, and therefore the only scope in
+    # which the two languages' cycle counts mean the same thing.
+    xp = cross_package_only(g)
+    assert find_cycles(xp) == [], "intra-package cycle must vanish at cross-package scope"
+    assert xp["app.db"].imports == set(), "app.db -> app.interfaces is intra-package"
+    two_pkg = {
+        "a/one.py": "from b import two\nclass One: pass\n",
+        "b/two.py": "from a import one\nclass Two: pass\n",
+    }
+    g2 = build_module_graph(two_pkg)
+    assert find_cycles(cross_package_only(g2)) == find_cycles(g2) != [], (
+        "a genuine cross-package cycle must SURVIVE the filter")
     print("graph.py self-check OK:",
           {m: sorted(i.imports) for m, i in g.items()},
           "| cycles:", [sorted(c) for c in cycles],

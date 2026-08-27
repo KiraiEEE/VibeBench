@@ -1,5 +1,5 @@
 """
-Optional LOCAL code-embedding encoder (non-LLM) — the sanctioned semantic
+Optional LOCAL code-embedding encoder (non-LLM) , the sanctioned semantic
 precision upgrade for the SRP / OCP / LSP screens.
 
 WHAT THIS IS. A small Hugging Face code encoder (default GraphCodeBERT, ~125M
@@ -9,7 +9,7 @@ differ (`fetch_page` ≈ `download_html`). That "meaning, not tokens" jump is
 exactly the precision ceiling of the three structural screens: god-vs-cohesive
 class (SRP), open-vs-closed type set (OCP), real-contract-vs-plugin-placeholder
 (LSP). Unlike an LLM it is small, runs on CPU or a 4GB GPU, needs no API, and is
-DETERMINISTIC at inference (eval mode, no sampling) — so it preserves the
+DETERMINISTIC at inference (eval mode, no sampling) , so it preserves the
 benchmark's reproducibility.
 
 WHY IT IS OPTIONAL / GUARDED. The base pipeline's only third-party deps are
@@ -54,7 +54,7 @@ _STATE: dict = {"tried": False, "ok": False, "reason": None,
 # --------------------------------------------------------------------------
 def available(model_name: str | None = None) -> bool:
     """True iff torch+transformers import AND the encoder loads. Memoized.
-    Never raises — a missing dependency just returns False."""
+    Never raises , a missing dependency just returns False."""
     name = model_name or getattr(C, "EMBED_MODEL", "microsoft/graphcodebert-base")
     with _LOCK:
         if _STATE["tried"] and _STATE["name"] == name:
@@ -157,7 +157,7 @@ def embed(texts: list[str], model_name: str | None = None,
 
 
 # --------------------------------------------------------------------------
-# Similarity helpers (pure numpy — testable without torch)
+# Similarity helpers (pure numpy , testable without torch)
 # --------------------------------------------------------------------------
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
     na, nb = np.linalg.norm(a), np.linalg.norm(b)
@@ -167,7 +167,7 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def mean_pairwise_cosine(vectors: np.ndarray | None) -> float | None:
-    """Mean cosine over all unordered pairs — the embedding analogue of C3.
+    """Mean cosine over all unordered pairs , the embedding analogue of C3.
     None if fewer than 2 non-zero vectors."""
     if vectors is None:
         return None
@@ -198,7 +198,7 @@ if __name__ == "__main__":
     # graceful degradation when torch is absent
     if not available():
         assert embed(["def f(): pass"]) is None
-        print("embeddings.py self-check OK (encoder UNAVAILABLE — "
+        print("embeddings.py self-check OK (encoder UNAVAILABLE , "
               f"{unavailable_reason()}); numpy helpers pass, callers will fall "
               "back to deterministic defaults.")
     else:

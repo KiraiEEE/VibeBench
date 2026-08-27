@@ -35,12 +35,29 @@ import detectors as D         # noqa: E402
 PR_RESULTS = C.CORPUS_DIR / "java_pr_results.parquet"
 
 
+_FRAMES: dict[str, pd.DataFrame] = {}
+
+
+def _frame(kind: str) -> pd.DataFrame:
+    """Load `java_pr_results` / the gold set ONCE per process.
+
+    These were re-read from parquet on every call. The caller caches trees per
+    PR, so this cost scaled with distinct PRs rather than rows -- tolerable for a
+    44-row sample, wasteful for a census where the label set spans well over a
+    thousand PRs and the gold set is half a megabyte.
+    """
+    if kind not in _FRAMES:
+        _FRAMES[kind] = pd.read_parquet(
+            PR_RESULTS if kind == "prs" else C.GOLD_SET_JAVA)
+    return _FRAMES[kind]
+
+
 def tree_for(full_name: str, pr_number: int) -> dict | None:
-    prs = pd.read_parquet(PR_RESULTS)
+    prs = _frame("prs")
     row = prs[(prs.full_name == full_name) & (prs.pr_number == pr_number)]
     if not len(row):
         return None
-    gold = pd.read_parquet(C.GOLD_SET_JAVA)
+    gold = _frame("gold")
     g = gold[(gold.full_name == full_name) & (gold.pr_number == pr_number)]
     if not len(g):
         return None
@@ -193,10 +210,18 @@ def main() -> None:
         elif a.principle == "dip":
             head.append(f"PR {r.full_name}#{int(r.pr_number)}"
                         + (f"   hits={r.get('dip_risk_hits')}" if a.show_verdict else ""))
+            # BLINDING LEAK, FIXED 2026-08-25. `new_cycle` IS the DIP flag
+            # (config.DIP_FLAG_INCLUDES_MEAN_D=False makes it the whole flag), and
+            # it was printed unconditionally while every other principle's verdict
+            # sits behind --show-verdict. A judge that can read the verdict is
+            # not judging, it is agreeing, and the resulting precision is an
+            # upper bound. The cycle COUNTS stay visible because they are
+            # evidence the judge needs; only the conclusion is hidden.
             head.append(f"cycles before={r.get('before_touched_cycles')} "
-                        f"after={r.get('after_touched_cycles')} "
-                        f"new_cycle={r.get('new_cycle')}  "
-                        f"mean_D {r.get('before_mean_d')} -> {r.get('after_mean_d')}")
+                        f"after={r.get('after_touched_cycles')}  "
+                        + (f"new_cycle={r.get('new_cycle')}  "
+                           if a.show_verdict else "")
+                        + f"mean_D {r.get('before_mean_d')} -> {r.get('after_mean_d')}")
             head.append("QUESTION: does this PR make a high-level module depend on a CONCRETE")
             head.append("          low-level one (or close an import cycle)?")
             mods = D.dip_modules(ix)

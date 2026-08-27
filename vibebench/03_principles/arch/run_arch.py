@@ -121,6 +121,10 @@ def main() -> None:
         extract_dir = getattr(C, "EXTRACT_DIR_JAVA", C.EXTRACT_DIR)
 
     prs = pd.read_parquet(gold)
+    # The liveness set for eviction is the FULL gold set, never the --limit
+    # subset: a smoke run with --limit 5 would otherwise evict every other row
+    # in the parquet as "not in the current corpus" and destroy the results.
+    live_pr_ids = set(prs.pr_id)
     if args.limit:
         prs = prs.head(args.limit)
 
@@ -130,6 +134,17 @@ def main() -> None:
         prev = pd.read_parquet(OUT)
         prev = prev[prev.lang == args.lang] if "lang" in prev.columns else prev
         keep = prev[prev.status.isin(PERMANENT)]
+        # EVICT ROWS FROM A PREVIOUS CORPUS (V2). Resume keeps permanent-status
+        # rows, which is what makes the harness restartable, and is also how a
+        # re-curated corpus silently inherits the old one: the stale PRs are
+        # never re-analysed and never noticed, so every count is taken over a
+        # corpus that no longer exists. Same failure the Java result parquets
+        # had to be renamed to avoid.
+        stale = set(keep.pr_id.unique()) - live_pr_ids
+        if stale:
+            print(f"evicting {len(stale)} rows from a previous {args.lang} corpus "
+                  f"(their PRs are not in the current gold set)", flush=True)
+            keep = keep[keep.pr_id.isin(live_pr_ids)]
         done = set(keep.pr_id.unique())
         other = pd.read_parquet(OUT)
         other = other[other.lang != args.lang] if "lang" in other.columns else other.iloc[0:0]
@@ -140,8 +155,14 @@ def main() -> None:
     for i, pr in enumerate(prs.itertuples(index=False), 1):
         if pr.pr_id in done:
             continue
+        # V2: `outcome` and `rejection_stratum` ride on every row of every
+        # parquet (REDESIGN_V2.md 3) so any report can split on them without a
+        # join. Defaulted rather than required, because this harness also has to
+        # read pre-V2 gold sets.
         base = {"pr_id": pr.pr_id, "agent": pr.agent, "full_name": pr.full_name,
-                "pr_number": pr.pr_number, "lang": args.lang}
+                "pr_number": pr.pr_number, "lang": args.lang,
+                "outcome": getattr(pr, "outcome", "merged"),
+                "rejection_stratum": getattr(pr, "rejection_stratum", "merged")}
 
         def emit(status: str, **extra):
             rows.append({**base, "row_type": "pr", "status": status, **extra})
@@ -193,11 +214,11 @@ def main() -> None:
             emit("error", error=f"{type(e).__name__}: {e}")
 
         if i % CHECKPOINT_EVERY == 0:
-            pd.DataFrame(rows).to_parquet(OUT, index=False)
+            gitsnap.write_parquet_atomic(pd.DataFrame(rows), OUT, index=False)
             print(f"  checkpoint {i}/{n}", flush=True)
 
     df = pd.DataFrame(rows)
-    df.to_parquet(OUT, index=False)
+    gitsnap.write_parquet_atomic(df, OUT, index=False)
     pk = df[(df.row_type == "package") & (df.lang == args.lang)]
     print(f"\nwrote {OUT}  ({len(df)} rows)")
     print(f"zone radius {ZONE_RADIUS}, main-sequence band {MAIN_SEQUENCE_BAND}")

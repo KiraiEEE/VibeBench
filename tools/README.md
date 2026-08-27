@@ -1,4 +1,4 @@
-# `tools/` — third-party analysers used ONLY as an independent cross-check
+# `tools/` , third-party analysers used ONLY as an independent cross-check
 
 Nothing here is a pipeline dependency. Our own detectors stay primary because the
 three languages must remain numerically commensurable (`metrics.py::
@@ -9,7 +9,7 @@ established, published Java analyser order and flag the same classes we do?*
 Driver: `vibebench/05_crosscheck/run_crosscheck_java.py`.
 Write-up: `VibeBench_Java_Guide.html` §6 "Convergent validity", `JAVA_STATUS.md` §9.
 
-## CK 0.7.0 (Aniche) — per-class metrics
+## CK 0.7.0 (Aniche) , per-class metrics
 
 ```
 mvn -f pom.xml dependency:build-classpath -Dmdep.outputFile=cp_ck.txt
@@ -19,12 +19,12 @@ java -cp "$(cat cp_ck.txt)" com.github.mauricioaniche.ck.Runner <srcdir> false 0
 `useJars=false` is what makes CK usable on a bare `git archive` tree: it falls
 back to partial resolution instead of demanding a classpath.
 
-**CK's `lcom` is LCOM1 and its `lcom*` is Henderson-Sellers. LCOM4 — ours — is not
+**CK's `lcom` is LCOM1 and its `lcom*` is Henderson-Sellers. LCOM4 , ours , is not
 implemented.** CK is therefore a RANK CORRELATE, never an agreement check, and the
 write-up says so.
 
 **Known crash.** CK embeds the Eclipse JDT compiler, which on an unbuildable tree
-can die outright — `OpenHFT/Chronicle-Core` produces
+can die outright , `OpenHFT/Chronicle-Core` produces
 `NullPointerException: Cannot read field "declaringClass" because "mb" is null` in
 `ReferenceExpression.generateCode` (a `MethodHandle.invokeExact` method reference
 whose type JDT cannot resolve). The crash kills the run and leaves a 0-byte csv.
@@ -34,7 +34,7 @@ JDT session to a slice and succeeds. Partitioning degrades cross-file metrics
 (`wmc`, `loc`, `totalMethodsQty`, `lcom`, `lcom*`, `tcc`). Affected repos are
 marked `ck_partitioned` in `java_crosscheck_status.csv`.
 
-## PMD 7.7.0 — design rules
+## PMD 7.7.0 , design rules
 
 ```
 mvn -f pom_pmd.xml dependency:build-classpath -Dmdep.outputFile=cp_pmd.txt
@@ -49,7 +49,7 @@ with us would destroy the only thing it is being asked for.
 `ExcessiveClassLength` was **removed in PMD 7**; `NcssCount` is its documented
 successor and is used in its place.
 
-## DesigniteJava 1.1.2 (Community) — design smells for SRP, LSP and DIP
+## DesigniteJava 1.1.2 (Community) , design smells for SRP, LSP and DIP
 
 Not on Maven Central and the binary download is form-gated, so it is built from
 source (`github.com/tushartushar/DesigniteJava`) and the jar is committed here.
@@ -73,14 +73,14 @@ mkdir -p <workdir>/output && (cd <workdir> && java -jar DesigniteJava-1.1.2.jar 
 2. It **ignores `-o`** and writes to `<cwd>/output/`, which must already exist.
    The driver runs it with `cwd` set per repo.
 
-Confirms JAVA_STATUS §0c: it is genuinely source-only — the old TOOLS.md
+Confirms JAVA_STATUS §0c: it is genuinely source-only , the old TOOLS.md
 "needs a build" rejection was wrong.
 
 ## Deliberately NOT used
 
 | Tool | Reason |
 |---|---|
-| **JDepend** | Reads `.class` files only. Our inputs are bare `git archive` trees with no build. It also computes *exactly* the Martin A/I/D + package-cycle metrics `dip/graph.py` already implements and that are shared across all three languages — so it would cost a build for numbers we already have. |
+| **JDepend** | Reads `.class` files only. Our inputs are bare `git archive` trees with no build. It also computes *exactly* the Martin A/I/D + package-cycle metrics `dip/graph.py` already implements and that are shared across all three languages , so it would cost a build for numbers we already have. |
 | **ArchUnit** | Also bytecode-only, and it is a *conformance DSL*: you hand-write the rules. It checks a project against an architecture you declare, which is not what a cross-corpus measurement needs. |
-| **SonarQube / Qodana** | Server or Docker plus per-project configuration — irreproducible as a thesis artefact. |
+| **SonarQube / Qodana** | Server or Docker plus per-project configuration , irreproducible as a thesis artefact. |
 | **DV8** | Commercial. |

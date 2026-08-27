@@ -14,7 +14,31 @@ from pathlib import Path
 # Repo root = the folder that contains this file's parent (vibebench/).
 VIBEBENCH_DIR = Path(__file__).resolve().parent
 ROOT_DIR = VIBEBENCH_DIR.parent                     # d:/VibeBench
-DATA_DIR = ROOT_DIR / "AIDev-full"                  # the parquet dataset
+# --- Source dataset --------------------------------------------------------
+# SWITCHED 2026-08-17: AIDev-full -> AIDev-7.6M (see RERUN_LOG.md for the full
+# provenance record and the measured comparison).
+#   AIDev-full : 932,791 PRs / 116,211 repos.  Claude_Code had 66 eligible
+#                Python PRs, so its corpus was dataset-bound at 37.
+#   AIDev-7.6M : 7,685,281 PRs / 957,209 repos, cutoff 2026-03-31, 6 agents.
+#                Claude_Code eligible Python 26,055.
+# DELETED 2026-08-27: the old AIDev-full download is gone. V1 is cancelled, so
+# nothing will regenerate it, its RESULT parquets are preserved for the V1-vs-V2
+# comparison, and the raw dataset is re-downloadable if ever needed. The OLD results stay
+# in corpus/ until the new run is accepted -- nothing is deleted.
+#
+# ⚠️ TABLE NAMES DIFFER BY DATASET AND THIS ALREADY CAUSED ONE WRONG ANALYSIS.
+# In AIDev / AIDev-2.7M / AIDev-7.6M, `pull_request.parquet` and
+# `repository.parquet` hold ONLY the >100-star "AIDev-pop" subset; the master
+# tables are `all_pull_request.parquet` / `all_repository.parquet`. AIDev-full is
+# the exception (its fork expanded pull_request.parquet to ~the full set), so
+# reading the same filename across datasets silently under-counts the newer ones.
+# PR_TABLE / REPO_TABLE below make the choice explicit instead of implicit.
+DATA_DIR = ROOT_DIR / "datasets" / "AIDev-7.6M"     # the parquet dataset
+PR_TABLE = "all_pull_request.parquet"               # master PR table
+REPO_TABLE = "all_repository.parquet"               # master repo table
+DATASET_NAME = "AIDev-7.6M"                         # for the methods note
+DATASET_PULLED = "2026-08-17"                       # snapshot download date
+DATASET_CUTOFF = "2026-03-31"                       # upstream collection cutoff
 
 CORPUS_DIR = VIBEBENCH_DIR / "corpus"
 CLONES_DIR = CORPUS_DIR / "clones"                  # per-repo git checkouts (cache)
@@ -34,12 +58,33 @@ LSP_RESULTS = CORPUS_DIR / "lsp_results.parquet"    # output of 03_principles/ls
 # First slice targets Python only. lizard already supports JS/TS/Java for later.
 TARGET_LANGUAGES = ["Python"]
 
-# Community-adoption floor. Lowered 100 -> 25 (2026-07) as a sample-size fix:
-# Claude_Code has only 30 merged Python PRs in the whole dataset at stars>=100
-# (permissive license) vs 42 at stars>=25 -- the small-agent samples are
-# dataset-bound, so the floor trades a little "adoption credibility" for ~40%
-# more Claude_Code/Cursor PRs. Verified counts at stars>=25:
-# Claude_Code 42, Copilot 288, Cursor 108, Devin 183, OpenAI_Codex 6017.
+# The 3-agent set, applied to BOTH languages as of 2026-08-17 (previously Python
+# took every agent and Java took OpenAI_Codex only). Same three in both corpora
+# makes the cross-language comparison a clean factorial design; every
+# cross-language claim is only ever computable on agents present in both anyway.
+# Cursor and Devin are excluded on Java data volume (n=94 with 72.3% in its top-3
+# repos, and n=6) -- their Python results from the prior run are KEPT as a
+# supplementary single-language observation, not deleted. Google_Jules is excluded
+# as unvalidated: it is new to this dataset generation with no track record in any
+# earlier AIDev release, so its PR-attribution would need validating from scratch.
+PY_ONLY_AGENTS = ["OpenAI_Codex", "Copilot", "Claude_Code"]
+
+# Community-adoption floor. Lowered 100 -> 25 in 2026-07 as a sample-size fix,
+# back when Claude_Code had 42 eligible merged Python PRs in the whole of
+# AIDev-full and the small-agent samples were dataset-bound.
+#
+# THE ORIGINAL JUSTIFICATION NO LONGER HOLDS, and the counts it quoted are from
+# a dataset this project no longer uses. On AIDev-7.6M, measured 2026-08-25 at
+# stars>=25 with a permissive license, eligible MERGED Python PRs are
+# Claude_Code 26,055 / Copilot 9,097 / OpenAI_Codex 14,276, so no agent is
+# anywhere near dataset-bound and the floor could be raised without costing
+# sample size.
+#
+# It is KEPT AT 25 anyway, deliberately: changing the star floor at the same
+# time as switching to an outcome-balanced corpus would make every old-vs-new
+# difference uninterpretable, since two variables would have moved at once. If
+# a jury objects that 25 stars is a low bar for "real project", the answer is a
+# star-band sensitivity check in the report, not a silent re-cut of the corpus.
 MIN_STARS = 25
 
 # Permissive licenses only: legal to clone + redistribute a reproducible benchmark.
@@ -51,14 +96,210 @@ PERMISSIVE_LICENSES = {
 
 # Balanced sampling: keep every PR from small agents, cap the large ones so a
 # single agent (OpenAI_Codex) cannot dominate the comparison. Seeded for repro.
-PER_AGENT_PR_CAP = 150
+#
+# RAISED 150 -> 500 on 2026-08-17, with the dataset switch. The cap was never
+# what limited the weakest agent -- the DATASET was (Claude_Code had 66 eligible
+# Python PRs in AIDev-full, so it landed at 37 regardless of the cap). Now that
+# every agent in the 3-agent set clears 500, the cap finally does what it is for.
+# WHY 500 AND NOT MORE: the binding scientific motive for this re-run is that
+# four of five principles produced single-digit PR-level flag counts, making
+# per-agent claims impossible. More PRs is the direct fix, and LABELLING COST
+# DOES NOT GROW WITH CORPUS SIZE (samplers draw a fixed --n-per-stratum), so the
+# extra cost is unattended compute only. The real ceiling is DISK: clones run
+# ~70 MB/repo and 114 GB was free at the time of writing.
+PER_AGENT_PR_CAP = 500
 RANDOM_SEED = 42
 
+# --- V2: OUTCOME-BALANCED CORPUS (2026-08-25) -------------------------------
+# V1 curated MERGED PRs only. Merged PRs passed human review, so the corpus was
+# filtered by the very quality signal the study measures -- survivorship bias,
+# and a legitimate attack on the result. V2 adds PRs that were NOT merged so
+# every rate can be reported merged-only, not-merged-only and pooled.
+#
+# OUTCOME derivation (vectorised, never row-wise .apply -- 7.6M rows):
+#     merged   : merged_at is not null            6,216,792  80.9%
+#     rejected : state == "closed" and not merged    733,321   9.5%
+#     open     : state == "open"                     735,168   9.6%
+# Verified against all_pull_request.parquet 2026-08-25.
+#
+# WHICH OUTCOMES GET BALANCED CELLS. Java `open` is too thin to balance
+# (OpenAI_Codex has 83), so balancing three outcomes would crush every Java cell
+# to 83. Java therefore balances merged vs rejected only and carries `open` as a
+# supplementary, unbalanced observation. Python matches Java's design so the
+# cross-language statement stays clean.
+V2_OUTCOMES = ["merged", "rejected"]          # the balanced axis
+V2_SUPPLEMENTARY_OUTCOMES = ["open"]          # carried, never in the headline
+
+# Per (agent x outcome) CELL cap, the V2 replacement for PER_AGENT_PR_CAP.
+#
+# THE CAP IS PER LANGUAGE BECAUSE THE CEILING IS PER LANGUAGE, and conflating
+# the two would throw away an order of magnitude of Python data for no reason.
+#
+# JAVA is DATASET-BOUND, not policy-bound. Measured 2026-08-25 on the real
+# curation path, the eligible rejected pools are Claude_Code 485, Copilot 1,272,
+# OpenAI_Codex **315**. That last cell is the binding constraint on a balanced
+# 3-agent x 2-outcome design and it cannot be raised without dropping a filter,
+# so 300 sits just under it and no cell is capped by policy below what the data
+# allows.
+#
+# PYTHON is not bound at all: its smallest cell is Copilot rejected at 3,716.
+# Running Python at Java's 300 would leave a factor of 12 unused. 750 is chosen
+# rather than the ceiling because the cost that actually scales is unattended
+# compute (clone, fetch, parse), while LABELLING COST DOES NOT SCALE AT ALL --
+# the samplers draw a fixed --n-per-stratum, and the census design enumerates
+# the flagged side, which grows only with the number of flags, not with corpus
+# size. 750/cell gives 4,500 Python PRs against V1's 1,786.
+CELL_PR_CAP = 300               # Java, and the default (legacy equal-cell mode)
+CELL_PR_CAP_PY = 750            # Python, where the pool allows far more
+
+# --- V2.1 DESIGN: WITHIN-AGENT OUTCOME BALANCE (2026-08-26) -----------------
+#
+# SUPERSEDES the equal-cell design above as the default. The equal-cell design
+# capped every cell at the SMALLEST cell in the whole corpus (OpenAI_Codex
+# rejected = 315), which threw away most of the eligible pool to buy equal n
+# ACROSS agents -- a control the reporting already provides by other means.
+#
+# THE ARGUMENT, stated so it can be checked rather than trusted:
+#   * The comparison that genuinely needs equal n is merged vs rejected WITHIN
+#     one agent, because that is the V2 contrast and unequal n there costs power
+#     and invites a "you compared 300 to 1,272" objection.
+#   * The comparison ACROSS agents is made on macro-per-repo RATES, and a rate
+#     is not biased by its denominator. Equal n across agents buys only equal
+#     precision, and it costs an order of magnitude of data to buy it.
+#   * REJECTED IS THE SCARCE SIDE in every agent, so taking all of it and
+#     matching merged to it maximises the corpus at exactly the point where the
+#     study is data-limited.
+#
+# Measured eligible pool, Java, 2026-08-26 (merged / rejected):
+#   Claude_Code 1,964 / 485    Copilot 2,676 / 1,272    OpenAI_Codex 1,989 / 315
+# so the balanced corpus is 970 + 2,544 + 630 = 4,144 PRs, against 1,800 under
+# equal cells, plus ~740 supplementary `open`.
+#
+# A side effect worth naming: taking ALL rejected PRs automatically captures
+# every `changes_requested` PR that exists in the eligible pool, which is the
+# only stratum carrying an explicit maintainer objection and is far too small to
+# sample for.
+V2_WITHIN_AGENT_BALANCE = True
+
+# OVER-DRAW ON THE MERGED SIDE, so within-agent balance survives attrition.
+#
+# The rejected side CANNOT be over-drawn: the design already takes every
+# eligible rejected PR, so its pool is exhausted by construction. Step 2 then
+# drops PRs that turn out to touch no Java (the git_diff route is not
+# pre-filtered), and the two sides do NOT attrit equally -- merged PRs carry
+# exact file lists far more often, so they survive better. Drawing merged
+# 1:1 with rejected would therefore leave MORE merged than rejected analysable,
+# and the balance the design exists to create would be lost silently between
+# curation and analysis.
+#
+# Drawing merged at 2x lets the balance be restored on ANALYSABLE PRs, which is
+# the population every rate is actually computed over. The surplus is not
+# wasted: it improves precision on the merged side and enlarges the head-state
+# inventory ("violations PRESENT"), which is the denominator of the study's
+# headline contrast.
+#
+# WHY 2x AND NOT THE WHOLE ELIGIBLE POOL. The full pool would give 6,629 merged
+# against 2,072 rejected, roughly 9,400 PRs, but the marginal scientific value
+# of merged PRs beyond 2x is small (that side is already well powered) while the
+# compute cost is linear in PRs and dominated by two JavaParser passes per PR.
+# 2x is where extra data stops buying extra confidence.
+MERGED_OVERDRAW = 2.0
+
+# Hard ceiling per (agent, outcome) cell. A COMPUTE guard, not a design choice,
+# so it is set above what the design actually asks for and should never bind.
+# It bound once at 1,500 (Copilot's merged side wants 2x1,272 = 2,544) and
+# silently clipped that agent, which is exactly the kind of quiet truncation a
+# cap should not do.
+CELL_HARD_CAP = 2600
+
+# DRAW PRIORITY, applied inside each repository bucket of the stratified draw.
+# The repository round-robin still controls concentration; this decides WHICH of
+# a repository's PRs are taken, and it is where three jury attacks are answered:
+#
+#   sticky        already extracted, so re-curation never discards paid work
+#   dataset       exact file list, ~0% Step-2 attrition (vs the git_diff route)
+#   multi_agent   the repository contains PRs from >= 2 agents, which is what
+#                 makes a WITHIN-REPOSITORY cross-agent comparison possible.
+#                 Measured: only 13 of 730 repositories held all three agents
+#                 and 6.7% of PRs sat in them, so a cross-agent claim was almost
+#                 entirely a BETWEEN-PROJECT claim. 111 eligible repositories
+#                 have >= 2 agents, holding 2,266 eligible PRs.
+#   recent        newest first. The agents worked in different ERAS (median PR
+#                 date OpenAI_Codex 2025-07-10 against Claude_Code 2026-02-21),
+#                 so a cross-agent comparison was partly a comparison of
+#                 repository eras and of older agent versions. Preferring recent
+#                 PRs narrows that gap AND measures the agents as they are now,
+#                 which is what the study is actually about.
+V2_DRAW_PRIORITY = ["sticky", "dataset", "multi_agent", "recent"]
+
+# A BALANCED CORPUS IS NOT A REPRESENTATIVE ONE. 50/50 merged-to-rejected
+# maximises power for the COMPARISON, but the real population is 80.9% merged.
+# Any PER-OUTCOME rate is valid as drawn; any OVERALL "agents violate X% of the
+# time" figure computed on the balanced corpus is wrong for the real world and
+# must be reweighted to the natural mix or explicitly labelled balanced-design.
+# These are the weights for that reweighting.
+V2_NATURAL_MIX = {"merged": 0.809, "rejected": 0.095, "open": 0.096}
+
+# REJECTION STRATA. "Rejected" does NOT mean "rejected for quality": measured on
+# the eligible pool, rejected PRs are HALF as likely to have any recorded review
+# (Java 10.8% vs 25.3% merged; Python 6.2% vs 12.1%). Most were closed with no
+# review at all -- superseded, stale, duplicate, abandoned or bulk-closed. So
+# not-merged is stratified and the strata are reported separately; a bare
+# merged-vs-rejected violation rate is never published as if rejection meant
+# quality refusal.
+#   changes_requested   : has a CHANGES_REQUESTED review  (strongest signal)
+#   reviewed_then_closed: has some review, closed unmerged
+#   closed_unreviewed   : no review recorded              (the majority)
+V2_REJECTION_STRATA = ["changes_requested", "reviewed_then_closed", "closed_unreviewed"]
+
+# THE DATASET'S REVIEW TABLE IS NOT THE LAST WORD, AND ITS GAP IS AGENT-BIASED.
+# `pr_reviews` covers 6-11% of rejected PRs, and `pr_timeline`'s close event is
+# worse: Claude_Code 2.8% against OpenAI_Codex 64.4% in Java. Deciding the
+# strata from it alone would have decided them by metadata coverage rather than
+# by what happened. `06_enrich/fetch_pr_outcomes.py` therefore re-fetches state,
+# every review state and the close actor from the GitHub API for the SELECTED
+# corpus only, and `apply_enrichment.py` writes `rejection_stratum_api` beside
+# the dataset's own `rejection_stratum`. Measured on the Java V2 corpus
+# 2026-08-25: close-actor coverage went to 99.4-100% with a 0.8pp per-cell
+# spread, and `changes_requested` went from 25 to 85 PRs.
+#
+# REPORTS MUST PREFER `rejection_stratum_api` AND SAY SO. The dataset column is
+# kept only so the two can be compared.
+#
+# DROPPED, and recorded so it is not re-attempted: "author-closed = abandonment".
+# It reads Claude_Code 78.2% / OpenAI_Codex 80.6% / Copilot 0.5%, which is not
+# behaviour but PR-ACCOUNT OWNERSHIP -- Copilot opens PRs from the
+# `copilot-swe-agent` bot (941 of 964) while the other two open from the
+# developer's own account, so a human closing a Copilot PR can never be "the
+# author". Replaced by `closed_by_automation` (bot / policy service), which does
+# not depend on account identity: Claude_Code 2.7%, Copilot 6.4%, Codex 2.0%.
+
+# CALIBRATED FROM A REAL PASS, not guessed: the first AIDev-7.6M run used 1.4 and
+# under-filled Copilot badly -- 641 drawn -> 280 analyzable, a 56.3% loss, against
+# 9.2% (Claude_Code) and 11.2% (OpenAI_Codex) for agents whose file lists come from
+# the dataset. 1/0.437 = 2.29, hence 2.3. Re-running curate with survival-aware
+# stickiness tops the shortfall up rather than restarting.
+# Over-draw factor for PRs whose file list must be resolved from git in Step 2
+# (files_source="git_diff"). Those PRs have not been pre-filtered for "touches
+# >=1 in-scope source file", so Step 2 discovers and drops some of them; drawing
+# exactly `cap` of them would land the corpus below the cap. Applied ONLY to the
+# git_diff portion of a draw -- dataset-sourced rows are already pre-filtered and
+# are taken first. See curate.py::balanced_sample.
+GIT_DIFF_OVERDRAW = 2.3
+
 # A PR is in-scope only if it touches at least one source file in this set.
-# (Copilot exception: pr_commit_details has NO filenames for Copilot, so its
-# PRs are sampled without this pre-filter and the touched-file list is derived
-# in Step 2 from the merge commit's git diff; PRs that turn out to touch no
-# source file are dropped there.)
+#
+# CORRECTED 2026-08-25. This note used to describe a "Copilot exception"
+# (pr_commit_details has no filenames for Copilot, so its PRs skip the
+# pre-filter). That was TRUE OF AIDev-full AND IS FALSE OF AIDev-7.6M, where
+# Copilot's filenames are 97.3% non-null and it is CLAUDE_CODE that lacks file
+# attribution (2.3% in Java, 3.1% in Python). The routing has been data-driven
+# since 2026-08-19 and no agent is named anywhere in it: a PR with a usable
+# in-scope file list becomes `dataset`, one without becomes `git_diff`, and
+# Step 2 derives the list from git and drops PRs that touch no source file.
+# The general rule this illustrates: WHICH agent has a metadata gap changes
+# between dataset releases, so a fallback selected by agent name is a bug
+# waiting for the next release.
 SOURCE_EXTENSIONS = {".py"}
 
 # Per-git-command timeout for the clone stage. 60s proved too short for huge
@@ -111,8 +352,12 @@ TS_TARGET_LANGUAGES = ["TypeScript"]
 # not "code the agent wrote" for SRP purposes. (They matter later for interface
 # inventories; the delta harness trees can include them when ISP-TS arrives.)
 TS_SOURCE_EXTENSIONS = {".ts", ".tsx"}
-# Path fragments that mark generated/vendored code -- excluded from extraction
-# and analysis (checked as substrings of the repo-relative path).
+# Generated/vendored code, excluded from extraction and analysis.
+#
+# MATCHING RULE (corrected 2026-08-27, see JAVA_EXCLUDED_PATH_PARTS for the
+# measurement that forced it): an entry ending in "/" names a DIRECTORY
+# COMPONENT and is matched against whole components, never as a substring.
+# Anything else is matched inside the FILE NAME only.
 TS_EXCLUDED_PATH_PARTS = ("node_modules/", "dist/", "build/", ".min.", ".generated.")
 
 GOLD_SET_TS = CORPUS_DIR / "gold_set_ts.parquet"
@@ -121,10 +366,16 @@ EXTRACT_DIR_TS = CORPUS_DIR / "ai_files_ts"
 SRP_RESULTS_TS = CORPUS_DIR / "srp_results_ts.parquet"
 
 # ---------------------------------------------------------------------------
-# JAVA (3rd language, 2026-08-02) -- a WITHIN-AGENT language study, not an
-# agent comparison. Measured on AIDev-full: only OpenAI_Codex has usable Java
-# (878 eligible PRs). The other four have 1, 2, 2 and 0, so a five-agent Java
-# comparison is impossible and is not attempted.
+# JAVA (V2) -- a THREE-AGENT, TWO-OUTCOME study.
+#
+# SUPERSEDED TEXT REMOVED 2026-08-27. This block used to read "a WITHIN-AGENT
+# language study, not an agent comparison ... only OpenAI_Codex has usable
+# Java". That was true of AIDev-full and is false of AIDev-7.6M, and it is
+# exactly the kind of stale premise that makes a later session design the wrong
+# experiment. Measured on the built V2 corpus: 3,880 usable PRs over 716
+# repositories, Claude_Code 724 / Copilot 2,044 / OpenAI_Codex 621, with both
+# merged and rejected present for every agent and 263 repositories
+# contributing BOTH outcomes (the paired within-repo contrast).
 #
 # WHY JAVA IS WORTH RUNNING ANYWAY. The headline finding of the Python and
 # TypeScript studies is that SOLID violations are rare per PR. The obvious
@@ -138,12 +389,38 @@ JAVA_TARGET_LANGUAGES = ["Java"]
 JAVA_SOURCE_EXTENSIONS = {".java"}
 # Build output, generated sources, and vendored code. `target/` (Maven) and
 # `build/` (Gradle) hold compiled + generated java that no human wrote.
+#
+# THESE ARE DIRECTORY COMPONENTS, NOT SUBSTRINGS (fixed 2026-08-27).
+# They used to be matched with `part in path`, which silently excluded any path
+# merely CONTAINING the fragment. Measured over 304,342 .java files in 133
+# cloned repositories: 521 files (0.17%) were dropped for no reason, because
+# "gradlebuild/" contains "build/" and "riksdagen/" contains "gen/". The loss
+# was concentrated in whole modules of gradle/gradle, Hack23/cia,
+# conductor-oss/conductor and several apache/* repositories, and it was mildly
+# agent-biased (Copilot 6.9% of PRs in an affected repo vs Codex 3.4%), so it
+# could move a per-agent rate rather than merely shrinking the corpus.
+#
+# The "-gen"/"_gen" SUFFIX rule is deliberate and separate: `src-gen/` is the
+# conventional name for generated sources (vavr generates its whole `src-gen`
+# tree from a Scala generator), so it must stay excluded, while `codegen/` --
+# which holds the hand-written GENERATOR -- must not be.
 JAVA_EXCLUDED_PATH_PARTS = (
-    "target/", "build/", "generated/", "gen/", "/out/", ".generated.",
+    "target/", "build/", "generated/", "gen/", "out/", ".generated.",
 )
-# Only this agent has enough Java to measure; recorded here so the restriction
-# is declarative rather than buried in a script.
-JAVA_ONLY_AGENTS = ["OpenAI_Codex"]
+# Directory-component suffixes that mark generated sources (src-gen, model_gen).
+GENERATED_DIR_SUFFIXES = ("-gen", "_gen")
+# WIDENED 2026-08-17 to the 3-agent set. Under AIDev-full only OpenAI_Codex had
+# usable Java (the others had 1, 2, 2 and 0), which is why this was a
+# within-agent study. Under AIDev-7.6M all three clear it: eligible Java PRs are
+# OpenAI_Codex 1,790 / Copilot 2,495 / Claude_Code 1,954.
+# NOTE the git_diff fallback in curate.py::attach_touched_files is what makes
+# Claude_Code viable here -- restricted to dataset-supplied file lists it has only
+# 45 usable Java PRs, because AIDev-7.6M's pr_commit_details covers just 2.6% of
+# the dataset and that loss is agent-biased.
+# Cursor (n=94, 72.3% in its top-3 repos) and Devin (n=6) are still excluded on
+# volume; Google_Jules is excluded as unvalidated (no track record in any earlier
+# AIDev release).
+JAVA_ONLY_AGENTS = ["OpenAI_Codex", "Copilot", "Claude_Code"]
 # NO CAP. Considered and rejected 2026-08-02 after building it: capping per
 # repository and macro-averaging per repository do the SAME job, and only the
 # second one is free. Every reported rate is already computed inside each repo
@@ -152,6 +429,32 @@ JAVA_ONLY_AGENTS = ["OpenAI_Codex"]
 # control we already have. Concentration is instead made visible in the report
 # (`top_repo_share`) rather than engineered away in the sample.
 JAVA_PER_REPO_PR_CAP = None
+
+# REPO-STRATIFIED DRAW (added 2026-08-19). Within an agent's cap, take PRs
+# round-robin across that agent's repositories instead of uniformly at random.
+# Same number of PRs, spread over far more repositories.
+#
+# Measured on the AIDev-7.6M Java pool (500 PRs/agent either way):
+#     agent          natural draw            stratified draw
+#     Claude_Code    145 repos, top-3 11.4%  271 repos, top-3  1.8%
+#     Copilot        153 repos, top-3 25.2%  373 repos, top-3  1.2%
+#     OpenAI_Codex    65 repos, top-3 48.8%  122 repos, top-3  9.6%
+#
+# WHY THIS IS WORTH A DESIGN CHANGE. Macro-per-repo averaging already stops a
+# mega-repo from dominating an agent's RATE, and that is why JAVA_PER_REPO_PR_CAP
+# stayed None. But macro-averaging cannot create independent units it does not
+# have: at 65 repos the macro mean for OpenAI_Codex is an average over 65 units,
+# and roughly half its PRs come from three of them. Stratifying doubles the
+# repositories at no cost in PRs, which widens the base the cross-agent
+# comparison rests on rather than merely re-weighting a narrow one.
+#
+# WHAT IT CHANGES, STATE THIS IN THE METHODS SECTION. The corpus no longer
+# mirrors the natural distribution of where each agent works -- OpenAI_Codex
+# really is concentrated, and the stratified corpus deliberately does not show
+# that. Concentration of the ELIGIBLE POOL is therefore still reported
+# (`top_repo_share`) alongside the drawn corpus, so the fact is disclosed rather
+# than sampled away. Set to False to recover the natural draw.
+JAVA_REPO_STRATIFIED_DRAW = True
 
 # Java scopes by FILE, not by the repository's headline language. The unit of
 # analysis is "Java the agent wrote", and a repo whose primary language is Kotlin
@@ -326,6 +629,24 @@ JAVA_DELTA_THRESHOLDS = {
     "dip": {"new_touched_cycles": 0, "delta_mean_d": 0.15},
 }
 
+# DIP: DOES `mean_d_worse` COUNT TOWARD THE FLAG? (added 2026-08-19 -- False.)
+#
+# It does not, and the evidence is two independent label rounds in two
+# languages. Python full census: `new_cycle` 13/13 correct (P=1.000),
+# `mean_d_worse` 0/7 (P=0.000). TypeScript, 40 rows: `new_cycle` 5/5 (P=1.000),
+# `mean_d_worse` 0/10 (P=0.000). Zero true positives in 17 flags across two
+# corpora is not a weak signal, it is an absent one -- most of those flags had no
+# new dependency at all and moved only because the package graph was recomposed.
+#
+# Averaging a perfect detector with an empty one does not produce a cautious
+# number, it produces a worse one: it adds false positives and UNDERSTATES the
+# best result this project has. `delta_mean_d` is still computed and still
+# written to the parquet, because Martin distance is a fair DESCRIPTOR of where a
+# package sits; it just no longer decides `dip_risk`.
+#
+# Set True only to reproduce the pre-2026-08-19 combined flag.
+DIP_FLAG_INCLUDES_MEAN_D = False
+
 GOLD_SET_JAVA = CORPUS_DIR / "gold_set_java.parquet"
 CLONE_MANIFEST_JAVA = CORPUS_DIR / "clone_manifest_java.parquet"
 EXTRACT_DIR_JAVA = CORPUS_DIR / "ai_files_java"
@@ -342,7 +663,54 @@ TREE_CACHE_DIR = CORPUS_DIR / "tree_cache"
 # Parallelism for the TS pipeline (new code is fast from day one; the validated
 # Python scripts are NOT retrofitted in the same change -- see PROJECT.md 7.C).
 FETCH_WORKERS = 6      # concurrent repos in clone/fetch (network-bound, threads)
-ANALYZE_WORKERS = 8    # concurrent PR-tree analyses (CPU-bound, processes; 12 cores)
+# CONCURRENT PR-TREE ANALYSES. Lowered 8 -> 4 on 2026-08-26, for two reasons.
+#
+# MEMORY, and this was a real misconfiguration: each worker launches a Java
+# sidecar with a 3 GB heap (JAVA_SIDECAR_HEAP), so 8 workers is 24 GB of
+# potential heap on a 15.4 GB machine. The comment justifying 8 cited the core
+# count and never checked the RAM. Under load that thrashes, and an
+# out-of-memory JVM is recorded as an ANALYSIS FAILURE rather than as a resource
+# problem -- a wrong result dressed as a data problem, which is this project's
+# recurring failure mode.
+#
+# USABILITY: these passes run for hours on a machine somebody is also using.
+#
+# RAISED 4 -> 5 on 2026-08-27, on measurement rather than on the core count that
+# justified the original 8. With the JVM flags added in java_bridge.JVM_TUNING
+# (the heap now shrinks back after each collection instead of staying at its
+# high-water mark) resident memory per sidecar fell from 2,953 MB peak / 2,029 MB
+# mean to 2,042 MB peak / 1,035 MB MEAN, sampled once per 1.2 s across a
+# 54-PR pilot. Five workers is therefore ~5.2 GB in the typical case against
+# 8.8 GB available on this machine.
+#
+# Note what does NOT change with worker count: OOM is governed by each JVM's own
+# -Xmx ceiling, not by system RAM, so adding workers costs PAGING (slower), never
+# a spurious analysis failure. That is why the safe ceiling is set by measured
+# MEAN residency and not by worst-case heap.
+ANALYZE_WORKERS = 7
+# SET TO 7 on 2026-08-27, after measuring where the time actually goes.
+# This pass is NETWORK-BOUND, not CPU-bound: sampled live at 5 workers there
+# were 12 concurrent git processes but only 1-2 live JVMs, CPU at ~40% and the
+# disk queue at 0. Workers spend most of their life fetching trees and only a
+# short burst parsing them, which is why raising the worker count costs almost
+# no extra memory (JVMs rarely overlap) and buys parallel fetches.
+#
+# The fetching is unavoidable here: the cache-key repair (see gitsnap
+# `_cache_key`) correctly invalidated every previously cached tree, so this run
+# rebuilds the tree cache from scratch. A later re-run reads it back and is
+# CPU-bound instead -- at which point this number should come back DOWN to ~5,
+# because then the JVMs really do run concurrently.
+#
+# WHY 7 AND NOT 10. Ten workers did saturate the machine (CPU 100%, 5-6 live
+# JVMs) but drove free RAM down to 0.8 GB. That is not a JVM out-of-memory risk
+# -- OOM is bounded by each JVM's own -Xmx -- it is a PAGING risk, and heavy
+# paging makes a sidecar exceed its timeout, which IS recorded as an analysis
+# failure and so becomes silent data loss. Seven keeps CPU high, leaves RAM
+# headroom, and keeps a laptop from running flat out for eight hours.
+
+# Java sidecar heap per worker. 3g is what one large tree needs; the number of
+# WORKERS is the knob to turn for total memory, not this.
+JAVA_SIDECAR_HEAP = "3g"
 
 # Node sidecar (03_principles/ts_sidecar): ts-morph 28.0.0 + typescript 5.9.3,
 # pinned via package-lock.json. The sidecar emits structural FACTS as JSON; all
@@ -493,13 +861,36 @@ SRP_TS_THRESHOLDS = {
 # NOTE: tuned in-sample on those 120 labels; confirm on a fresh holdout sample
 # before publishing headline numbers.
 SRP_THRESHOLDS = {
-    "class_loc": 200,        # class source lines of code
-    "class_wmc": 47,         # weighted methods per class (sum of method CCN)
-    "class_methods": 20,     # number of methods in a class
-    "class_lcom": 0.8,       # LCOM4-style lack-of-cohesion (0=cohesive, 1=split)
-    "file_loc": 400,         # module-level LOC (file-level rows only, see above)
-    "func_ccn": 15,          # max cyclomatic complexity of any function
-    "func_params": 6,        # max parameter count of any function
+    # RECALIBRATED 2026-08-17 on the AIDev-7.6M corpus's own distribution,
+    # BEFORE any label existed (the non-circular method used for OCP, TS and
+    # Java). Anchored at the ~p90 of PRODUCTION classes, n=19,658 of 29,345.
+    #
+    # WHY PRODUCTION-ONLY, a deliberate change from earlier calibrations.
+    # Test classes are 33% of the Python corpus and are systematically smaller,
+    # so calibrating on ALL classes drags every threshold DOWN and makes
+    # production code cross them more readily -- while the production-only rate
+    # is what the report leads with. Calibrating on the population that is
+    # actually reported removes that mismatch. (Java is affected far more: 72.2%
+    # of its types are tests, so the same change is applied there.)
+    #
+    # MEASURED, production classes (n=19,658):
+    #   class_loc   p90=260  p95=490
+    #   wmc         p90=36   p95=69
+    #   methods     p90=11   p95=17
+    #   method ccn  p90=11   p95=17
+    #   params      p90=6    p95=9
+    #   file_loc    p90=871  p95=1325   (n=7,472 production files)
+    "class_loc": 260,       # was 200
+    "class_wmc": 36,        # was 47
+    "class_methods": 11,    # was 20 -- the old bar sat above this corpus's p95
+    "class_lcom": 0.8,      # UNCHANGED and NOT percentile-derived: on the
+                            # population it applies to (>=4 methods, 31.7% of
+                            # classes) LCOM reads p75=p90=p95=1.000. A metric
+                            # pinned at its own maximum cannot be calibrated by
+                            # percentile, so the validated 0.8 is kept.
+    "file_loc": 871,        # was 400
+    "func_ccn": 11,         # was 15
+    "func_params": 6,       # was 6 -- unchanged, p90 landed on the same value
 }
 # A file/class is flagged as an SRP risk when it exceeds this many rubric metrics.
 #
@@ -543,6 +934,21 @@ DIP_THRESHOLDS = {
     "new_touched_cycles": 0,
     "delta_mean_d": 0.15,
 }
+
+# Does the Martin-distance delta count toward dip_risk? NO, as of 2026-08-17.
+# VALIDATED PRECISION 0.000 IN TWO LANGUAGES INDEPENDENTLY: Python 0/7 true
+# positives, TypeScript 0/10. Four of the seven Python false positives had ZERO
+# new dependencies, so the signal fires on graph RECOMPOSITION (a package's Ce/Ca
+# shifting because modules moved) rather than on a real dependency inversion.
+# Effect of this switch on the shipped Python result: 20 flagged PRs at P=0.650
+# -> 13 flagged PRs at P=1.000, with NO recall loss (the 7 dropped were not
+# violations under any reading). `new_cycle` carries the whole signal.
+# The raw delta and a `mean_d_worse` boolean are still WRITTEN to the parquet, so
+# this is reversible and the negative result stays auditable -- it is a real
+# finding about Martin's D as a change signal and belongs in the write-up.
+# Martin A/I/D remains sound as a STATIC package descriptor; see the arch/ zone
+# work. That is a different claim from "this PR made D worse".
+DIP_MEAN_D_COUNTS_AS_RISK = False
 
 # --- ISP rubric thresholds (Step 3-ISP) --------------------------------------
 # Interface Segregation: "no client should be forced to depend on methods it

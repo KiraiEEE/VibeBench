@@ -81,6 +81,7 @@ sys.path.insert(0, str(_HERE.parents[1]))
 sys.path.insert(0, str(_HERE.parents[1] / "03_principles"))
 sys.path.insert(0, str(_HERE.parents[1] / "03_principles" / "java_lang"))
 import config as C  # noqa: E402
+import safeio  # noqa: E402  -- crash-safe writes
 import gitsnap  # noqa: E402
 import detectors as D  # noqa: E402
 from java_bridge import analyze_tree  # noqa: E402
@@ -312,7 +313,16 @@ def our_key(t: dict) -> tuple[str, str]:
 def analyse_repo(pr, work_root: Path, skip_tools: bool) -> dict:
     full = pr.full_name
     slug = full.replace("/", "__")
+    # `head_outcome` records WHICH KIND of PR supplied this repository's
+    # head-state tree. It is merged wherever the repository contributed a merged
+    # PR, and a not-merged PR head otherwise. That distinction matters for the
+    # QUALITY PROFILE (PMD rule rates, Designite smell frequencies), which is
+    # meant to describe real projects: a never-integrated branch tip is not the
+    # project. It matters much less for the AGREEMENT figures (kappa, rho),
+    # where all that is required is that our detector and the external tools see
+    # THE SAME tree, which they do either way.
     res = {"full_name": full, "pr_id": pr.pr_id, "status": "ok",
+           "head_outcome": getattr(pr, "outcome", "merged"),
            "our_rows": [], "ck_rows": [], "pmd_rows": [], "dj_rows": [],
            "pmd_error_files": []}
     try:
@@ -715,6 +725,54 @@ def build_report(our: pd.DataFrame, ck: pd.DataFrame, pmd: pd.DataFrame,
                          "pmd_godclass": int(g["GodClass"].sum()),
                          "godclass_P": gc["precision"], "godclass_R": gc["recall"]})
     rep["per_repo_production"] = per_repo
+
+    # ---------------------------------------------------------------- profile
+    # CODE-QUALITY PROFILE (added 2026-08-19). Everything below was already
+    # being COMPUTED by the same three tool invocations and then discarded:
+    # only PMD's GodClass and the five SOLID-mapped Designite smells were ever
+    # reported, out of 7 PMD design rules and Designite's full vocabulary.
+    #
+    # These are NOT SOLID measurements and are not presented as such -- no
+    # published source-only Java tool implements an OCP or ISP check, and
+    # inventing a mapping for one is exactly the error this file refuses to make
+    # elsewhere. They are established, citable descriptors of the code agents
+    # touched (coupling, inheritance depth, cohesion, size), which is worth
+    # having beside the SOLID result at literally zero extra tool runtime.
+    prod = joined[~joined["is_test"].astype(bool)]
+    profile: dict = {"n_production_types": int(len(prod))}
+    if len(prod):
+        profile["pmd_design_rules"] = {
+            rule: {"n": int(prod[rule].sum()),
+                   "rate": round(float(prod[rule].mean()), 4)}
+            for rule in ("GodClass", "TooManyMethods", "NcssCount",
+                         "CouplingBetweenObjects", "CyclomaticComplexity",
+                         "ExcessivePublicCount", "TooManyFields")
+            if rule in prod.columns
+        }
+        ck_metrics = {}
+        for col, label in (("ck_cbo", "coupling_between_objects"),
+                           ("ck_rfc", "response_for_class"),
+                           ("ck_dit", "depth_inheritance_tree"),
+                           ("ck_tcc", "tight_class_cohesion"),
+                           ("ck_lcom_star", "lcom_henderson_sellers"),
+                           ("ck_wmc", "weighted_methods"),
+                           ("ck_loc", "lines_of_code")):
+            if col in prod.columns and prod[col].notna().any():
+                s = prod[col].dropna()
+                ck_metrics[label] = {"median": float(s.median()),
+                                     "p90": float(s.quantile(.90)),
+                                     "n": int(len(s))}
+        profile["ck_metrics_production"] = ck_metrics
+    # Designite's WHOLE smell vocabulary, counted from the raw per-type frame.
+    # Reported as observed frequencies, with no principle attached to any smell
+    # that Designite does not itself name.
+    if dj is not None and len(dj) and "smell" in dj.columns:
+        vc = dj["smell"].value_counts()
+        profile["designite_all_smells"] = {str(k): int(v) for k, v in vc.items()}
+        profile["designite_note"] = (
+            "Frequencies only. Designite has no OCP or ISP smell; the five "
+            "mapped to SRP/LSP/DIP are listed in DESIGNITE_SRP/LSP/DIP.")
+    rep["quality_profile"] = profile
     return rep, joined
 
 
@@ -853,13 +911,37 @@ def main() -> None:
         sj = OUT_DIR / "java_crosscheck_summary.json"
         rep = json.loads(sj.read_text(encoding="utf-8")) if sj.exists() else {}
         rep["tri_tool"] = block
-        sj.write_text(json.dumps(rep, indent=2, default=str), encoding="utf-8")
+        safeio.write_text(sj, json.dumps(rep, indent=2, default=str))
         print_report(rep)
         print(f"\nupdated {sj}")
         return
 
     gs = pd.read_parquet(C.GOLD_SET_JAVA)
-    head = gs.sort_values("merged_at").groupby("full_name").tail(1)
+    # HEAD-STATE TREE SELECTION, corrected for V2 (2026-08-25).
+    #
+    # This used to be `sort_values("merged_at").groupby("full_name").tail(1)`,
+    # which was right for a merged-only corpus and is WRONG now. A not-merged PR
+    # has `merged_at` NaN, pandas sorts NaN LAST, and `tail(1)` therefore picked
+    # a REJECTED PR as the repository's "head state" wherever one existed. A
+    # rejected PR's head is a branch that was never integrated, so the external
+    # tools would have been run against code that is not in the project at all,
+    # and every kappa would have been computed against the wrong tree.
+    #
+    # Correct order: prefer a MERGED PR (the closest available thing to the
+    # repository's mainline), latest first; fall back to the most recent PR of
+    # any outcome only for repositories that contributed no merged PR.
+    gs = gs.copy()
+    gs["_is_merged"] = gs["outcome"].eq("merged") if "outcome" in gs.columns \
+        else gs["merged_at"].notna()
+    gs["_when"] = pd.to_datetime(
+        gs["merged_at"].fillna(gs.get("created_at")), errors="coerce", utc=True)
+    head = (gs.sort_values(["_is_merged", "_when"], na_position="first")
+              .groupby("full_name").tail(1))
+    n_nonmerged = int((~head["_is_merged"]).sum())
+    if n_nonmerged:
+        print(f"note: {n_nonmerged} of {len(head)} repos contributed no merged PR; "
+              f"their head-state tree comes from a not-merged PR head and is "
+              f"marked as such", flush=True)
     if a.repo:
         head = head[head["full_name"] == a.repo]
     head = head.sort_values("full_name")
@@ -887,6 +969,7 @@ def main() -> None:
                 dj += r["dj_rows"]
                 pmd_bad |= {(r["full_name"], f) for f in (r.get("pmd_error_files") or [])}
                 statuses.append({"full_name": r["full_name"], "status": r["status"],
+                                 "head_outcome": r.get("head_outcome"),
                                  "n_files": r.get("n_files"), "sha": r.get("sha"),
                                  "n_types": len(r["our_rows"]), "n_ck": len(r["ck_rows"]),
                                  "n_pmd": len(r["pmd_rows"]), "n_dj": len(r["dj_rows"]),
@@ -905,7 +988,7 @@ def main() -> None:
     dj_df = pd.DataFrame(dj)
     st_df = pd.DataFrame(statuses)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    st_df.to_csv(OUT_DIR / "java_crosscheck_status.csv", index=False)
+    safeio.to_csv(st_df, OUT_DIR / "java_crosscheck_status.csv", index=False)
     print("\nper-repo status:")
     print(st_df.sort_values("full_name").to_string(index=False))
     if our_df.empty:
@@ -913,9 +996,9 @@ def main() -> None:
         return
 
     rep, joined = build_report(our_df, ck_df, pmd_df, dj_df, pmd_bad)
-    joined.to_csv(OUT_DIR / "java_crosscheck_classes.csv", index=False)
-    (OUT_DIR / "java_crosscheck_summary.json").write_text(
-        json.dumps(rep, indent=2, default=str), encoding="utf-8")
+    safeio.to_csv(joined, OUT_DIR / "java_crosscheck_classes.csv", index=False)
+    safeio.write_text(OUT_DIR / "java_crosscheck_summary.json",
+                      json.dumps(rep, indent=2, default=str))
     print_report(rep)
     print(f"\nwrote {OUT_DIR / 'java_crosscheck_classes.csv'}")
     print(f"wrote {OUT_DIR / 'java_crosscheck_summary.json'}")

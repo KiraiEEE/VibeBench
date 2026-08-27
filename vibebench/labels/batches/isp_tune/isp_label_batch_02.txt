@@ -1,0 +1,968 @@
+======================================================================
+ROW 16 | implementer | OpenAI_Codex | marin-community/levanter#1124
+implementer levanter.models.gemma:GemmaLMHeadModel of levanter.models.lm_model:LmHeadModel (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/levanter/models/lm_model.py]
+METHOD INDEX:
+  L157: def config(...)
+  L162: def Vocab(...)
+  L166: def Pos(...)
+  L170: def KeyPos(...)
+  L174: def Embed(...)
+  L179: def init(...)
+  L182: def __call__(...)
+  L212: def activations(...)
+  L234: def get_lm_head(...)
+  L241: def resize_vocab(...)
+  L249: def vocab_size(...)
+
+SOURCE:
+class LmHeadModel(eqx.Module, Generic[LmConfigT]):
+    """
+    Superclass for models with a language modeling head.
+    """
+
+    @property
+    @abc.abstractmethod
+    def config(self) -> LmConfigT:
+        pass
+
+    @property
+    @abc.abstractmethod
+    def Vocab(self) -> Axis:
+        pass
+
+    @property
+    def Pos(self) -> Axis:
+        return self.config.Pos
+
+    @property
+    def KeyPos(self) -> Axis:
+        return self.config.KeyPos
+
+    @property
+    def Embed(self) -> Axis:
+        return self.config.Embed
+
+    @classmethod
+    @abc.abstractmethod
+    def init(cls, Vocab: Axis, config: LmConfigT, *, key: PRNGKeyArray) -> "LmHeadModel[LmConfigT]":
+        pass
+
+    def __call__(
+        self,
+        input_ids: NamedArray,
+        attn_mask: Optional[AttentionMask | NamedArray] = None,
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
+    ) -> NamedArray:
+        """
+        Compute the logits for the next token in a sequence.
+        Args:
+            input_ids: token IDs with shape [..., Pos]
+            attn_mask: attention mask with shape [..., Pos, KeyPos]
+            key: PRNGKeyArray for random number generation
+
+        Returns:
+            NamedArray: logits with shape [..., Pos, Vocab]
+
+        """
+        try:
+            x = self.activations(input_ids, attn_mask, key=key, pos_ids=pos_ids)
+        except TypeError:
+            # For backward compatibility with models that don't yet support pos_ids
+            x = self.activations(input_ids, attn_mask, key=key)
+
+        lm_logits = hax.dot(x, self.get_lm_head(), axis=self.Embed)
+
+        return lm_logits
+
+    @abc.abstractmethod
+    def activations(
+        self,
+        input_ids: NamedArray,
+        attn_mask: Optional[AttentionMask | NamedArray] = None,
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
+    ) -> NamedArray:
+        """
+        Compute the activations for the next token in a sequence.
+        Args:
+            input_ids: token IDs with shape {Pos}
+            attn_mask: attention mask with shape {Pos, KeyPos}
+            key: PRNGKeyArray for random number generation
+
+        Returns:
+            NamedArray: activations with shape {Pos, Embed}
+
+        """
+        pass
+
+    @abc.abstractmethod
+    def get_lm_head(self) -> hax.NamedArray:
+        """
+        The language modeling head of the model. Should have shape {Embed, Vocab}.
+        """
+        raise NotImplementedError("get_lm_head not implemented")
+
+    @abc.abstractmethod
+    def resize_vocab(self, new_size: int, key: Optional[PRNGKeyArray] = None) -> "LmHeadModel[LmConfigT]":
+        """
+        Resizes the vocabulary of the model. Key may be provided to use random initialization, otherwise, there
+        should be some deterministic initialization of any new parameters.
+        """
+        pass
+
+    @property
+    def vocab_size(self) -> int:
+        return self.Vocab.size
+
+--- IMPLEMENTER ---
+[src/levanter/models/gemma.py]
+METHOD INDEX:
+  L372: def config(...)
+  L376: def vocab_size(...)
+  L380: def Vocab(...)
+  L383: def get_lm_head(...)
+  L390: def init(...)
+  L400: def activations(...)
+  L422: def resize_vocab(...)
+  L433: def _state_dict_key_map(...)
+
+SOURCE:
+class GemmaLMHeadModel(LmHeadModel[GemmaConfig], ModuleWithStateDictSerialization):
+    transformer: GemmaTransformer
+
+    # Gemma ties the weights of the embedding matrix and LM head.  Rather than
+    # use eqx.Shared which is a bit cumbersome, we juse re-use the embedding matrix
+    # as we do in GPT-2.
+    embeddings: LlamaEmbedding
+    lm_head: hnn.Linear | None
+
+    @property
+    def config(self):
+        return self.transformer.config
+
+    @property
+    def vocab_size(self) -> int:
+        return self.Vocab.size
+
+    @property
+    def Vocab(self) -> Axis:
+        return self.embeddings.Vocab
+
+    def get_lm_head(self) -> hax.NamedArray:
+        if self.lm_head is None:
+            return self.embeddings.token_embeddings.weight
+        else:
+            return self.lm_head.weight
+
+    @classmethod
+    def init(cls, Vocab: Axis, config: GemmaConfig, *, key) -> "GemmaLMHeadModel":
+        k_t, k_emb = jrandom.split(key, 2)
+        transformer = GemmaTransformer.init(config, key=k_t)
+        embeddings = LlamaEmbedding.init(Vocab, config, key=k_emb)
+        if config.tie_word_embeddings:
+            lm_head = None
+        else:
+            lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
+        return GemmaLMHeadModel(transformer, embeddings, lm_head)
+
+    def activations(
+        self,
+        input_ids: NamedArray,
+        attn_mask: NamedArray | AttentionMask | None = None,
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
+    ) -> NamedArray:
+        """
+        Args:
+            input_ids (NamedArray): [batch, position]
+                Indices of input sequence tokens in the vocabulary.
+            attn_mask (Union[NamedArray, AttentionMask], optional): [batch, position]
+                Mask to avoid performing attention on the padding token indices of the encoder input.
+                The attn_mask from training pipeline may be an AttentionMask object instead of NamedArray
+        """
+        x = self.embeddings.embed(input_ids)
+        normalizer = jnp.sqrt(self.config.hidden_dim).astype(x.dtype)
+        x = x * normalizer
+        x = self.transformer(x, attn_mask=attn_mask, key=key, pos_ids=pos_ids)
+        return x
+
+    def resize_vocab(self, new_size: int, key=None) -> "LmHeadModel[GemmaConfig]":
+        new_Vocab = self.Vocab.resize(new_size)
+        k1, k2 = maybe_rng_split(key, 2)
+        new_embeddings = self.embeddings.resize_embeddings(new_size, key=k1)
+        if self.lm_head is not None:
+            new_lm_matrix = hax.tree_util.resize_axis(self.lm_head.weight, self.Vocab, new_size, key=k2)
+            new_lm_head = dataclasses.replace(self.lm_head, Out=new_Vocab, weight=new_lm_matrix)
+            return dataclasses.replace(self, embeddings=new_embeddings, lm_head=new_lm_head)
+        else:
+            return dataclasses.replace(self, embeddings=new_embeddings)
+
+    def _state_dict_key_map(self) -> dict[str, str | None]:
+        """Map from Levanter model names to HF."""
+        return {"transformer": "model", "embeddings": None}
+
+======================================================================
+ROW 17 | implementer | Claude_Code | Red-Hat-AI-Innovation-Team/sdg_hub#241
+implementer sdg_hub.blocks.llm.llm_chat_block:LLMChatBlock of sdg_hub.blocks.base:BaseBlock (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/sdg_hub/blocks/base.py]
+METHOD INDEX:
+  L61: def __init__(...)
+  L85: def block_name(...)
+  L90: def input_cols(...)
+  L97: def output_cols(...)
+  L103: def _normalize_columns(...)
+  L139: def _validate_columns(...)
+  L180: def _validate_dataset_not_empty(...)
+  L200: def _validate_output_columns(...)
+  L241: def _validate_dataset(...)
+  L262: def _validate_custom(...)
+  L281: def _log_input_data(...)
+  L324: def _log_output_data(...)
+  L402: def generate(...)
+  L422: def __call__(...)
+  L466: def __repr__(...)
+  L473: def get_info(...)
+
+SOURCE:
+class BaseBlock(ABC):
+    """Enhanced base class with standardized patterns for all blocks.
+
+    This class provides a unified interface for block construction, column handling,
+    and configuration loading. All blocks should inherit from this class
+    to ensure consistent behavior across the system.
+
+    Parameters
+    ----------
+    block_name : str
+        Unique identifier for this block instance.
+    input_cols : Optional[Union[str, List[str]]], optional
+        Input column name(s). Can be a single string or list of strings.
+        If None, block may not require input columns.
+    output_cols : Optional[Union[str, List[str]]], optional
+        Output column name(s). Can be a single string or list of strings.
+        If None, block may not produce output columns.
+    **kwargs : Any
+        Additional block-specific parameters.
+
+    Attributes
+    ----------
+    block_name : str
+        Name of the block instance.
+    input_cols : Union[List[str], Dict[str, Any]]
+        Normalized input column specification.
+    output_cols : Union[List[str], Dict[str, Any]]
+        Normalized output column specification.
+    """
+
+    def __init__(
+        self,
+        block_name: str,
+        input_cols: Optional[Union[str, List[str], Dict[str, Any]]] = None,
+        output_cols: Optional[Union[str, List[str], Dict[str, Any]]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize base block with standardized parameters."""
+        self._block_name = block_name
+        self._input_cols = self._normalize_columns(input_cols)
+        self._output_cols = self._normalize_columns(output_cols)
+        # Store additional kwargs for subclass access
+        self.kwargs = kwargs
+
+        logger.debug(
+            f"Initialized {self.__class__.__name__} '{block_name}'",
+            extra={
+                "block_name": block_name,
+                "input_cols": self._input_cols,
+                "output_cols": self._output_cols,
+            },
+        )
+
+    @property
+    def block_name(self) -> str:
+        """Get the block name (immutable)."""
+        return self._block_name
+
+    @property
+    def input_cols(self) -> Union[List[str], Dict[str, Any]]:
+        """Get the input column specification (immutable)."""
+        if isinstance(self._input_cols, dict):
+            return deepcopy(self._input_cols)
+        return self._input_cols.copy()
+
+    @property
+    def output_cols(self) -> Union[List[str], Dict[str, Any]]:
+        """Get the output column specification (immutable)."""
+        if isinstance(self._output_cols, dict):
+            return deepcopy(self._output_cols)
+        return self._output_cols.copy()
+
+    def _normalize_columns(
+        self, cols: Optional[Union[str, List[str], Dict[str, Any]]]
+    ) -> Union[List[str], Dict[str, Any]]:
+        """Normalize column specifications to appropriate format.
+
+        Parameters
+        ----------
+        cols : Optional[Union[str, List[str], Dict[str, Any]]]
+            Column specification as string, list of strings, dictionary keys, or None.
+
+        Returns
+        -------
+        Union[List[str], Dict[str, Any]]
+            Normalized column specification. Returns empty list if cols is None,
+            single-item list for strings, copy of list for lists, or deep copy
+            of dictionary for dictionaries.
+
+        Raises
+        ------
+        ValueError
+            If cols is not None, str, List[str], or Dict.
+        """
+        if cols is None:
+            return []
+        if isinstance(cols, str):
+            return [cols]
+        if isinstance(cols, list):
+            return cols.copy()
+        if isinstance(cols, dict):
+            return deepcopy(cols)
+
+        # This will only be reached if cols is not None, str, list, or dict
+        raise ValueError(
+            f"Invalid column specification: {cols} (type: {type(cols)}). Must be str, List[str], Dict, or None."
+        )
+
+    def _validate_columns(self, dataset: Dataset) -> None:
+        """Validate that required input columns exist in dataset.
+
+        Parameters
+        ----------
+        dataset : Dataset
+            The dataset to validate against.
+
+        Raises
+        ------
+        MissingColumnError
+            If required input columns are missing from the dataset.
+... <<truncated, 336 more lines>>
+
+--- IMPLEMENTER ---
+[src/sdg_hub/blocks/llm/llm_chat_block.py]
+METHOD INDEX:
+  L128: def __init__(...)
+  L220: def generate(...)
+  L279: def _generate_sync(...)
+  L333: def _generate_async(...)
+  L372: def get_model_info(...)
+  L388: def _validate_custom(...)
+  L452: def __del__(...)
+  L461: def __repr__(...)
+  L404: def validate_sample(...)
+
+SOURCE:
+class LLMChatBlock(BaseBlock):
+    """Unified LLM chat block supporting all providers via LiteLLM.
+
+    This block replaces OpenAIChatBlock and OpenAIAsyncChatBlock with a single
+    implementation that supports 100+ LLM providers through LiteLLM, including:
+    - OpenAI (GPT-3.5, GPT-4, etc.)
+    - Anthropic (Claude models)
+    - Google (Gemini, PaLM)
+    - Local models (vLLM, Ollama, etc.)
+    - And many more...
+
+    Parameters
+    ----------
+    block_name : str
+        Name of the block.
+    input_cols : Union[str, List[str]]
+        Input column name(s). Should contain the messages list.
+    output_cols : Union[str, List[str]]
+        Output column name(s) for the response.
+    model : str
+        Model identifier in LiteLLM format. Examples:
+        - "openai/gpt-4"
+        - "anthropic/claude-3-sonnet-20240229"
+        - "hosted_vllm/meta-llama/Llama-2-7b-chat-hf"
+    api_key : Optional[str], optional
+        API key for the provider. Falls back to environment variables.
+    api_base : Optional[str], optional
+        Base URL for the API. Required for local models.
+    async_mode : bool, optional
+        Whether to use async processing, by default False.
+    timeout : float, optional
+        Request timeout in seconds, by default 120.0.
+    max_retries : int, optional
+        Maximum number of retry attempts, by default 6.
+
+    ### Generation Parameters ###
+
+    temperature : Optional[float], optional
+        Sampling temperature (0.0 to 2.0).
+    max_tokens : Optional[int], optional
+        Maximum tokens to generate.
+    top_p : Optional[float], optional
+        Nucleus sampling parameter (0.0 to 1.0).
+    frequency_penalty : Optional[float], optional
+        Frequency penalty (-2.0 to 2.0).
+    presence_penalty : Optional[float], optional
+        Presence penalty (-2.0 to 2.0).
+    stop : Optional[Union[str, List[str]]], optional
+        Stop sequences.
+    seed : Optional[int], optional
+        Random seed for reproducible outputs.
+    response_format : Optional[Dict[str, Any]], optional
+        Response format specification (e.g., JSON mode).
+    stream : Optional[bool], optional
+        Whether to stream responses.
+    n : Optional[int], optional
+        Number of completions to generate.
+    logprobs : Optional[bool], optional
+        Whether to return log probabilities.
+    top_logprobs : Optional[int], optional
+        Number of top log probabilities to return.
+    user : Optional[str], optional
+        End-user identifier.
+    extra_headers : Optional[Dict[str, str]], optional
+        Additional headers to send with requests.
+    extra_body : Optional[Dict[str, Any]], optional
+        Additional parameters for the request body.
+    **kwargs : Any
+        Additional provider-specific parameters.
+
+    Examples
+    --------
+    >>> # OpenAI GPT-4
+    >>> block = LLMChatBlock(
+    ...     block_name="gpt4_block",
+    ...     input_cols="messages",
+    ...     output_cols="response",
+    ...     model="openai/gpt-4",
+    ...     temperature=0.7
+    ... )
+
+    >>> # Anthropic Claude
+    >>> block = LLMChatBlock(
+    ...     block_name="claude_block",
+    ...     input_cols="messages",
+    ...     output_cols="response",
+    ...     model="anthropic/claude-3-sonnet-20240229",
+    ...     temperature=0.7
+    ... )
+
+    >>> # Local vLLM model
+    >>> block = LLMChatBlock(
+    ...     block_name="local_llama",
+    ...     input_cols="messages",
+    ...     output_cols="response",
+    ...     model="hosted_vllm/meta-llama/Llama-2-7b-chat-hf",
+    ...     api_base="http://localhost:8000/v1",
+    ...     temperature=0.7
+    ... )
+    """
+
+    def __init__(
+        self,
+        block_name: str,
+        input_cols: Union[str, List[str]],
+        output_cols: Union[str, List[str]],
+        model: str,
+        api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
+        async_mode: bool = False,
+        timeout: float = 120.0,
+        max_retries: int = 6,
+        # Generation parameters
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        stop: Optional[Union[str, List[str]]] = None,
+        seed: Optional[int] = None,
+... <<truncated, 320 more lines>>
+
+======================================================================
+ROW 18 | implementer | Claude_Code | getsentry/sentry-python#5319
+implementer sentry_sdk.integrations.anthropic:AnthropicIntegration of sentry_sdk.integrations:Integration (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[sentry_sdk/integrations/__init__.py]
+METHOD INDEX:
+  L329: def setup_once(...)
+  L342: def setup_once_with_options(...)
+
+SOURCE:
+class Integration(ABC):
+    """Baseclass for all integrations.
+
+    To accept options for an integration, implement your own constructor that
+    saves those options on `self`.
+    """
+
+    install = None
+    """Legacy method, do not implement."""
+
+    identifier: "str" = None  # type: ignore[assignment]
+    """String unique ID of integration type"""
+
+    @staticmethod
+    @abstractmethod
+    def setup_once() -> None:
+        """
+        Initialize the integration.
+
+        This function is only called once, ever. Configuration is not available
+        at this point, so the only thing to do here is to hook into exception
+        handlers, and perhaps do monkeypatches.
+
+        Inside those hooks `Integration.current` can be used to access the
+        instance again.
+        """
+        pass
+
+    def setup_once_with_options(
+        self, options: "Optional[Dict[str, Any]]" = None
+    ) -> None:
+        """
+        Called after setup_once in rare cases on the instance and with options since we don't have those available above.
+        """
+        pass
+
+--- IMPLEMENTER ---
+[sentry_sdk/integrations/anthropic.py]
+METHOD INDEX:
+  L55: def __init__(...)
+  L59: def setup_once(...)
+
+SOURCE:
+class AnthropicIntegration(Integration):
+    identifier = "anthropic"
+    origin = f"auto.ai.{identifier}"
+
+    def __init__(self: "AnthropicIntegration", include_prompts: bool = True) -> None:
+        self.include_prompts = include_prompts
+
+    @staticmethod
+    def setup_once() -> None:
+        version = package_version("anthropic")
+        _check_minimum_version(AnthropicIntegration, version)
+
+        Messages.create = _wrap_message_create(Messages.create)
+        AsyncMessages.create = _wrap_message_create_async(AsyncMessages.create)
+
+======================================================================
+ROW 19 | implementer | OpenAI_Codex | Pioreactor/pioreactor#570
+implementer pioreactor.utils.streaming:ExportDosingSource of pioreactor.utils.streaming:DosingObservationSource (kind=protocol)
+======================================================================
+--- INTERFACE (the contract) ---
+[pioreactor/utils/streaming.py]
+METHOD INDEX:
+  L43: def __iter__(...)
+
+SOURCE:
+class DosingObservationSource(Protocol):
+    """Anything that can be iterated to yield ODReadings objects."""
+
+    is_live: bool
+
+    def __iter__(self) -> Iterator[DosingEvent]:
+        ...
+
+--- IMPLEMENTER ---
+[pioreactor/utils/streaming.py]
+METHOD INDEX:
+  L100: def __init__(...)
+  L112: def __enter__(...)
+  L125: def __exit__(...)
+  L128: def __iter__(...)
+
+SOURCE:
+class ExportDosingSource(DosingObservationSource):
+    is_live = False
+
+    def __init__(
+        self,
+        filename: str | None,
+        skip_first: int = 0,
+        pioreactor_unit: pt.Unit = "$broadcast",
+        experiment: pt.Experiment = "$experiment",
+    ) -> None:
+        self.filename = filename
+        self.skip_first = skip_first
+        self.experiment = experiment
+        self.pioreactor_unit = pioreactor_unit
+
+    def __enter__(self, *args, **kwargs):
+        import csv
+
+        if self.filename is None:
+            # No file?  Give the reader an **empty CSV with headers only**.
+            # This satisfies csv.DictReader and still closes cleanly later.
+            headers = "timestamp,volume_change_ml,event," "source_of_event,pioreactor_unit,experiment\n"
+            self.file_instance = io.StringIO(headers)
+        else:
+            self.file_instance = open(self.filename, "r")
+        self.csv_reader = csv.DictReader(self.file_instance, quoting=csv.QUOTE_MINIMAL)
+        return self
+
+    def __exit__(self, *args, **kwargs):
+        self.file_instance.close()
+
+    def __iter__(self):
+        for i, line in enumerate(self.csv_reader):
+            if i <= self.skip_first:
+                continue
+            if self.pioreactor_unit != "$broadcast" and self.pioreactor_unit != line["pioreactor_unit"]:
+                continue
+            if self.experiment != "$experiment" and self.experiment != line["experiment"]:
+                continue
+            dt = to_datetime(line["timestamp"])
+            event = DosingEvent(
+                volume_change=float(line["volume_change_ml"]),
+                timestamp=dt,
+                event=line["event"],
+                source_of_event=line["source_of_event"],
+            )
+            yield event
+
+======================================================================
+ROW 20 | implementer | Claude_Code | vllm-project/vllm#37322
+implementer tests.v1.engine.test_abort_final_step:DummyKVConnector of vllm.distributed.kv_transfer.kv_connector.v1.base:KVConnectorBase_V1 (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[vllm/distributed/kv_transfer/kv_connector/v1/base.py]
+METHOD INDEX:
+  L176: def prefer_cross_layer_blocks(...)
+  L183: def __init__(...)
+  L210: def role(...)
+  L217: def bind_connector_metadata(...)
+  L229: def clear_connector_metadata(...)
+  L237: def _get_connector_metadata(...)
+  L249: def has_connector_metadata(...)
+  L257: def register_kv_caches(...)
+  L267: def register_cross_layers_kv_cache(...)
+  L284: def set_host_xfer_buffer_ops(...)
+  L291: def handle_preemptions(...)
+  L299: def start_load_kv(...)
+  L317: def wait_for_layer_load(...)
+  L331: def save_kv_layer(...)
+  L353: def wait_for_save(...)
+  L363: def get_finished(...)
+  L381: def get_block_ids_with_load_errors(...)
+  L401: def shutdown(...)
+  L409: def get_kv_connector_stats(...)
+  L415: def get_kv_connector_kv_cache_events(...)
+  L423: def get_handshake_metadata(...)
+  L435: def build_connector_worker_meta(...)
+  L450: def get_num_new_matched_tokens(...)
+  L485: def update_state_after_alloc(...)
+  L506: def build_connector_meta(...)
+  L520: def update_connector_output(...)
+  L530: def request_finished(...)
+  L551: def take_events(...)
+  L561: def get_required_kvcache_layout(...)
+  L580: def requires_piecewise_for_cudagraph(...)
+  L601: def get_finished_count(...)
+  L614: def build_kv_connector_stats(...)
+  L624: def set_xfer_handshake_metadata(...)
+  L636: def build_prom_metrics(...)
+  L650: def reset_cache(...)
+
+SOURCE:
+class KVConnectorBase_V1(ABC):
+    """
+    Base class for KV connectors.
+    """
+
+    @property
+    def prefer_cross_layer_blocks(self) -> bool:
+        """
+        Indicates whether this connector prefers KV blocks that hold KV data for all
+        layers, which can speed up KV data transfers. Defaults to False.
+        """
+        return False
+
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig | None" = None,
+    ):
+        logger.warning(
+            "Initializing KVConnectorBase_V1. This API is experimental and "
+            "subject to change in the future as we iterate the design."
+        )
+        self._connector_metadata: KVConnectorMetadata | None = None
+        self._vllm_config = vllm_config
+        if vllm_config.kv_transfer_config is not None:
+            self._kv_transfer_config = vllm_config.kv_transfer_config
+        else:
+            raise ValueError("kv_transfer_config must be set for KVConnectorBase_V1")
+        self._kv_cache_config = kv_cache_config
+        if self._kv_cache_config is None:
+            logger.warning(
+                "KVConnectorBase_V1 initialized without kv_cache_config. "
+                "This is deprecated - please update your connector to accept "
+                "kv_cache_config as the third constructor argument and pass it "
+                "to super().__init__()."
+            )
+        self._role = role
+
+    @property
+    def role(self) -> KVConnectorRole:
+        return self._role
+
+    # ==============================
+    # Worker-side methods
+    # ==============================
+
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        """Set the connector metadata from the scheduler.
+
+        This function should be called by the model runner every time
+        before the model execution. The metadata will be used for runtime
+        KV cache loading and saving.
+
+        Args:
+            connector_metadata (dict): the connector metadata.
+        """
+        self._connector_metadata = connector_metadata
+
+    def clear_connector_metadata(self) -> None:
+        """Clear the connector metadata.
+
+        This function should be called by the model runner every time
+        after the model execution.
+        """
+        self._connector_metadata = None
+
+    def _get_connector_metadata(self) -> KVConnectorMetadata:
+        """Get the connector metadata.
+
+        This function should only be called inside the connector.
+
+        Returns:
+            ConnectorMetadata: the connector metadata.
+        """
+        # Should only be called while set to valid metadata.
+        assert self._connector_metadata is not None
+        return self._connector_metadata
+
+    def has_connector_metadata(self) -> bool:
+        """Check whether the connector metadata is currently set.
+
+        Returns:
+            bool: True if connector metadata exists, False otherwise.
+        """
+        return self._connector_metadata is not None
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        """
+        Initialize with the KV caches. Useful for pre-registering the
+        KV Caches in the KVConnector (e.g. for NIXL).
+
+        Args:
+            kv_caches: dictionary of layer names, kv cache
+        """
+        return
+
+    def register_cross_layers_kv_cache(
+        self, kv_cache: torch.Tensor, attn_backend: type["AttentionBackend"]
+    ):
+        """
+        Initialize with a single KV cache tensor used by all layers.
+        The first dimension should be num_layers.
+        This function will only be called for models with uniform layers,
+        and only if the prefers_cross_layer_blocks is set to True.
+        Only one of the functions
+        {register_kv_caches, register_cross_layers_kv_cache} will be called.
+
+        Args:
+            kv_cache: a cross-layers kv cache tensor
+            attn_backend: The attention backend that corresponds to all layers
+        """
+        return
+
+    def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
+        """
+        Set the xPU-specific ops for copying KV between host and device.
+        Needed when host buffer is used for kv transfer (e.g., in NixlConnector)
+        """
+        return
+... <<truncated, 373 more lines>>
+
+--- IMPLEMENTER ---
+[tests/v1/engine/test_abort_final_step.py]
+METHOD INDEX:
+  L65: def __init__(...)
+  L83: def get_num_new_matched_tokens(...)
+  L90: def update_state_after_alloc(...)
+  L98: def build_connector_meta(...)
+  L103: def request_finished(...)
+  L119: def start_load_kv(...)
+  L122: def wait_for_layer_load(...)
+  L125: def save_kv_layer(...)
+  L134: def wait_for_save(...)
+
+SOURCE:
+class DummyKVConnector(KVConnectorBase_V1):
+    """
+    Dummy KV connector that captures request finish statuses to a file.
+    This is used to verify the fix - without the fix, a request aborted
+    during its final step would be captured as FINISHED_LENGTH_CAPPED
+    instead of FINISHED_ABORTED.
+
+    The connector runs in a separate process, so we write statuses to a file
+    that can be read by the test process.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        role: KVConnectorRole,
+        kv_cache_config: KVCacheConfig | None = None,
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
+        # Get the status file path from extra config
+        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        self.status_file = extra_config.get("status_file")
+        # Log that we were initialized
+        if self.status_file:
+            try:
+                with open(self.status_file, "a") as f:
+                    f.write(f"INIT:{role.name}\n")
+            except Exception:
+                pass
+
+    def get_num_new_matched_tokens(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+    ) -> tuple[int | None, bool]:
+        return (0, False)
+
+    def update_state_after_alloc(
+        self,
+        request: Request,
+        blocks: Any,
+        num_external_tokens: int,
+    ):
+        pass
+
+    def build_connector_meta(
+        self, scheduler_output: SchedulerOutput
+    ) -> KVConnectorMetadata:
+        return DummyKVConnectorMetadata()
+
+    def request_finished(
+        self,
+        request: Request,
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Capture the request status when finished by writing to a file."""
+        if self.status_file:
+            try:
+                with open(self.status_file, "a") as f:
+                    # Write the status name (e.g., "FINISHED_ABORTED")
+                    f.write(f"{request.status.name}\n")
+            except Exception as e:
+                # Log but don't fail - this is just test instrumentation
+                print(f"[DummyKVConnector] Failed to write status: {e}")
+        return False, None
+
+    def start_load_kv(self, forward_context: Any, **kwargs: Any) -> None:
+        pass
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        pass
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: Any,
+        attn_metadata: Any,
+        **kwargs: Any,
+    ) -> None:
+        pass
+
+    def wait_for_save(self):
+        pass
+
+======================================================================
+ROW 21 | interface | Claude_Code | nexi-lab/nexus#2488
+interface nexus.bricks.context_manifest.executors.snapshot_lookup_db:SnapshotLookup kind=protocol
+======================================================================
+[src/nexus/bricks/context_manifest/executors/snapshot_lookup_db.py]
+METHOD INDEX:
+  L26: def get_snapshot(...)
+  L30: def get_latest_snapshot(...)
+
+SOURCE:
+class SnapshotLookup(Protocol):
+    """Protocol for workspace snapshot retrieval."""
+
+    def get_snapshot(self, snapshot_id: str) -> dict[str, Any] | None:
+        """Get snapshot metadata by ID. Returns None if not found."""
+        ...
+
+    def get_latest_snapshot(self, workspace_path: str) -> dict[str, Any] | None:
+        """Get the most recent snapshot for a workspace path. Returns None if none exist."""
+        ...
+
+======================================================================
+ROW 22 | interface | OpenAI_Codex | marin-community/haliax#224
+interface haliax.nn.scan:VmapFunction kind=protocol
+======================================================================
+[src/haliax/nn/scan.py]
+METHOD INDEX:
+  L58: def __call__(...)
+
+SOURCE:
+class VmapFunction(Protocol[M_contra, P, OutputT_co]):
+    def __call__(self, module: M_contra, *args: P.args, **kwargs: P.kwargs) -> OutputT_co: ...
+
+======================================================================
+ROW 23 | implementer | Copilot | Neoteroi/BlackSheep#653
+implementer blacksheep.server.bindings.converters:UUIDConverter of blacksheep.server.bindings.converters:TypeConverter (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[blacksheep/server/bindings/converters.py]
+METHOD INDEX:
+  L56: def can_convert(...)
+  L60: def convert(...)
+
+SOURCE:
+class TypeConverter(ABC):
+    """
+    Base class for types that converts input values into
+    instances of specific types.
+    """
+
+    @abstractmethod
+    def can_convert(self, expected_type) -> bool:
+        """Returns True if this converter can handle the expected type."""
+
+    @abstractmethod
+    def convert(self, value, expected_type) -> Any:
+        """Converts a str value into an object of the expected type."""
+
+--- IMPLEMENTER ---
+[blacksheep/server/bindings/converters.py]
+METHOD INDEX:
+  L123: def __init__(...)
+
+SOURCE:
+class UUIDConverter(InitTypeConverter):
+
+    def __init__(self) -> None:
+        super().__init__(UUID)

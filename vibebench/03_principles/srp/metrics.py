@@ -40,6 +40,11 @@ from dataclasses import dataclass, field
 
 import lizard
 from radon.metrics import mi_visit
+
+# Files above this many characters skip radon's maintainability-index (see the
+# guard in analyze_file). 80 KB sits well above normal source files -- the
+# reproduced pathological case was 130 KB -- and MI is not a rubric criterion.
+MI_MAX_CHARS = 80_000
 from radon.raw import analyze as radon_raw
 
 
@@ -327,15 +332,38 @@ def analyze_file(path: str, source: str, c3_mode: str = "tfidf") -> FileMetrics:
     liz = lizard.analyze_file.analyze_source_code(path, source)
 
     # --- radon: file-level LOC + Maintainability Index ---
-    try:
-        raw = radon_raw(source)
-        file_loc = raw.loc
-    except Exception:
+    # BOTH radon entry points hang on the same pathological input (see the MI
+    # note below): `radon.raw.analyze` never returned on pdfminer/glyphlist.py
+    # either. file_loc IS a rubric criterion, so it falls back to the newline
+    # count -- the same fallback the except branch already used, and an accurate
+    # LOC for a file that is one flat literal.
+    if len(source) > MI_MAX_CHARS:
         file_loc = source.count("\n") + 1
-    try:
-        mi = mi_visit(source, multi=True)
-    except Exception:
+    else:
+        try:
+            raw = radon_raw(source)
+            file_loc = raw.loc
+        except Exception:
+            file_loc = source.count("\n") + 1
+    # SIZE GUARD (added 2026-08-17). radon's maintainability-index HANGS -- not
+    # errors, spins a core indefinitely -- on very large files that are mostly one
+    # huge literal. Reproduced on pdfminer/glyphlist.py (130 KB / 4,366 lines, a
+    # single ~4k-entry dict): `ast.parse` takes 0.03 s, `mi_visit` never returns
+    # (>90 s, killed). It stalled a full SRP pass at 100% CPU on one file with no
+    # error and no progress, which is worse than a crash because it looks alive.
+    #
+    # Skipping is FREE here: `maintainability_index` is recorded for reference and
+    # is NOT one of the SRP rubric criteria (class_loc, class_wmc, class_methods,
+    # class_lcom, file_loc, func_ccn, func_params). No flag depends on it, so a
+    # None costs nothing analytically. Affects ~2.9% of this corpus's files.
+    # A `try/except` cannot catch this: a hang is not an exception.
+    if len(source) > MI_MAX_CHARS:
         mi = None
+    else:
+        try:
+            mi = mi_visit(source, multi=True)
+        except Exception:
+            mi = None
 
     # Match each lizard function to its AST node by (name, start_line) -- lizard's
     # start_line is the `def` line, same as ast.FunctionDef.lineno (decorators excluded).

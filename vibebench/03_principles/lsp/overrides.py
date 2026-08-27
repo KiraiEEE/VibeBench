@@ -108,7 +108,7 @@ _FACTORY_NAMES = {"create", "build", "new", "of", "make", "construct", "from_dic
 
 
 def _looks_typevar(ann: str | None) -> bool:
-    """Heuristic: an unbound TypeVar (T, S, KT, T_co, ...) — variance against one
+    """Heuristic: an unbound TypeVar (T, S, KT, T_co, ...) , variance against one
     is meaningless (the subclass may bind it to anything)."""
     if not ann:
         return False

@@ -1,0 +1,1436 @@
+======================================================================
+ROW 96 | implementer | OpenAI_Codex | openai/openai-agents-python#746
+implementer agents.models.openai_chatcompletions:OpenAIChatCompletionsModel of agents.models.interface:Model (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/agents/models/interface.py]
+METHOD INDEX:
+  L38: def get_response(...)
+  L69: def stream_response(...)
+
+SOURCE:
+class Model(abc.ABC):
+    """The base interface for calling an LLM."""
+
+    @abc.abstractmethod
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        *,
+        previous_response_id: str | None,
+    ) -> ModelResponse:
+        """Get a response from the model.
+
+        Args:
+            system_instructions: The system instructions to use.
+            input: The input items to the model, in OpenAI Responses format.
+            model_settings: The model settings to use.
+            tools: The tools available to the model.
+            output_schema: The output schema to use.
+            handoffs: The handoffs available to the model.
+            tracing: Tracing configuration.
+            previous_response_id: the ID of the previous response. Generally not used by the model,
+                except for the OpenAI Responses API.
+
+        Returns:
+            The full model response.
+        """
+        pass
+
+    @abc.abstractmethod
+    def stream_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        *,
+        previous_response_id: str | None,
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        """Stream a response from the model.
+
+        Args:
+            system_instructions: The system instructions to use.
+            input: The input items to the model, in OpenAI Responses format.
+            model_settings: The model settings to use.
+            tools: The tools available to the model.
+            output_schema: The output schema to use.
+            handoffs: The handoffs available to the model.
+            tracing: Tracing configuration.
+            previous_response_id: the ID of the previous response. Generally not used by the model,
+                except for the OpenAI Responses API.
+
+        Returns:
+            An iterator of response stream events, in OpenAI Responses format.
+        """
+        pass
+
+--- IMPLEMENTER ---
+[src/agents/models/openai_chatcompletions.py]
+METHOD INDEX:
+  L35: def __init__(...)
+  L43: def _non_null_or_not_given(...)
+  L46: def get_response(...)
+  L130: def stream_response(...)
+  L179: def _fetch_response(...)
+  L193: def _fetch_response(...)
+  L206: def _fetch_response(...)
+  L306: def _get_client(...)
+
+SOURCE:
+class OpenAIChatCompletionsModel(Model):
+    def __init__(
+        self,
+        model: str | ChatModel,
+        openai_client: AsyncOpenAI,
+    ) -> None:
+        self.model = model
+        self._client = openai_client
+
+    def _non_null_or_not_given(self, value: Any) -> Any:
+        return value if value is not None else NOT_GIVEN
+
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        previous_response_id: str | None,
+    ) -> ModelResponse:
+        with generation_span(
+            model=str(self.model),
+            model_config=model_settings.to_json_dict() | {"base_url": str(self._client.base_url)},
+            disabled=tracing.is_disabled(),
+        ) as span_generation:
+            response = await self._fetch_response(
+                system_instructions,
+                input,
+                model_settings,
+                tools,
+                output_schema,
+                handoffs,
+                span_generation,
+                tracing,
+                stream=False,
+            )
+
+            first_choice = response.choices[0]
+            message = first_choice.message
+
+            if _debug.DONT_LOG_MODEL_DATA:
+                logger.debug("Received model response")
+            else:
+                if message is not None:
+                    logger.debug(
+                        "LLM resp:\n%s\n",
+                        json.dumps(message.model_dump(), indent=2),
+                    )
+                else:
+                    logger.debug(
+                        "LLM resp had no message. finish_reason: %s",
+                        first_choice.finish_reason,
+                    )
+
+            usage = (
+                Usage(
+                    requests=1,
+                    input_tokens=response.usage.prompt_tokens,
+                    output_tokens=response.usage.completion_tokens,
+                    total_tokens=response.usage.total_tokens,
+                    input_tokens_details=InputTokensDetails(
+                        cached_tokens=getattr(
+                            response.usage.prompt_tokens_details, "cached_tokens", 0
+                        )
+                        or 0,
+                    ),
+                    output_tokens_details=OutputTokensDetails(
+                        reasoning_tokens=getattr(
+                            response.usage.completion_tokens_details, "reasoning_tokens", 0
+                        )
+                        or 0,
+                    ),
+                )
+                if response.usage
+                else Usage()
+            )
+            if tracing.include_data():
+                span_generation.span_data.output = (
+                    [message.model_dump()] if message is not None else []
+                )
+            span_generation.span_data.usage = {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+            }
+
+            items = Converter.message_to_output_items(message) if message is not None else []
+
+            return ModelResponse(
+                output=items,
+                usage=usage,
+                response_id=None,
+            )
+
+    async def stream_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        *,
+        previous_response_id: str | None,
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        """
+        Yields a partial message as it is generated, as well as the usage information.
+        """
+        with generation_span(
+            model=str(self.model),
+            model_config=model_settings.to_json_dict() | {"base_url": str(self._client.base_url)},
+            disabled=tracing.is_disabled(),
+        ) as span_generation:
+            response, stream = await self._fetch_response(
+                system_instructions,
+                input,
+                model_settings,
+... <<truncated, 156 more lines>>
+
+======================================================================
+ROW 97 | implementer | Claude_Code | vibrantlabsai/ragas#2316
+implementer ragas.metrics._answer_similarity:AnswerSimilarity of ragas.metrics.base:Metric (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/ragas/metrics/base.py]
+METHOD INDEX:
+  L87: def __post_init__(...)
+  L92: def required_columns(...)
+  L104: def required_columns(...)
+  L116: def get_required_columns(...)
+  L138: def init(...)
+  L141: def score(...)
+  L174: def ascore(...)
+  L208: def _ascore(...)
+  L157: def _async_wrapper(...)
+
+SOURCE:
+class Metric(ABC):
+    """
+    Abstract base class for metrics in Ragas.
+
+    Attributes
+    ----------
+    name : str
+        The name of the metric.
+    required_columns : Dict[str, Set[str]]
+        A dictionary mapping metric type names to sets of required column names. This is
+        a property and raises `ValueError` if columns are not in `VALID_COLUMNS`.
+    """
+
+    _required_columns: t.Dict[MetricType, t.Set[str]] = field(default_factory=dict)
+    name: str = field(default="", repr=True)
+
+    def __post_init__(self):
+        if self.name == "":
+            self.name = camel_to_snake(self.__class__.__name__)
+
+    @property
+    def required_columns(self) -> t.Dict[str, t.Set[str]]:
+        required_columns = {}
+        # ignore any value that contains marker suffixes like ":optional" or ":ignored"
+        for k, v in self._required_columns.items():
+            required_columns[k.name] = {
+                column
+                for column in v
+                if not column.endswith(":optional") and not column.endswith(":ignored")
+            }
+        return required_columns
+
+    @required_columns.setter
+    def required_columns(self, required_columns: t.Dict[MetricType, t.Set[str]]):
+        rc = {}
+        for metric_type, columns in required_columns.items():
+            for column in columns:
+                base_column = column.split(":")[0]
+                if base_column not in VALID_COLUMNS:
+                    raise ValueError(
+                        f"Invalid column '{column}'. Base column '{base_column}' must be one of {VALID_COLUMNS}"
+                    )
+            rc[metric_type] = columns
+        self._required_columns = rc
+
+    def get_required_columns(
+        self, with_optional: bool = False
+    ) -> t.Dict[str, t.Set[str]]:
+        if with_optional:
+            # get all the required columns with optional columns, remove the optional suffix
+            required_columns = {}
+            for k, v in self._required_columns.items():
+                # if any column ends with ":optional", add it to the required columns after removing the suffix
+                # if any column ends with ":ignored", do not include it
+                required_columns[k.name] = set()
+                for column in v:
+                    if column.endswith(":ignored"):
+                        continue
+                    if column.endswith(":optional"):
+                        required_columns[k.name].add(column[: -len(":optional")])
+                    else:
+                        required_columns[k.name].add(column)
+            return required_columns
+        else:
+            return self.required_columns
+
+    @abstractmethod
+    def init(self, run_config: RunConfig): ...
+
+    @deprecated("0.2", removal="0.3", alternative="single_turn_ascore")
+    def score(self, row: t.Dict, callbacks: Callbacks = None) -> float:
+        """
+        Calculates the score for a single row of data.
+
+        Note
+        ----
+        This method is deprecated and will be removed in 0.3. Please use `single_turn_ascore` or `multi_turn_ascore` instead.
+        """
+        callbacks = callbacks or []
+        rm, group_cm = new_group(
+            self.name,
+            inputs=row,
+            callbacks=callbacks,
+            metadata={"type": ChainType.METRIC},
+        )
+
+        async def _async_wrapper():
+            try:
+                result = await self._ascore(row=row, callbacks=group_cm)
+            except Exception as e:
+                if not group_cm.ended:
+                    rm.on_chain_error(e)
+                raise e
+            else:
+                if not group_cm.ended:
+                    rm.on_chain_end({"output": result})
+                return result
+
+        # Apply nest_asyncio logic to ensure compatibility in notebook/Jupyter environments.
+        apply_nest_asyncio()
+        return run(_async_wrapper)
+
+    @deprecated("0.2", removal="0.3", alternative="single_turn_ascore")
+    async def ascore(
+        self,
+        row: t.Dict,
+        callbacks: Callbacks = None,
+        timeout: t.Optional[float] = None,
+    ) -> float:
+        """
+        Asynchronously calculates the score for a single row of data.
+
+        Note
+        ----
+        This method is deprecated and will be removed in 0.3. Please use `single_turn_ascore` instead.
+        """
+        callbacks = callbacks or []
+        rm, group_cm = new_group(
+            self.name,
+            inputs=row,
+... <<truncated, 21 more lines>>
+
+--- IMPLEMENTER ---
+[src/ragas/metrics/_answer_similarity.py]
+METHOD INDEX:
+  L112: def _ascore(...)
+
+SOURCE:
+class AnswerSimilarity(SemanticSimilarity):
+    name: str = "answer_similarity"
+
+    async def _ascore(self, row: t.Dict, callbacks: Callbacks) -> float:
+        return await super()._ascore(row, callbacks)
+
+======================================================================
+ROW 98 | interface | Copilot | NewFuture/DDNS#505
+interface ddns.provider._base:SimpleProvider kind=abc
+======================================================================
+[ddns/provider/_base.py]
+METHOD INDEX:
+  L206: def __init__(...)
+  L231: def set_record(...)
+  L251: def set_proxy(...)
+  L267: def _validate(...)
+  L281: def _http(...)
+  L386: def _encode(...)
+  L403: def _quote(...)
+  L416: def _mask_sensitive_data(...)
+
+SOURCE:
+class SimpleProvider(object):
+    """
+    简单DNS服务商接口的抽象基类, 必须实现 `set_record` 方法。
+
+    Abstract base class for all simple DNS provider APIs.
+    Subclasses must implement `set_record`.
+
+    * set_record(domain, value, record_type="A", ttl=None, line=None, **extra)
+    """
+
+    __metaclass__ = ABCMeta
+
+    # API endpoint domain (to be defined in subclass)
+    API = ""  # type: str # https://exampledns.com
+    # Content-Type for requests (to be defined in subclass)
+    content_type = TYPE_FORM  # type: Literal["application/x-www-form-urlencoded"] | Literal["application/json"]
+    # 默认 accept 头部, 空则不设置
+    accept = TYPE_JSON  # type: str | None
+    # Decode Response as JSON by default
+    decode_response = True
+    # 是否验证 SSL 证书，默认为 True
+    verify_ssl = "auto"  # type: bool | str
+
+    # 版本
+    version = environ.get("DDNS_VERSION", "0.0.0")
+    # Description
+    remark = "Managed by [DDNS v{}](https://ddns.newfuture.cc)".format(version)
+
+    def __init__(self, auth_id, auth_token, logger=None, verify_ssl=None, **options):
+        # type: (str, str, Logger | None, bool|str| None, **object) -> None
+        """
+        初始化服务商对象
+
+        Initialize provider instance.
+
+        Args:
+            auth_id (str): 身份认证 ID / Authentication ID
+            auth_token (str): 密钥 / Authentication Token
+            options (dict): 其它参数，如代理、调试等 / Additional options
+        """
+        self.auth_id = auth_id  # type: str
+        self.auth_token = auth_token  # type: str
+        self.options = options
+        name = self.__class__.__name__
+        self.logger = (logger or getLogger()).getChild(name)
+        self.proxy = None  # type: str | None
+        if verify_ssl is not None:
+            self.verify_ssl = verify_ssl
+        self._zone_map = {}  # type: dict[str, str]
+        self.logger.debug("%s initialized with: %s", self.__class__.__name__, auth_id)
+        self._validate()  # 验证身份认证信息
+
+    @abstractmethod
+    def set_record(self, domain, value, record_type="A", ttl=None, line=None, **extra):
+        # type: (str, str, str, str | int | None, str | None, **object) -> bool
+        """
+        设置 DNS 记录（创建或更新）
+
+        Set or update DNS record.
+
+        Args:
+            domain (str): 完整域名
+            value (str): 新记录值
+            record_type (str): 记录类型
+            ttl (int | None): TTL 值，可选
+            line (str | None): 线路信息
+            extra (dict): 额外参数
+
+        Returns:
+            Any: 执行结果
+        """
+        raise NotImplementedError("This set_record should be implemented by subclasses")
+
+    def set_proxy(self, proxy_str):
+        # type: (str | None) -> SimpleProvider
+        """
+        设置代理服务器
+
+        Set HTTPS proxy string.
+
+        Args:
+            proxy_str (str): 代理地址
+
+        Returns:
+            Self: 自身
+        """
+        self.proxy = proxy_str
+        return self
+
+    def _validate(self):
+        # type: () -> None
+        """
+        验证身份认证信息是否填写
+
+        Validate authentication credentials.
+        """
+        if not self.auth_id:
+            raise ValueError("id must be configured")
+        if not self.auth_token:
+            raise ValueError("token must be configured")
+        if not self.API:
+            raise ValueError("API endpoint must be defined in {}".format(self.__class__.__name__))
+
+    def _http(self, method, url, params=None, body=None, queries=None, headers=None):  # noqa: C901
+        # type: (str, str, dict[str,Any]|str|None, dict[str,Any]|str|None, dict[str,Any]|None, dict|None) -> Any
+        """
+        发送 HTTP/HTTPS 请求，自动根据 API/url 选择协议。
+
+        Args:
+            method (str): 请求方法，如 GET、POST
+            url (str): 请求路径
+            params (dict[str, Any] | None): 请求参数,自动处理 query string 或者body
+            body (dict[str, Any] | str | None): 请求体内容
+            queries (dict[str, Any] | None): 查询参数，自动处理为 URL 查询字符串
+            headers (dict): 头部，可选
+
+        Returns:
+            Any: 解析后的响应内容
+
+        Raises:
+... <<truncated, 142 more lines>>
+
+======================================================================
+ROW 99 | implementer | Copilot | zfit/zfit#643
+implementer zfit.models.dist_tfp:LogNormal of zfit._interfaces:ZfitModel (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/zfit/_interfaces.py]
+METHOD INDEX:
+  L834: def update_integration_options(...)
+  L838: def integrate(...)
+  L856: def register_analytic_integral(...)
+  L879: def partial_integrate(...)
+  L908: def register_inverse_analytic_integral(...)
+  L917: def sample(...)
+
+SOURCE:
+class ZfitModel(ZfitNumericParametrized, ZfitDimensional):
+    @abstractmethod
+    def update_integration_options(self, *args, **kwargs):  # TODO: handling integration properly
+        raise NotImplementedError
+
+    @abstractmethod
+    def integrate(self, limits: ztyping.LimitsType, norm: ztyping.LimitsType = None, *, options=None) -> ztyping.XType:
+        """Integrate the function over `limits` (normalized over `norm` if not False).
+
+        Args:
+            * ():
+            options ():
+            limits: the limits to integrate over
+            norm: the limits to normalize over or False to integrate the
+                unnormalized probability
+            name:
+
+        Returns:
+            The integral value
+        """
+        raise NotImplementedError
+
+    @classmethod
+    @abstractmethod
+    def register_analytic_integral(
+        cls,
+        func: Callable,
+        limits: ztyping.LimitsType = None,
+        priority: int = 50,
+        *,
+        supports_norm: bool = False,
+        supports_multiple_limits: bool = False,
+    ):
+        """Register an analytic integral with the class.
+
+        Args:
+            func:
+            limits: |@doc:pdf.integrate.limits| Limits of the integration. |@docend:pdf.integrate.limits|
+            priority:
+            supports_multiple_limits:
+            supports_norm:
+
+        Returns:
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def partial_integrate(
+        self,
+        x: ztyping.XType,
+        limits: ztyping.LimitsType,
+        *,
+        norm=None,
+        options=None,
+        norm_range: ztyping.LimitsType = None,
+    ) -> ztyping.XType:
+        """Partially integrate the function over the `limits` and evaluate it at `x`.
+
+        Dimension of `limits` and `x` have to add up to the full dimension and be therefore equal
+        to the dimensions of `norm` (if not False)
+
+        Args:
+            * ():
+            norm ():
+            options ():
+            x: The value at which the partially integrated function will be evaluated
+            limits: the limits to integrate over. Can contain only some axes
+            norm: the limits to normalize over. Has to have all axes
+
+        Returns:
+            The value of the partially integrated function evaluated at `x`.
+        """
+        raise NotImplementedError
+
+    @classmethod
+    @abstractmethod
+    def register_inverse_analytic_integral(cls, func: Callable):
+        """Register an inverse analytical integral, the inverse (unnormalized) cdf.
+
+        Args:
+            func:
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def sample(self, n: int, limits: ztyping.LimitsType = None) -> ztyping.XType:
+        """Sample `n` points within `limits` from the model.
+
+        Args:
+            n: The number of samples to be generated
+            limits: In which region to sample in
+            name:
+
+        Returns:
+            Tensor(n_obs, n_samples)
+        """
+        raise NotImplementedError
+
+--- IMPLEMENTER ---
+[src/zfit/models/dist_tfp.py]
+METHOD INDEX:
+  L562: def __init__(...)
+  L606: def dist_params(...)
+
+SOURCE:
+class LogNormal(WrapDistribution, SerializableMixin):
+    _N_OBS = 1
+
+    def __init__(
+        self,
+        mu: ztyping.ParamTypeInput,
+        sigma: ztyping.ParamTypeInput,
+        obs: ztyping.ObsTypeInput,
+        *,
+        extended: ExtendedInputType = None,
+        norm: NormInputType = None,
+        name: str = "LogNormal",
+        label: str | None = None,
+    ):
+        r"""Log-normal distribution, the exponential of a normal distribution.
+
+        The probability density function of the log-normal distribution is only defined for positive values and
+        is given by
+
+        .. math::
+            f(x \\mid \mu, \sigma) = \frac{1}{x \sigma \sqrt{2\pi}} e^{-\frac{(\ln(x) - \mu)^2}{2\sigma^2}}
+
+        with :math:`\mu` the mean and :math:`\sigma` the standard deviation of the underlying normal distribution.
+
+        Args:
+            mu: Mean of the underlying normal distribution.
+            sigma: Standard deviation of the underlying normal distribution.
+            obs: Observables and normalization range the pdf is defined in
+            extended: |@doc:pdf.init.extended| The overall yield of the PDF.
+               If this is parameter-like, it will be used as the yield,
+               the expected number of events, and the PDF will be extended.
+               An extended PDF has additional functionality, such as the
+               ``ext_*`` methods and the ``counts`` (for binned PDFs). |@docend:pdf.init.extended|
+            norm: |@doc:pdf.init.norm| Normalization of the PDF.
+               By default, this is the same as the default space of the PDF. |@docend:pdf.init.norm|
+            name: |@doc:pdf.init.name| Name of the PDF.
+               Maybe has implications on the serialization and deserialization of the PDF.
+               For a human-readable name, use the label. |@docend:pdf.init.name|
+            label: |@doc:pdf.init.label| Human-readable name
+               or label of
+               the PDF for a better description, to be used with plots etc.
+               Has no programmatical functional purpose as identification. |@docend:pdf.init.label|
+        """
+        mu, sigma = self._check_input_params_tfp(mu, sigma)
+
+        params = {"mu": mu, "sigma": sigma}
+
+        def dist_params():
+            return {"loc": mu.value(), "scale": sigma.value()}
+
+        distribution = tfp.distributions.LogNormal
+        super().__init__(
+            distribution=distribution,
+            dist_params=dist_params,
+            obs=obs,
+            params=params,
+            name=name,
+            extended=extended,
+            norm=norm,
+            label=label,
+        )
+
+======================================================================
+ROW 100 | implementer | Claude_Code | vllm-project/vllm#37201
+implementer vllm.v1.attention.backends.rocm_aiter_fa:AiterFlashAttentionMetadataBuilder of vllm.v1.attention.backend:AttentionMetadataBuilder (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[vllm/v1/attention/backend.py]
+METHOD INDEX:
+  L482: def __init__(...)
+  L495: def get_cudagraph_support(...)
+  L503: def _init_reorder_batch_threshold(...)
+  L536: def build(...)
+  L555: def update_block_table(...)
+  L570: def build_for_cudagraph_capture(...)
+  L582: def build_for_drafting(...)
+  L604: def use_cascade_attention(...)
+
+SOURCE:
+class AttentionMetadataBuilder(ABC, Generic[M]):
+    # Does this backend/builder support CUDA Graphs for attention (default: no).
+    # Do not access directly. Call get_cudagraph_support() instead.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    # Does this backend/builder reorder the batch?
+    # If not, set this to None. Otherwise set it to the query
+    # length that will be pulled into the front of the batch.
+    reorder_batch_threshold: int | None = None
+    # Does this backend/builder support updating the block table in existing
+    # metadata
+    supports_update_block_table: bool = False
+
+    @abstractmethod
+    def __init__(
+        self,
+        kv_cache_spec: "AttentionSpec",
+        layer_names: list[str],
+        vllm_config: "VllmConfig",
+        device: torch.device,
+    ):
+        self.kv_cache_spec = kv_cache_spec
+        self.layer_names = layer_names
+        self.vllm_config = vllm_config
+        self.device = device
+
+    @classmethod
+    def get_cudagraph_support(
+        cls: type["AttentionMetadataBuilder"],
+        vllm_config: "VllmConfig",
+        kv_cache_spec: "AttentionSpec",
+    ) -> AttentionCGSupport:
+        """Get the cudagraph support level of this builder class."""
+        return cls._cudagraph_support
+
+    def _init_reorder_batch_threshold(
+        self,
+        reorder_batch_threshold: int | None = 1,
+        supports_spec_as_decode: bool = False,
+        supports_dcp_with_varlen: bool = False,
+    ) -> None:
+        self.reorder_batch_threshold = reorder_batch_threshold
+        if self.reorder_batch_threshold is not None and supports_spec_as_decode:
+            # If the backend supports spec-as-decode kernels, then we can set
+            # the reorder_batch_threshold based on the number of speculative
+            # tokens from the config.
+            speculative_config = self.vllm_config.speculative_config
+            if (
+                speculative_config is not None
+                and speculative_config.num_speculative_tokens is not None
+            ):
+                max_num_queries_for_spec = (
+                    1
+                    + (2 if speculative_config.parallel_drafting else 1)
+                    * speculative_config.num_speculative_tokens
+                )
+                self.reorder_batch_threshold = max(
+                    self.reorder_batch_threshold,
+                    max_num_queries_for_spec,
+                )
+
+        if (
+            self.vllm_config.parallel_config.decode_context_parallel_size > 1
+            and not supports_dcp_with_varlen
+        ):
+            self.reorder_batch_threshold = 1
+
+    @abstractmethod
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> M:
+        """
+        Central method that builds attention metadata.
+        Some builders (MLA) require reorder_batch to be called prior to build.
+
+        Args:
+            common_prefix_len: The length of the common prefix of the batch.
+            common_attn_metadata: The common attention metadata.
+            fast_build: The meta-data will prioritize speed of building over
+                then speed at execution. Can be used for spec-decode where the
+                result of a build call may only be used for few layers/iters.
+        """
+        raise NotImplementedError
+
+    def update_block_table(
+        self,
+        metadata: M,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> M:
+        """
+        Update the block table for the attention metadata.
+        Faster when theres multiple kv-cache groups that create virtually the
+        same metadata but just with different block tables.
+
+        Only needs to be implemented if supports_update_block_table is True.
+        """
+        raise NotImplementedError
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> M:
+        """
+        Build attention metadata for CUDA graph capture. Uses build by default.
+        Subclasses that override this method should call self.build or
+        super().build_for_cudagraph_capture.
+        """
+        return self.build(
+            common_prefix_len=0, common_attn_metadata=common_attn_metadata
+        )
+
+    def build_for_drafting(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> M:
+        """
+        Build attention metadata for draft model. Uses build by default.
+... <<truncated, 28 more lines>>
+
+--- IMPLEMENTER ---
+[vllm/v1/attention/backends/rocm_aiter_fa.py]
+METHOD INDEX:
+  L403: def __init__(...)
+  L454: def build_for_cudagraph_capture(...)
+  L465: def build(...)
+  L683: def build_for_drafting(...)
+  L730: def use_cascade_attention(...)
+
+SOURCE:
+class AiterFlashAttentionMetadataBuilder(
+    AttentionMetadataBuilder[AiterFlashAttentionMetadata]
+):
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+
+        self.model_config = vllm_config.model_config
+        self.parallel_config = vllm_config.parallel_config
+        self.cache_config = vllm_config.cache_config
+
+        self.num_heads_q = self.model_config.get_num_attention_heads(
+            self.parallel_config
+        )
+        self.num_heads_kv = self.model_config.get_num_kv_heads(self.parallel_config)
+        self.headdim = self.model_config.get_head_size()
+        self.block_size = kv_cache_spec.block_size
+        # Sliding window size to be used with the AOT scheduler will be
+        # populated on first build() call.
+        self.aot_sliding_window: tuple[int, int] | None = None
+        self.total_tokens: int = 0
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+        sliding_window_configs: set[tuple[int, int] | None] = set()
+        layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+        for name, layer in layers.items():
+            if name not in layer_names:
+                continue
+            assert isinstance(layer.impl, AiterFlashAttentionImpl), (
+                "Aiter Flash Attention Metadata Builder can only be used "
+                "with Aiter Flash Attention Impl."
+            )
+            sliding_window_configs.add(layer.impl.sliding_window)
+
+        while len(sliding_window_configs) > 0:
+            sliding_window_config = sliding_window_configs.pop()
+            if sliding_window_config is not None and sliding_window_config[0] != -1:
+                assert self.aot_sliding_window is None, (
+                    "Aiter Flash ATTENTION can only support one valid sliding window!"
+                )
+                self.aot_sliding_window = sliding_window_config
+
+        self.extend_workspace = torch.empty(
+            [2, _CP_TOKENS_PER_ITER_ROCM, self.num_heads_kv, self.headdim],
+            dtype=self.model_config.dtype,
+            device=device,
+        )
+        self.scale = torch.tensor([1.0], dtype=torch.float, device=self.device)
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ):
+        self.total_tokens = (
+            self.model_config.max_model_len
+            * self.vllm_config.scheduler_config.max_num_partial_prefills
+        )
+        res = self.build(common_prefix_len=0, common_attn_metadata=common_attn_metadata)
+        self.total_tokens = 0
+        return res
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> "AiterFlashAttentionMetadata":
+        assert self.reorder_batch_threshold is not None
+        split_ret = split_decodes_prefills_and_extends(
+            common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold,
+        )
+        # Allocate scales for fp8 shuffle kv cache with shuffle_kv_cache enabled
+        if (
+            rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+            and self.scale.numel() == 1
+            and self.vllm_config.cache_config.cache_dtype.startswith("fp8")
+        ):
+            layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+            first_layer_name = [k for k in layers][0]
+            kv_cache_shape = (
+                self.vllm_config.compilation_config.static_forward_context[
+                    first_layer_name
+                ]
+                .kv_cache[0]
+                .shape
+            )
+            num_blocks = kv_cache_shape[1]
+            self.scale = torch.ones(
+                [num_blocks, self.num_heads_kv, self.block_size],
+                dtype=torch.float32,
+                device=self.device,
+            )
+        (
+            num_decodes,
+            num_extends,
+            num_prefills,
+            num_decode_tokens,
+            num_extend_tokens,
+            num_prefill_tokens,
+        ) = split_ret
+
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+
+        seq_lens = common_attn_metadata.seq_lens.cpu()
+
+        query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+
+        decode_metadata = None
+        if num_decodes > 0:
+            decode_metadata = AiterFlashAttentionDecodeMetadata(
+                max_query_len=query_lens_cpu[:num_decodes].max().item(),
+                min_query_len=query_lens_cpu[:num_decodes].min().item(),
+                max_seq_len=seq_lens[:num_decodes].max().item(),
+... <<truncated, 214 more lines>>
+
+======================================================================
+ROW 101 | implementer | Claude_Code | nexi-lab/nexus#280
+implementer nexus.remote.client:RemoteNexusFS of nexus.core.filesystem:NexusFilesystem (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/nexus/core/filesystem.py]
+METHOD INDEX:
+  L45: def read(...)
+  L68: def write(...)
+  L102: def write_batch(...)
+  L146: def delete(...)
+  L162: def rename(...)
+  L183: def exists(...)
+  L200: def list(...)
+  L232: def glob(...)
+  L262: def grep(...)
+  L313: def mkdir(...)
+  L332: def rmdir(...)
+  L350: def is_directory(...)
+  L367: def get_available_namespaces(...)
+  L390: def get_version(...)
+  L410: def list_versions(...)
+  L427: def rollback(...)
+  L446: def diff_versions(...)
+  L475: def workspace_snapshot(...)
+  L498: def workspace_restore(...)
+  L519: def workspace_log(...)
+  L539: def workspace_diff(...)
+  L562: def close(...)
+  L566: def __enter__(...)
+  L570: def __exit__(...)
+
+SOURCE:
+class NexusFilesystem(ABC):
+    """
+    Abstract base class for Nexus filesystem implementations.
+
+    All filesystem modes (Embedded, Monolith, Distributed) must implement
+    this interface to ensure consistent behavior across modes.
+
+    This interface provides:
+    - Core file operations (read, write, delete, exists)
+    - File discovery operations (list, glob, grep)
+    - Directory operations (mkdir, rmdir, is_directory)
+    - Lifecycle management (close, context manager)
+
+    Version History:
+    - v0.1.0: Initial interface with file ops, discovery ops, directory ops
+    - v0.2.0: Will add permission operations (chmod, chown, chgrp)
+    - v0.3.0: Monolith mode implementation
+    - v0.4.0: Distributed mode implementation
+    """
+
+    # Instance attributes (set by implementations)
+    agent_id: str | None
+    tenant_id: str | None
+
+    # ============================================================
+    # Core File Operations
+    # ============================================================
+
+    @abstractmethod
+    def read(
+        self, path: str, context: Any = None, return_metadata: bool = False
+    ) -> bytes | dict[str, Any]:
+        """
+        Read file content as bytes.
+
+        Args:
+            path: Virtual path to read
+            context: Optional operation context for permission checks
+            return_metadata: If True, return dict with content and metadata (v0.3.9)
+
+        Returns:
+            If return_metadata=False: File content as bytes
+            If return_metadata=True: Dict with content, etag, version, etc.
+
+        Raises:
+            NexusFileNotFoundError: If file doesn't exist
+            InvalidPathError: If path is invalid
+            AccessDeniedError: If access is denied
+        """
+        ...
+
+    @abstractmethod
+    def write(
+        self,
+        path: str,
+        content: bytes,
+        context: Any = None,
+        if_match: str | None = None,
+        if_none_match: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Write content to a file with optional optimistic concurrency control.
+
+        Creates parent directories if needed. Overwrites existing files.
+
+        Args:
+            path: Virtual path to write
+            content: File content as bytes
+            context: Optional operation context for permission checks
+            if_match: Optional etag for OCC (v0.3.9)
+            if_none_match: If True, create-only mode (v0.3.9)
+            force: If True, skip version check (v0.3.9)
+
+        Returns:
+            Dict with metadata (etag, version, modified_at, size)
+
+        Raises:
+            InvalidPathError: If path is invalid
+            AccessDeniedError: If access is denied
+            PermissionError: If path is read-only
+            ConflictError: If if_match doesn't match current etag (v0.3.9)
+        """
+        ...
+
+    @abstractmethod
+    def write_batch(
+        self, files: builtins.list[tuple[str, bytes]], context: Any = None
+    ) -> builtins.list[dict[str, Any]]:
+        """
+        Write multiple files in a single transaction for improved performance.
+
+        This is 4x faster than calling write() multiple times for small files
+        because it uses a single database transaction instead of N transactions.
+
+        All files are written atomically - either all succeed or all fail.
+
+        Args:
+            files: List of (path, content) tuples to write
+            context: Optional operation context for permission checks (uses default if not provided)
+
+        Returns:
+            List of metadata dicts for each file (in same order as input):
+                - etag: Content hash (SHA-256) of the written content
+                - version: New version number
+                - modified_at: Modification timestamp
+                - size: File size in bytes
+
+        Raises:
+            InvalidPathError: If any path is invalid
+            BackendError: If write operation fails
+            AccessDeniedError: If access is denied (tenant isolation or read-only namespace)
+            PermissionError: If any path is read-only or user doesn't have write permission
+
+        Examples:
+            >>> # Write 100 small files in a single batch (4x faster!)
+            >>> files = [(f"/logs/file_{i}.txt", b"log data") for i in range(100)]
+            >>> results = nx.write_batch(files)
+            >>> print(f"Wrote {len(results)} files")
+
+... <<truncated, 437 more lines>>
+
+--- IMPLEMENTER ---
+[src/nexus/remote/client.py]
+METHOD INDEX:
+  L119: def __init__(...)
+  L183: def _call_rpc(...)
+  L291: def _handle_rpc_error(...)
+  L331: def read(...)
+  L351: def write(...)
+  L388: def write_batch(...)
+  L410: def delete(...)
+  L414: def rename(...)
+  L418: def exists(...)
+  L427: def list(...)
+  L446: def glob(...)
+  L451: def grep(...)
+  L476: def mkdir(...)
+  L480: def rmdir(...)
+  L484: def is_directory(...)
+  L489: def get_available_namespaces(...)
+  L501: def get_metadata(...)
+  L525: def get_version(...)
+  L530: def list_versions(...)
+  L535: def rollback(...)
+  L540: def diff_versions(...)
+  L551: def workspace_snapshot(...)
+  L577: def workspace_restore(...)
+  L601: def workspace_log(...)
+  L624: def workspace_diff(...)
+  L654: def chmod(...)
+  L668: def chown(...)
+  L682: def chgrp(...)
+  L700: def grant_user(...)
+  L729: def grant_group(...)
+  L758: def deny_user(...)
+  L784: def revoke_acl(...)
+  L815: def get_acl(...)
+  L846: def batch_get_content_ids(...)
+  L862: def export_metadata(...)
+  L888: def import_metadata(...)
+  L925: def rebac_create(...)
+  L962: def rebac_check(...)
+  L992: def rebac_expand(...)
+  L1017: def rebac_delete(...)
+  L1033: def rebac_list_tuples(...)
+  L1063: def close(...)
+
+SOURCE:
+class RemoteNexusFS(NexusFilesystem):
+    """Remote Nexus filesystem client.
+
+    Implements NexusFilesystem interface by making RPC calls to a remote server.
+    """
+
+    def __init__(
+        self,
+        server_url: str,
+        api_key: str | None = None,
+        timeout: int = 30,
+        connect_timeout: int = 5,
+        max_retries: int = 3,
+        pool_connections: int = 10,
+        pool_maxsize: int = 20,
+    ):
+        """Initialize remote filesystem client.
+
+        Args:
+            server_url: Base URL of Nexus RPC server (e.g., "http://localhost:8080")
+            api_key: Optional API key for authentication
+            timeout: Request timeout in seconds (default: 30)
+            connect_timeout: Connection timeout in seconds (default: 5)
+            max_retries: Maximum number of retry attempts (default: 3)
+            pool_connections: Number of connection pools (default: 10)
+            pool_maxsize: Maximum pool size (default: 20)
+        """
+        self.server_url = server_url.rstrip("/")
+        self.api_key = api_key
+        self.timeout = timeout
+        self.connect_timeout = connect_timeout
+        self.max_retries = max_retries
+
+        # Set agent_id and tenant_id (required by NexusFilesystem protocol)
+        self.agent_id: str | None = None
+        self.tenant_id: str | None = None
+
+        # Create HTTP session with connection pooling
+        self.session = requests.Session()
+
+        # Configure connection pooling with retry strategy
+        # Retry on connection errors, timeouts, and 5xx server errors
+        retry_strategy = Retry(
+            total=0,  # We'll handle retries with tenacity at RPC level
+            connect=0,
+            read=0,
+            status_forcelist=[500, 502, 503, 504],
+            backoff_factor=0,
+        )
+
+        adapter = HTTPAdapter(
+            pool_connections=pool_connections,
+            pool_maxsize=pool_maxsize,
+            max_retries=retry_strategy,
+        )
+
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+        if api_key:
+            self.session.headers["Authorization"] = f"Bearer {api_key}"
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(
+            (requests.ConnectionError, requests.Timeout, RemoteConnectionError)
+        ),
+        reraise=True,
+    )
+    def _call_rpc(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        """Make RPC call to server with automatic retry logic.
+
+        This method automatically retries on transient failures (connection errors,
+        timeouts) using exponential backoff (1s, 2s, 4s, up to 10s).
+
+        Args:
+            method: Method name
+            params: Method parameters
+
+        Returns:
+            Method result
+
+        Raises:
+            NexusError: On RPC error
+            RemoteConnectionError: On connection failure
+            RemoteTimeoutError: On timeout
+            RemoteFilesystemError: On other remote errors
+        """
+        # Build request
+        request = RPCRequest(
+            jsonrpc="2.0",
+            id=str(uuid.uuid4()),
+            method=method,
+            params=params,
+        )
+
+        # Encode request
+        body = encode_rpc_message(request.to_dict())
+
+        # Make HTTP request
+        url = urljoin(self.server_url, f"/api/nfs/{method}")
+
+        # Log API call
+        start_time = time.time()
+        logger.debug(f"API call: {method} with params: {params}")
+
+        try:
+            # Use tuple for timeout: (connect_timeout, read_timeout)
+            response = self.session.post(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                timeout=(self.connect_timeout, self.timeout),
+            )
+
+            elapsed = time.time() - start_time
+
+            # Check HTTP status
+            if response.status_code != 200:
+... <<truncated, 833 more lines>>
+
+======================================================================
+ROW 102 | interface | Copilot | RailtownAI/railtracks#607
+interface packages.railtracks.src.railtracks.built_nodes.concrete.structured_tool_call_llm_base:StructuredToolCallLLM kind=abc
+======================================================================
+[packages/railtracks/src/railtracks/built_nodes/concrete/structured_tool_call_llm_base.py]
+METHOD INDEX:
+  L39: def __init_subclass__(...)
+  L67: def __init__(...)
+  L76: def invoke(...)
+
+SOURCE:
+class StructuredToolCallLLM(
+    StructuredOutputMixIn[_TBaseModel],
+    OutputLessToolCallLLM[StructuredResponse[_TBaseModel]],
+    ABC,
+    Generic[_TBaseModel],
+):
+    """
+    A base class for structured tool call LLMs that do not return an output.
+    This class is used to define the structure of the tool call and handle the
+    structured output.
+    """
+
+    def __init_subclass__(cls):
+        system_structured = (
+            "You are a structured LLM tasked with extracting structured information from the conversation history of another LLM.\n"
+            "The input will be the full message history (including system, user, tool, and assistant messages) from a prior LLM interaction."
+            "Your job is to analyze this history and produce a structured response according to a specified format.\n"
+            "Ensure the output is clean, valid, and matches the structure and output_schema defined. If certain fields cannot be confidently filled based on the conversation"
+            "return None\n"
+            "Do not summarize, speculate, or reinterpret the original intent,only extract information that is directly supported by the conversation content.\n"
+            "Respond only with the structured output in the specified format."
+        )
+
+        has_abstract_methods = any(
+            getattr(getattr(cls, name, None), "__isabstractmethod__", False)
+            for name in dir(cls)
+        )
+
+        from ..easy_usage_wrappers.helpers import structured_llm
+
+        # we only want to verify the output_schema is the class is not abstract
+        if not has_abstract_methods:
+            cls.structured_resp_node = structured_llm(
+                cls.output_schema(),
+                system_message=system_structured,
+                llm=cls.get_llm(),
+            )
+
+        super().__init_subclass__()
+
+    def __init__(
+        self,
+        user_input: MessageHistory | UserMessage | str | list[Message],
+        llm: ModelBase | None = None,
+        max_tool_calls: int | None = None,
+    ):
+        super().__init__(user_input=user_input, llm=llm, max_tool_calls=max_tool_calls)
+        self.structured_output: _TBaseModel | Exception | None = None
+
+    async def invoke(self):
+        await self._handle_tool_calls()
+
+        try:
+            response = await call(
+                self.structured_resp_node,
+                user_input=MessageHistory(
+                    [UserMessage(str(self.message_hist), inject_prompt=False)]
+                ),
+                llm=self.llm_model,
+            )
+
+            structured_output = response.structured
+        except Exception as e:
+            # the original exception will be presented with our wrapped one.
+            raise LLMError(
+                reason="Failed to parse assistant response into structured output.",
+                message_history=self.message_hist,
+            ) from e
+
+        # Might need to change the logic so that you keep the unstructured message
+        self.message_hist.pop()
+        self.message_hist.append(AssistantMessage(content=structured_output))
+
+        if (key := self.return_into()) is not None:
+            output = self.return_output()
+            context.put(key, self.format_for_context(output.structured))
+            return self.format_for_return(output.structured)
+
+        return self.return_output()
+
+======================================================================
+ROW 103 | interface | Claude_Code | mlflow/mlflow#16758
+interface mlflow.gateway.providers.base:ProviderAdapter kind=abc
+======================================================================
+[mlflow/gateway/providers/base.py]
+METHOD INDEX:
+  L83: def model_to_embeddings(...)
+  L87: def model_to_completions(...)
+  L90: def model_to_completions_streaming(...)
+  L95: def completions_to_model(...)
+  L98: def completions_streaming_to_model(...)
+  L102: def model_to_chat(...)
+  L106: def model_to_chat_streaming(...)
+  L110: def chat_to_model(...)
+  L114: def chat_streaming_to_model(...)
+  L119: def embeddings_to_model(...)
+  L122: def check_keys_against_mapping(...)
+
+SOURCE:
+class ProviderAdapter(ABC):
+    @classmethod
+    @abstractmethod
+    def model_to_embeddings(cls, resp, config): ...
+
+    @classmethod
+    @abstractmethod
+    def model_to_completions(cls, resp, config): ...
+
+    @classmethod
+    def model_to_completions_streaming(cls, resp, config):
+        raise NotImplementedError
+
+    @classmethod
+    @abstractmethod
+    def completions_to_model(cls, payload, config): ...
+
+    @classmethod
+    def completions_streaming_to_model(cls, payload, config):
+        raise NotImplementedError
+
+    @classmethod
+    def model_to_chat(cls, resp, config):
+        raise NotImplementedError
+
+    @classmethod
+    def model_to_chat_streaming(cls, resp, config):
+        raise NotImplementedError
+
+    @classmethod
+    def chat_to_model(cls, payload, config):
+        raise NotImplementedError
+
+    @classmethod
+    def chat_streaming_to_model(cls, payload, config):
+        raise NotImplementedError
+
+    @classmethod
+    @abstractmethod
+    def embeddings_to_model(cls, payload, config): ...
+
+    @classmethod
+    def check_keys_against_mapping(cls, mapping, payload):
+        for k1, k2 in mapping.items():
+            if k2 in payload:
+                raise AIGatewayException(
+                    status_code=400, detail=f"Invalid parameter {k2}. Use {k1} instead."
+                )

@@ -26,25 +26,24 @@ from graph import (  # noqa: E402
 )
 sys.path.insert(0, str(HERE.parents[0] / "03_principles" / "dip"))
 import run_dip as R  # noqa: E402
+sys.path.insert(0, str(HERE.parents[0] / "03_principles"))
+import gitsnap  # noqa: E402
+
+SHOW_VERDICT = False   # set from --show-verdict in main()
 
 
-def graft_safe_parent(d: Path, merge_sha: str) -> str | None:
-    """First parent via `git cat-file -p` (shallow-graft-proof)."""
-    if not R.have_commit(d, merge_sha):
-        R.run_git(["fetch", "--depth", "2", "origin", merge_sha], cwd=d)
-    if not R.have_commit(d, merge_sha):
-        return None
-    r = R.run_git(["cat-file", "-p", merge_sha], cwd=d)
-    if r is None:
-        return None
-    parents = [ln.split()[1] for ln in r.stdout.splitlines()
-               if ln.startswith("parent ")]
-    if not parents:
-        return None
-    p = parents[0]
-    if not R.have_commit(d, p):
-        R.run_git(["fetch", "--depth", "2", "origin", p], cwd=d)
-    return p if R.have_commit(d, p) else None
+def resolve_pair(d: Path, pr):
+    """(before_sha, after_sha) via the SHARED 3-tier resolver, or None.
+
+    REPLACED 2026-08-17 (was `graft_safe_parent`, merge_sha only). Same defect as
+    the other Python extractors: 69% of flagged rows on this corpus have
+    merge_sha = NaN, so `str(nan)` -> "nan" -> git fails -> the row renders as
+    unjudgeable. gitsnap.delta_pair adds the commit-set and refs/pull/<N>/head
+    tiers, and keeps the extractor on the same resolution path as the harness --
+    so the judge sees exactly the before/after the detector scored.
+    """
+    with gitsnap.repo_lock(pr.full_name):
+        return gitsnap.delta_pair(d, pr)
 
 
 def touched_modules(pr) -> set[str]:
@@ -57,16 +56,25 @@ def touched_modules(pr) -> set[str]:
 
 
 def describe(pr) -> str:
-    L = [f"### PR {pr.pr_id}  {pr.agent}  {pr.full_name}#{pr.pr_number}",
-         f"stratum={pr.stratum}  dip_risk(pred)={pr.dip_risk}  hits={pr.dip_risk_hits}",
-         f"delta: mean_d={pr.delta_mean_d:+.3f}  abstract_dep_ratio="
-         f"{pr.delta_abstract_dep_ratio:+.3f}  touched_cycles={pr.delta_touched_cycles:+.0f}"]
+    # BLIND BY DEFAULT (2026-08-17). The verdict, the hit list AND the signed
+    # deltas the rubric thresholds on are all withheld unless --show-verdict:
+    # printing them above the evidence anchors the judge toward the tool. Same
+    # leak fixed for Java on 2026-08-04 and never backported here, so any DIP
+    # figure from a pre-2026-08-17 batch is an UPPER BOUND.
+    L = [f"### PR {pr.pr_id}  {pr.agent}  {pr.full_name}#{pr.pr_number}"]
+    if SHOW_VERDICT:
+        L.append(f"stratum={pr.stratum}  dip_risk(pred)={pr.dip_risk}  "
+                 f"hits={pr.dip_risk_hits}")
+        L.append(f"delta: mean_d={pr.delta_mean_d:+.3f}  abstract_dep_ratio="
+                 f"{pr.delta_abstract_dep_ratio:+.3f}  "
+                 f"touched_cycles={pr.delta_touched_cycles:+.0f}")
     d = R.ensure_repo(pr.full_name)
-    parent = graft_safe_parent(d, pr.merge_sha)
-    if parent is None:
-        return "\n".join(L + ["  (could not resolve parent / fetch)"])
+    pair = resolve_pair(d, pr)
+    if pair is None:
+        return "\n".join(L + ["  (could not resolve before/after pair)"])
+    parent, after_sha = pair
     before = R.py_tree(d, parent)
-    after = R.py_tree(d, pr.merge_sha)
+    after = R.py_tree(d, after_sha)
     if not before or not after or "__TOO_LARGE__" in (before or {}) or "__TOO_LARGE__" in (after or {}):
         return "\n".join(L + ["  (tree unavailable / too large)"])
     gb, ga = build_module_graph(before), build_module_graph(after)
@@ -89,9 +97,24 @@ def describe(pr) -> str:
     cb = [c for c in find_cycles(gb) if c & tmods]
     ca = [c for c in find_cycles(ga) if c & tmods]
     new_cycles = [c for c in ca if c not in cb]
+    # BLINDING LEAK, FIXED 2026-08-25. This printed "NEW CYCLE: ..." for every
+    # cycle the detector considered new, unconditionally, while every other
+    # principle's verdict sits behind --show-verdict. `new_cycle` IS the DIP
+    # flag, so a judge reading that line is confirming the tool rather than
+    # checking it, and the precision that comes back is an upper bound.
+    #
+    # The cycle MEMBERSHIP still has to be visible or the row cannot be judged
+    # at all, so what is shown is the after-state cycles WITHOUT the novelty
+    # label. The judge decides novelty from the new-edge list above, which is the
+    # independent check the label round exists to provide.
     L.append(f"import cycles touching touched modules: before={len(cb)} after={len(ca)}")
-    for c in new_cycles[:5]:
-        L.append(f"    NEW CYCLE: {' -> '.join(sorted(c))}")
+    if SHOW_VERDICT:
+        for c in new_cycles[:5]:
+            L.append(f"    NEW CYCLE (detector's verdict): {' -> '.join(sorted(c))}")
+    else:
+        for c in ca[:5]:
+            L.append(f"    cycle present AFTER: {' -> '.join(sorted(c))}")
+        L.append("    (novelty is NOT marked -- decide it from the new-edge list above)")
     return "\n".join(L)
 
 
@@ -100,7 +123,12 @@ def main() -> None:
     ap.add_argument("--file", default="dip_labeling_sample.csv")
     ap.add_argument("--out-dir", default=str(HERE / "dip_batches"))
     ap.add_argument("--per-batch", type=int, default=10)
+    ap.add_argument("--show-verdict", action="store_true",
+                    help="print the rubric verdict and the delta metrics it "
+                         "thresholds on (NOT blind -- debugging only)")
     a = ap.parse_args()
+    global SHOW_VERDICT
+    SHOW_VERDICT = a.show_verdict
     df = pd.read_csv(HERE / a.file)
     # touched_files / files_source live in the gold set, not the dip sample -- join them.
     gold = pd.read_parquet(C.GOLD_SET)[["pr_id", "touched_files", "files_source"]]

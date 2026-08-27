@@ -42,6 +42,7 @@ import argparse
 import io
 import json
 import subprocess
+import pathlib
 import sys
 import tarfile
 from pathlib import Path
@@ -72,6 +73,22 @@ _SIG_REASON = {
     "return_type_widened": "new_type_variance",
 }
 
+
+
+def _atomic_parquet(df, path):
+    """Write a checkpoint so a power cut can never leave a CORRUPT file.
+
+    `to_parquet(path)` overwrites in place, so a crash mid-write truncates the
+    file. Writing to a sibling temp and then `os.replace` (atomic on NTFS and
+    POSIX) means a reader always sees either the previous complete checkpoint or
+    the new one -- never a half-written one. Matters most for the long overnight
+    delta runs, which checkpoint every 25 PRs and so have many more write windows
+    than a single end-of-run write.
+    """
+    import os
+    tmp = pathlib.Path(str(path) + ".tmp")
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
 
 def run_git(args: list[str], cwd: Path, binary: bool = False):
     try:
@@ -228,8 +245,24 @@ def main() -> None:
     for i, pr in enumerate(gold.itertuples(index=False), 1):
         if pr.pr_id in done_ids:
             continue
+        # V2: `outcome` and `rejection_stratum` ride on EVERY row of EVERY
+        # parquet (REDESIGN_V2.md 3), so any report can split on them without a
+        # join and no analysis can accidentally pair results with the wrong
+        # gold set. Defaulted, because this harness must also read a pre-V2
+        # gold set.
+        #
+        # `merge_sha` is normalised here rather than left as `pr.merge_sha or
+        # ""`: a NOT-MERGED PR has no merge SHA, the parquet stores that as a
+        # float NaN, and `nan or ""` evaluates to NaN (NaN is truthy), so the
+        # old expression put a float into a string column for every rejected
+        # and open PR. gitsnap.delta_pair already type-checks it, but the
+        # column itself would have been unusable.
+        _ms = getattr(pr, "merge_sha", None)
         base = {"pr_id": pr.pr_id, "agent": pr.agent, "full_name": pr.full_name,
-                "pr_number": pr.pr_number, "merge_sha": pr.merge_sha or ""}
+                "pr_number": pr.pr_number,
+                "merge_sha": _ms if isinstance(_ms, str) else "",
+                "outcome": getattr(pr, "outcome", "merged"),
+                "rejection_stratum": getattr(pr, "rejection_stratum", "merged")}
 
         def emit(status: str, **extra) -> None:
             rows.append({**base, "row_type": "pr", "status": status, **extra})
@@ -295,10 +328,10 @@ def main() -> None:
             emit("error")
 
         if i % 25 == 0:
-            pd.DataFrame(rows).to_parquet(C.LSP_RESULTS, index=False)
+            _atomic_parquet(pd.DataFrame(rows), C.LSP_RESULTS)
 
     results = pd.DataFrame(rows)
-    results.to_parquet(C.LSP_RESULTS, index=False)
+    _atomic_parquet(results, C.LSP_RESULTS)
     print(f"\n[lsp] results written to {C.LSP_RESULTS}")
     pr_rows = results[results.row_type == "pr"]
     print(pr_rows["status"].value_counts().to_string())

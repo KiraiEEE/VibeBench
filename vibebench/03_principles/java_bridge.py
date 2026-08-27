@@ -39,6 +39,30 @@ FACTS_CACHE = C.CORPUS_DIR / "java_facts_cache"
 TIMEOUT_S = getattr(C, "JAVA_SIDECAR_TIMEOUT_S", 900)
 HEAP = getattr(C, "JAVA_SIDECAR_HEAP", "3g")
 
+# JVM flags, all three measured on this machine rather than guessed.
+#
+# MaxHeapFreeRatio/MinHeapFreeRatio: -Xmx is a CEILING, but G1 does not hand
+#   pages back to the OS once it has grown into them, so a worker that parses
+#   one big tree keeps ~3 GB resident for the rest of its life even while
+#   parsing tiny ones. Measured with 4 workers: system available RAM fell to
+#   1.53 GB and stayed there. These ratios make the heap shrink after each
+#   collection, so resident memory tracks the CURRENT tree, not the largest
+#   one seen so far.
+# ActiveProcessorCount: each JVM otherwise sizes its GC thread pool from all
+#   12 logical cores, so N workers spawn ~12N GC threads that fight for the
+#   same cores. Capping it keeps the machine responsive and, because the
+#   contention is removed, does not cost throughput.
+# ExitOnOutOfMemoryError: without it a JVM at its heap limit spends minutes in
+#   back-to-back full GCs before failing, freezing the whole machine. With it
+#   the worker dies at once with a non-zero exit, which analyze_tree already
+#   turns into a recorded failure carrying its reason.
+JVM_TUNING = [
+    "-XX:MaxHeapFreeRatio=30",
+    "-XX:MinHeapFreeRatio=10",
+    "-XX:ActiveProcessorCount=2",
+    "-XX:+ExitOnOutOfMemoryError",
+]
+
 
 # Bump when a change makes previously cached facts WRONG rather than merely
 # stale. v2 = the CRLF line-doubling fix (2026-08-04): the tree CONTENT is
@@ -145,7 +169,8 @@ def analyze_tree(files: dict[str, str], use_cache: bool = True) -> dict:
             print(f"  [java_bridge] skipped {skipped} file(s) unwritable on this OS", flush=True)
         try:
             proc = subprocess.run(
-                ["java", f"-Xmx{HEAP}", "-cp", str(SIDECAR_JAR), "vb.Facts", str(tmp)],
+                ["java", f"-Xmx{HEAP}", *JVM_TUNING,
+                 "-cp", str(SIDECAR_JAR), "vb.Facts", str(tmp)],
                 capture_output=True, timeout=TIMEOUT_S,
             )
         except subprocess.TimeoutExpired:

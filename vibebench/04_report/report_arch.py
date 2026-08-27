@@ -39,7 +39,7 @@ def section(title: str) -> None:
 
 
 def report_lang(pk: pd.DataFrame, prs: pd.DataFrame, lang: str) -> pd.DataFrame:
-    section(f"{lang.upper()} — Martin component zones (descriptive)")
+    section(f"{lang.upper()} , Martin component zones (descriptive)")
 
     ok = prs[prs.status == "ok"]
     print(f"  PRs analysed              {len(ok)} of {len(prs)}")
@@ -85,7 +85,7 @@ def report_lang(pk: pd.DataFrame, prs: pd.DataFrame, lang: str) -> pd.DataFrame:
               f"   pain {(t.zone == 'pain').mean() * 100:.1f}%")
         print(f"  packages they did not      {len(u)}"
               f"   pain {(u.zone == 'pain').mean() * 100:.1f}%")
-        print("  (descriptive contrast only — not an agent attribution)")
+        print("  (descriptive contrast only , not an agent attribution)")
 
     worst = placed.nlargest(8, "D")[
         ["full_name", "package", "Ce", "Ca", "I", "A", "D", "zone"]]
@@ -99,7 +99,7 @@ def report_lang(pk: pd.DataFrame, prs: pd.DataFrame, lang: str) -> pd.DataFrame:
 
 def main() -> None:
     if not SRC.exists():
-        print(f"no {SRC} — run 03_principles/arch/run_arch.py first")
+        print(f"no {SRC} , run 03_principles/arch/run_arch.py first")
         return
     df = pd.read_parquet(SRC)
     pkgs = df[df.row_type == "package"]
@@ -116,7 +116,7 @@ def main() -> None:
         return
     allu = pd.concat(frames, ignore_index=True)
 
-    section("ZONE DISTRIBUTION — both languages, placed packages only")
+    section("ZONE DISTRIBUTION , both languages, placed packages only")
     placed = allu[allu.zone != "unknown"]
     tab = (placed.groupby(["lang", "zone"]).size().unstack(fill_value=0)
            .reindex(columns=[z for z in ZONE_ORDER if z != "unknown"], fill_value=0))
