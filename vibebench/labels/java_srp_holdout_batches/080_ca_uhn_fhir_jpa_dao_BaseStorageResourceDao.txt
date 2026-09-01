@@ -1,0 +1,397 @@
+row 80   hapifhir/hapi-fhir#7584
+============================================================================
+CLASS ca.uhn.fhir.jpa.dao.BaseStorageResourceDao   loc=392 methods=20 wmc=55 lcom=0.0526315789473684 c3=0.2238432611394165
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       71  public abstract class BaseStorageResourceDao<T extends IBaseResource> extends BaseStorageDao
+       72  		implements IFhirResourceDao<T>, IJpaDao<T> {
+       73  	public static final StrictErrorHandler STRICT_ERROR_HANDLER = new StrictErrorHandler();
+       74  
+       75  	@Autowired
+       76  	protected abstract HapiTransactionService getTransactionService();
+       77  
+       78  	@Autowired
+       79  	protected abstract MatchResourceUrlService getMatchResourceUrlService();
+       80  
+       81  	@Autowired
+       82  	protected abstract IStorageResourceParser getStorageResourceParser();
+       83  
+       84  	@Autowired
+       85  	protected abstract IDeleteExpungeJobSubmitter getDeleteExpungeJobSubmitter();
+       86  
+       87  	@Autowired
+       88  	protected abstract IRequestPartitionHelperSvc getRequestPartitionHelperService();
+       89  
+       90  	@Autowired
+       91  	protected abstract MatchUrlService getMatchUrlService();
+       92  
+       93  	@Override
+       94  	public DaoMethodOutcome patch(
+       95  			IIdType theId,
+       96  			String theConditionalUrl,
+       97  			PatchTypeEnum thePatchType,
+       98  			String thePatchBody,
+       99  			IBaseParameters theFhirPatchBody,
+      100  			RequestDetails theRequestDetails) {
+      101  
+      102  		ReadPartitionIdRequestDetails details;
+      103  		if (isNotBlank(theConditionalUrl)) {
+      104  			MatchUrlService.ResourceTypeAndSearchParameterMap parsed =
+      105  					getMatchUrlService().parseAndTranslateMatchUrl(theConditionalUrl);
+      106  			details = ReadPartitionIdRequestDetails.forPatch(
+      107  					parsed.resourceDefinition().getName(), parsed.searchParameterMap());
+      108  		} else {
+      109  			details = ReadPartitionIdRequestDetails.forPatch(getResourceName(), theId);
+      110  		}
+      111  		RequestPartitionId requestPartitionId =
+      112  				getRequestPartitionHelperService().determineReadPartitionForRequest(theRequestDetails, details);
+      113  
+      114  		TransactionDetails transactionDetails = new TransactionDetails();
+      115  		return getTransactionService()
+      116  				.withRequest(theRequestDetails)
+      117  				.withTransactionDetails(transactionDetails)
+      118  				.withRequestPartitionId(requestPartitionId)
+      119  				.execute(tx -> patchInTransaction(
+      120  						theId,
+      121  						theConditionalUrl,
+      122  						true,
+      123  						thePatchType,
+      124  						thePatchBody,
+      125  						theFhirPatchBody,
+      126  						theRequestDetails,
+      127  						transactionDetails,
+      128  						requestPartitionId));
+      129  	}
+      130  
+      131  	@Override
+      132  	public DaoMethodOutcome patchInTransaction(
+      133  			IIdType theId,
+      134  			String theConditionalUrl,
+      135  			boolean thePerformIndexing,
+      136  			PatchTypeEnum thePatchType,
+      137  			String thePatchBody,
+      138  			IBaseParameters theFhirPatchBody,
+      139  			RequestDetails theRequestDetails,
+      140  			TransactionDetails theTransactionDetails,
+      141  			RequestPartitionId theRequestPartitionId) {
+      142  		assert TransactionSynchronizationManager.isActualTransactionActive();
+      143  
+      144  		boolean isHistoryRewrite = myStorageSettings.isUpdateWithHistoryRewriteEnabled()
+      145  				&& theRequestDetails != null
+      146  				&& theRequestDetails.isRewriteHistory();
+      147  
+      148  		if (isHistoryRewrite && !theId.hasVersionIdPart()) {
+      149  			throw new InvalidRequestException(
+      150  					Msg.code(2717) + "Invalid resource ID for rewrite history: ID must contain a history version");
+      151  		}
+      152  
+      153  		IBasePersistedResource entityToUpdate;
+      154  		IIdType resourceId;
+      155  		if (isNotBlank(theConditionalUrl)) {
+      156  			entityToUpdate = getEntityToPatchWithMatchUrlCache(
+      157  					theConditionalUrl, theRequestDetails, theTransactionDetails, theRequestPartitionId);
+      158  			resourceId = entityToUpdate.getIdDt();
+      159  		} else {
+      160  			resourceId = theId;
+      161  
+      162  			if (isHistoryRewrite) {
+      163  				entityToUpdate = readEntity(theId, theRequestDetails);
+      164  			} else {
+      165  				entityToUpdate = readEntityLatestVersion(theId, theRequestDetails, theTransactionDetails);
+      166  				validateIsCurrentVersionOrThrow(theId, entityToUpdate);
+      167  			}
+      168  		}
+      169  
+      170  		validateResourceIsNotDeletedOrThrow(entityToUpdate);
+      171  		validateResourceType(entityToUpdate, getResourceName());
+      172  
+      173  		IBaseResource resourceToUpdate = getStorageResourceParser().toResource(entityToUpdate, false);
+      174  		if (resourceToUpdate == null) {
+      175  			// If this is null, we are presumably in a FHIR transaction bundle with both a create and a patch on the
+      176  			// same
+      177  			// resource. This is weird but not impossible.
+      178  			resourceToUpdate = theTransactionDetails.getResolvedResource(resourceId);
+      179  		}
+      180  
+      181  		// Interceptor call: STORAGE_PRESTORAGE_RESOURCE_PREPATCH
+      182  		IInterceptorBroadcaster compositeBroadcaster =
+      183  				CompositeInterceptorBroadcaster.newCompositeBroadcaster(myInterceptorBroadcaster, theRequestDetails);
+      184  		if (compositeBroadcaster.hasHooks(Pointcut.STORAGE_PRESTORAGE_RESOURCE_PREPATCH)) {
+      185  			PrePatchDetails prePatchDetails =
+      186  					new PrePatchDetails(resourceToUpdate, thePatchType, thePatchBody, theFhirPatchBody);
+      187  
+      188  			HookParams params = new HookParams();
+      189  			params.add(RequestDetails.class, theRequestDetails);
+      190  			params.addIfMatchesType(ServletRequestDetails.class, theRequestDetails);
+      191  			params.add(prePatchDetails);
+      192  			compositeBroadcaster.callHooks(Pointcut.STORAGE_PRESTORAGE_RESOURCE_PREPATCH, params);
+      193  		}
+      194  
+      195  		IBaseResource destination =
+      196  				applyPatchToResource(thePatchType, thePatchBody, theFhirPatchBody, resourceToUpdate);
+      197  		@SuppressWarnings("unchecked")
+      198  		T destinationCasted = (T) destination;
+      199  
+      200  		preProcessResourceForStorage(destinationCasted, theRequestDetails, theTransactionDetails, true);
+      201  
+      202  		if (isHistoryRewrite) {
+      203  			return getTransactionService()
+      204  					.withRequest(theRequestDetails)
+      205  					.withTransactionDetails(theTransactionDetails)
+      206  					.execute(tx -> doUpdateWithHistoryRewrite(
+      207  							destinationCasted,
+      208  							theRequestDetails,
+      209  							theTransactionDetails,
+      210  							theRequestPartitionId,
+      211  							RestOperationTypeEnum.PATCH));
+      212  		}
+      213  
+      214  		UpdateParameters updateParameters = new UpdateParameters<>()
+      215  				.setRequestDetails(theRequestDetails)
+      216  				.setResourceIdToUpdate(resourceId)
+      217  				.setMatchUrl(theConditionalUrl)
+      218  				.setShouldPerformIndexing(thePerformIndexing)
+      219  				.setShouldForceUpdateVersion(false)
+      220  				.setResource(destinationCasted)
+      221  				.setEntity(entityToUpdate)
+      222  				.setOperationType(RestOperationTypeEnum.PATCH)
+      223  				.setTransactionDetails(theTransactionDetails)
+      224  				.setShouldForcePopulateOldResourceForProcessing(false);
+      225  
+      226  		return doUpdateForUpdateOrPatch(updateParameters);
+      227  	}
+      228  
+      229  	private static void validateIsCurrentVersionOrThrow(IIdType theId, IBasePersistedResource theEntityToUpdate) {
+      230  		if (theId.hasVersionIdPart() && theId.getVersionIdPartAsLong() != theEntityToUpdate.getVersion()) {
+      231  			throw new ResourceVersionConflictException(Msg.code(974) + "Version " + theId.getVersionIdPart()
+      232  					+ " is not the most recent version of this resource, unable to apply patch");
+      233  		}
+      234  	}
+      235  
+      236  	DaoMethodOutcome doUpdateWithHistoryRewrite(
+      237  			T theResource,
+      238  			RequestDetails theRequest,
+      239  			TransactionDetails theTransactionDetails,
+      240  			RequestPartitionId theRequestPartitionId,
+      241  			RestOperationTypeEnum theRestOperationType) {
+      242  
+      243  		throw new UnsupportedOperationException(Msg.code(2718) + "Patch with history rewrite is unsupported.");
+      244  	}
+      245  
+      246  	private void validateResourceIsNotDeletedOrThrow(IBasePersistedResource theEntityToUpdate) {
+      247  		if (theEntityToUpdate.isDeleted()) {
+      248  			throw createResourceGoneException(theEntityToUpdate);
+      249  		}
+      250  	}
+      251  
+      252  	private IBaseResource applyPatchToResource(
+      253  			PatchTypeEnum thePatchType,
+      254  			String thePatchBody,
+      255  			IBaseParameters theFhirPatchBody,
+      256  			IBaseResource theResourceToUpdate) {
+      257  		IBaseResource destination;
+      258  		switch (thePatchType) {
+      259  			case JSON_PATCH:
+      260  				destination = JsonPatchUtils.apply(getContext(), theResourceToUpdate, thePatchBody);
+      261  				break;
+      262  			case XML_PATCH:
+      263  				destination = XmlPatchUtils.apply(getContext(), theResourceToUpdate, thePatchBody);
+      264  				break;
+      265  			case FHIR_PATCH_XML:
+      266  			case FHIR_PATCH_JSON:
+      267  			default:
+      268  				IBaseParameters fhirPatchJson = theFhirPatchBody;
+      269  				new FhirPatch(getContext()).apply(theResourceToUpdate, fhirPatchJson);
+      270  				destination = theResourceToUpdate;
+      271  				break;
+      272  		}
+      273  		return destination;
+      274  	}
+      275  
+      276  	private IBasePersistedResource getEntityToPatchWithMatchUrlCache(
+      277  			String theConditionalUrl,
+      278  			RequestDetails theRequestDetails,
+      279  			TransactionDetails theTransactionDetails,
+      280  			RequestPartitionId theRequestPartitionId) {
+      281  		IBasePersistedResource theEntityToUpdate;
+      282  
+      283  		Set<IResourcePersistentId> match = getMatchResourceUrlService()
+      284  				.processMatchUrl(
+      285  						theConditionalUrl,
+      286  						getResourceType(),
+      287  						theTransactionDetails,
+      288  						theRequestDetails,
+      289  						theRequestPartitionId);
+      290  		if (match.size() > 1) {
+      291  			String msg = getContext()
+      292  					.getLocalizer()
+      293  					.getMessageSanitized(
+      294  							BaseStorageDao.class,
+      295  							"transactionOperationWithMultipleMatchFailure",
+      296  							"PATCH",
+      297  							getResourceName(),
+      298  							theConditionalUrl,
+      299  							match.size());
+      300  			throw new PreconditionFailedException(Msg.code(972) + msg);
+      301  		} else if (match.size() == 1) {
+      302  			IResourcePersistentId pid = match.iterator().next();
+      303  			theEntityToUpdate = readEntityLatestVersion(pid, theRequestDetails, theTransactionDetails);
+      304  
+      305  		} else {
+      306  			String msg = getContext()
+      307  					.getLocalizer()
+      308  					.getMessageSanitized(BaseStorageDao.class, "invalidMatchUrlNoMatches", theConditionalUrl);
+      309  			throw new ResourceNotFoundException(Msg.code(973) + msg);
+      310  		}
+      311  		return theEntityToUpdate;
+      312  	}
+      313  
+      314  	@Override
+      315  	@Nonnull
+      316  	public abstract Class<T> getResourceType();
+      317  
+      318  	@Override
+      319  	@Nonnull
+      320  	protected abstract String getResourceName();
+      321  
+      322  	protected abstract IBasePersistedResource readEntityLatestVersion(
+      323  			IResourcePersistentId thePersistentId,
+      324  			RequestDetails theRequestDetails,
+      325  			TransactionDetails theTransactionDetails);
+      326  
+      327  	protected abstract IBasePersistedResource readEntityLatestVersion(
+      328  			IIdType theId, RequestDetails theRequestDetails, TransactionDetails theTransactionDetails);
+      329  
+      330  	protected DaoMethodOutcome doUpdateForUpdateOrPatch(UpdateParameters<T> theUpdateParameters) {
+      331  
+      332  		if (theUpdateParameters.getResourceIdToUpdate().hasVersionIdPart()) {
+      333  			boolean versionMatches = theUpdateParameters.getResourceIdToUpdate().isVersionIdPartValidLong()
+      334  					&& Long.parseLong(
+      335  									theUpdateParameters.getResourceIdToUpdate().getVersionIdPart())
+      336  							== theUpdateParameters.getEntity().getVersion();
+      337  			if (!versionMatches) {
+      338  				throw new ResourceVersionConflictException(Msg.code(989) + "Trying to update "
+      339  						+ theUpdateParameters.getResourceIdToUpdate() + " but this is not the current version");
+      340  			}
+      341  		}
+      342  
+      343  		if (theUpdateParameters.getResourceIdToUpdate().hasResourceType()
+      344  				&& !theUpdateParameters
+      345  						.getResourceIdToUpdate()
+      346  						.getResourceType()
+      347  						.equals(getResourceName())) {
+      348  			throw new UnprocessableEntityException(Msg.code(990) + "Invalid resource ID["
+      349  					+ theUpdateParameters.getEntity().getIdDt().toUnqualifiedVersionless() + "] of type["
+      350  					+ theUpdateParameters.getEntity().getResourceType()
+      351  					+ "] - Does not match expected [" + getResourceName() + "]");
+      352  		}
+      353  
+      354  		IBaseResource oldResource;
+      355  		if (getStorageSettings().isMassIngestionMode()
+      356  				&& !theUpdateParameters.shouldForcePopulateOldResourceForProcessing()) {
+      357  			oldResource = null;
+      358  		} else {
+      359  			oldResource = getStorageResourceParser().toResource(theUpdateParameters.getEntity(), false);
+      360  		}
+      361  
+      362  		/*
+      363  		 * Mark the entity as not deleted - This is also done in the actual updateInternal()
+      364  		 * method later on so it usually doesn't matter whether we do it here, but in the
+      365  		 * case of a transaction with multiple PUTs we don't get there until later so
+      366  		 * having this here means that a transaction can have a reference in one
+      367  		 * resource to another resource in the same transaction that is being
+      368  		 * un-deleted by the transaction. Wacky use case, sure. But it's real.
+      369  		 *
+      370  		 * See SystemProviderR4Test#testTransactionReSavesPreviouslyDeletedResources
+      371  		 * for a test that needs this.
+      372  		 */
+      373  		boolean wasDeleted = theUpdateParameters.getEntity().isDeleted();
+      374  		theUpdateParameters.getEntity().setNotDeleted();
+      375  
+      376  		/*
+      377  		 * If we aren't indexing, that means we're doing this inside a transaction.
+      378  		 * The transaction will do the actual storage to the database a bit later on,
+      379  		 * after placeholder IDs have been replaced, by calling {@link #updateInternal}
+      380  		 * directly. So we just bail now.
+      381  		 */
+      382  		if (!theUpdateParameters.shouldPerformIndexing()) {
+      383  			theUpdateParameters
+      384  					.getResource()
+      385  					.setId(theUpdateParameters.getEntity().getIdDt().getValue());
+      386  			DaoMethodOutcome outcome = toMethodOutcome(
+      387  							theUpdateParameters.getRequest(),
+      388  							theUpdateParameters.getEntity(),
+      389  							theUpdateParameters.getResource(),
+      390  							theUpdateParameters.getMatchUrl(),
+      391  							theUpdateParameters.getOperationType())
+      392  					.setCreated(wasDeleted);
+      393  			outcome.setPreviousResource(oldResource);
+      394  			if (!outcome.isNop()) {
+      395  				// Technically this may not end up being right since we might not increment if the
+      396  				// contents turn out to be the same
+      397  				outcome.setId(outcome.getId()
+      398  						.withVersion(Long.toString(outcome.getId().getVersionIdPartAsLong() + 1)));
+      399  			}
+      400  			return outcome;
+      401  		}
+      402  
+      403  		/*
+      404  		 * Otherwise, we're not in a transaction
+      405  		 */
+      406  		return updateInternal(
+      407  				theUpdateParameters.getRequest(),
+      408  				theUpdateParameters.getResource(),
+      409  				theUpdateParameters.getMatchUrl(),
+      410  				theUpdateParameters.shouldPerformIndexing(),
+      411  				theUpdateParameters.shouldForceUpdateVersion(),
+      412  				theUpdateParameters.getEntity(),
+      413  				theUpdateParameters.getResourceIdToUpdate(),
+      414  				oldResource,
+      415  				theUpdateParameters.getOperationType(),
+      416  				theUpdateParameters.getTransactionDetails());
+      417  	}
+      418  
+      419  	public static void validateResourceType(IBasePersistedResource<?> theEntity, String theResourceName) {
+      420  		if (!theResourceName.equals(theEntity.getResourceType())) {
+      421  			throw new ResourceNotFoundException(Msg.code(935) + "Resource with ID "
+      422  					+ theEntity.getIdDt().getIdPart() + " exists but it is not of type " + theResourceName
+      423  					+ ", found resource of type " + theEntity.getResourceType());
+      424  		}
+      425  	}
+      426  
+      427  	protected DeleteMethodOutcome deleteExpunge(String theUrl, RequestDetails theRequest) {
+      428  		if (!getStorageSettings().canDeleteExpunge()) {
+      429  			throw new MethodNotAllowedException(Msg.code(963) + "_expunge is not enabled on this server: "
+      430  					+ getStorageSettings().cannotDeleteExpungeReason());
+      431  		}
+      432  
+      433  		RestfulServerUtils.DeleteCascadeDetails cascadeDelete =
+      434  				RestfulServerUtils.extractDeleteCascadeParameter(theRequest);
+      435  		boolean cascade = false;
+      436  		Integer cascadeMaxRounds = null;
+      437  		if (cascadeDelete.getMode() == DeleteCascadeModeEnum.DELETE) {
+      438  			cascade = true;
+      439  			cascadeMaxRounds = cascadeDelete.getMaxRounds();
+      440  			if (cascadeMaxRounds == null) {
+      441  				cascadeMaxRounds = myStorageSettings.getMaximumDeleteConflictQueryCount();
+      442  			} else if (myStorageSettings.getMaximumDeleteConflictQueryCount() != null
+      443  					&& myStorageSettings.getMaximumDeleteConflictQueryCount() < cascadeMaxRounds) {
+      444  				cascadeMaxRounds = myStorageSettings.getMaximumDeleteConflictQueryCount();
+      445  			}
+      446  		}
+      447  
+      448  		List<String> urlsToDeleteExpunge = Collections.singletonList(theUrl);
+      449  		try {
+      450  			String jobId = getDeleteExpungeJobSubmitter()
+      451  					.submitJob(
+      452  							getStorageSettings().getExpungeBatchSize(),
+      453  							urlsToDeleteExpunge,
+      454  							cascade,
+      455  							cascadeMaxRounds,
+      456  							theRequest);
+      457  			return new DeleteMethodOutcome(createInfoOperationOutcome("Delete job submitted with id " + jobId));
+      458  		} catch (InvalidRequestException e) {
+      459  			throw new InvalidRequestException(Msg.code(965) + "Invalid Delete Expunge Request: " + e.getMessage(), e);
+      460  		}
+      461  	}
+      462  }

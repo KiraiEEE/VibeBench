@@ -1,0 +1,270 @@
+row 56   mr3project/hive-mr3#73
+============================================================================
+CLASS org.apache.hadoop.hive.ql.reexec.ReExecDriver   loc=265 methods=23 wmc=44 lcom=0.0454545454545454 c3=0.0653146764438965
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       60  public class ReExecDriver implements IDriver {
+       61    private static final Logger LOG = LoggerFactory.getLogger(ReExecDriver.class);
+       62    private static final SessionState.LogHelper CONSOLE = new SessionState.LogHelper(LOG);
+       63  
+       64    private final Driver coreDriver;
+       65    private final QueryState queryState;
+       66    private final List<IReExecutionPlugin> plugins;
+       67  
+       68    private boolean explainReOptimization;
+       69    private String currentQuery;
+       70    private int executionIndex;
+       71  
+       72    public ReExecDriver(QueryState queryState, QueryInfo queryInfo, List<IReExecutionPlugin> plugins) {
+       73      this.queryState = queryState;
+       74      this.coreDriver = new Driver(queryState, queryInfo, null);
+       75      this.plugins = plugins;
+       76  
+       77      coreDriver.getHookRunner().addSemanticAnalyzerHook(new HandleReOptimizationExplain());
+       78      plugins.forEach(p -> p.initialize(coreDriver));
+       79    }
+       80  
+       81    @VisibleForTesting
+       82    public int compile(String command, boolean resetTaskIds) {
+       83      return coreDriver.compile(command, resetTaskIds);
+       84    }
+       85  
+       86    @VisibleForTesting
+       87    public List<IReExecutionPlugin> getPlugins() {
+       88      return plugins;
+       89    }
+       90  
+       91    private boolean firstExecution() {
+       92      return executionIndex == 0;
+       93    }
+       94  
+       95    private void checkHookConfig() throws CommandProcessorException {
+       96      String strategies = coreDriver.getConf().getVar(ConfVars.HIVE_QUERY_REEXECUTION_STRATEGIES);
+       97      CBOFallbackStrategy fallbackStrategy =
+       98          CBOFallbackStrategy.valueOf(coreDriver.getConf().getVar(ConfVars.HIVE_CBO_FALLBACK_STRATEGY));
+       99      if (fallbackStrategy.allowsRetry() &&
+      100          (strategies == null || !Arrays.stream(strategies.split(",")).anyMatch("recompile_without_cbo"::equals))) {
+      101        String errorMsg = "Invalid configuration. If fallbackStrategy is set to " + fallbackStrategy.name() + " then " +
+      102            ConfVars.HIVE_QUERY_REEXECUTION_STRATEGIES.varname + " should contain 'recompile_without_cbo'";
+      103        CONSOLE.printError(errorMsg);
+      104        throw new CommandProcessorException(errorMsg);
+      105      }
+      106    }
+      107  
+      108    @Override
+      109    public CommandProcessorResponse compileAndRespond(String statement) throws CommandProcessorException {
+      110      currentQuery = statement;
+      111  
+      112      checkHookConfig();
+      113  
+      114      int compileIndex = 0;
+      115      int maxCompilations = 1 + coreDriver.getConf().getIntVar(ConfVars.HIVE_QUERY_MAX_RECOMPILATION_COUNT);
+      116      while (true) {
+      117        compileIndex++;
+      118  
+      119        final int currentIndex = compileIndex;
+      120        plugins.forEach(p -> p.beforeCompile(currentIndex));
+      121  
+      122        LOG.info("Compile #{} of query", compileIndex);
+      123        CommandProcessorResponse cpr = null;
+      124        CommandProcessorException cpe = null;
+      125        try {
+      126          cpr = coreDriver.compileAndRespond(statement);
+      127        } catch (CommandProcessorException e) {
+      128          cpe = e;
+      129        }
+      130  
+      131        final boolean success = cpe == null;
+      132        plugins.forEach(p -> p.afterCompile(success));
+      133  
+      134        // If the compilation was successful return the result
+      135        if (success) {
+      136          return cpr;
+      137        }
+      138  
+      139        if (compileIndex >= maxCompilations || !plugins.stream().anyMatch(p -> p.shouldReCompile(currentIndex))) {
+      140          // If we do not have to recompile, return the last error
+      141          throw cpe;
+      142        }
+      143  
+      144        // Prepare for the recompile and start the next loop
+      145        plugins.forEach(IReExecutionPlugin::prepareToReCompile);
+      146      }
+      147    }
+      148  
+      149    @Override
+      150    public HiveConf getConf() {
+      151      return queryState.getConf();
+      152    }
+      153  
+      154    @Override
+      155    public QueryPlan getPlan() {
+      156      return coreDriver.getPlan();
+      157    }
+      158  
+      159    @Override
+      160    public QueryState getQueryState() {
+      161      return queryState;
+      162    }
+      163  
+      164    @Override
+      165    public QueryDisplay getQueryDisplay() {
+      166      return coreDriver.getQueryDisplay();
+      167    }
+      168  
+      169    @Override
+      170    public void setOperationId(String operationId) {
+      171      coreDriver.setOperationId(operationId);
+      172    }
+      173  
+      174    @Override
+      175    public CommandProcessorResponse run() throws CommandProcessorException {
+      176      executionIndex = 0;
+      177      int maxExecutions = 1 + coreDriver.getConf().getIntVar(ConfVars.HIVE_QUERY_MAX_REEXECUTION_COUNT);
+      178  
+      179      while (true) {
+      180        executionIndex++;
+      181  
+      182        for (IReExecutionPlugin p : plugins) {
+      183          p.beforeExecute(executionIndex, explainReOptimization);
+      184        }
+      185        coreDriver.getContext().setExecutionIndex(executionIndex);
+      186        LOG.info("Execution #{} of query", executionIndex);
+      187        CommandProcessorResponse cpr = null;
+      188        CommandProcessorException cpe = null;
+      189        try {
+      190          cpr = coreDriver.run();
+      191        } catch (CommandProcessorException e) {
+      192          cpe = e;
+      193        }
+      194  
+      195        PlanMapper oldPlanMapper = coreDriver.getPlanMapper();
+      196        boolean success = cpr != null;
+      197        plugins.forEach(p -> p.afterExecute(oldPlanMapper, success));
+      198  
+      199        boolean shouldReExecute = explainReOptimization && executionIndex==1;
+      200        shouldReExecute |= cpr == null && plugins.stream().anyMatch(p -> p.shouldReExecute(executionIndex));
+      201  
+      202        LOG.info("Re-execution decision is made according to: executionIndex: {}, maxExecutions: {}, shouldReExecute: {}",
+      203            executionIndex, maxExecutions, shouldReExecute);
+      204        if (executionIndex >= maxExecutions || !shouldReExecute) {
+      205          if (cpr != null) {
+      206            return cpr;
+      207          } else {
+      208            throw cpe;
+      209          }
+      210        }
+      211        LOG.info("Preparing to re-execute query");
+      212        plugins.forEach(IReExecutionPlugin::prepareToReExecute);
+      213  
+      214        try {
+      215          coreDriver.compileAndRespond(currentQuery);
+      216        } catch (CommandProcessorException e) {
+      217          LOG.error("Recompilation of the query failed; this is unexpected.");
+      218          // FIXME: somehow place pointers that re-execution compilation have failed; the query have been successfully compiled before?
+      219          throw e;
+      220        }
+      221  
+      222        PlanMapper newPlanMapper = coreDriver.getPlanMapper();
+      223        if (!explainReOptimization &&
+      224            !plugins.stream().anyMatch(p -> p.shouldReExecuteAfterCompile(executionIndex, oldPlanMapper, newPlanMapper))) {
+      225          LOG.info("re-running the query would probably not yield better results; returning with last error");
+      226          // FIXME: retain old error; or create a new one?
+      227          return cpr;
+      228        }
+      229      }
+      230    }
+      231  
+      232    @Override
+      233    public CommandProcessorResponse run(String command) throws CommandProcessorException {
+      234      compileAndRespond(command);
+      235      return run();
+      236    }
+      237  
+      238    @Override
+      239    public boolean getResults(List res) throws IOException {
+      240      return coreDriver.getResults(res);
+      241    }
+      242  
+      243    @Override
+      244    public void setMaxRows(int maxRows) {
+      245      coreDriver.setMaxRows(maxRows);
+      246    }
+      247  
+      248    @Override
+      249    public FetchTask getFetchTask() {
+      250      return coreDriver.getFetchTask();
+      251    }
+      252  
+      253    @Override
+      254    public Schema getSchema() {
+      255      if (explainReOptimization) {
+      256        return new Schema(ExplainTask.getResultSchema(), null);
+      257      }
+      258      return coreDriver.getSchema();
+      259    }
+      260  
+      261    @Override
+      262    public boolean isFetchingTable() {
+      263      return coreDriver.isFetchingTable();
+      264    }
+      265  
+      266    @Override
+      267    public void resetFetch() throws IOException {
+      268      coreDriver.resetFetch();
+      269    }
+      270  
+      271    @Override
+      272    public void close() {
+      273      coreDriver.close();
+      274    }
+      275  
+      276    @Override
+      277    public void destroy() {
+      278      coreDriver.destroy();
+      279    }
+      280  
+      281    @Override
+      282    public final Context getContext() {
+      283      return coreDriver.getContext();
+      284    }
+      285  
+      286    @VisibleForTesting
+      287    public void setStatsSource(StatsSource statsSource) {
+      288      coreDriver.setStatsSource(statsSource);
+      289    }
+      290  
+      291    @Override
+      292    public boolean hasResultSet() {
+      293      return explainReOptimization || coreDriver.hasResultSet();
+      294    }
+      295  
+      296    private class HandleReOptimizationExplain implements HiveSemanticAnalyzerHook {
+      297  
+      298      @Override
+      299      public ASTNode preAnalyze(HiveSemanticAnalyzerHookContext context, ASTNode ast) throws SemanticException {
+      300        if (ast.getType() == HiveParser.TOK_EXPLAIN) {
+      301          int childCount = ast.getChildCount();
+      302          for (int i = 1; i < childCount; i++) {
+      303            if (ast.getChild(i).getType() == HiveParser.KW_REOPTIMIZATION) {
+      304              explainReOptimization = true;
+      305              ast.deleteChild(i);
+      306              break;
+      307            }
+      308          }
+      309          if (explainReOptimization && firstExecution()) {
+      310            Tree execTree = ast.getChild(0);
+      311            execTree.setParent(ast.getParent());
+      312            ast.getParent().setChild(0, execTree);
+      313            return (ASTNode) execTree;
+      314          }
+      315        }
+      316        return ast;
+      317      }
+      318  
+      319      @Override
+      320      public void postAnalyze(HiveSemanticAnalyzerHookContext context, List<Task<?>> rootTasks)
+      321          throws SemanticException {
+      322      }
+      323    }
+      324  }

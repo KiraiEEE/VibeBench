@@ -261,6 +261,36 @@ def check_confound_controls(pr: pd.DataFrame) -> None:
         if not changed else f"agent ranking CHANGES for {changed} under resolution control")
 
 
+def check_degenerate_pairs(pr: pd.DataFrame) -> None:
+    head("J. DEGENERATE BEFORE/AFTER PAIRS (before == after)")
+    print("     A pair where before == after diffs to nothing, and every layer")
+    print("     above reads that emptiness as 'this PR touches no Java'. It cost")
+    print("     ~700 analysable PRs before it was found on 2026-09-01.")
+    okr = pr[pr.status == "ok"]
+    same = okr[okr.before_sha == okr.after_sha]
+    (ok if len(same) == 0 else fail)(
+        f"no analysable PR has before_sha == after_sha ({len(same)} found)")
+    empty = pr[pr.status == "no_touched_files"]
+    if len(empty):
+        import json as _json
+        base = Path(C.EXTRACT_DIR_JAVA)
+        bad = 0
+        for pid in empty.pr_id.astype(str):
+            f = base / pid / "_touched.json"
+            if not f.exists():
+                continue
+            try:
+                if not _json.loads(f.read_text()):
+                    bad += 1
+            except Exception:
+                pass
+        (ok if bad == 0 else fail)(
+            f"no PR is dropped on an EMPTY cached file list ({bad} found) -- "
+            f"an empty raw diff is a resolution failure, never an answer")
+    else:
+        ok("no PR carries the no_touched_files status")
+
+
 def check_stale() -> None:
     head("I. STALE ARTEFACTS must not sit beside V2 outputs")
     rep = Path(__file__).resolve().parents[1] / "04_report"
@@ -289,6 +319,7 @@ def main() -> None:
     check_label_samples()
     check_batches()
     check_confound_controls(pr)
+    check_degenerate_pairs(pr)
     check_stale()
     print("\n" + "=" * 70)
     print(f"RESULT: {len(FAILS)} FAIL, {len(WARNS)} warn")
