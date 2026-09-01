@@ -281,6 +281,14 @@ def derive_touched_files(d: Path, merge_sha: str | None,
     if diff.returncode != 0:
         return None
     files = [ln.strip() for ln in diff.stdout.splitlines() if ln.strip()]
+    if not files:
+        # Third instance of the same defect (all fixed 2026-09-01). A merge
+        # commit whose first-parent diff is empty is a resolution problem (a
+        # graft artefact of the depth-2 fetch, or a merge SHA that does not
+        # belong to this PR), never a description of the PR's content. Return
+        # None so the caller falls through to routes 2 and 3 instead of caching
+        # "no files" and dropping the PR.
+        return None
     return sorted(f for f in files if is_source_file(f, profile))
 
 
@@ -315,6 +323,25 @@ def derive_via_pull_ref(d: Path, pr, profile: dict) -> tuple[str, list[str]] | N
     if diff is None or diff.returncode != 0:
         return None
     files = [ln.strip() for ln in diff.stdout.splitlines() if ln.strip()]
+    if not files:
+        # AN EMPTY RAW DIFF IS A RESOLUTION FAILURE, NOT AN ANSWER (2026-09-01).
+        # `git diff A B` exiting 0 with no output means A and B are the same
+        # tree, i.e. the pair we resolved does not describe this PR. Returning
+        # `(after, [])` here made that indistinguishable from "this PR really
+        # touches no Java", and the caller caches any non-None result, so the
+        # PR was recorded as `no_touched_files` and silently dropped.
+        #
+        # MEASURED COST of getting this wrong: 2,819 PRs cached an empty list.
+        # Sampling 40 of them against the GitHub API, 10 (25%) DO change Java
+        # files -- qaiu/netdisk-fast-download#162 changes 208 of them and the
+        # local diff for our resolved pair returns zero. That is roughly 700
+        # analysable PRs, about 18% of the corpus, lost to a `[]` that looked
+        # like data.
+        #
+        # A real "no Java in this PR" still returns an empty list below, because
+        # `files` is non-empty in that case and only the .java filter empties it.
+        # The two are now distinguishable, which is the whole point.
+        return None
     return after, sorted(f for f in files if is_source_file(f, profile))
 
 
@@ -362,6 +389,8 @@ def derive_from_commit_set(d: Path, shas: list[str],
     head = tips[0]
 
     files: set[str] = set()
+
+    any_diff_ran = False
     for sha in shas:
         if len(parents[sha]) != 1:
             continue  # merge commit (or orphan root): not the agent's own change
@@ -375,8 +404,17 @@ def derive_from_commit_set(d: Path, shas: list[str],
         diff = run_git(["diff", "--name-only", "--diff-filter=ACMR", p, sha], cwd=d)
         if diff.returncode != 0:
             continue
-        files.update(f.strip() for f in diff.stdout.splitlines()
-                     if f.strip() and is_source_file(f.strip(), profile))
+        raw = [f.strip() for f in diff.stdout.splitlines() if f.strip()]
+        any_diff_ran = any_diff_ran or bool(raw)
+        files.update(f for f in raw if is_source_file(f, profile))
+    if not any_diff_ran:
+        # SAME DEFECT AS derive_via_pull_ref (fixed 2026-09-01). Every commit
+        # here can `continue` -- merge commit, unfetchable parent, non-zero
+        # diff -- and the function would still return an empty list, which the
+        # caller caches as the authoritative answer "this PR touches no Java".
+        # If not one diff produced a single path, we learned nothing about this
+        # PR and must say so rather than assert an empty result.
+        return None
     return head, sorted(files)
 
 

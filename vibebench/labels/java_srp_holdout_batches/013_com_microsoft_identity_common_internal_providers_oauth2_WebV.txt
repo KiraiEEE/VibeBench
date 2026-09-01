@@ -1,0 +1,406 @@
+row 13   AzureAD/microsoft-authentication-library-common-for-android#2983
+============================================================================
+CLASS com.microsoft.identity.common.internal.providers.oauth2.WebViewAuthorizationFragment   loc=598 methods=17 wmc=62 lcom=0.0 c3=0.147948079598575
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      104  public class WebViewAuthorizationFragment extends AuthorizationFragment {
+      105  
+      106      private static final String TAG = WebViewAuthorizationFragment.class.getSimpleName();
+      107  
+      108      @VisibleForTesting
+      109      private static final String PKEYAUTH_STATUS = "pkeyAuthStatus";
+      110  
+      111      private WebView mWebView;
+      112  
+      113      private AzureActiveDirectoryWebViewClient mAADWebViewClient;
+      114  
+      115      private ProgressBar mProgressBar;
+      116  
+      117      private Intent mAuthIntent;
+      118  
+      119      private boolean mPkeyAuthStatus = false;
+      120  
+      121      private String mAuthorizationRequestUrl;
+      122  
+      123      private String mRedirectUri;
+      124  
+      125      private HashMap<String, String> mRequestHeaders;
+      126  
+      127      // For MSAL CPP test cases only
+      128      private String mPostPageLoadedJavascript;
+      129  
+      130      private boolean webViewZoomControlsEnabled;
+      131  
+      132      private boolean webViewZoomEnabled;
+      133  
+      134      private boolean isWebViewWebcpEnabledInBrokerlessCase;
+      135  
+      136      private String mUtid;
+      137  
+      138      private final CameraPermissionRequestHandler mCameraPermissionRequestHandler = new CameraPermissionRequestHandler(this);
+      139  
+      140      // This is used by LegacyFido2ApiManager to launch a PendingIntent received by the legacy API.
+      141      private ActivityResultLauncher<LegacyFido2ApiObject> mFidoLauncher;
+      142      // This is used by the switch browser protocol to handle the resume of the flow.
+      143      private SwitchBrowserProtocolCoordinator mSwitchBrowserProtocolCoordinator = null;
+      144  
+      145      // FileProvider authority for sharing camera-capture temporary files with the camera app.
+      146      private static final String FILE_PROVIDER_AUTHORITY_SUFFIX = ".microsoft.common.file.provider";
+      147  
+      148      // Pending file chooser callback from the WebView; null when no file chooser is active.
+      149      private ValueCallback<Uri[]> mFilePathCallback;
+      150      // Temporary file created for camera capture; used to delete the file after the capture.
+      151      private File mCameraImageFile;
+      152      // Content URI for mCameraImageFile (produced by MsalFileProvider); passed to the camera app.
+      153      private Uri mCameraImageUri;
+      154      // Launcher for the file chooser / camera intent.
+      155      private ActivityResultLauncher<Intent> mFileChooserLauncher;
+      156  
+      157      private boolean isBrokerRequest = false;
+      158  
+      159      private static Bundle switchBrowserBundle;
+      160  
+      161      @Override
+      162      public void onCreate(@Nullable Bundle savedInstanceState) {
+      163          super.onCreate(savedInstanceState);
+      164          final String methodTag = TAG + ":onCreate";
+      165          Logger.verbose(methodTag, "WebViewAuthorizationFragment onCreate");
+      166          final FragmentActivity activity = getActivity();
+      167          if (activity != null) {
+      168              WebViewUtil.setDataDirectorySuffix(activity.getApplicationContext());
+      169          }
+      170          if (CommonFlightsManager.INSTANCE.getFlightsProvider().isFlightEnabled(CommonFlight.ENABLE_LEGACY_FIDO_SECURITY_KEY_LOGIC)
+      171                  && Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+      172              mFidoLauncher = registerForActivityResult(
+      173                      new LegacyFidoActivityResultContract(),
+      174                      result -> {
+      175                          Logger.info(methodTag, "Legacy FIDO2 API result received.");
+      176                      }
+      177              );
+      178          }
+      179          // Register the file chooser launcher unconditionally so it is always available for
+      180          // onShowFileChooser() regardless of flight state changes during the fragment lifetime.
+      181          // The callback handles three cases:
+      182          //   1. User cancelled  → results will be null → pass null to WebView callback.
+      183          //   2. File picker selection → parseResult() returns non-null Uri[].
+      184          //   3. Camera capture → data is null but mCameraImageUri points to the captured image.
+      185          // The camera temp file is deleted after use to prevent unbounded cache growth.
+      186          mFileChooserLauncher = registerForActivityResult(
+      187                  new ActivityResultContracts.StartActivityForResult(),
+      188                  (ActivityResult result) -> {
+      189                      if (mFilePathCallback == null) {
+      190                          return;
+      191                      }
+      192                      // parseResult handles null data gracefully and returns null on cancellation.
+      193                      Uri[] results = WebChromeClient.FileChooserParams.parseResult(
+      194                              result.getResultCode(), result.getData());
+      195                      if (results == null && mCameraImageUri != null
+      196                              && result.getResultCode() == Activity.RESULT_OK) {
+      197                          // Camera capture: the image was written directly to mCameraImageUri.
+      198                          results = new Uri[]{mCameraImageUri};
+      199                      }
+      200                      mFilePathCallback.onReceiveValue(results);
+      201                      mFilePathCallback = null;
+      202                      // Delete the temporary camera file now that it has been consumed (or
+      203                      // the chooser was cancelled). This prevents accumulation in the cache.
+      204                      deleteCameraTempFile();
+      205                  }
+      206          );
+      207      }
+      208  
+      209      @Override
+      210      public void onResume() {
+      211          super.onResume();
+      212          Logger.verbose(TAG + ":onResume", "WebViewAuthorizationFragment onResume");
+      213          if (getSwitchBrowserCoordinator().isExpectingSwitchBrowserResume()) {
+      214              resumeSwitchBrowser();
+      215          } else {
+      216              setSwitchBrowserBundle(null);
+      217          }
+      218      }
+      219  
+      220      /**
+      221       * Resume the switch browser protocol flow.
+      222       */
+      223      private void resumeSwitchBrowser() {
+      224          final String methodTag = TAG + ":resumeSwitchBrowser";
+      225          try {
+      226              if (switchBrowserBundle == null) {
+      227                  throw new ClientException(
+      228                          ClientException.NULL_OBJECT,
+      229                          "No switch browser bundle found to resume the flow."
+      230                  );
+      231              }
+      232              Logger.info(methodTag, "Resuming switch browser flow");
+      233              getSwitchBrowserCoordinator().processSwitchBrowserResume(
+      234                      mAuthorizationRequestUrl,
+      235                      switchBrowserBundle,
+      236                      (switchBrowserResumeUri, switchBrowserResumeHeaders) -> {
+      237                          launchWebView(switchBrowserResumeUri.toString(), switchBrowserResumeHeaders);
+      238                          return null;
+      239                      }
+      240              );
+      241              setSwitchBrowserBundle(null);
+      242          } catch (final ClientException e) {
+      243              Logger.error(methodTag, "Error processing switch browser resume", e);
+      244              sendResult(RawAuthorizationResult.fromException(e));
+      245              finish();
+      246          }
+      247      }
+      248  
+      249      @Override
+      250      public void onSaveInstanceState(@NonNull Bundle outState) {
+      251          super.onSaveInstanceState(outState);
+      252          outState.putParcelable(AUTH_INTENT, mAuthIntent);
+      253          outState.putBoolean(PKEYAUTH_STATUS, mPkeyAuthStatus);
+      254          outState.putString(REDIRECT_URI, mRedirectUri);
+      255          outState.putString(REQUEST_URL, mAuthorizationRequestUrl);
+      256          outState.putSerializable(REQUEST_HEADERS, mRequestHeaders);
+      257          outState.putSerializable(POST_PAGE_LOADED_URL, mPostPageLoadedJavascript);
+      258          outState.putBoolean(WEB_VIEW_ZOOM_CONTROLS_ENABLED, webViewZoomControlsEnabled);
+      259          outState.putBoolean(WEB_VIEW_ZOOM_ENABLED, webViewZoomEnabled);
+      260          outState.putBoolean(WEB_VIEW_WEB_CP_ENABLED, isWebViewWebcpEnabledInBrokerlessCase);
+      261          outState.putString(UTID, mUtid);
+      262      }
+      263  
+      264      @Override
+      265      void extractState(@NonNull final Bundle state) {
+      266          super.extractState(state);
+      267          mAuthIntent = state.getParcelable(AUTH_INTENT);
+      268          mPkeyAuthStatus = state.getBoolean(PKEYAUTH_STATUS, false);
+      269          mAuthorizationRequestUrl = state.getString(REQUEST_URL);
+      270          final Context context = getContext();
+      271          if (context != null) {
+      272              isBrokerRequest = ProcessUtil.isRunningOnAuthService(context);
+      273          }
+      274          mRedirectUri = state.getString(REDIRECT_URI);
+      275          mRequestHeaders = getRequestHeaders(state);
+      276          mPostPageLoadedJavascript = state.getString(POST_PAGE_LOADED_URL);
+      277          webViewZoomEnabled = state.getBoolean(WEB_VIEW_ZOOM_ENABLED, true);
+      278          webViewZoomControlsEnabled = state.getBoolean(WEB_VIEW_ZOOM_CONTROLS_ENABLED, true);
+      279          isWebViewWebcpEnabledInBrokerlessCase = state.getBoolean(WEB_VIEW_WEB_CP_ENABLED, false);
+      280          mUtid = state.getString(UTID);
+      281      }
+      282  
+      283      @Nullable
+      284      @Override
+      285      public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container, @Nullable Bundle savedInstanceState) {
+      286          final String methodTag = TAG + ":onCreateView";
+      287          final View view = inflater.inflate(R.layout.common_activity_authentication, container, false);
+      288          mProgressBar = view.findViewById(R.id.common_auth_webview_progressbar);
+      289  
+      290          final FragmentActivity activity = getActivity();
+      291          if (activity == null) {
+      292              return null;
+      293          }
+      294          mAADWebViewClient = new AzureActiveDirectoryWebViewClient(
+      295                  activity,
+      296                  new AuthorizationCompletionCallback(),
+      297                  new OnPageLoadedCallback() {
+      298                      @Override
+      299                      public void onPageLoaded(final String url) {
+      300                          final String[] javascriptToExecute = new String[1];
+      301                          mProgressBar.setVisibility(View.INVISIBLE);
+      302                          try {
+      303                              javascriptToExecute[0] = String.format("window.expectedUrl = '%s';%n%s",
+      304                                      URLEncoder.encode(url, "UTF-8"),
+      305                                      mPostPageLoadedJavascript);
+      306                          } catch (final UnsupportedEncodingException e) {
+      307                              // Encode url component failed, fallback.
+      308                              Logger.warn(methodTag, "Inject expectedUrl failed.");
+      309                          }
+      310                          // Inject the javascript string from testing. This should only be evaluated if we haven't sent
+      311                          // an auth result already.
+      312                          if (!mAuthResultSent && !StringExtensions.isNullOrBlank(javascriptToExecute[0])) {
+      313                              mWebView.evaluateJavascript(javascriptToExecute[0], null);
+      314                          }
+      315                      }
+      316                  },
+      317                  mRedirectUri,
+      318                  getSwitchBrowserCoordinator().getSwitchBrowserRequestHandler(),
+      319                  mUtid,
+      320                  isWebViewWebcpEnabledInBrokerlessCase,
+      321                  new IUrlLoadTracker() {
+      322                      @Override
+      323                      public void trackNewUrlStatus(final String url, final String loadingError, final String authError) {
+      324                          WebViewAuthorizationFragment.this.trackUrlStatus(url, loadingError, authError);
+      325                      }
+      326  
+      327                      @Override
+      328                      public void updateLatestUrlStatus(final String loadingError, final String authError) {
+      329                          WebViewAuthorizationFragment.this.updateLatestUrlStatus(loadingError, authError);
+      330                      }
+      331  
+      332                      @Override
+      333                      public Map<Integer, UrlStatus> getUrlStatusMap() {
+      334                          return WebViewAuthorizationFragment.this.getUrlLoadTracker();
+      335                      }
+      336                  }
+      337          );
+      338          setUpWebView(view, mAADWebViewClient);
+      339          mAADWebViewClient.initializeAuthUxJavaScriptApi(mWebView, mAuthorizationRequestUrl);
+      340          launchWebView(mAuthorizationRequestUrl, mRequestHeaders);
+      341          return view;
+      342      }
+      343  
+      344      @Override
+      345      public void handleBackButtonPressed() {
+      346          final String methodTag = TAG + ":handleBackButtonPressed";
+      347          Logger.info(methodTag, "Back button is pressed");
+      348  
+      349          if (mWebView.canGoBack()) {
+      350              mWebView.goBack();
+      351          } else {
+      352              cancelAuthorization(true);
+      353          }
+      354      }
+      355  
+      356      /**
+      357       * Set up the web view configurations.
+      358       *
+      359       * @param view          View
+      360       * @param webViewClient AzureActiveDirectoryWebViewClient
+      361       */
+      362      @SuppressLint({"SetJavaScriptEnabled", "ClickableViewAccessibility"})
+      363      private void setUpWebView(@NonNull final View view,
+      364                                @NonNull final AzureActiveDirectoryWebViewClient webViewClient) {
+      365          final String methodTag = TAG + ":setUpWebView";
+      366  
+      367          // Create the Web View to show the page
+      368          mWebView = view.findViewById(R.id.common_auth_webview);
+      369          final WebSettings webSettings = mWebView.getSettings();
+      370          final String userAgent = webSettings.getUserAgentString();
+      371          webSettings.setUserAgentString(
+      372                  userAgent + AuthenticationConstants.Broker.CLIENT_TLS_NOT_SUPPORTED);
+      373          webSettings.setJavaScriptEnabled(true);
+      374  
+      375          // Security settings to prevent unauthorized access - controlled by flight
+      376          if (CommonFlightsManager.INSTANCE.getFlightsProvider().isFlightEnabled(CommonFlight.ENABLE_WEBVIEW_SECURITY_SETTINGS)) {
+      377              webSettings.setAllowFileAccess(false);
+      378              webSettings.setAllowContentAccess(false);
+      379              webSettings.setAllowFileAccessFromFileURLs(false);
+      380              webSettings.setAllowUniversalAccessFromFileURLs(false);
+      381              webSettings.setGeolocationEnabled(false);
+      382          }
+      383  
+      384          mWebView.requestFocus(View.FOCUS_DOWN);
+      385  
+      386          // Set focus to the view for touch event
+      387          mWebView.setOnTouchListener(new View.OnTouchListener() {
+      388              @Override
+      389              public boolean onTouch(final View view, final MotionEvent event) {
+      390                  int action = event.getAction();
+      391                  if ((action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_UP) && !view.hasFocus()) {
+      392                      view.requestFocus();
+      393                  }
+      394                  return false;
+      395              }
+      396          });
+      397  
+      398          mWebView.getSettings().setLoadWithOverviewMode(true);
+      399          mWebView.getSettings().setDomStorageEnabled(true);
+      400          mWebView.getSettings().setUseWideViewPort(true);
+      401          mWebView.getSettings().setBuiltInZoomControls(webViewZoomControlsEnabled);
+      402          mWebView.getSettings().setSupportZoom(webViewZoomEnabled);
+      403          mWebView.setVisibility(View.INVISIBLE);
+      404          mWebView.setWebViewClient(webViewClient);
+      405          mWebView.setWebChromeClient(new WebChromeClient() {
+      406              @Override
+      407              public void onPermissionRequest(final PermissionRequest request) {
+      408                  requireActivity().runOnUiThread(() -> {
+      409                      // Log the permission request
+      410                      Logger.info(methodTag,
+      411                              "Permission requested from:" + request.getOrigin() +
+      412                                      " for resources:" + Arrays.toString(request.getResources())
+      413                      );
+      414                      mCameraPermissionRequestHandler.handle(request, requireContext());
+      415                  });
+      416              }
+      417  
+      418              @Override
+      419              public Bitmap getDefaultVideoPoster() {
+      420                  // When not playing, video elements are represented by a 'poster' image.
+      421                  // The image to use can be specified by the poster attribute of the video tag in HTML.
+      422                  // If the attribute is absent, then a default poster will be used.
+      423                  // This method allows the ChromeClient to provide that default image.
+      424                  // We will return a 10x10 empty image, instead of the default grey playback image. #2424
+      425                  return Bitmap.createBitmap(10, 10, Bitmap.Config.ARGB_8888);
+      426              }
+      427  
+      428              @Override
+      429              public boolean onShowFileChooser(final WebView webView,
+      430                                               final ValueCallback<Uri[]> filePathCallback,
+      431                                               final FileChooserParams fileChooserParams) {
+      432                  if (!CommonFlightsManager.INSTANCE.getFlightsProvider()
+      433                          .isFlightEnabled(CommonFlight.ENABLE_WEBVIEW_FILE_CHOOSER)) {
+      434                      return false;
+      435                  }
+      436                  final String fileChooserTag = methodTag + ":onShowFileChooser";
+      437                  Logger.info(fileChooserTag, "WebView requested file chooser.");
+      438                  // Cancel any previous pending callback to avoid leaking it.
+      439                  if (mFilePathCallback != null) {
+      440                      mFilePathCallback.onReceiveValue(null);
+      441                      mFilePathCallback = null;
+      442                  }
+      443                  mFilePathCallback = filePathCallback;
+      444                  // Build the file chooser intent from the WebView's params (GET_CONTENT).
+      445                  final Intent filePickerIntent = fileChooserParams.createIntent();
+      446                  // Attempt to add camera capture as an additional option by creating a
+      447                  // temporary file in the app's cache directory. Using getCacheDir() ensures
+      448                  // the file is stored in an app-private location and the path is valid on
+      449                  // all Android versions. The content URI produced by MsalFileProvider is
+      450                  // required for Android 7+ to avoid FileUriExposedException.
+      451                  Intent cameraIntent = null;
+      452                  try {
+      453                      final File tempFile = File.createTempFile(
+      454                              "msal_image_capture_", ".jpg", requireContext().getCacheDir());
+      455                      mCameraImageFile = tempFile;
+      456                      mCameraImageUri = MsalFileProvider.getUriForFile(
+      457                              requireContext(),
+      458                              requireContext().getPackageName() + FILE_PROVIDER_AUTHORITY_SUFFIX,
+      459                              tempFile);
+      460                      cameraIntent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+      461                      cameraIntent.putExtra(MediaStore.EXTRA_OUTPUT, mCameraImageUri);
+      462                  } catch (final IOException e) {
+      463                      Logger.warn(fileChooserTag,
+      464                              "Failed to create temporary file in cache directory for camera capture: "
+      465                                      + e.getMessage());
+      466                      mCameraImageFile = null;
+      467                      mCameraImageUri = null;
+      468                  } catch (final IllegalArgumentException e) {
+      469                      // FileProvider not configured or authority mismatch; proceed without camera.
+      470                      Logger.warn(fileChooserTag,
+      471                              "MsalFileProvider configuration issue — verify that the provider "
+      472                                      + "authority matches '" + requireContext().getPackageName()
+      473                                      + FILE_PROVIDER_AUTHORITY_SUFFIX
+      474                                      + "' and that msal_image_capture_paths.xml is referenced "
+      475                                      + "correctly in AndroidManifest.xml. Camera capture unavailable: "
+      476                                      + e.getMessage());
+      477                      mCameraImageFile = null;
+      478                      mCameraImageUri = null;
+      479                  }
+      480                  // Combine file picker and (if available) camera capture into one chooser.
+      481                  final Intent chooserIntent;
+      482                  if (cameraIntent != null) {
+      483                      chooserIntent = Intent.createChooser(filePickerIntent, null);
+      484                      chooserIntent.putExtra(Intent.EXTRA_INITIAL_INTENTS,
+      485                              new Intent[]{cameraIntent});
+      486                  } else {
+      487                      chooserIntent = filePickerIntent;
+      488                  }
+      489                  try {
+      490                      mFileChooserLauncher.launch(chooserIntent);
+      491                  } catch (final ActivityNotFoundException e) {
+      492                      Logger.error(fileChooserTag, "No activity available to handle file chooser.", e);
+      493                      mFilePathCallback.onReceiveValue(null);
+      494                      mFilePathCallback = null;
+      495                      deleteCameraTempFile();
+      496                      return false;
+      497                  }
+      498                  return true;
+      499              }
+      500          });
+      501          setupPasskeyWebListener(mWebView, webViewClient);
+      502      }
+      503  
+       ... truncated at 400 lines ...

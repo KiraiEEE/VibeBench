@@ -1,0 +1,406 @@
+row 18   apache/atlas#529
+============================================================================
+CLASS org.apache.atlas.notification.NotificationHookConsumer.HookConsumer   loc=458 methods=7 wmc=65 lcom=0.0 c3=0.1409641165756089
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      528      @VisibleForTesting
+      529      class HookConsumer extends ShutdownableThread {
+      530          private final NotificationConsumer<HookNotification> consumer;
+      531          private final AtomicBoolean                          shouldRun      = new AtomicBoolean(false);
+      532          private final List<String>                           failedMessages = new ArrayList<>();
+      533          private final AdaptiveWaiter                         adaptiveWaiter = new AdaptiveWaiter(minWaitDuration, maxWaitDuration, minWaitDuration);
+      534  
+      535          public HookConsumer(NotificationConsumer<HookNotification> consumer) {
+      536              super("atlas-hook-consumer-thread", false);
+      537  
+      538              this.consumer = consumer;
+      539          }
+      540  
+      541          @Override
+      542          public void doWork() {
+      543              LOG.info("==> HookConsumer doWork()");
+      544  
+      545              shouldRun.set(true);
+      546  
+      547              if (!serverAvailable(new NotificationHookConsumer.Timer())) {
+      548                  return;
+      549              }
+      550  
+      551              try {
+      552                  while (shouldRun.get()) {
+      553                      try {
+      554                          List<AtlasKafkaMessage<HookNotification>> messages = consumer.receiveWithCheckedCommit(lastCommittedPartitionOffset);
+      555  
+      556                          for (AtlasKafkaMessage<HookNotification> msg : messages) {
+      557                              handleMessage(msg);
+      558                          }
+      559                      } catch (IllegalStateException ex) {
+      560                          adaptiveWaiter.pause(ex);
+      561                      } catch (Exception e) {
+      562                          if (shouldRun.get()) {
+      563                              LOG.warn("Exception in NotificationHookConsumer", e);
+      564  
+      565                              adaptiveWaiter.pause(e);
+      566                          } else {
+      567                              break;
+      568                          }
+      569                      }
+      570                  }
+      571              } finally {
+      572                  if (consumer != null) {
+      573                      LOG.info("closing NotificationConsumer");
+      574  
+      575                      consumer.close();
+      576                  }
+      577  
+      578                  LOG.info("<== HookConsumer doWork()");
+      579              }
+      580          }
+      581  
+      582          @VisibleForTesting
+      583          void handleMessage(AtlasKafkaMessage<HookNotification> kafkaMsg) throws AtlasServiceException, AtlasException {
+      584              AtlasPerfTracer  perf           = null;
+      585              HookNotification message        = kafkaMsg.getMessage();
+      586              String           messageUser    = message.getUser();
+      587              long             startTime      = System.currentTimeMillis();
+      588              NotificationStat stats          = new NotificationStat();
+      589              AuditLog         auditLog       = null;
+      590  
+      591              if (authorizeUsingMessageUser) {
+      592                  setCurrentUser(messageUser);
+      593              }
+      594  
+      595              if (AtlasPerfTracer.isPerfTraceEnabled(PERF_LOG)) {
+      596                  perf = AtlasPerfTracer.getPerfTracer(PERF_LOG, message.getType().name());
+      597              }
+      598  
+      599              try {
+      600                  // covert V1 messages to V2 to enable preProcess
+      601                  try {
+      602                      switch (message.getType()) {
+      603                          case ENTITY_CREATE: {
+      604                              final EntityCreateRequest      createRequest = (EntityCreateRequest) message;
+      605                              final AtlasEntitiesWithExtInfo entities      = instanceConverter.toAtlasEntities(createRequest.getEntities());
+      606                              final EntityCreateRequestV2    v2Request     = new EntityCreateRequestV2(message.getUser(), entities);
+      607  
+      608                              kafkaMsg = new AtlasKafkaMessage<>(v2Request, kafkaMsg.getOffset(), kafkaMsg.getTopic(), kafkaMsg.getPartition());
+      609                              message  = kafkaMsg.getMessage();
+      610                          }
+      611                          break;
+      612  
+      613                          case ENTITY_FULL_UPDATE: {
+      614                              final EntityUpdateRequest      updateRequest = (EntityUpdateRequest) message;
+      615                              final AtlasEntitiesWithExtInfo entities      = instanceConverter.toAtlasEntities(updateRequest.getEntities());
+      616                              final EntityUpdateRequestV2    v2Request     = new EntityUpdateRequestV2(messageUser, entities);
+      617  
+      618                              kafkaMsg = new AtlasKafkaMessage<>(v2Request, kafkaMsg.getOffset(), kafkaMsg.getTopic(), kafkaMsg.getPartition());
+      619                              message  = kafkaMsg.getMessage();
+      620                          }
+      621                          break;
+      622                      }
+      623                  } catch (AtlasBaseException excp) {
+      624                      LOG.error("handleMessage(): failed to convert V1 message to V2", message.getType().name());
+      625                  }
+      626  
+      627                  PreprocessorContext context = preProcessNotificationMessage(kafkaMsg);
+      628  
+      629                  if (isEmptyMessage(kafkaMsg)) {
+      630                      commit(kafkaMsg);
+      631                      return;
+      632                  }
+      633  
+      634                  // Used for intermediate conversions during create and update
+      635                  String exceptionClassName = StringUtils.EMPTY;
+      636                  for (int numRetries = 0; numRetries < maxRetries; numRetries++) {
+      637                      if (LOG.isDebugEnabled()) {
+      638                          LOG.debug("handleMessage({}): attempt {}", message.getType().name(), numRetries);
+      639                      }
+      640  
+      641                      try {
+      642                          RequestContext requestContext = RequestContext.get();
+      643  
+      644                          requestContext.setAttemptCount(numRetries + 1);
+      645                          requestContext.setMaxAttempts(maxRetries);
+      646  
+      647                          requestContext.setUser(messageUser, null);
+      648                          requestContext.setInNotificationProcessing(true);
+      649                          requestContext.setCreateShellEntityForNonExistingReference(createShellEntityForNonExistingReference);
+      650  
+      651                          switch (message.getType()) {
+      652                              case ENTITY_CREATE: {
+      653                                  final EntityCreateRequest      createRequest = (EntityCreateRequest) message;
+      654                                  final AtlasEntitiesWithExtInfo entities      = instanceConverter.toAtlasEntities(createRequest.getEntities());
+      655  
+      656                                  if (auditLog == null) {
+      657                                      auditLog = new AuditLog(messageUser, THREADNAME_PREFIX,
+      658                                                              AtlasClientV2.API_V2.CREATE_ENTITY.getMethod(),
+      659                                                              AtlasClientV2.API_V2.CREATE_ENTITY.getNormalizedPath());
+      660                                  }
+      661  
+      662                                  createOrUpdate(entities, false, stats, context);
+      663                              }
+      664                              break;
+      665  
+      666                              case ENTITY_PARTIAL_UPDATE: {
+      667                                  final EntityPartialUpdateRequest partialUpdateRequest = (EntityPartialUpdateRequest) message;
+      668                                  final Referenceable              referenceable        = partialUpdateRequest.getEntity();
+      669                                  final AtlasEntitiesWithExtInfo   entities             = instanceConverter.toAtlasEntity(referenceable);
+      670  
+      671                                  if (auditLog == null) {
+      672                                      auditLog = new AuditLog(messageUser, THREADNAME_PREFIX,
+      673                                                              AtlasClientV2.API_V2.UPDATE_ENTITY_BY_ATTRIBUTE.getMethod(),
+      674                                                              String.format(AtlasClientV2.API_V2.UPDATE_ENTITY_BY_ATTRIBUTE.getNormalizedPath(), partialUpdateRequest.getTypeName()));
+      675                                  }
+      676  
+      677                                  AtlasEntityType entityType = typeRegistry.getEntityTypeByName(partialUpdateRequest.getTypeName());
+      678                                  String          guid       = AtlasGraphUtilsV2.getGuidByUniqueAttributes(entityType, Collections.singletonMap(partialUpdateRequest.getAttribute(), (Object)partialUpdateRequest.getAttributeValue()));
+      679  
+      680                                  // There should only be one root entity
+      681                                  entities.getEntities().get(0).setGuid(guid);
+      682  
+      683                                  createOrUpdate(entities, true, stats, context);
+      684                              }
+      685                              break;
+      686  
+      687                              case ENTITY_DELETE: {
+      688                                  final EntityDeleteRequest deleteRequest = (EntityDeleteRequest) message;
+      689  
+      690                                  if (auditLog == null) {
+      691                                      auditLog = new AuditLog(messageUser, THREADNAME_PREFIX,
+      692                                                              AtlasClientV2.API_V2.DELETE_ENTITY_BY_ATTRIBUTE.getMethod(),
+      693                                                              String.format(AtlasClientV2.API_V2.DELETE_ENTITY_BY_ATTRIBUTE.getNormalizedPath(), deleteRequest.getTypeName()));
+      694                                  }
+      695  
+      696                                  try {
+      697                                      AtlasEntityType type = (AtlasEntityType) typeRegistry.getType(deleteRequest.getTypeName());
+      698  
+      699                                      EntityMutationResponse response = atlasEntityStore.deleteByUniqueAttributes(type, Collections.singletonMap(deleteRequest.getAttribute(), (Object) deleteRequest.getAttributeValue()));
+      700  
+      701                                      stats.updateStats(response);
+      702                                      entityCorrelationManager.add(kafkaMsg.getSpooled(), kafkaMsg.getMsgCreated(), response.getDeletedEntities());
+      703                                  } catch (ClassCastException cle) {
+      704                                      LOG.error("Failed to delete entity {}", deleteRequest);
+      705                                  }
+      706                              }
+      707                              break;
+      708  
+      709                              case ENTITY_FULL_UPDATE: {
+      710                                  final EntityUpdateRequest      updateRequest = (EntityUpdateRequest) message;
+      711                                  final AtlasEntitiesWithExtInfo entities      = instanceConverter.toAtlasEntities(updateRequest.getEntities());
+      712  
+      713                                  if (auditLog == null) {
+      714                                      auditLog = new AuditLog(messageUser, THREADNAME_PREFIX,
+      715                                                              AtlasClientV2.API_V2.UPDATE_ENTITY.getMethod(),
+      716                                                              AtlasClientV2.API_V2.UPDATE_ENTITY.getNormalizedPath());
+      717                                  }
+      718  
+      719                                  createOrUpdate(entities, false, stats, context);
+      720                              }
+      721                              break;
+      722  
+      723                              case ENTITY_CREATE_V2: {
+      724                                  final EntityCreateRequestV2 createRequestV2 = (EntityCreateRequestV2) message;
+      725                                  final AtlasEntitiesWithExtInfo entities        = createRequestV2.getEntities();
+      726  
+      727                                  if (auditLog == null) {
+      728                                      auditLog = new AuditLog(messageUser, THREADNAME_PREFIX,
+      729                                                              AtlasClientV2.API_V2.CREATE_ENTITY.getMethod(),
+      730                                                              AtlasClientV2.API_V2.CREATE_ENTITY.getNormalizedPath());
+      731                                  }
+      732  
+      733                                  createOrUpdate(entities, false, stats, context);
+      734                              }
+      735                              break;
+      736  
+      737                              case ENTITY_PARTIAL_UPDATE_V2: {
+      738                                  final EntityPartialUpdateRequestV2 partialUpdateRequest = (EntityPartialUpdateRequestV2) message;
+      739                                  final AtlasObjectId                entityId             = partialUpdateRequest.getEntityId();
+      740                                  final AtlasEntityWithExtInfo       entity               = partialUpdateRequest.getEntity();
+      741  
+      742                                  if (auditLog == null) {
+      743                                      auditLog = new AuditLog(messageUser, THREADNAME_PREFIX,
+      744                                                              AtlasClientV2.API_V2.UPDATE_ENTITY.getMethod(),
+      745                                                              AtlasClientV2.API_V2.UPDATE_ENTITY.getNormalizedPath());
+      746                                  }
+      747  
+      748                                  EntityMutationResponse response = atlasEntityStore.updateEntity(entityId, entity, true);
+      749  
+      750                                  stats.updateStats(response);
+      751                              }
+      752                              break;
+      753  
+      754                              case ENTITY_FULL_UPDATE_V2: {
+      755                                  final EntityUpdateRequestV2    updateRequest = (EntityUpdateRequestV2) message;
+      756                                  final AtlasEntitiesWithExtInfo entities      = updateRequest.getEntities();
+      757  
+      758                                  if (auditLog == null) {
+      759                                      auditLog = new AuditLog(messageUser, THREADNAME_PREFIX,
+      760                                                              AtlasClientV2.API_V2.UPDATE_ENTITY.getMethod(),
+      761                                                              AtlasClientV2.API_V2.UPDATE_ENTITY.getNormalizedPath());
+      762                                  }
+      763  
+      764                                  createOrUpdate(entities, false, stats, context);
+      765                              }
+      766                              break;
+      767  
+      768                              case ENTITY_DELETE_V2: {
+      769                                  final EntityDeleteRequestV2 deleteRequest = (EntityDeleteRequestV2) message;
+      770                                  final List<AtlasObjectId>   entities      = deleteRequest.getEntities();
+      771  
+      772                                  try {
+      773                                      for (AtlasObjectId entity : entities) {
+      774                                          if (auditLog == null) {
+      775                                              auditLog = new AuditLog(messageUser, THREADNAME_PREFIX,
+      776                                                                      AtlasClientV2.API_V2.DELETE_ENTITY_BY_ATTRIBUTE.getMethod(),
+      777                                                                      String.format(AtlasClientV2.API_V2.DELETE_ENTITY_BY_ATTRIBUTE.getNormalizedPath(), entity.getTypeName()));
+      778                                          }
+      779  
+      780                                          AtlasEntityType type = (AtlasEntityType) typeRegistry.getType(entity.getTypeName());
+      781  
+      782                                          EntityMutationResponse response = atlasEntityStore.deleteByUniqueAttributes(type, entity.getUniqueAttributes());
+      783  
+      784                                          stats.updateStats(response);
+      785                                          entityCorrelationManager.add(kafkaMsg.getSpooled(), kafkaMsg.getMsgCreated(), response.getDeletedEntities());
+      786                                      }
+      787                                  } catch (ClassCastException cle) {
+      788                                      LOG.error("Failed to do delete entities {}", entities);
+      789                                  }
+      790                              }
+      791                              break;
+      792  
+      793                              default:
+      794                                  throw new IllegalStateException("Unknown notification type: " + message.getType().name());
+      795                          }
+      796  
+      797                          if (StringUtils.isNotEmpty(exceptionClassName)) {
+      798                              LOG.warn("{}: Pausing & retry: Try: {}: Pause: {} ms. Handled!",
+      799                                                  exceptionClassName, numRetries, adaptiveWaiter.waitDuration);
+      800                              exceptionClassName = StringUtils.EMPTY;
+      801                          }
+      802                          break;
+      803                      } catch (Throwable e) {
+      804                          RequestContext.get().resetEntityGuidUpdates();
+      805                          exceptionClassName = e.getClass().getSimpleName();
+      806  
+      807                          if (numRetries == (maxRetries - 1)) {
+      808                              String strMessage = AbstractNotification.getMessageJson(message);
+      809  
+      810                              LOG.warn("Max retries exceeded for message {}", strMessage, e);
+      811  
+      812                              stats.isFailedMsg = true;
+      813  
+      814                              failedMessages.add(strMessage);
+      815  
+      816                              if (failedMessages.size() >= failedMsgCacheSize) {
+      817                                  recordFailedMessages();
+      818                              }
+      819                              return;
+      820                          } else if (e instanceof org.apache.atlas.repository.graphdb.AtlasSchemaViolationException) {
+      821                              LOG.warn("{}: Continuing: {}", exceptionClassName, e.getMessage());
+      822                          } else if (exceptionClassName.equals(EXCEPTION_CLASS_NAME_JANUSGRAPH_EXCEPTION)
+      823                                  || exceptionClassName.equals(EXCEPTION_CLASS_NAME_PERMANENTLOCKING_EXCEPTION)) {
+      824                              LOG.warn("{}: Pausing & retry: Try: {}: Pause: {} ms. {}",
+      825                                      exceptionClassName, numRetries, adaptiveWaiter.waitDuration, e.getMessage());
+      826  
+      827                              adaptiveWaiter.pause((Exception) e);
+      828                          } else {
+      829                              LOG.warn("Error handling message", e);
+      830  
+      831                              try {
+      832                                  LOG.info("Sleeping for {} ms before retry", consumerRetryInterval);
+      833  
+      834                                  Thread.sleep(consumerRetryInterval);
+      835                              } catch (InterruptedException ie) {
+      836                                  LOG.error("Notification consumer thread sleep interrupted");
+      837                              }
+      838                          }
+      839                      } finally {
+      840                          RequestContext.clear();
+      841                      }
+      842                  }
+      843  
+      844                  commit(kafkaMsg);
+      845              } finally {
+      846                  AtlasPerfTracer.log(perf);
+      847  
+      848                  stats.timeTakenMs = System.currentTimeMillis() - startTime;
+      849  
+      850                  metricsUtil.onNotificationProcessingComplete(kafkaMsg.getTopic(), kafkaMsg.getPartition(), kafkaMsg.getOffset(), stats);
+      851  
+      852                  if (stats.timeTakenMs > largeMessageProcessingTimeThresholdMs) {
+      853                      String strMessage = AbstractNotification.getMessageJson(message);
+      854  
+      855                      LOG.warn("msgProcessingTime={}, msgSize={}, topicOffset={}}", stats.timeTakenMs, strMessage.length(), kafkaMsg.getOffset());
+      856                      LARGE_MESSAGES_LOG.warn("{\"msgProcessingTime\":{},\"msgSize\":{},\"topicOffset\":{},\"data\":{}}", stats.timeTakenMs, strMessage.length(), kafkaMsg.getOffset(), strMessage);
+      857                  }
+      858  
+      859                  if (auditLog != null) {
+      860                      auditLog.setHttpStatus(stats.isFailedMsg ? SC_BAD_REQUEST : SC_OK);
+      861                      auditLog.setTimeTaken(stats.timeTakenMs);
+      862  
+      863                      AuditFilter.audit(auditLog);
+      864                  }
+      865  
+      866                  Instant now = Instant.now();
+      867  
+      868                  if (now.isAfter(nextStatsLogTime)) {
+      869                      LOG.info("STATS: {}", AtlasJson.toJson(metricsUtil.getStats()));
+      870  
+      871                      nextStatsLogTime = AtlasMetricsCounter.getNextHourStartTime(now);
+      872                  }
+      873              }
+      874          }
+      875  
+      876          private void createOrUpdate(AtlasEntitiesWithExtInfo entities, boolean isPartialUpdate, NotificationStat stats, PreprocessorContext context) throws AtlasBaseException {
+      877              List<AtlasEntity> entitiesList = entities.getEntities();
+      878              AtlasEntityStream entityStream = new AtlasEntityStream(entities);
+      879  
+      880              if (commitBatchSize <= 0 || entitiesList.size() <= commitBatchSize) {
+      881                  EntityMutationResponse response = atlasEntityStore.createOrUpdate(entityStream, isPartialUpdate);
+      882  
+      883                  recordProcessedEntities(response, stats, context);
+      884              } else {
+      885                  for (int fromIdx = 0; fromIdx < entitiesList.size(); fromIdx += commitBatchSize) {
+      886                      int toIndex = fromIdx + commitBatchSize;
+      887  
+      888                      if (toIndex > entitiesList.size()) {
+      889                          toIndex = entitiesList.size();
+      890                      }
+      891  
+      892                      List<AtlasEntity> entitiesBatch = new ArrayList<>(entitiesList.subList(fromIdx, toIndex));
+      893  
+      894                      updateProcessedEntityReferences(entitiesBatch, context.getGuidAssignments());
+      895  
+      896                      AtlasEntitiesWithExtInfo batch       = new AtlasEntitiesWithExtInfo(entitiesBatch);
+      897                      AtlasEntityStream        batchStream = new AtlasEntityStream(batch, entityStream);
+      898  
+      899                      EntityMutationResponse response = atlasEntityStore.createOrUpdate(batchStream, isPartialUpdate);
+      900  
+      901                      recordProcessedEntities(response, stats, context);
+      902  
+      903                      RequestContext.get().resetEntityGuidUpdates();
+      904  
+      905                      entityCorrelationManager.add(context.isSpooledMessage(), context.getMsgCreated(), response.getDeletedEntities());
+      906  
+      907                      RequestContext.get().clearCache();
+      908                  }
+      909              }
+      910  
+      911              if (context != null) {
+      912                  context.prepareForPostUpdate();
+      913  
+      914                  List<AtlasEntity> postUpdateEntities = context.getPostUpdateEntities();
+      915  
+      916                  if (CollectionUtils.isNotEmpty(postUpdateEntities)) {
+      917                      atlasEntityStore.createOrUpdate(new AtlasEntityStream(postUpdateEntities), true);
+      918                  }
+      919              }
+      920          }
+      921  
+      922          private void recordFailedMessages() {
+      923              //logging failed messages
+      924              for (String message : failedMessages) {
+      925                  FAILED_LOG.error("[DROPPED_NOTIFICATION] {}", message);
+      926              }
+      927  
+       ... truncated at 400 lines ...
