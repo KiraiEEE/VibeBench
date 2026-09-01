@@ -1488,3 +1488,145 @@ by any filter, because the PRs it excludes contain no Java to measure.
 (6,859), of which only 10.5% are recoverable under a final renamed path -- higher
 than the 2% the check wants. Mostly PRs whose head no longer resolves the listed
 path. Quantified, not silent.
+
+### 15.34 Mid-run audit of the calibration pass (clean), and the tier x outcome confound
+
+Audited at 1,604 / 6,956 PRs. **18 checks, 0 failures.** Structural: no duplicate
+PR rows, no orphaned entity rows in any of the four principle parquets, no nulls
+in `agent`/`outcome` on any row, no negative sizes, LCOM and C3 inside [0,1], and
+`agent`/`outcome` matching the gold set exactly.
+
+Contract checks that matter for this pass specifically: SRP/OCP/ISP flags are
+100% NULL (calibration must not flag), while LSP `violation` is 100% populated
+(its signals are categorical and were never threshold-tuned, so it is not part of
+calibration). Both behaved correctly.
+
+`is_new` is **21.0%** of types. This is the cheap detector for the "empty before
+tree" defect repaired in 15.x: a failed parent tree scored as an empty one makes
+every type look newly authored and inflates the headline "violations the PR
+INTRODUCED" counts. Near-100% would mean the bug is back; 21% is plausible.
+
+**THE CONFOUND, and it is structural rather than a defect.** The before/after
+pair is resolved in three tiers, and the tier mix DIFFERS BY OUTCOME by
+construction, because a rejected PR has no merge commit:
+
+| outcome | tier1 merge commit | tier2 commit set | tier3 pull ref |
+|---|---|---|---|
+| merged | **46.6%** | 19.1% | 34.3% |
+| open | 1.9% | 44.9% | 53.3% |
+| rejected | **0.0%** | 57.8% | 42.2% |
+
+A bare merged-vs-rejected contrast is therefore PARTLY a contrast of how the
+before-tree was reconstructed. Recording `pair_tier` on every row makes this
+visible but does not settle it.
+
+**The test that settles it, to run when the pass completes.** Merged PRs appear
+in ALL THREE tiers, so the tier effect can be measured WITHIN the merged group,
+where outcome is held constant:
+
+* if violation rates do not differ by tier within merged, tier is not biasing the
+  measurement and the full outcome contrast stands;
+* if they do differ, the headline contrast must be restricted to tiers 2 and 3,
+  which are the tiers both outcomes actually share.
+
+Either way the answer is decidable from data already being collected, so this is
+a limitation that gets RESOLVED rather than merely disclosed.
+
+### 15.35 Memory grows with the run: the analysis process, not the JVMs
+
+Measured at 1,268 / 3,936 analysable PRs with 4 workers: the **python process
+held 2.68 GB**, more than every Java sidecar combined (882 MB at that instant).
+
+`run_java.main` accumulates `prs` and the five `buckets` lists in memory for the
+whole run and rewrites the complete parquet set at every checkpoint. That is what
+makes each checkpoint a valid COMPLETE snapshot -- the property that made a
+reboot cost nothing -- but it means resident memory grows LINEARLY with progress,
+and the growth is in the coordinator, not in the workers everyone watches.
+
+Consequence for tuning: a worker count validated early in a run is not valid late
+in it. The right setting must leave headroom for the coordinator to roughly
+double. Concretely, 5 workers measured safe at 1,000 PRs drove free RAM to 0.2 GB
+once JVM heaps grew with larger trees and desktop applications loaded; 4 workers
+with a 2.7 GB floor is the setting that survives to the end.
+
+**Not fixed, deliberately.** Streaming rows to disk instead of accumulating them
+would cap memory, but it would also break the "every checkpoint is a complete
+snapshot" guarantee that crash-safety rests on. The trade is correct as it
+stands; the growth just has to be BUDGETED FOR rather than discovered at 90%.
+
+### 15.36 The flagged pass is GIL-bound, not network-bound (measured 2026-09-01)
+
+The bottleneck MOVED THREE TIMES during this phase, and each time the previous
+worker setting stopped being right. Measured, not assumed:
+
+| stage of the run | bottleneck | evidence |
+|---|---|---|
+| tree cache cold | NETWORK | 14 git procs, ~1 live JVM, CPU 40%, link saturated at ~28 Mbps |
+| tree cache warming | mixed | JVM bursts to 200-266% then idle |
+| **tree cache warm** | **PYTHON, one core** | **git 0, java 0, python 91-100% of a core, sustained** |
+
+**Why more workers stopped helping.** `run_java` uses a ThreadPoolExecutor, and
+the detector stage (`build_index`, `snapshot`, the five principles) is pure
+Python bytecode, so the GIL serialises it. Measured directly: 4 workers gave
+35.7 PRs/min and 10 gave 40 -- an 11% difference for 2.5x the workers, because
+the interpreter, not the machine, is the limit.
+
+Checkpointing was RULED OUT as the cause: rewriting the full parquet set costs
+0.20 s against a 98 s cycle, i.e. **0.2%**. The remaining ~100% is detector work.
+
+**The fix is PROCESSES, not threads**, and it is deferred to Python V2.1 rather
+than applied mid-run:
+
+* `gitsnap.repo_lock` is a `threading.Lock`; under processes it silently becomes
+  a no-op, so two processes could run git in one repository at once. Those
+  failures would be recorded as ordinary fetch failures -- silent,
+  repository-correlated, therefore agent-correlated loss.
+* The clean form is to PARTITION `todo` BY REPOSITORY so each process owns whole
+  repositories and no lock is needed at all.
+* Note the irony to watch for: four separate Python heaps could recreate the
+  MEMORY pressure this phase just escaped. The process count must be re-measured,
+  not inherited from the thread count.
+
+**Ranked improvement list for Python V2.1**, now that the measurements exist:
+
+| change | expected gain |
+|---|---|
+| ProcessPool + repo partitioning | ~4x on the detector stage -- THE BIG ONE |
+| GitHub API file lists before extraction | skips ~2,800 per-PR fetches that yield no Java |
+| SQLite/WAL checkpointing | flat memory instead of linear growth |
+
+Python V2.1 also still runs FIVE SEPARATE HARNESSES (run_srp/dip/isp/ocp/lsp),
+each re-fetching and re-parsing the same trees. Porting it to Java's single-pass
+design is probably a larger win than all three of the above combined, and should
+be measured before that run starts.
+
+### 15.37 The `sidecar_failed` PRs are HEAP EXHAUSTION, not timeouts (2026-09-01)
+
+The flagged pass carries 9 `sidecar_failed` PRs and the error is `exit 3`, i.e.
+the JVM terminating under `-XX:+ExitOnOutOfMemoryError`. They are **not**
+timeouts, which means the timeout raise from 900s to 2400s made no difference to
+them and never could have. Diagnosing the status by name rather than by its
+error string would have hidden that.
+
+**All 9 are one repository -- `kubernetes-client/java` -- and all 9 are
+Copilot's.** The cause is repository size (it is dominated by generated
+Kubernetes API model classes) and the tree does not fit a 3 GB heap. But the
+EFFECT is agent-shaped: leaving them out costs Copilot 9 PRs and the other two
+agents none. Size correlates with repository, repository correlates with agent,
+and that is the same silent bias family as the no-merge-SHA drop and the
+`pr_commit_details` inner join.
+
+**Fix, deliberately deferred to AFTER the main pass:** retry just these PRs with
+ONE worker and a 6-8 GB heap. A larger heap is safe when nothing competes for
+memory, and unsafe during the main run where three concurrent JVMs already push
+free RAM to 0.39 GB on the largest trees. Cost is minutes -- the trees are
+already fetched and cached.
+
+**Method note worth keeping:** the three failure statuses have three different
+causes and three different fixes, and only the error string distinguishes them:
+
+| status | cause | fix |
+|---|---|---|
+| `sidecar_failed` (exit 3) | JVM heap exhausted | bigger heap, run alone |
+| `sidecar_failed` (timeout) | tree too slow to parse | longer timeout |
+| `archive_failed` / `no_delta_pair` | transient git | retry (automatic) |

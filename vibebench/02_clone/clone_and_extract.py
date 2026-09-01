@@ -199,7 +199,7 @@ def sweep_stale_locks(clones_dir: Path) -> int:
 def run_git(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
-            ["git", *args],
+            ["git", *args], **gitsnap.NO_WINDOW,
             cwd=str(cwd) if cwd else None,
             capture_output=True,
             text=True,

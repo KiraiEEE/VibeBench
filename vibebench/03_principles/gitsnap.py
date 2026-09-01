@@ -80,6 +80,18 @@ def repo_lock(full_name: str) -> threading.Lock:
 #
 # Applies to every consumer of run_git: the clone stage and all five delta
 # harnesses, plus the arch and cross-check runs.
+# WINDOWS CONSOLE WINDOWS. Every subprocess launched from a non-console parent
+# on Windows creates its own console window, which flashes on screen. This
+# pipeline spawns two JVMs and several git commands PER PR, i.e. tens of
+# thousands of flashes across a run that takes most of a day, on a machine
+# somebody is also using. CREATE_NO_WINDOW suppresses that; it is Windows-only,
+# so it resolves to an empty dict everywhere else and changes nothing.
+#
+# `clone_and_extract` imports this by name, so removing it breaks that stage
+# with an AttributeError rather than merely restoring the flashing.
+NO_WINDOW = ({"creationflags": subprocess.CREATE_NO_WINDOW}
+             if hasattr(subprocess, "CREATE_NO_WINDOW") else {})
+
 _net_lock = threading.Lock()
 _net_last_ok = [0.0]          # monotonic time of the last successful probe
 
@@ -170,7 +182,7 @@ def run_git(args: list[str], cwd: Path, binary: bool = False, _retry: bool = Tru
         try:
             return subprocess.run(
                 ["git", *args], cwd=str(cwd), capture_output=True,
-                timeout=C.GIT_TIMEOUT_S,
+                timeout=C.GIT_TIMEOUT_S, **NO_WINDOW,
                 **({} if binary else dict(text=True, encoding="utf-8",
                                           errors="replace")),
             )

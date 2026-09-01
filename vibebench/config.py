@@ -534,25 +534,32 @@ SRP_JAVA_THRESHOLDS_VOID = {
 # so carrying either over would have flagged ordinary Java code.
 # Each size knob below fires on ~10% of production types, as a p90 anchor should.
 SRP_JAVA_THRESHOLDS = {
-    # SIZE knobs: ~p90 of the production, deduplicated distribution
-    # RECALIBRATED 2026-08-04 after the CRLF line-doubling fix (JAVA_STATUS 8.5).
-    # Every LOC the Java layer produced was 2x the truth, so the original p90 of
-    # 926 was really 463. The corrected production p90 is 463.5 and 465 fires on
-    # 10.0% -- the SAME design point. That 930 = 2 x 465 almost exactly is the
-    # confirmation that the doubling was uniform across the corpus, which is why
-    # the flag set barely moves. Only this knob was affected: the other five are
-    # structural (wmc, method count, CCN, params, LCOM) and never used line numbers.
-    "class_loc": 465,          # p90=463.5  fires on 10.0%   (was 930 pre-fix)
-    "class_wmc": 58,           # p90=58    fires on 10.1%
-    "class_methods": 27,       # p90=27    fires on 10.8%
-    "func_ccn": 11,            # p90=11    fires on 10.5%
-    # SCALE-FREE knobs keep their Python-validated values, exactly as the TS port
-    # did. Java's p90 for params is 4, which is not a god-class signal in any
-    # taxonomy -- a percentile is a tail heuristic, not a licence to flag
-    # ordinary code.
-    "func_params": 6,
-    "class_lcom": 0.8,
+    # RECALIBRATED 2026-08-29 ON THE V2 CORPUS. The previous values were derived
+    # from V1 (867 PRs / 27 repos / one agent, merged-only). V2 is 3,823
+    # analysable PRs over 729 repositories with rejected and open PRs included,
+    # so the size distribution is a different population and the old bar no
+    # longer sits at p90 of it. Carrying V1 numbers over would have UNDER-flagged
+    # -- every one of them is above the V2 p90.
+    #
+    # SOURCE: the PRODUCTION, ENTITY-DEDUPLICATED distribution (n=53,182), never
+    # the raw row set (n=148,361). The raw set is 25.4% test code and carries
+    # 2.08x duplication because a class recurs once per PR that touched it;
+    # calibrating on it puts class_loc at 519 instead of 362, i.e. ~30% too high,
+    # and the flag would then fire on far fewer than the 10% a p90 anchor means.
+    "class_loc": 362,          # V2 p90=362   (V1 was 465)
+    "class_wmc": 45,           # V2 p90=45    (V1 was 58)
+    "class_methods": 20,       # V2 p90=20    (V1 was 27)
+    "func_ccn": 11,            # V2 p90=11    (unchanged)
+    # SCALE-FREE knobs. `func_params` moves to the V2 p90 of 5; `class_lcom` to
+    # 0.86. A percentile is a tail heuristic, not a licence to flag ordinary
+    # code, so these stay anchored rather than chasing a lower tail.
+    "func_params": 5,          # V2 p90=5     (V1 was 6)
+    "class_lcom": 0.86,        # V2 p90=0.86  (V1 was 0.8)
     "lcom_min_methods": 4,
+    # c3_suppress is a SUPPRESSOR, not a p90 anchor: it withholds the flag from a
+    # class whose vocabulary is cohesive despite its size. 0.4 sits around p80-85
+    # of the V2 c3 distribution (p75=0.32, p90=0.51), which is the intended
+    # "clearly cohesive" region. Kept.
     "c3_suppress": 0.4,
     "min_hits": 2,
     "strict_hits": 3,
@@ -623,9 +630,29 @@ LSP_JAVA_STRONG_SIGNALS = [
 #      NOTE: `mean_d` scored 0/17 precision across Python AND TypeScript
 #      validation. It is emitted for comparability, but the report leads with
 #      new_cycle and marks mean_d indicative only.
+# RECALIBRATED 2026-08-29 on the V2 corpus (see SRP_JAVA_THRESHOLDS for why V1
+# values could not be carried over).
+#
+# OCP. Calibrated per KIND on DISTINCT chains (n=13,938 of 32,744 rows), because
+# type-based and tag-based dispatch have different natural widths:
+#   instanceof p90=5 | switch_tag p90=12 | type_eq p90=19 | value_switch p90=8
+# `type_branches` stays 3 -- Martin's own minimum for a switch, used unchanged in
+# all three languages so the type-based bar stays cross-language comparable.
+# `value_branches` moves to the V2 p90 of the value_switch family: 11 -> 8.
+# Note 2,078 of 13,938 chains have an enum subject and are exhaustive by
+# construction; the closed-set suppressor already excludes those.
+#
+# ISP. Contract width on DISTINCT contracts (n=8,089 of 18,783 rows): p90=13.
+# `fat_members` 18 -> 13. WIDTH IS THE WEAKER HALF OF ISP and should be reported
+# as such: the semantically meaningful signal is `forced_stub` (an implementer
+# obliged to stub methods it does not need), which is scale-free and needs no
+# threshold at all.
+#
+# DIP is unchanged: `new_touched_cycles` is a count, not a percentile, and
+# `delta_mean_d` does not feed the flag (DIP_FLAG_INCLUDES_MEAN_D = False).
 JAVA_DELTA_THRESHOLDS = {
-    "ocp": {"type_branches": 3, "value_branches": 11},
-    "isp": {"fat_members": 18, "min_stubs": 2, "stub_ratio": 0.5},
+    "ocp": {"type_branches": 3, "value_branches": 8},
+    "isp": {"fat_members": 13, "min_stubs": 2, "stub_ratio": 0.5},
     "dip": {"new_touched_cycles": 0, "delta_mean_d": 0.15},
 }
 
@@ -687,8 +714,8 @@ FETCH_WORKERS = 6      # concurrent repos in clone/fetch (network-bound, threads
 # -Xmx ceiling, not by system RAM, so adding workers costs PAGING (slower), never
 # a spurious analysis failure. That is why the safe ceiling is set by measured
 # MEAN residency and not by worst-case heap.
-ANALYZE_WORKERS = 7
-# SET TO 7 on 2026-08-27, after measuring where the time actually goes.
+ANALYZE_WORKERS = 3
+# SET TO 5 on 2026-08-27, after measuring where the time actually goes.
 # This pass is NETWORK-BOUND, not CPU-bound: sampled live at 5 workers there
 # were 12 concurrent git processes but only 1-2 live JVMs, CPU at ~40% and the
 # disk queue at 0. Workers spend most of their life fetching trees and only a
@@ -705,12 +732,101 @@ ANALYZE_WORKERS = 7
 # JVMs) but drove free RAM down to 0.8 GB. That is not a JVM out-of-memory risk
 # -- OOM is bounded by each JVM's own -Xmx -- it is a PAGING risk, and heavy
 # paging makes a sidecar exceed its timeout, which IS recorded as an analysis
-# failure and so becomes silent data loss. Seven keeps CPU high, leaves RAM
-# headroom, and keeps a laptop from running flat out for eight hours.
+# failure and so becomes silent data loss.
+#
+# SEVEN WAS ALSO TOO MANY, measured live with the desktop in normal use: JVMs
+# peaked at 7 concurrent and free RAM fell to 0.4 GB. The pipeline is not the
+# only tenant -- an editor, a browser, the AV service and the OS hold ~5 GB of
+# the 15.4 GB before any worker starts. Five keeps CPU high (85-100%) with a
+# measured floor of ~2.2 GB free, which is the setting that leaves the machine
+# usable and the run safe.
+#
+# LOWERED AGAIN TO 4 on 2026-08-28. Five was measured safe when the desktop held
+# ~3.5 GB of apps; with Discord, VS Code and two browsers open it is not. Sampled
+# live: java alone at 7.6 GB across 5 workers (larger trees give larger heaps)
+# against 4.6 GB of other applications, leaving 0.2 GB free. The right number
+# depends on what else is running, so it is set from the MEASURED floor rather
+# than fixed once -- and the floor that matters is free RAM under load, not the
+# core count.
+#
+# LOWERED TO 3 on 2026-08-28 after measuring the SECOND-ORDER cost. At 4 workers
+# free RAM sat at 0.16-0.4 GB, and that is not merely "tight": paging slows every
+# sidecar, and a slowed sidecar crosses its 900 s timeout and is recorded as an
+# ANALYSIS FAILURE. Observed together, and almost certainly the same cause:
+# throughput fell 3.67 -> 1.78 PRs/min and the failure rate rose 0.15% -> 1.88%.
+# Fewer workers that all run at full speed beat more workers that page -- the
+# extra worker was buying negative throughput AND manufacturing data loss.
+#
+# RAISED TO 6 for the FLAGGED pass (2026-08-29). The bottleneck is different in
+# this phase and the right worker count follows the bottleneck, not the machine.
+# Calibration was CPU+RAM bound: it PARSED every tree, so 3 concurrent JVMs
+# saturated memory. The flagged pass reads those parses back from the facts
+# cache, so measured live it runs at CPU 41%, 4.6-5.9 GB RAM free, and only
+# 0.8 live JVMs against 2.8 concurrent git processes -- it is NETWORK bound,
+# waiting on tree fetches. Extra workers therefore buy parallel fetches at
+# almost no memory cost.
+#
+# RAISED AGAIN TO 10 while the tree cache is still cold. Measured at 6: CPU 30%,
+# 4.7 GB RAM free, 2.27 MB/s network against the 3.5 MB/s this connection
+# sustained during extraction -- headroom in all three.
+#
+# THIS SETTING IS ONLY VALID WHILE FETCHING DOMINATES. The moment the tree cache
+# warms, the phase flips to parsing and ten concurrent JVMs would demand 15-30 GB
+# on a 15.4 GB machine -- precisely the thrash that cost hours in calibration.
+# LOWERED TO 4 (2026-08-29) -- SAFE IN BOTH REGIMES, which is the property that
+# actually matters for an unattended run.
+#
+# 10 was correct for the phase as it is RIGHT NOW (network-bound, ~1 live JVM),
+# but that state is temporary: the tree cache is refilling, and when it is warm
+# the fetches stop and the phase becomes parsing-bound -- at which point ten
+# concurrent JVMs would demand far more than this machine has. A monitor can
+# warn about that flip, but a warning only helps if someone is watching, and
+# this run is meant to be left alone.
+#
+# 4 is the largest count measured safe while PARSING (calibration: 3 gave a
+# 3.05 GB floor, 4 was workable with a light desktop, 5+ collapsed to 0.16 GB and
+# cost 44% throughput plus a 5x failure rate). Choosing it costs speed while the
+# phase is still fetch-bound, and buys the guarantee that no bottleneck flip can
+# thrash the machine unsupervised. The safe-by-construction setting beats the
+# fast setting plus a promise to intervene.
+#
+# LOWERED TO 3 mid-run (2026-09-01) when the guard fired REPEATEDLY, which is the
+# trigger that distinguishes a pattern from an outlier. The first trip was a
+# single transient and was correctly ignored; by the second, sampling showed free
+# RAM below 2 GB in 13 of 30 consecutive samples (43% of the time) with a floor of
+# 0.57 GB, and JVM residency had risen from 2.3 GB to 6.0 GB across three
+# processes as the pass reached larger trees.
+#
+# Acted BEFORE damage rather than after: the failure rate was still 0.26% at this
+# point. Waiting for failures to appear would have meant waiting for exactly the
+# silent, size-correlated (and therefore agent-correlated) loss this project
+# exists to avoid.
 
 # Java sidecar heap per worker. 3g is what one large tree needs; the number of
 # WORKERS is the knob to turn for total memory, not this.
-JAVA_SIDECAR_HEAP = "3g"
+JAVA_SIDECAR_HEAP = "8g"
+
+# Seconds a single sidecar call may take before it is abandoned.
+#
+# 900 is right for the MAIN pass: it bounds the cost of one pathological tree so
+# a single repository cannot stall a 25-hour run. It is NOT right for a cleanup
+# pass, because the trees that exceed it are not broken, only large.
+#
+# Measured on the V2 run: the timeouts concentrate in a handful of very large
+# repositories (kubernetes-client/java, opentelemetry-java-instrumentation,
+# open-metadata/OpenMetadata), and repository size CORRELATES WITH AGENT, so
+# leaving them out turns a size-driven loss into an agent-driven one -- the exact
+# bias family this project keeps having to hunt down. Large codebases are also
+# where SOLID pressure is most interesting, so they are the worst PRs to drop.
+#
+# RAISED TO 2400 for the FLAGGED pass (2026-08-29). The calibration pass ran at
+# 900 and finished with 19 `sidecar_failed`, concentrated in a handful of very
+# large repositories. Because `sidecar_failed` is deliberately NOT a permanent
+# status, those PRs are retried automatically by the next run -- so raising the
+# ceiling here recovers them inside the flagged pass instead of needing a
+# separate cleanup run. The trees are already parsed and cached, so the extra
+# ceiling costs nothing on the PRs that were already succeeding.
+JAVA_SIDECAR_TIMEOUT_S = 2400
 
 # Node sidecar (03_principles/ts_sidecar): ts-morph 28.0.0 + typescript 5.9.3,
 # pinned via package-lock.json. The sidecar emits structural FACTS as JSON; all

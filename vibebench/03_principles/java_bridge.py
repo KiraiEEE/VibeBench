@@ -31,7 +31,8 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import config as C  # noqa: E402
+import config as C
+import gitsnap  # noqa: E402  -- NO_WINDOW  # noqa: E402
 
 SIDECAR_DIR = Path(__file__).resolve().parent / "java_sidecar"
 SIDECAR_JAR = SIDECAR_DIR / "target" / "java-sidecar-1.0-jar-with-dependencies.jar"
@@ -172,6 +173,7 @@ def analyze_tree(files: dict[str, str], use_cache: bool = True) -> dict:
                 ["java", f"-Xmx{HEAP}", *JVM_TUNING,
                  "-cp", str(SIDECAR_JAR), "vb.Facts", str(tmp)],
                 capture_output=True, timeout=TIMEOUT_S,
+                **gitsnap.NO_WINDOW,
             )
         except subprocess.TimeoutExpired:
             return {"ok": False, "error": f"sidecar timeout after {TIMEOUT_S}s"}
