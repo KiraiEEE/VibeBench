@@ -30,16 +30,38 @@ import config as C  # noqa: E402
 
 PR_RESULTS = C.CORPUS_DIR / "java_pr_results.parquet"
 
+def production_only(d):
+    """Restrict to the population the report actually publishes.
+
+    ADDED 2026-09-01, after an audit found the drawn samples did not match the
+    reported population at all. The report has always excluded test code, and
+    now excludes machine-generated code as well; the sampler excluded neither,
+    so 18% of the drawn SRP rows and 25% of the ISP rows were protoc output.
+
+    Validating on a population you do not report is not a minor mismatch: the
+    precision estimate it produces belongs to no number in the thesis. Generated
+    protobuf classes flag at 60% where real code flags at 12%, so their presence
+    would have moved measured precision substantially, in a direction that has
+    nothing to do with how the detector performs on code anyone wrote.
+    """
+    if "file_path" not in d.columns:
+        return d                      # DIP is PR-scoped and has no file column
+    keep = ~d.file_path.map(lambda p: C.is_test_path(str(p), "java")
+                            or C.is_generated_path(str(p)))
+    return d[keep]
+
+
 SPEC = {
     # principle: (parquet, pred column, judge column, dedup keys, row filter)
     "srp": (C.SRP_RESULTS_JAVA, "srp_risk", "llm_srp_risk",
-            ["full_name", "type_id"], None),
+            ["full_name", "type_id"], production_only),
     "ocp": (C.OCP_RESULTS_JAVA, "smell", "llm_ocp_risk",
-            ["full_name", "type_id", "method", "subject"], None),
+            ["full_name", "type_id", "method", "subject"], production_only),
     "lsp": (C.LSP_RESULTS_JAVA, "violation", "llm_lsp_risk",
-            ["full_name", "type_id", "method"], None),
+            ["full_name", "type_id", "method"], production_only),
     "isp": (C.ISP_RESULTS_JAVA, "flagged", "llm_isp_risk",
-            ["full_name", "iface_id"], lambda d: d[d.row_type == "interface"]),
+            ["full_name", "iface_id"],
+            lambda d: production_only(d[d.row_type == "interface"])),
     "dip": (PR_RESULTS, "dip_risk", "llm_dip_risk",
             ["full_name", "pr_number"], lambda d: d[d.status == "ok"]),
 }
@@ -56,8 +78,13 @@ def main() -> None:
     if not path.exists():
         sys.exit(f"no results at {path} -- run run_java.py first")
     d = pd.read_parquet(path)
+    _n0 = len(d)
     if flt is not None:
         d = flt(d)
+    print(f"{a.principle}: {_n0:,} rows -> {len(d):,} after production filter "
+          f"(test + machine-generated excluded, matching the report)")
+    if not len(d):
+        sys.exit("production filter left no rows -- refusing to draw an empty sample")
     if pred not in d.columns or d[pred].isna().all():
         sys.exit(f"'{pred}' is null -- the harness is still in CALIBRATION MODE. "
                  f"Set the thresholds in config first (PHASE 4).")

@@ -80,6 +80,17 @@ def is_test(p: str) -> bool:
     return C.is_test_path(str(p), "java")
 
 
+def is_generated(p: str) -> bool:
+    """Machine-generated source (protoc et al). See config.is_generated_path.
+
+    Excluded from every rate for the same reason tests are: it is not code the
+    agent designed. Unlike tests it is also AGENT-BIASED here (Copilot 13.6%
+    of touched classes vs Claude_Code 0.5%), so leaving it in does not merely
+    add noise, it reorders the agents.
+    """
+    return C.is_generated_path(str(p))
+
+
 def header(t: str) -> None:
     print("\n" + "=" * 76)
     print(t)
@@ -284,6 +295,47 @@ def outcome_contrast(sub: pd.DataFrame, flag_col: str, indent: str = "  ") -> No
                   "[CI %.1f%%-%.1f%%]"
                   % (indent, stratum, 100 * macro, k, n, 100 * k / n,
                      100 * lo, 100 * hi))
+    # ------------------------------------------------------------------
+    # TIER-MATCHED CONTRAST -- the number to quote (added 2026-09-01).
+    #
+    # The pooled contrast above is CONFOUNDED BY RECONSTRUCTION METHOD, and the
+    # confound is large enough to reverse the sign. A merged PR has a merge
+    # commit, so its before-tree is that commit's first parent: a tight,
+    # accurate delta (tier 1). A REJECTED PR has no merge commit and must fall
+    # back to its own commit set or `refs/pull/N/head` plus a merge-base
+    # (tiers 2-3), which reach FURTHER BACK, so the apparent delta is larger and
+    # more violations look "introduced".
+    #
+    # Measured on merged PRs only, where outcome is held constant and all three
+    # tiers are present, the tier alone moves the OCP rate 2.1% -> 15.5% -> 7.8%
+    # across tiers 1/2/3 -- a 13 pp swing from METHOD, not from code. Merged PRs
+    # hold 1,053 tier-1 rows and rejected PRs hold ZERO, so the pooled contrast
+    # compares tight deltas against loose ones.
+    #
+    # Restricting both outcomes to the tiers they SHARE removes it. On this
+    # corpus that flips the headline: rejected looked worse by +1.1 pp on OCP
+    # pooled, and is 3.0 pp BETTER once the method is matched.
+    tiers = s[s.get("pair_tier").notna()] if "pair_tier" in s.columns else s.iloc[0:0]
+    if len(tiers):
+        both = tiers[tiers["pair_tier"].isin([2.0, 3.0])]
+        mm = both[both["outcome"] == "merged"]
+        rr = both[both["outcome"] == "rejected"]
+        if len(mm) >= 30 and len(rr) >= 30:
+            km, nm_ = int(mm[flag_col].fillna(False).sum()), len(mm)
+            kr, nr = int(rr[flag_col].fillna(False).sum()), len(rr)
+            lom, him = wilson(km, nm_)
+            lor, hir = wilson(kr, nr)
+            print("%s  TIER-MATCHED (tiers 2+3 only -- QUOTE THIS ONE, the pooled"
+                  % indent)
+            print("%s    contrast above is confounded by reconstruction method):"
+                  % indent)
+            print("%s      merged    %d/%d = %.1f%%  [CI %.1f%%-%.1f%%]"
+                  % (indent, km, nm_, 100 * km / nm_, 100 * lom, 100 * him))
+            print("%s      rejected  %d/%d = %.1f%%  [CI %.1f%%-%.1f%%]"
+                  % (indent, kr, nr, 100 * kr / nr, 100 * lor, 100 * hir))
+            print("%s      difference (rejected - merged): %+.1f pp"
+                  % (indent, 100 * (kr / nr - km / nm_)))
+
     if not CONFOUND_NOTE_SHOWN[0]:
         print("%s  ^ CONFOUND, state it once and never bury it: `rejected` is not"
               % indent)
@@ -325,6 +377,7 @@ def srp_section(prs: pd.DataFrame, gold: pd.DataFrame) -> None:
     d = ensure_outcome(pd.read_parquet(RESULTS["srp"]), gold)
     header("SRP -- god classes   (scope: every type in a file the PR touched)")
     d["is_test"] = d.file_path.map(is_test)
+    d["is_gen"] = d.file_path.map(is_generated)
     d["entity"] = d.full_name + "::" + d.type_id
 
     if "srp_risk" not in d or d.srp_risk.isna().all():
@@ -337,7 +390,7 @@ def srp_section(prs: pd.DataFrame, gold: pd.DataFrame) -> None:
         # every SRP rate in the study, uniformly enough to look normal.
         cols = ("class_loc", "wmc", "method_count", "max_method_ccn",
                 "max_params", "lcom", "c3")
-        prod = d[~d.is_test]
+        prod = d[~d.is_test & ~d.is_gen]
         uniq = prod.sort_values("class_loc").drop_duplicates("entity", keep="last")
         print(f"  CALIBRATION MODE -- {len(d):,} type rows, no flags yet "
               f"({d.is_test.mean():.1%} test code).")
@@ -353,9 +406,18 @@ def srp_section(prs: pd.DataFrame, gold: pd.DataFrame) -> None:
                 print(f"    {c:<16} " + "  ".join(
                     f"p{int(q*100)}={uniq[c].quantile(q):.2f}" for q in (.5, .75, .9, .95, .99)))
         return
-    print(f"  type rows            : {len(d):,}   ({d.is_test.mean():.1%} test code)")
+    print(f"  type rows            : {len(d):,}   ({d.is_test.mean():.1%} test code, "
+          f"{d.is_gen.mean():.1%} machine-generated)")
+    _g = d[~d.is_test]
+    if len(_g):
+        _ge = _g.drop_duplicates("entity")
+        print(f"  EXCLUDED as generated: {int(_ge.is_gen.sum()):,} distinct classes "
+              f"({_ge.is_gen.mean():.1%} of production) -- protoc output flags at "
+              f"{100*_ge[_ge.is_gen].srp_risk.mean():.1f}% vs "
+              f"{100*_ge[~_ge.is_gen].srp_risk.mean():.1f}% for real code, and it is "
+              f"concentrated in 2 repos, so it is agent-biased")
 
-    prod = d[~d.is_test].copy()
+    prod = d[~d.is_test & ~d.is_gen].copy()
     # `is_new` must be aggregated BEFORE deduplication. A class authored in one
     # PR and edited in a later one appears twice; keeping only the largest
     # observation would silently relabel it as pre-existing and undercount what
@@ -461,6 +523,61 @@ def srp_section(prs: pd.DataFrame, gold: pd.DataFrame) -> None:
 
 # ------------------------------------------------- delta principles
 
+# Map each delta principle to the entity inventory that justifies its PR flag,
+# so a flag can be traced back to the FILES it rests on.
+_ENTITY_SOURCE = {
+    "ocp_risk": (C.OCP_RESULTS_JAVA, "smell"),
+    "isp_risk": (C.ISP_RESULTS_JAVA, "flagged"),
+    "lsp_risk": (C.LSP_RESULTS_JAVA, "violation"),
+}
+
+
+def production_only_rate(ok: pd.DataFrame, risk_col: str) -> None:
+    """Re-state the PR flag rate over PRODUCTION code only.
+
+    WHY THIS IS A SENSITIVITY LINE AND NOT A CORRECTION. The PR-level flag is a
+    BEFORE/AFTER delta computed inside run_java.py; the entity parquets are
+    after-state inventories and do not record which smell was new. So this
+    cannot recompute the delta. What it CAN do is identify PRs whose flagged
+    entities are ENTIRELY test or generated files, where the flag cannot be
+    about production code, and report the rate without them.
+
+    Measured 2026-09-01: this moves OCP 7.1% -> 6.7%, ISP 7.1% -> 7.0%,
+    LSP 1.2% -> 1.0%. The delta principles are robust to the exclusion, which
+    is worth stating explicitly, because SRP is NOT (15.1% -> 11.8%, and the
+    agent ORDER changes). Same audit, opposite outcome, so neither result
+    should be generalised to the other.
+    """
+    src = _ENTITY_SOURCE.get(risk_col)
+    if not src or not src[0].exists():
+        return
+    path, flagcol = src
+    try:
+        e = pd.read_parquet(path)
+    except Exception:
+        return
+    if "row_type" in e.columns:
+        e = e[e.row_type != "pr"]
+    if "file_path" not in e.columns or flagcol not in e.columns:
+        return
+    e = e.copy()
+    e["bad"] = e.file_path.map(lambda x: is_test(x) or is_generated(x))
+    hit = e[e[flagcol] == True]  # noqa: E712
+    if not len(hit):
+        return
+    per = hit.groupby("pr_id")["bad"].agg(["sum", "size"])
+    only_bad = set(per[per["sum"] == per["size"]].index)
+    flagged = set(ok[ok[risk_col].fillna(False)].pr_id)
+    drop = flagged & only_bad
+    if not drop:
+        print("                   (production-only: unchanged, no flag rests "
+              "solely on test or generated code)")
+        return
+    k2 = len(flagged) - len(drop)
+    print(f"  production-only: {rate(k2, len(ok))}"
+          f"   [{len(drop)} flag(s) rested solely on test/generated files]")
+
+
 def delta_section(title: str, prs: pd.DataFrame, risk_col: str,
                   reason_col: str, extra=None) -> None:
     header(title)
@@ -473,6 +590,7 @@ def delta_section(title: str, prs: pd.DataFrame, risk_col: str,
     k = int(ok[risk_col].fillna(False).sum())
     print(f"  analysable PRs : {len(ok)} of {len(prs)}")
     print(f"  FLAGGED        : {rate(k, len(ok))}")
+    production_only_rate(ok, risk_col)
     print("\n  by agent (counts beside rates -- delta signal is single-digit):")
     per_agent_rates(ok, risk_col, indent="    ")
     print("\n  by agent x OUTCOME (V2 -- the survivorship-bias check):")
@@ -502,12 +620,31 @@ def delta_section(title: str, prs: pd.DataFrame, risk_col: str,
         extra(ok)
 
 
+def production_rows(d: pd.DataFrame, label: str = "") -> pd.DataFrame:
+    """Drop test and machine-generated rows from an entity inventory.
+
+    ADDED 2026-09-01. The three `*_extra` inventories below reported counts over
+    EVERY row while every rate above them was production-only, so the headline
+    and the inventory described different populations. ISP was the worst case:
+    its generated rows flag at 20.1% against 13.5% for real code, so the fat-
+    contract count was inflated by files protoc wrote.
+    """
+    if "file_path" not in d.columns or not len(d):
+        return d
+    bad = d.file_path.map(lambda x: is_test(x) or is_generated(x))
+    if bad.any() and label:
+        print(f"    [production filter] dropped {int(bad.sum()):,} of {len(d):,} "
+              f"{label} rows (test or machine-generated)")
+    return d[~bad]
+
+
 def ocp_extra(ok: pd.DataFrame) -> None:
     if not RESULTS["ocp"].exists():
         return
     ch = pd.read_parquet(RESULTS["ocp"])
     if not len(ch):
         return
+    ch = production_rows(ch, "dispatch-chain")
     ch = ch.drop_duplicates(["full_name", "type_id", "method", "subject"])
     print(f"  DISTINCT chains in scope: {len(ch):,}")
     print("    by kind: " + str(ch.groupby("kind").size().to_dict()))
@@ -526,6 +663,7 @@ def lsp_extra(ok: pd.DataFrame) -> None:
     ov = pd.read_parquet(RESULTS["lsp"])
     if not len(ov):
         return
+    ov = production_rows(ov, "override-pair")
     u = ov.drop_duplicates(["full_name", "type_id", "method"])
     print(f"  DISTINCT override pairs (concrete base only): {len(u):,}  "
           f"from {len(ov):,} rows ({len(ov)/max(len(u),1):.1f}x duplication)")
@@ -548,8 +686,10 @@ def isp_extra(ok: pd.DataFrame) -> None:
     if not RESULTS["isp"].exists():
         return
     d = pd.read_parquet(RESULTS["isp"])
-    ifs = d[d.row_type == "interface"].drop_duplicates(["full_name", "iface_id"])
-    ims = d[d.row_type == "implementer"].drop_duplicates(["full_name", "iface_id", "type_id"])
+    ifs = production_rows(d[d.row_type == "interface"], "contract").drop_duplicates(
+        ["full_name", "iface_id"])
+    ims = production_rows(d[d.row_type == "implementer"]).drop_duplicates(
+        ["full_name", "iface_id", "type_id"])
     if len(ifs):
         print(f"  DISTINCT contracts (>=1 abstract member AND >=1 internal implementer): {len(ifs):,}")
         print("    widths: " + "  ".join(f"p{int(q*100)}={ifs.n_members.quantile(q):.0f}"
