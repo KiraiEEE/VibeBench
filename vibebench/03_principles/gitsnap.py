@@ -506,10 +506,33 @@ def pull_ref_pair(d: Path, pr_number) -> tuple[str, str] | None:
         mb = run_git(["merge-base", after, base_tip], cwd=d)
         if mb is not None and mb.returncode == 0 and mb.stdout.strip():
             before = mb.stdout.strip()
-            if have_commit(d, before):
+            # BEFORE == AFTER IS NOT A PAIR (2026-09-01). `merge-base` returns
+            # `after` itself whenever the PR head is already an ancestor of the
+            # base tip -- the PR's commits landed, or the branch was rebased,
+            # or the shallow graft makes it look that way. Diffing a commit
+            # against itself yields nothing, and every layer above read that
+            # emptiness as the finding "this PR touches no Java", cached it,
+            # and dropped the PR.
+            #
+            # THIS IS THE ROOT CAUSE of the 2,819 empty `_touched.json` files.
+            # Confirmed on amikos-tech/chromadb-java-client#116 and
+            # jenkinsci/chucknorris-plugin#249: both resolve to (X, X), both
+            # have added/modified Java on GitHub, both were dropped. Sampling
+            # 40 such PRs, 25% have real Java, so ~700 analysable PRs (about
+            # 18% of the corpus) were lost to a pair that was never valid.
+            #
+            # Deepening can genuinely change the answer, so retry the next rung
+            # before giving up, then fail honestly rather than guess a parent:
+            # for a MULTI-COMMIT PR, `after^1` is the PR's own previous commit,
+            # and diffing that would capture only the last commit and miss
+            # violations introduced earlier -- biasing every delta principle
+            # toward "no new violation", which is the very result this
+            # benchmark reports.
+            if before != after and have_commit(d, before):
                 return before, after
-        # merge-base failed: the branch point lies outside both shallow
-        # boundaries. Deepen and retry rather than guessing.
+        # merge-base failed, or returned a degenerate pair: the branch point
+        # lies outside both shallow boundaries. Deepen and retry rather than
+        # guessing.
     return None
 
 

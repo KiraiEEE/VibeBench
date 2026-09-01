@@ -1,0 +1,406 @@
+row 43   apache/pulsar#24592
+============================================================================
+CLASS org.apache.pulsar.broker.service.AbstractReplicator   loc=509 methods=31 wmc=77 lcom=0.1 c3=0.0991747261395349
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       51  public abstract class AbstractReplicator implements Replicator {
+       52  
+       53      protected final BrokerService brokerService;
+       54      protected final String localTopicName;
+       55      protected final String localCluster;
+       56      protected final String remoteTopicName;
+       57      protected final String remoteCluster;
+       58      protected final PulsarClientImpl replicationClient;
+       59      protected final PulsarClientImpl client;
+       60      protected String replicatorId;
+       61      @Getter
+       62      protected final Topic localTopic;
+       63      @VisibleForTesting
+       64      @Getter
+       65      protected volatile ProducerImpl producer;
+       66      public static final String REPL_PRODUCER_NAME_DELIMITER = "-->";
+       67  
+       68      protected final int producerQueueSize;
+       69      protected final ProducerBuilder<byte[]> producerBuilder;
+       70  
+       71      protected final Backoff backOff = new Backoff(100, TimeUnit.MILLISECONDS, 1, TimeUnit.MINUTES, 0,
+       72              TimeUnit.MILLISECONDS);
+       73  
+       74      protected final String replicatorPrefix;
+       75  
+       76      protected static final AtomicReferenceFieldUpdater<AbstractReplicator, State> STATE_UPDATER =
+       77              AtomicReferenceFieldUpdater.newUpdater(AbstractReplicator.class, State.class, "state");
+       78      @VisibleForTesting
+       79      @Getter
+       80      protected volatile State state = State.Disconnected;
+       81  
+       82      private volatile Attributes attributes = null;
+       83      private static final AtomicReferenceFieldUpdater<AbstractReplicator, Attributes> ATTRIBUTES_UPDATER =
+       84              AtomicReferenceFieldUpdater.newUpdater(AbstractReplicator.class, Attributes.class, "attributes");
+       85  
+       86      public enum State {
+       87          /**
+       88           * This enum has two mean meanings：
+       89           *   Init: replicator is just created, has not been started now.
+       90           *   Disconnected: the producer was closed after {@link PersistentTopic#checkGC} called {@link #disconnect}.
+       91           */
+       92          // The internal producer is disconnected.
+       93          Disconnected,
+       94          // Trying to create a new internal producer.
+       95          Starting,
+       96          // The internal producer has started, and tries copy data.
+       97          Started,
+       98          /**
+       99           * The producer is closing after {@link PersistentTopic#checkGC} called {@link #disconnect}.
+      100           */
+      101          // The internal producer is trying to disconnect.
+      102          Disconnecting,
+      103          // The replicator is in terminating.
+      104          Terminating,
+      105          // The replicator is never used again. Pulsar will create a new Replicator when enable replication again.
+      106          Terminated;
+      107      }
+      108  
+      109      public AbstractReplicator(String localCluster, Topic localTopic, String remoteCluster, String remoteTopicName,
+      110                                String replicatorPrefix, BrokerService brokerService, PulsarClientImpl replicationClient)
+      111              throws PulsarServerException {
+      112          this.brokerService = brokerService;
+      113          this.localTopic = localTopic;
+      114          this.localTopicName = localTopic.getName();
+      115          this.replicatorPrefix = replicatorPrefix;
+      116          this.localCluster = StringInterner.intern(localCluster);
+      117          this.remoteTopicName = remoteTopicName;
+      118          this.remoteCluster = StringInterner.intern(remoteCluster);
+      119          this.replicationClient = replicationClient;
+      120          this.client = (PulsarClientImpl) brokerService.pulsar().getClient();
+      121          this.producer = null;
+      122          this.producerQueueSize = brokerService.pulsar().getConfiguration().getReplicationProducerQueueSize();
+      123          this.replicatorId = String.format("%s | %s",
+      124                  StringUtils.equals(localTopicName, remoteTopicName) ? localTopicName :
+      125                          localTopicName + "-->" + remoteTopicName,
+      126                  StringUtils.equals(localCluster, remoteCluster) ? localCluster : localCluster + "-->" + remoteCluster
+      127          );
+      128          this.producerBuilder = replicationClient.newProducer(Schema.AUTO_PRODUCE_BYTES()) //
+      129                  .topic(remoteTopicName)
+      130                  .messageRoutingMode(MessageRoutingMode.SinglePartition)
+      131                  .enableBatching(false)
+      132                  .sendTimeout(0, TimeUnit.SECONDS) //
+      133                  .maxPendingMessages(producerQueueSize) //
+      134                  .producerName(getProducerName());
+      135          STATE_UPDATER.set(this, State.Disconnected);
+      136      }
+      137  
+      138      protected abstract String getProducerName();
+      139  
+      140      protected abstract void setProducerAndTriggerReadEntries(org.apache.pulsar.client.api.Producer<byte[]> producer);
+      141  
+      142      protected abstract Position getReplicatorReadPosition();
+      143  
+      144      public abstract long getNumberOfEntriesInBacklog();
+      145  
+      146      protected abstract void disableReplicatorRead();
+      147  
+      148      @Override
+      149      public boolean isConnected() {
+      150          var producer = this.producer;
+      151          return producer != null && producer.isConnected();
+      152      }
+      153  
+      154      public long getReplicationDelayMs() {
+      155          var producer = this.producer;
+      156          return producer == null ? 0 : producer.getDelayInMillis();
+      157      }
+      158  
+      159      public String getRemoteCluster() {
+      160          return remoteCluster;
+      161      }
+      162  
+      163      protected CompletableFuture<Void> prepareCreateProducer() {
+      164          return CompletableFuture.completedFuture(null);
+      165      }
+      166  
+      167      public void startProducer() {
+      168          // Guarantee only one task call "producerBuilder.createAsync()".
+      169          Pair<Boolean, State> setStartingRes = compareSetAndGetState(State.Disconnected, State.Starting);
+      170          if (!setStartingRes.getLeft()) {
+      171              if (setStartingRes.getRight() == State.Starting) {
+      172                  log.info("[{}] Skip the producer creation since other thread is doing starting, state : {}",
+      173                          replicatorId, state);
+      174              } else if (setStartingRes.getRight() == State.Started) {
+      175                  // Since the method "startProducer" will be called even if it is started, only print debug-level log.
+      176                  if (log.isDebugEnabled()) {
+      177                      log.debug("[{}] Replicator was already running. state: {}", replicatorId, state);
+      178                  }
+      179              } else if (setStartingRes.getRight() == State.Disconnecting) {
+      180                  if (log.isDebugEnabled()) {
+      181                      log.debug("[{}] Rep.producer is closing, delay to retry(wait the producer close success)."
+      182                              + " state: {}", replicatorId, state);
+      183                  }
+      184                  delayStartProducerAfterDisconnected();
+      185              } else {
+      186                  /** {@link State.Terminating}, {@link State.Terminated}. **/
+      187                  log.info("[{}] Skip the producer creation since the replicator state is : {}", replicatorId, state);
+      188              }
+      189              return;
+      190          }
+      191  
+      192          log.info("[{}] Starting replicator", replicatorId);
+      193  
+      194          // Force only replicate messages to a non-partitioned topic, to avoid auto-create a partitioned topic on
+      195          // the remote cluster.
+      196          prepareCreateProducer().thenCompose(ignore -> {
+      197              ProducerBuilderImpl builderImpl = (ProducerBuilderImpl) producerBuilder;
+      198              builderImpl.getConf().setNonPartitionedTopicExpected(true);
+      199              builderImpl.getConf().setReplProducer(true);
+      200              return producerBuilder.createAsync().thenAccept(producer -> {
+      201                  setProducerAndTriggerReadEntries(producer);
+      202              });
+      203          }).exceptionally(ex -> {
+      204              Pair<Boolean, State> setDisconnectedRes = compareSetAndGetState(State.Starting, State.Disconnected);
+      205              if (setDisconnectedRes.getLeft()) {
+      206                  long waitTimeMs = backOff.next();
+      207                  log.warn("[{}] Failed to create remote producer ({}), retrying in {} s",
+      208                          replicatorId, ex.getMessage(), waitTimeMs / 1000.0);
+      209                  // BackOff before retrying
+      210                  scheduleCheckTopicActiveAndStartProducer(waitTimeMs);
+      211              } else {
+      212                  if (setDisconnectedRes.getRight() == State.Terminating
+      213                          || setDisconnectedRes.getRight() == State.Terminated) {
+      214                      log.info("[{}] Skip to create producer, because it has been terminated, state is : {}",
+      215                              replicatorId, state);
+      216                  } else {
+      217                      /** {@link  State.Disconnected}, {@link  State.Starting}, {@link  State.Started} **/
+      218                      // Since only one task can call "producerBuilder.createAsync()", this scenario is not expected.
+      219                      // So print a warn log.
+      220                      log.warn("[{}] Other thread will try to create the producer again. so skipped current one task."
+      221                                      + " State is : {}",
+      222                              replicatorId, state);
+      223                  }
+      224              }
+      225              return null;
+      226          });
+      227  
+      228      }
+      229  
+      230      /***
+      231       * The producer is disconnecting, delay to start the producer.
+      232       * If we start a producer immediately, we will get a conflict producer(same name producer) registered error.
+      233       */
+      234      protected void delayStartProducerAfterDisconnected() {
+      235          long waitTimeMs = backOff.next();
+      236          if (log.isDebugEnabled()) {
+      237              log.debug(
+      238                      "[{}] waiting for producer to close before attempting to reconnect, retrying in {} s",
+      239                      replicatorId, waitTimeMs / 1000.0);
+      240          }
+      241          scheduleCheckTopicActiveAndStartProducer(waitTimeMs);
+      242      }
+      243  
+      244      protected void scheduleCheckTopicActiveAndStartProducer(final long waitTimeMs) {
+      245          brokerService.executor().schedule(() -> {
+      246              if (state == State.Terminating || state == State.Terminated) {
+      247                  log.info("[{}] Skip scheduled to start the producer since the replicator state is : {}",
+      248                          replicatorId, state);
+      249                  return;
+      250              }
+      251              CompletableFuture<Optional<Topic>> topicFuture = brokerService.getTopics().get(localTopicName);
+      252              if (topicFuture == null) {
+      253                  // Topic closed.
+      254                  log.info("[{}] Skip scheduled to start the producer since the topic was closed successfully."
+      255                          + " And trigger a terminate.", replicatorId);
+      256                  terminate();
+      257                  return;
+      258              }
+      259              topicFuture.thenAccept(optional -> {
+      260                  if (optional.isEmpty()) {
+      261                      // Topic closed.
+      262                      log.info("[{}] Skip scheduled to start the producer since the topic was closed. And trigger a"
+      263                              + " terminate.", replicatorId);
+      264                      terminate();
+      265                      return;
+      266                  }
+      267                  if (optional.get() != localTopic) {
+      268                      // Topic closed and created a new one, current replicator is outdated.
+      269                      log.info("[{}] Skip scheduled to start the producer since the topic was closed. And trigger a"
+      270                              + " terminate.", replicatorId);
+      271                      terminate();
+      272                      return;
+      273                  }
+      274                  Replicator replicator = localTopic.getReplicators().get(remoteCluster);
+      275                  if (replicator != AbstractReplicator.this) {
+      276                      // Current replicator has been closed, and created a new one.
+      277                      log.info("[{}] Skip scheduled to start the producer since a new replicator has instead current"
+      278                              + " one. And trigger a terminate.", replicatorId);
+      279                      terminate();
+      280                      return;
+      281                  }
+      282                  startProducer();
+      283              }).exceptionally(ex -> {
+      284                  log.error("[{}] [{}] Stop retry to create producer due to unknown error(topic create failed), and"
+      285                                  + " trigger a terminate. Replicator state: {}",
+      286                          localTopicName, replicatorId, STATE_UPDATER.get(this), ex);
+      287                  terminate();
+      288                  return null;
+      289              });
+      290          }, waitTimeMs, TimeUnit.MILLISECONDS);
+      291      }
+      292  
+      293      protected CompletableFuture<Boolean> isLocalTopicActive() {
+      294          CompletableFuture<Optional<Topic>> topicFuture = brokerService.getTopics().get(localTopicName);
+      295          if (topicFuture == null){
+      296              return CompletableFuture.completedFuture(false);
+      297          }
+      298          return topicFuture.thenApplyAsync(optional -> {
+      299              if (optional.isEmpty()) {
+      300                  return false;
+      301              }
+      302              return optional.get() == localTopic;
+      303          }, brokerService.executor());
+      304      }
+      305  
+      306      /**
+      307       * This method only be used by {@link PersistentTopic#checkGC} now.
+      308       */
+      309      @Override
+      310      public CompletableFuture<Void> disconnect() {
+      311          long backlog = getNumberOfEntriesInBacklog();
+      312          if (backlog > 0) {
+      313              CompletableFuture<Void> disconnectFuture = new CompletableFuture<>();
+      314              disconnectFuture.completeExceptionally(new TopicBusyException("Cannot close a replicator with backlog"));
+      315              if (log.isDebugEnabled()) {
+      316                  log.debug("[{}] Replicator disconnect failed since topic has backlog", replicatorId);
+      317              }
+      318              return disconnectFuture;
+      319          }
+      320          log.info("[{}] Disconnect replicator at position {} with backlog {}", replicatorId,
+      321                  getReplicatorReadPosition(), backlog);
+      322          return beforeDisconnect()
+      323              .thenCompose(__ -> closeProducerAsync(true))
+      324              .thenApply(__ -> {
+      325                  afterDisconnected();
+      326                  return null;
+      327              });
+      328      }
+      329  
+      330      /**
+      331       * This method and {@link #afterDisconnected()} are used to solve the following race condition:
+      332       * - Thread 1: calling disconnect.
+      333       *             passed the check: no backlog.
+      334       * - Thread 2: published a message, then the cursor.pendingRead completes.
+      335       * - Thread 1: continue to disconnect.
+      336       * - Thread 2: read entries from the cursor, and try to send messages, but the messages will be discarded because
+      337       *             the producer is closed.
+      338       * Issue: the pending reading's read position is not correct.
+      339       */
+      340      protected CompletableFuture<Void> beforeDisconnect() {
+      341          return CompletableFuture.completedFuture(null);
+      342      }
+      343  
+      344      protected void afterDisconnected() {}
+      345  
+      346      /**
+      347       * This method only be used by {@link PersistentTopic#checkGC} now.
+      348       */
+      349      protected CompletableFuture<Void> closeProducerAsync(boolean closeTheStartingProducer) {
+      350          Pair<Boolean, State> setDisconnectingRes = compareSetAndGetState(State.Started, State.Disconnecting);
+      351          if (!setDisconnectingRes.getLeft()) {
+      352              if (setDisconnectingRes.getRight() == State.Starting) {
+      353                  if (closeTheStartingProducer) {
+      354                      /**
+      355                       * Delay retry(wait for the start producer task is finish).
+      356                       * Note: If the producer always start fail, the start producer task will always retry until the
+      357                       *   state changed to {@link State.Terminated}.
+      358                       *   Nit: The better solution is creating a {@link CompletableFuture} to trace the in-progress
+      359                       *     creation and call "inProgressCreationFuture.thenApply(closeProducer())".
+      360                       */
+      361                      long waitTimeMs = backOff.next();
+      362                      brokerService.executor().schedule(() -> closeProducerAsync(true),
+      363                              waitTimeMs, TimeUnit.MILLISECONDS);
+      364                  } else {
+      365                      log.info("[{}] Skip current producer closing since the previous producer has been closed,"
+      366                                      + " and trying start a new one, state : {}",
+      367                              replicatorId, setDisconnectingRes.getRight());
+      368                  }
+      369              } else if (setDisconnectingRes.getRight() == State.Disconnected
+      370                      || setDisconnectingRes.getRight() == State.Disconnecting) {
+      371                  log.info("[{}] Skip current producer closing since other thread did closing, state : {}",
+      372                          replicatorId, setDisconnectingRes.getRight());
+      373              } else if (setDisconnectingRes.getRight() == State.Terminating
+      374                      || setDisconnectingRes.getRight() == State.Terminated) {
+      375                  log.info("[{}] Skip current producer closing since other thread is doing termination, state : {}",
+      376                          replicatorId, state);
+      377              }
+      378              log.info("[{}] Skip current termination since other thread is doing close producer or termination,"
+      379                              + " state : {}", replicatorId, state);
+      380              return CompletableFuture.completedFuture(null);
+      381          }
+      382  
+      383          // Close producer and update state.
+      384          return doCloseProducerAsync(producer, () -> {
+      385              Pair<Boolean, State> setDisconnectedRes = compareSetAndGetState(State.Disconnecting, State.Disconnected);
+      386              if (setDisconnectedRes.getLeft()) {
+      387                  this.producer = null;
+      388                  // deactivate further read
+      389                  disableReplicatorRead();
+      390                  return;
+      391              }
+      392              if (setDisconnectedRes.getRight() == State.Terminating
+      393                      || setDisconnectingRes.getRight() == State.Terminated) {
+      394                  log.info("[{}] Skip setting state to terminated because it was terminated, state : {}",
+      395                          replicatorId, state);
+      396              } else {
+      397                  // Since only one task can call "doCloseProducerAsync(producer, action)", this scenario is not expected.
+      398                  // So print a warn log.
+      399                  log.warn("[{}] Other task has change the state to terminated. so skipped current one task."
+      400                                  + " State is : {}",
+      401                          replicatorId, state);
+      402              }
+      403          });
+      404      }
+      405  
+      406      protected CompletableFuture<Void> doCloseProducerAsync(Producer<byte[]> producer, Runnable actionAfterClosed) {
+      407          CompletableFuture<Void> future =
+      408                  producer == null ? CompletableFuture.completedFuture(null) : producer.closeAsync();
+      409          return future.thenRun(() -> {
+      410              actionAfterClosed.run();
+      411          }).exceptionally(ex -> {
+      412              long waitTimeMs = backOff.next();
+      413              log.warn(
+      414                      "[{}] Exception: '{}' occurred while trying to close the producer. Replicator state: {}."
+      415                              + " Retrying again in {} s.",
+      416                      replicatorId, ex.getMessage(), state, waitTimeMs / 1000.0);
+      417              // BackOff before retrying
+      418              brokerService.executor().schedule(() -> doCloseProducerAsync(producer, actionAfterClosed),
+      419                      waitTimeMs, TimeUnit.MILLISECONDS);
+      420              return null;
+      421          });
+      422      }
+      423  
+      424      protected abstract void beforeTerminate();
+      425  
+      426      public CompletableFuture<Void> terminate() {
+      427          if (!tryChangeStatusToTerminating()) {
+      428              log.info("[{}] Skip current termination since other thread is doing termination, state : {}", replicatorId,
+      429                      state);
+      430              return CompletableFuture.completedFuture(null);
+      431          }
+      432          beforeTerminate();
+      433          return doCloseProducerAsync(producer, () -> {
+      434              STATE_UPDATER.set(this, State.Terminated);
+      435              this.producer = null;
+      436              // set the cursor as inactive.
+      437              disableReplicatorRead();
+      438              // release resources.
+      439              doReleaseResources();
+      440          });
+      441      }
+      442  
+      443      protected void doReleaseResources() {}
+      444  
+      445      protected boolean tryChangeStatusToTerminating() {
+      446          if (STATE_UPDATER.compareAndSet(this, State.Starting, State.Terminating)){
+      447              return true;
+      448          }
+      449          if (STATE_UPDATER.compareAndSet(this, State.Started, State.Terminating)){
+      450              return true;
+       ... truncated at 400 lines ...
