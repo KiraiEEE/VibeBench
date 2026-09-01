@@ -1,0 +1,406 @@
+row 38   mzmine/mzmine#3253
+============================================================================
+CLASS io.github.mzmine.modules.io.projectload.version_3_0.FeatureListLoadTask   loc=410 methods=9 wmc=58 lcom=0.0 c3=0.2863388474522308
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       91  public class FeatureListLoadTask extends AbstractTask {
+       92  
+       93    public static final String TEMP_FLIST_DATA_FOLDER = "mzmine_featurelists_temp";
+       94    public static final Pattern fileNamePattern = Pattern.compile(
+       95        "([^\\n]+)(" + FeatureListSaveTask.DATA_FILE_SUFFIX + ")");
+       96  
+       97    private static final Logger logger = Logger.getLogger(FeatureListLoadTask.class.getName());
+       98    final String idTypeUniqueID = new IDType().getUniqueID();
+       99    private final ZipFile zip;
+      100    private final MZmineProject project;
+      101    private final AtomicInteger rowCounter = new AtomicInteger(0);
+      102    private int totalRows = 1;
+      103    private int processedRows = 0;
+      104    private String currentFlist = "";
+      105    private int numFlists = 1;
+      106    private int processedFlists;
+      107  
+      108    public FeatureListLoadTask(@Nullable MemoryMapStorage storage, @NotNull MZmineProject project,
+      109        ZipFile zip) {
+      110      super(storage, Instant.now());
+      111      this.project = project;
+      112      this.zip = zip;
+      113    }
+      114  
+      115    /**
+      116     * @param reader  The xml reader.
+      117     * @param type    the data type to be read.
+      118     * @param project The current project.
+      119     * @param flist   The current feature list.
+      120     * @param row     The row.
+      121     * @param feature The current feature. Can be null.
+      122     * @param file    The data file of the current feature. null if the feature is null.
+      123     * @return
+      124     */
+      125    public static Object parseDataType(XMLStreamReader reader, DataType<?> type,
+      126        MZmineProject project, ModularFeatureList flist, ModularFeatureListRow row,
+      127        ModularFeature feature, RawDataFile file) {
+      128      if (type != null) {
+      129        try {
+      130          return type.loadFromXML(reader, project, flist, row, feature, file);
+      131        } catch (Exception e) {
+      132          logger.log(Level.WARNING, e,
+      133              () -> "Error loading data type " + type.getHeaderString() + " in row (id=" + row.getID()
+      134                  + ") feature " + (file != null ? file.getName() : "") + " from XML.");
+      135        }
+      136      } else {
+      137        logger.info(() -> "No data type for id " + reader.getAttributeValue(null,
+      138            CONST.XML_DATA_TYPE_ID_ATTR));
+      139      }
+      140      return null;
+      141    }
+      142  
+      143    @Override
+      144    public String getTaskDescription() {
+      145      return "Importing feature list " + currentFlist + (processedFlists + 1) + "/" + numFlists
+      146          + ". Parsing row " + processedRows + "/" + totalRows;
+      147    }
+      148  
+      149    @Override
+      150    public double getFinishedPercentage() {
+      151      return (double) processedFlists / numFlists // overall progress finished flists
+      152          + (double) processedRows / totalRows / numFlists; // current flist progress
+      153    }
+      154  
+      155    @Override
+      156    public void run() {
+      157      setStatus(TaskStatus.PROCESSING);
+      158  
+      159      List<FeatureList> loadedFeatureLists = new ArrayList<>();
+      160      try {
+      161        Path tempDirectory = FileAndPathUtil.createTempDirectory(TEMP_FLIST_DATA_FOLDER);
+      162  
+      163        logger.info(() -> "Unzipping feature lists of project to " + tempDirectory.toString());
+      164        ZipUtils.unzipDirectory(FeatureListSaveTask.FLIST_FOLDER, zip, tempDirectory.toFile());
+      165        logger.info(() -> "Unzipping feature lists done.");
+      166  
+      167        File[] files = new File(tempDirectory.toFile(), FeatureListSaveTask.FLIST_FOLDER).listFiles(
+      168            (dir, name) -> fileNamePattern.matcher(name).matches());
+      169        if (files == null) {
+      170          logger.info("Did not find feature lists to load.");
+      171          setStatus(TaskStatus.FINISHED);
+      172          return;
+      173        }
+      174  
+      175        numFlists = files.length;
+      176  
+      177        final MemoryMapStorage storage = MemoryMapStorage.forFeatureList();
+      178  
+      179        // enable caching of mobility scans during project import.
+      180        project.setProjectLoadImsImportCaching(true);
+      181  
+      182        for (File flistFile : files) {
+      183          if (isCanceled()) {
+      184            return;
+      185          }
+      186          rowCounter.set(0);
+      187  
+      188          final File metadataFile = new File(flistFile.toString()
+      189              .replace(FeatureListSaveTask.DATA_FILE_SUFFIX,
+      190                  FeatureListSaveTask.METADATA_FILE_SUFFIX));
+      191          ModularFeatureList flist = createRows(storage, flistFile, metadataFile);
+      192  
+      193          if (flist == null) {
+      194            logger.severe(
+      195                () -> "Cannot load feature list from files " + flistFile.getAbsolutePath() + " and "
+      196                    + metadataFile.getAbsolutePath());
+      197            continue;
+      198          }
+      199          parseFeatureList(storage, project, flist, flistFile);
+      200  
+      201          // TODO maybe remove so that ModularFeatureList.getFeatureList can be unmodifiable
+      202          // disable buffering after the import (replace references to CachedIMSRawDataFiles with IMSRawDataFiles
+      203          flist.replaceCachedFilesAndScans();
+      204  
+      205          project.addFeatureList(flist);
+      206          loadedFeatureLists.add(flist);
+      207          processedFlists++;
+      208        }
+      209      } catch (Exception e) {
+      210        e.printStackTrace();
+      211        logger.log(Level.SEVERE, e.getMessage(), e);
+      212        setStatus(TaskStatus.ERROR);
+      213        project.setProjectLoadImsImportCaching(false);
+      214        MZmineCore.getDesktop().displayErrorMessage(e.getMessage());
+      215        return;
+      216      }
+      217  
+      218      // disable caching on project level
+      219      project.setProjectLoadImsImportCaching(false);
+      220  
+      221      //  group flists by date created, only use the latest set of feature lists in next batch step
+      222      final Set<FeatureList> mostRecentStepFeatureLists = Set.copyOf(loadedFeatureLists.stream()
+      223          .collect(
+      224              Collectors.groupingBy(flist -> flist.getAppliedMethods().getLast().getModuleCallDate()))
+      225          .entrySet().stream().max(Entry.comparingByKey()).map(Entry::getValue).orElse(List.of()));
+      226      loadedFeatureLists.forEach(
+      227          flist -> flist.setExcludedFromBatchLast(!mostRecentStepFeatureLists.contains(flist)));
+      228  
+      229      setStatus(TaskStatus.FINISHED);
+      230    }
+      231  
+      232    private void parseFeatureList(MemoryMapStorage storage, MZmineProject project,
+      233        ModularFeatureList flist, File flistFile) {
+      234      currentFlist = flist.getName();
+      235      processedRows = 0;
+      236      totalRows = flist.getNumberOfRows();
+      237  
+      238      try (InputStream fis = new FileInputStream(flistFile)) {
+      239        final XMLInputFactory xif = XMLInputFactory.newInstance();
+      240        final XMLStreamReader reader = xif.createXMLStreamReader(fis);
+      241  
+      242        while (reader.hasNext()) {
+      243          if (isCanceled()) {
+      244            return;
+      245          }
+      246  
+      247          int type = reader.next();
+      248          if (type == XMLEvent.START_ELEMENT) {
+      249            final String localName = reader.getLocalName();
+      250            if (CONST.XML_FEATURE_LIST_ELEMENT.equals(localName)) {
+      251              if (!flist.getName().equals(reader.getAttributeValue(null, CONST.XML_FLIST_NAME_ATTR))
+      252                  || !flist.getDateCreated()
+      253                  .equals(reader.getAttributeValue(null, CONST.XML_DATE_CREATED_ATTR))) {
+      254                throw new IllegalArgumentException(
+      255                    "The name of the loaded feature list does not match the expected name. %s != %s Does a feature list with this name already exist?".formatted(
+      256                        flist.getName(), reader.getAttributeValue(null, CONST.XML_FLIST_NAME_ATTR)));
+      257              }
+      258            } else if (CONST.XML_ROW_ELEMENT.equals(localName)) {
+      259              parseRow(reader, storage, project, flist);
+      260              processedRows++;
+      261            }
+      262          }
+      263        }
+      264  
+      265      } catch (IOException | XMLStreamException e) {
+      266        logger.log(Level.WARNING, "Error opening file " + flistFile.getAbsolutePath(), e);
+      267      }
+      268    }
+      269  
+      270    /**
+      271     * Creates the modular feature list from the metadata file using
+      272     * {@link this#readMetadataCreateFeatureList(File, MemoryMapStorage)}.
+      273     * <p></p>
+      274     * Then passes the feature list data file once and creates the rows with the associated ids. No
+      275     * other data will be put into the rows. This is done so rows can reference each other by their id
+      276     * while being loaded to the feature list.
+      277     *
+      278     * @param storage      The storage for the feature list.
+      279     * @param dataFile     The file containing the feature list data.
+      280     * @param metadataFile The file containign the metadata associated with the feature list.
+      281     * @return The created feature list with empty rows (row ids are set)
+      282     */
+      283    private ModularFeatureList createRows(MemoryMapStorage storage, File dataFile,
+      284        File metadataFile) {
+      285  
+      286      ModularFeatureList flist = readMetadataCreateFeatureList(metadataFile, storage);
+      287      if (flist == null) {
+      288        throw new IllegalStateException("Cannot create feature list.");
+      289      }
+      290  
+      291      try (InputStream fis = new FileInputStream(dataFile)) {
+      292        final XMLInputFactory xif = XMLInputFactory.newInstance();
+      293        final XMLStreamReader reader = xif.createXMLStreamReader(fis);
+      294  
+      295        logger.finest(
+      296            () -> "Creating " + ModularFeatureListRow.class.getSimpleName() + "s for feature list "
+      297                + flist.getName() + ".");
+      298        while (reader.hasNext()) {
+      299          final int type = reader.next();
+      300          if (type == XMLEvent.START_ELEMENT && reader.getLocalName().equals(CONST.XML_ROW_ELEMENT)) {
+      301            int id = Integer.parseInt(reader.getAttributeValue(null, idTypeUniqueID));
+      302            flist.addRow(new ModularFeatureListRow(flist, id));
+      303          }
+      304        }
+      305      } catch (IOException | XMLStreamException e) {
+      306        logger.log(Level.WARNING, e.getMessage(), e);
+      307        return null;
+      308      }
+      309  
+      310      logger.finest(
+      311          () -> "Created " + flist.getNumberOfRows() + " rows in feature list " + flist.getName());
+      312      return flist;
+      313    }
+      314  
+      315    /**
+      316     * Creates a feature list from the metadata xml file. Adds the selected raw data files (must be in
+      317     * the loaded project) and sets the selected scans.
+      318     *
+      319     * @param file    The Metadata file.
+      320     * @param storage The storage to use for the feature list.
+      321     * @return The created feature list.
+      322     */
+      323    private ModularFeatureList readMetadataCreateFeatureList(File file, MemoryMapStorage storage) {
+      324      try {
+      325        final Document configuration = XMLUtils.load(file);
+      326  
+      327        final XPathFactory factory = XPathFactory.newInstance();
+      328        final XPath xpath = factory.newXPath();
+      329  
+      330        XPathExpression metadataExpr = xpath.compile(
+      331            "//" + CONST.XML_ROOT_ELEMENT + "/" + CONST.XML_FLIST_METADATA_ELEMENT);
+      332        final Element metadataElement = (Element) (((NodeList) metadataExpr.evaluate(configuration,
+      333            XPathConstants.NODESET)).item(0));
+      334  
+      335        XPathExpression expr = xpath.compile(
+      336            "//" + CONST.XML_ROOT_ELEMENT + "/" + CONST.XML_FLIST_APPLIED_METHODS_LIST_ELEMENT);
+      337        NodeList nodelist = (NodeList) expr.evaluate(configuration, XPathConstants.NODESET);
+      338        if (nodelist.getLength() != 1) {
+      339          throw new IllegalArgumentException(
+      340              "XML file " + file + " does not have an applied methods element.");
+      341        }
+      342        // set applied methods
+      343        Element appliedMethodsList = (Element) nodelist.item(0);
+      344        NodeList methodElements = appliedMethodsList.getElementsByTagName(
+      345            CONST.XML_FLIST_APPLIED_METHOD_ELEMENT);
+      346  
+      347        List<FeatureListAppliedMethod> appliedMethods = new ArrayList<>();
+      348        for (int i = 0; i < methodElements.getLength(); i++) {
+      349          FeatureListAppliedMethod method = SimpleFeatureListAppliedMethod.loadValueFromXML(
+      350              (Element) methodElements.item(i));
+      351          appliedMethods.add(method);
+      352        }
+      353  
+      354        XPathExpression rawFilesListExpr = xpath.compile(
+      355            "//" + CONST.XML_ROOT_ELEMENT + "/" + CONST.XML_RAW_FILES_LIST_ELEMENT);
+      356        nodelist = (NodeList) rawFilesListExpr.evaluate(configuration, XPathConstants.NODESET);
+      357        NodeList filesList = ((Element) nodelist.item(0)).getElementsByTagName(
+      358            CONST.XML_RAW_FILE_ELEMENT);
+      359  
+      360        // order of raw files is not important. Will be sorted in feature list by name
+      361        Map<RawDataFile, List<Scan>> selectedScansMap = new HashMap<>();
+      362        for (int i = 0; i < filesList.getLength(); i++) {
+      363          NodeList nameList = ((Element) filesList.item(i)).getElementsByTagName(
+      364              CONST.XML_RAW_FILE_NAME_ELEMENT);
+      365          NodeList pathList = ((Element) filesList.item(i)).getElementsByTagName(
+      366              CONST.XML_RAW_FILE_PATH_ELEMENT);
+      367          String name = nameList.item(0).getTextContent();
+      368          String path = pathList.item(0).getTextContent();
+      369  
+      370          Optional<RawDataFile> f = Arrays.stream(project.getDataFiles())
+      371              .filter(r -> r.getName().equals(name) /*&& (
+      372                  path.isEmpty() && path.equals("null") && r.getAbsolutePath() != null ? true
+      373                      : r.getAbsolutePath().equals(path))*/).findFirst();
+      374          if (f.isEmpty()) {
+      375            throw new IllegalStateException("Raw data file with name " + name + " and path " + path
+      376                + " not imported to project.");
+      377          }
+      378  
+      379          final Element selectedScansElement = (Element) ((Element) filesList.item(
+      380              i)).getElementsByTagName(CONST.XML_FLIST_SELECTED_SCANS_ELEMENT).item(0);
+      381          final int[] selectedScanIndices = ParsingUtils.stringToIntArray(
+      382              selectedScansElement.getTextContent());
+      383          final List<Scan> selectedScans = ParsingUtils.getSublistFromIndices(f.get().getScans(),
+      384              selectedScanIndices);
+      385          selectedScansMap.put(f.get(), selectedScans);
+      386        }
+      387  
+      388        var dataFiles = new ArrayList<>(selectedScansMap.keySet());
+      389        var flistName = metadataElement.getElementsByTagName(CONST.XML_FLIST_NAME_ELEMENT).item(0)
+      390            .getTextContent();
+      391        // need data files in constructor
+      392        // make sure the non-cached ims files are used to create the columns in the data model.
+      393        // the caching is only needed in the selected scans map
+      394        final ModularFeatureList flist = new ModularFeatureList(flistName, storage,
+      395            dataFiles.stream().map(f -> f instanceof CachedIMSRawDataFile c ? c.getOriginalFile() : f)
+      396                .toList());
+      397        flist.setDateCreated(
+      398            metadataElement.getElementsByTagName(CONST.XML_FLIST_DATE_CREATED_ELEMENT).item(0)
+      399                .getTextContent());
+      400        flist.getAppliedMethods().addAll(appliedMethods);
+      401        selectedScansMap.forEach(flist::setSelectedScans);
+      402  
+      403        final FeatureListAppliedMethod preferredAnnoationSorting = ParameterUtils.getLatestModuleCall(
+      404            appliedMethods, PreferredAnnotationRankingModule.class);
+      405        if (preferredAnnoationSorting != null) {
+      406          PreferredAnnotationRankingParameters param = (PreferredAnnotationRankingParameters) preferredAnnoationSorting.getParameters();
+      407          flist.setAnnotationSortConfig(param.toConfig());
+      408        }
+      409        return flist;
+      410      } catch (XPathExpressionException | ParserConfigurationException | SAXException |
+      411               IOException e) {
+      412        logger.log(Level.SEVERE, e.getMessage(), e);
+      413        return null;
+      414      }
+      415    }
+      416  
+      417    private void parseRow(XMLStreamReader reader, MemoryMapStorage storage, MZmineProject project,
+      418        ModularFeatureList flist) throws XMLStreamException {
+      419      if (!reader.getLocalName().equals(CONST.XML_ROW_ELEMENT)) {
+      420        throw new IllegalStateException("Cannot parse row if current element is not a row element");
+      421      }
+      422  
+      423      int id = Integer.parseInt(reader.getAttributeValue(null, idTypeUniqueID));
+      424      final ModularFeatureListRow row = (ModularFeatureListRow) flist.getRow(rowCounter.get());
+      425      if (id != row.getID()) {
+      426        throw new IllegalStateException("Row ids do not match.");
+      427      }
+      428  
+      429      while (!(reader.getEventType() == XMLEvent.END_ELEMENT && reader.getLocalName()
+      430          .equals(CONST.XML_ROW_ELEMENT)) && reader.hasNext()) {
+      431        if (reader.next() == XMLEvent.START_ELEMENT) {
+      432          if (reader.getLocalName().equals(CONST.XML_FEATURE_ELEMENT)) {
+      433            final String fileName = reader.getAttributeValue(null, CONST.XML_RAW_FILE_ELEMENT);
+      434            final RawDataFile file = project.getCurrentRawDataFiles().stream()
+      435                .filter(f -> f.getName().equals(fileName)).findFirst().orElse(null);
+      436            if (file == null) {
+      437              logger.warning(() -> "Cannot load feature for row id " + id + " for file " + fileName
+      438                  + ". File does not exist in project.");
+      439              continue;
+      440            }
+      441            parseFeature(reader, storage, project, flist, row, file);
+      442          } else if (reader.getLocalName().equals(CONST.XML_DATA_TYPE_ELEMENT)) {
+      443            DataType type = DataTypes.getTypeForId(
+      444                reader.getAttributeValue(null, CONST.XML_DATA_TYPE_ID_ATTR));
+      445            Object value = parseDataType(reader, type, project, flist, row, null, null);
+      446            if (type != null && value != null) {
+      447              try {
+      448                row.set(type, value);
+      449              } catch (RuntimeException e) {
+      450                // TODO - maybe log?
+      451                logger.log(Level.WARNING, () -> String.format(
+      452                    "DataType %s and value %s were not set to row. Maybe incompatible during loading?",
+      453                    type, value));
+      454                // cannot set bound values. can go silent.
+      455              }
+      456            }
+      457          }
+      458        }
+      459      }
+      460      rowCounter.getAndIncrement();
+      461    }
+      462  
+      463    private void parseFeature(@NotNull XMLStreamReader reader, @Nullable MemoryMapStorage storage,
+      464        MZmineProject project, @NotNull ModularFeatureList flist, @NotNull ModularFeatureListRow row,
+      465        @NotNull RawDataFile file) throws XMLStreamException {
+      466  
+      467      // create feature with original file, but use buffered file for data type loading.
+      468      final RawDataFile originalFile =
+      469          file instanceof CachedIMSRawDataFile c ? c.getOriginalFile() : file;
+      470      final ModularFeature feature = new ModularFeature(flist, originalFile, null, null);
+      471  
+      472      while (!(reader.getEventType() == XMLEvent.END_ELEMENT && reader.getLocalName()
+      473          .equals(CONST.XML_FEATURE_ELEMENT)) && reader.hasNext()) {
+      474        if (reader.next() != XMLEvent.START_ELEMENT) {
+      475          continue;
+      476        }
+      477  
+      478        if (reader.getLocalName().equals(CONST.XML_DATA_TYPE_ELEMENT)) {
+      479          // the data types are responsible for loading their values
+      480          DataType type = DataTypes.getTypeForId(
+      481              reader.getAttributeValue(null, CONST.XML_DATA_TYPE_ID_ATTR));
+      482          Object value = parseDataType(reader, type, project, flist, row, feature, file);
+      483          if (type != null && value != null) {
+      484            try {
+      485              feature.set(type, value);
+      486            } catch (RuntimeException e) {
+      487              // TODO - maybe log?
+      488              logger.log(Level.WARNING, () -> String.format(
+      489                  "DataType %s and value %s were not set to feature. Maybe incompatible during loading?",
+      490                  type, value));
+       ... truncated at 400 lines ...

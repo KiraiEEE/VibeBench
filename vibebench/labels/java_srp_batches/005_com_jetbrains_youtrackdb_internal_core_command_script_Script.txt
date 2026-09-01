@@ -1,0 +1,406 @@
+row 5   JetBrains/youtrackdb#649
+============================================================================
+CLASS com.jetbrains.youtrackdb.internal.core.command.script.ScriptManager   loc=521 methods=31 wmc=72 lcom=0.1333333333333333 c3=0.1236803088942157
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       65  public class ScriptManager {
+       66  
+       67    protected static final Object[] EMPTY_PARAMS = new Object[]{};
+       68    protected static final int LINES_AROUND_ERROR = 5;
+       69    protected static final String DEF_LANGUAGE = "javascript";
+       70    protected String defaultLanguage = DEF_LANGUAGE;
+       71    protected ScriptEngineManager scriptEngineManager;
+       72    protected Map<String, ScriptEngineFactory> engines = new HashMap<String, ScriptEngineFactory>();
+       73    protected Map<String, ScriptFormatter> formatters = new HashMap<String, ScriptFormatter>();
+       74    protected List<ScriptInjection> injections = new ArrayList<ScriptInjection>();
+       75    protected ConcurrentHashMap<String, DatabaseScriptManager> dbManagers =
+       76        new ConcurrentHashMap<String, DatabaseScriptManager>();
+       77    protected Map<String, ScriptResultHandler> handlers =
+       78        new HashMap<String, ScriptResultHandler>();
+       79    protected Map<String, java.util.function.Function<String, ScriptExecutor>> executorsFactories = new HashMap<>();
+       80    protected CommandManager commandManager = new CommandManager();
+       81  
+       82    public ScriptManager() {
+       83      scriptEngineManager = new ScriptEngineManager();
+       84  
+       85      final var useGraal = GlobalConfiguration.SCRIPT_POLYGLOT_USE_GRAAL.getValueAsBoolean();
+       86      executorsFactories.put(
+       87          "javascript",
+       88          (lang) ->
+       89              useGraal
+       90                  ? new PolyglotScriptExecutor(lang, new ScriptTransformerImpl())
+       91                  : new Jsr223ScriptExecutor(lang, new ScriptTransformerImpl()));
+       92      executorsFactories.put(
+       93          "ecmascript",
+       94          (lang) ->
+       95              useGraal
+       96                  ? new PolyglotScriptExecutor(lang, new ScriptTransformerImpl())
+       97                  : new Jsr223ScriptExecutor(lang, new ScriptTransformerImpl()));
+       98  
+       99      for (var f : scriptEngineManager.getEngineFactories()) {
+      100        registerEngine(f.getLanguageName().toLowerCase(Locale.ENGLISH), f);
+      101  
+      102        if (defaultLanguage == null) {
+      103          defaultLanguage = f.getLanguageName();
+      104        }
+      105      }
+      106  
+      107      if (!existsEngine(DEF_LANGUAGE)) {
+      108        // if graal is disabled, try to load nashorn manually
+      109        var defEngine =
+      110            scriptEngineManager.getEngineByName(useGraal ? DEF_LANGUAGE : "nashorn");
+      111        if (defEngine == null) {
+      112          // no nashorn engine, use the default
+      113          defEngine = scriptEngineManager.getEngineByName(DEF_LANGUAGE);
+      114        }
+      115        if (defEngine == null) {
+      116          LogManager.instance()
+      117              .warn(this, "Cannot find default script language for %s", DEF_LANGUAGE);
+      118        } else {
+      119          // GET DIRECTLY THE LANGUAGE BY NAME (DON'T KNOW WHY SOMETIMES DOESN'T RETURN IT WITH
+      120          // getEngineFactories() ABOVE!
+      121          registerEngine(DEF_LANGUAGE, defEngine.getFactory());
+      122          defaultLanguage = DEF_LANGUAGE;
+      123        }
+      124      }
+      125  
+      126      registerFormatter(SQLScriptEngine.NAME, new SQLScriptFormatter());
+      127      registerFormatter(DEF_LANGUAGE, new JSScriptFormatter());
+      128      registerFormatter("ruby", new RubyScriptFormatter());
+      129      registerFormatter("groovy", new GroovyScriptFormatter());
+      130      for (var lang : engines.keySet()) {
+      131        var factory = executorsFactories.get(lang);
+      132        ScriptExecutor executor = null;
+      133        if (factory != null) {
+      134          executor = factory.apply(lang);
+      135        } else {
+      136          executor = new Jsr223ScriptExecutor(lang, new ScriptTransformerImpl());
+      137        }
+      138        commandManager.registerScriptExecutor(lang, executor);
+      139      }
+      140  
+      141      // Registring sql script engine after for not fight with the basic engine
+      142      registerEngine(SQLScriptEngine.NAME, new SQLScriptEngineFactory());
+      143  
+      144      var customExecutors =
+      145          ClassLoaderHelper.lookupProviderWithYouTrackDBClassLoader(ScriptExecutorRegister.class);
+      146  
+      147      customExecutors.forEachRemaining(e -> e.registerExecutor(this, commandManager));
+      148    }
+      149  
+      150    public String getFunctionDefinition(DatabaseSessionEmbedded session, final Function iFunction) {
+      151      final var formatter =
+      152          formatters.get(iFunction.getLanguage().toLowerCase(Locale.ENGLISH));
+      153      if (formatter == null) {
+      154        throw new IllegalArgumentException(
+      155            "Cannot find script formatter for the language '" + iFunction.getLanguage() + "'");
+      156      }
+      157  
+      158      return formatter.getFunctionDefinition(session, iFunction);
+      159    }
+      160  
+      161    public String getFunctionInvoke(DatabaseSessionEmbedded session, final Function iFunction,
+      162        final Object[] iArgs) {
+      163      final var formatter =
+      164          formatters.get(iFunction.getLanguage().toLowerCase(Locale.ENGLISH));
+      165      if (formatter == null) {
+      166        throw new IllegalArgumentException(
+      167            "Cannot find script formatter for the language '" + iFunction.getLanguage() + "'");
+      168      }
+      169  
+      170      return formatter.getFunctionInvoke(session, iFunction, iArgs);
+      171    }
+      172  
+      173    /**
+      174     * Formats the library of functions for a language.
+      175     *
+      176     * @param session   Current database instance
+      177     * @param iLanguage Language as filter
+      178     * @return String containing all the functions
+      179     */
+      180    @Nullable
+      181    public String getLibrary(final DatabaseSessionEmbedded session, final String iLanguage) {
+      182      if (session == null)
+      183      // NO DB = NO LIBRARY
+      184      {
+      185        return null;
+      186      }
+      187  
+      188      final var code = new StringBuilder();
+      189  
+      190      final var functions = session.getMetadata().getFunctionLibrary().getFunctionNames();
+      191      for (var fName : functions) {
+      192        final var f = session.getMetadata().getFunctionLibrary().getFunction(session, fName);
+      193  
+      194        if (f.getLanguage() == null) {
+      195          throw new ConfigurationException(session.getDatabaseName(),
+      196              "Database function '" + fName + "' has no language");
+      197        }
+      198  
+      199        if (f.getLanguage().equalsIgnoreCase(iLanguage)) {
+      200          final var def = getFunctionDefinition(session, f);
+      201          if (def != null) {
+      202            code.append(def);
+      203            code.append("\n");
+      204          }
+      205        }
+      206      }
+      207  
+      208      return code.length() == 0 ? null : code.toString();
+      209    }
+      210  
+      211    public boolean existsEngine(String iLanguage) {
+      212      if (iLanguage == null) {
+      213        return false;
+      214      }
+      215  
+      216      iLanguage = iLanguage.toLowerCase(Locale.ENGLISH);
+      217      return engines.containsKey(iLanguage);
+      218    }
+      219  
+      220    public ScriptEngine getEngine(String dbName, final String iLanguage) {
+      221      if (iLanguage == null) {
+      222        throw new CommandScriptException(dbName, "No language was specified");
+      223      }
+      224  
+      225      final var lang = iLanguage.toLowerCase(Locale.ENGLISH);
+      226  
+      227      final var scriptEngineFactory = engines.get(lang);
+      228      if (scriptEngineFactory == null) {
+      229        throw new CommandScriptException(dbName,
+      230            "Unsupported language: "
+      231                + iLanguage
+      232                + ". Supported languages are: "
+      233                + getSupportedLanguages());
+      234      }
+      235  
+      236      return scriptEngineFactory.getScriptEngine();
+      237    }
+      238  
+      239    /**
+      240     * Acquires a database engine from the pool. Once finished using it, the instance MUST be returned
+      241     * in the pool by calling the method #releaseDatabaseEngine(String, ScriptEngine).
+      242     *
+      243     * @param db       Database instance
+      244     * @param language Script language
+      245     * @return ScriptEngine instance with the function library already parsed
+      246     * @see #releaseDatabaseEngine(String, String, ScriptEngine)
+      247     */
+      248    public ScriptEngine acquireDatabaseEngine(final DatabaseSessionEmbedded db,
+      249        final String language) {
+      250      var dbManager = dbManagers.get(db.getDatabaseName());
+      251      if (dbManager == null) {
+      252        // CREATE A NEW DATABASE SCRIPT MANAGER
+      253        dbManager = new DatabaseScriptManager(this, db.getDatabaseName());
+      254        final var prev = dbManagers.putIfAbsent(db.getDatabaseName(), dbManager);
+      255        if (prev != null) {
+      256          dbManager.close();
+      257          // GET PREVIOUS ONE
+      258          dbManager = prev;
+      259        }
+      260      }
+      261  
+      262      return dbManager.acquireEngine(db, language);
+      263    }
+      264  
+      265    /**
+      266     * Acquires a database engine from the pool. Once finished using it, the instance MUST be returned
+      267     * in the pool by calling the method
+      268     *
+      269     * @param iLanguage     Script language
+      270     * @param iDatabaseName Database name
+      271     * @param poolEntry     Pool entry to free
+      272     * @see #acquireDatabaseEngine(DatabaseSessionEmbedded, String)
+      273     */
+      274    public void releaseDatabaseEngine(
+      275        final String iLanguage, final String iDatabaseName, final ScriptEngine poolEntry) {
+      276      final var dbManager = dbManagers.get(iDatabaseName);
+      277      // We check if there is still a valid pool because it could be removed by the function reload
+      278      if (dbManager != null) {
+      279        dbManager.releaseEngine(iLanguage, poolEntry);
+      280      }
+      281    }
+      282  
+      283    public Iterable<String> getSupportedLanguages() {
+      284      final var result = new HashSet<String>();
+      285      result.addAll(engines.keySet());
+      286      return result;
+      287    }
+      288  
+      289    public Bindings bindContextVariables(
+      290        ScriptEngine engine,
+      291        final Bindings binding,
+      292        final DatabaseSessionEmbedded db,
+      293        final CommandContext iContext,
+      294        final Map<Object, Object> iArgs) {
+      295  
+      296      bindDatabase(binding, db);
+      297  
+      298      bindInjectors(engine, binding, db);
+      299  
+      300      bindContext(binding, iContext);
+      301  
+      302      bindParameters(binding, iArgs);
+      303  
+      304      return binding;
+      305    }
+      306  
+      307    @Deprecated
+      308    public Bindings bind(
+      309        ScriptEngine scriptEngine,
+      310        final Bindings binding,
+      311        final DatabaseSessionEmbedded db,
+      312        final CommandContext iContext,
+      313        final Map<Object, Object> iArgs) {
+      314  
+      315      bindLegacyDatabaseAndUtil(binding, db);
+      316  
+      317      bindDatabase(binding, db);
+      318  
+      319      bindInjectors(scriptEngine, binding, db);
+      320  
+      321      bindContext(binding, iContext);
+      322  
+      323      bindParameters(binding, iArgs);
+      324  
+      325      return binding;
+      326    }
+      327  
+      328    private void bindInjectors(ScriptEngine engine, Bindings binding,
+      329        DatabaseSessionEmbedded database) {
+      330      for (var i : injections) {
+      331        i.bind(engine, binding, database);
+      332      }
+      333    }
+      334  
+      335    private void bindContext(Bindings binding, CommandContext iContext) {
+      336      // BIND CONTEXT VARIABLE INTO THE SCRIPT
+      337      if (iContext != null) {
+      338        binding.put("ctx", iContext);
+      339        for (var a : iContext.getVariables().entrySet()) {
+      340          binding.put(a.getKey(), a.getValue());
+      341        }
+      342      }
+      343    }
+      344  
+      345    private void bindLegacyDatabaseAndUtil(Bindings binding, DatabaseSessionEmbedded db) {
+      346      if (db != null) {
+      347        // BIND FIXED VARIABLES
+      348        //      binding.put("db", new ScriptDocumentDatabaseWrapper(db));
+      349        binding.put("youtrackdb", new ScriptYouTrackDbWrapper(db));
+      350      }
+      351      binding.put("util", new FunctionUtilWrapper());
+      352    }
+      353  
+      354    private void bindDatabase(Bindings binding, DatabaseSessionEmbedded db) {
+      355      if (db != null) {
+      356        binding.put("db", new ScriptDatabaseWrapper(db));
+      357      }
+      358    }
+      359  
+      360    private void bindParameters(Bindings binding, Map<Object, Object> iArgs) {
+      361      // BIND PARAMETERS INTO THE SCRIPT
+      362      if (iArgs != null) {
+      363        for (var a : iArgs.entrySet()) {
+      364          binding.put(a.getKey().toString(), a.getValue());
+      365        }
+      366  
+      367        binding.put("params", iArgs.values().toArray());
+      368      } else {
+      369        binding.put("params", EMPTY_PARAMS);
+      370      }
+      371    }
+      372  
+      373    public String throwErrorMessage(String dbName, final ScriptException e, final String lib) {
+      374      var errorLineNumber = e.getLineNumber();
+      375  
+      376      if (errorLineNumber <= 0) {
+      377        // FIX TO RHINO: SOMETIMES HAS THE LINE NUMBER INSIDE THE TEXT :-(
+      378        final var excMessage = e.toString();
+      379        final var pos = excMessage.indexOf("<Unknown Source>#");
+      380        if (pos > -1) {
+      381          final var end = excMessage.indexOf(')', pos + "<Unknown Source>#".length());
+      382          var lineNumberAsString = excMessage.substring(pos + "<Unknown Source>#".length(), end);
+      383          errorLineNumber = Integer.parseInt(lineNumberAsString);
+      384        }
+      385      }
+      386  
+      387      if (errorLineNumber <= 0) {
+      388        throw new CommandScriptException(dbName,
+      389            "Error on evaluation of the script library. Error: "
+      390                + e.getMessage()
+      391                + "\nScript library was:\n"
+      392                + lib);
+      393      } else {
+      394        final var code = new StringBuilder();
+      395        final var scanner = new Scanner(lib);
+      396        try {
+      397          scanner.useDelimiter("\n");
+      398          String currentLine = null;
+      399          var lastFunctionName = "unknown";
+      400  
+      401          for (var currentLineNumber = 1; scanner.hasNext(); currentLineNumber++) {
+      402            currentLine = scanner.next();
+      403            var pos = currentLine.indexOf("function");
+      404            if (pos > -1) {
+      405              final var words =
+      406                  StringParser.getWords(
+      407                      currentLine.substring(
+      408                          Math.min(pos + "function".length() + 1, currentLine.length())),
+      409                      " \r\n\t");
+      410              if (words.length > 0 && words[0] != "(") {
+      411                lastFunctionName = words[0];
+      412              }
+      413            }
+      414  
+      415            if (currentLineNumber == errorLineNumber)
+      416            // APPEND X LINES BEFORE
+      417            {
+      418              code.append(String.format("%4d: >>> %s\n", currentLineNumber, currentLine));
+      419            } else if (Math.abs(currentLineNumber - errorLineNumber) <= LINES_AROUND_ERROR)
+      420            // AROUND: APPEND IT
+      421            {
+      422              code.append(String.format("%4d: %s\n", currentLineNumber, currentLine));
+      423            }
+      424          }
+      425  
+      426          code.insert(
+      427              0,
+      428              String.format(
+      429                  "ScriptManager: error %s.\nFunction %s:\n\n", e.getMessage(), lastFunctionName));
+      430  
+      431        } finally {
+      432          scanner.close();
+      433        }
+      434  
+      435        throw new CommandScriptException(dbName, code.toString());
+      436      }
+      437    }
+      438  
+      439    /**
+      440     * Unbinds variables
+      441     */
+      442    public void unbind(
+      443        ScriptEngine scriptEngine,
+      444        final Bindings binding,
+      445        final CommandContext iContext,
+      446        final Map<Object, Object> iArgs) {
+      447      for (var i : injections) {
+      448        i.unbind(scriptEngine, binding);
+      449      }
+      450  
+      451      binding.put("db", null);
+      452      binding.put("youtrackdb", null);
+      453  
+      454      binding.put("util", null);
+      455  
+      456      binding.put("ctx", null);
+      457      if (iContext != null) {
+      458        for (var a : iContext.getVariables().entrySet()) {
+      459          binding.put(a.getKey(), null);
+      460        }
+      461      }
+      462  
+      463      if (iArgs != null) {
+      464        for (var a : iArgs.entrySet()) {
+       ... truncated at 400 lines ...
