@@ -105,7 +105,25 @@ def network_is_up(timeout: float = 4.0) -> bool:
         return False
 
 
-def wait_for_network(max_wait_s: int = 1800, quiet: bool = False) -> bool:
+# HOW LONG TO WAIT FOR THE LINK (raised 2026-09-02 from 1800s).
+#
+# THE INCIDENT. This machine's connection drops for a few minutes most
+# mornings. The old 30-minute ceiling meant that after the wait expired the
+# harness CONTINUED, and because `git fetch` fails in seconds rather than
+# hanging, it then raced through its remaining work marking every PR failed.
+# Giving up on the wait is therefore not a safe default: it converts a
+# transient outage into thousands of failure rows, which is exactly the silent,
+# repository-correlated (and so agent-correlated) loss this project keeps
+# having to hunt down.
+#
+# Waiting costs nothing but wall clock, and every stage is resumable and
+# checkpointed, so the correct ceiling is "longer than any outage you expect to
+# sleep through". 8 hours. The supervisor script restarts the process itself if
+# it exits, so the two layers cover each other.
+NET_WAIT_S = 8 * 3600
+
+
+def wait_for_network(max_wait_s: int = NET_WAIT_S, quiet: bool = False) -> bool:
     """Block until GitHub is reachable, up to `max_wait_s`. Thread-safe.
 
     Only ONE thread probes at a time; the rest wait on the lock and then see a
@@ -588,8 +606,23 @@ def api_pair(d: Path, full_name: str | None, pr_number) -> tuple[str, str] | Non
         _GH_MISSING[0] = True          # no gh on PATH: never try again
         return None
     except (subprocess.TimeoutExpired, OSError):
-        return None
-    if r.returncode != 0:
+        r = None
+    # NETWORK-AWARE, like run_git (added 2026-09-02). This shells out to `gh`
+    # rather than to git, so it does NOT inherit run_git's outage handling. A
+    # morning outage would otherwise make every tier-4 lookup return None in
+    # seconds, dropping exactly the PRs this tier exists to recover -- the same
+    # "race through the work marking everything failed" failure the shared layer
+    # was built to prevent.
+    if (r is None or r.returncode != 0) and not network_is_up():
+        wait_for_network()
+        try:
+            r = subprocess.run(
+                ["gh", "api", f"repos/{full_name}/pulls/{n}",
+                 "-q", ".base.sha + \" \" + .head.sha"],
+                capture_output=True, text=True, timeout=60, **NO_WINDOW)
+        except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+            return None
+    if r is None or r.returncode != 0:
         return None
     parts = r.stdout.split()
     if len(parts) != 2:
