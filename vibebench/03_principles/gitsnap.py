@@ -410,16 +410,31 @@ def delta_pair(d: Path, pr, info: dict | None = None) -> tuple[str, str] | None:
     # falls through to it. NOTE: an early `return None` here silently disabled
     # the whole fallback when it was first added, so keep these as `_fb()`.
     def _fb():
-        got = pull_ref_pair(d, getattr(pr, "pr_number", None))
-        if got is not None:
-            _tier(3)
-            return got
-        # TIER 4: tier 3 returns None when merge-base gives a degenerate pair
-        # (head already an ancestor of the base tip). GitHub still records the
-        # PR's real base, so ask for it rather than dropping the PR.
+        # ORDER MATTERS FOR SPEED, and it is a 24x difference (measured
+        # 2026-09-02 on amikos-tech/chromadb-java-client):
+        #     tier 3, one `fetch --depth 500` of a pull ref : 21,281 ms
+        #     tier 4, one `gh api` call                     :     879 ms
+        # Tier 3 does TWO such fetches (the pull ref and the base branch) and
+        # repeats the pair at depth 3000 if merge-base fails, so it costs
+        # 40-120s per PR against tier 4's ~1s plus two `--depth 1` fetches of
+        # two known SHAs. Running the deep ladder FIRST and only then falling
+        # back to the cheap exact answer had the recovery pass projected at 67
+        # hours; asking GitHub first is the same answer for ~1/20th of the work.
+        #
+        # Tier 4 is also STRICTLY BETTER when it succeeds: `base.sha` is the
+        # base recorded when the PR was opened, whereas tier 3 infers a branch
+        # point with merge-base and returns a degenerate pair whenever the head
+        # is already an ancestor of the base tip.
+        #
+        # Tier 3 stays as the fallback for when `gh` is absent, unauthenticated,
+        # rate-limited, or the PR is no longer served by the API.
         got = api_pair(d, getattr(pr, "full_name", None),
                        getattr(pr, "pr_number", None))
-        _tier(4 if got is not None else 0)
+        if got is not None:
+            _tier(4)
+            return got
+        got = pull_ref_pair(d, getattr(pr, "pr_number", None))
+        _tier(3 if got is not None else 0)
         return got
 
     raw = getattr(pr, "commit_shas", None)
