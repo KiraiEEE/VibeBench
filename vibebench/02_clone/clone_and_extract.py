@@ -661,7 +661,25 @@ def main() -> None:
                 agg = mine.groupby("pr_id")["extract_status"].agg(
                     ok=lambda s: (s == "ok").any(),
                     only_none=lambda s: set(s) == {"no_source_files"})
-                settled = set(agg.index[agg["ok"] | agg["only_none"]])
+                # `no_source_files` COUNTS AS SETTLED ONLY IF ITS EVIDENCE STILL
+                # EXISTS (2026-09-01). The claim "this PR touches no Java" rests
+                # entirely on the derived file list in `_touched.json`. When the
+                # degenerate-pair bug was found, those caches were deleted
+                # precisely because the lists in them were not trustworthy -- yet
+                # fast resume kept carrying the CONCLUSION forward and never
+                # revisited the PR, so 2,855 of 2,948 recovered PRs were skipped
+                # by a run whose whole purpose was to recover them.
+                #
+                # A conclusion whose evidence has been withdrawn is not settled.
+                # For a `git_diff` PR the cache file IS the evidence, so require
+                # it; dataset-sourced PRs carry their list in the gold set and
+                # are unaffected.
+                have_cache = {
+                    pid for pid in agg.index[agg["only_none"]]
+                    if (Path(profile["extract_dir"]) / str(pid) /
+                        "_touched.json").exists()}
+                only_none_ok = agg["only_none"] & agg.index.isin(have_cache)
+                settled = set(agg.index[agg["ok"] | only_none_ok])
                 if settled:
                     carried += mine[mine["pr_id"].isin(settled)].to_dict("records")
                     print("[clone] fast resume: %d PRs already settled in the "
