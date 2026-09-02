@@ -393,7 +393,15 @@ def delta_pair(d: Path, pr, info: dict | None = None) -> tuple[str, str] | None:
     # the whole fallback when it was first added, so keep these as `_fb()`.
     def _fb():
         got = pull_ref_pair(d, getattr(pr, "pr_number", None))
-        _tier(3 if got is not None else 0)
+        if got is not None:
+            _tier(3)
+            return got
+        # TIER 4: tier 3 returns None when merge-base gives a degenerate pair
+        # (head already an ancestor of the base tip). GitHub still records the
+        # PR's real base, so ask for it rather than dropping the PR.
+        got = api_pair(d, getattr(pr, "full_name", None),
+                       getattr(pr, "pr_number", None))
+        _tier(4 if got is not None else 0)
         return got
 
     raw = getattr(pr, "commit_shas", None)
@@ -534,6 +542,74 @@ def pull_ref_pair(d: Path, pr_number) -> tuple[str, str] | None:
         # lies outside both shallow boundaries. Deepen and retry rather than
         # guessing.
     return None
+
+
+# --------------------------------------------------------------------------
+# TIER 4: the GitHub API (added 2026-09-01)
+# --------------------------------------------------------------------------
+# WHY A FOURTH TIER. Tier 3 resolves the branch point with `merge-base` against
+# the default branch. That returns `after` ITSELF whenever the PR head is
+# already an ancestor of the base tip -- which is the normal state for a MERGED
+# PR whose commits are now in the base branch, and also happens after a rebase.
+# The pair is then degenerate, every diff is empty, and 2,819 PRs were dropped
+# reading that emptiness as "this PR touches no Java".
+#
+# Deepening does not help: the head genuinely IS an ancestor, so merge-base is
+# arithmetically correct and simply not the question we meant to ask. The base
+# we want is the base AT THE TIME THE PR WAS OPENED, which is not recoverable
+# from the graph afterwards but IS recorded by GitHub as `base.sha`.
+#
+# MEASURED on the two PRs that exposed the bug -- the API pair reproduces
+# GitHub's own file count exactly:
+#   amikos-tech/chromadb-java-client#116  ->  3 files,  3 java  (API changed=3)
+#   jenkinsci/chucknorris-plugin#249      -> 10 files,  8 java  (API changed=10)
+# Both SHAs were already in the local clone, so this usually costs one API call
+# and no fetch.
+#
+# Guarded: if `gh` is missing, unauthenticated or rate-limited, this returns
+# None and the caller behaves exactly as before.
+_GH_MISSING = [False]
+
+
+def api_pair(d: Path, full_name: str | None, pr_number) -> tuple[str, str] | None:
+    """(before, after) from GitHub's own record of the PR. LAST RESORT."""
+    if _GH_MISSING[0] or not full_name:
+        return None
+    try:
+        n = int(pr_number)
+    except (TypeError, ValueError):
+        return None
+    try:
+        r = subprocess.run(
+            ["gh", "api", f"repos/{full_name}/pulls/{n}",
+             "-q", ".base.sha + \" \" + .head.sha"],
+            capture_output=True, text=True, timeout=60, **NO_WINDOW)
+    except FileNotFoundError:
+        _GH_MISSING[0] = True          # no gh on PATH: never try again
+        return None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    parts = r.stdout.split()
+    if len(parts) != 2:
+        return None
+    before, after = parts
+    if before == after:
+        return None
+    for sha in (before, after):
+        if not have_commit(d, sha):
+            f = run_git(["fetch", "--depth", "1", "-q", "origin", sha], cwd=d)
+            if f is None or f.returncode != 0 or not have_commit(d, sha):
+                return None
+    # Prefer the true fork point when both sides are present; `base.sha` is the
+    # base tip when the PR was opened, which may itself have moved on.
+    mb = run_git(["merge-base", before, after], cwd=d)
+    if mb is not None and mb.returncode == 0 and mb.stdout.strip():
+        cand = mb.stdout.strip()
+        if cand != after and have_commit(d, cand):
+            before = cand
+    return before, after
 
 
 def src_tree(d: Path, sha: str, extensions, excluded_parts=(),

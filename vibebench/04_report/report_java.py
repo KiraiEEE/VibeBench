@@ -317,7 +317,13 @@ def outcome_contrast(sub: pd.DataFrame, flag_col: str, indent: str = "  ") -> No
     # pooled, and is 3.0 pp BETTER once the method is matched.
     tiers = s[s.get("pair_tier").notna()] if "pair_tier" in s.columns else s.iloc[0:0]
     if len(tiers):
-        both = tiers[tiers["pair_tier"].isin([2.0, 3.0])]
+        # Tiers 2, 3 and 4 all take the PR'S OWN branch point as "before";
+        # only tier 1 takes the merge commit's first parent, and only merged PRs
+        # can have a tier 1, which is what made the raw contrast a comparison of
+        # reconstruction method. Tier 4 (GitHub's recorded base.sha, added
+        # 2026-09-01) is available to merged and unmerged PRs alike, so it
+        # belongs with 2 and 3 rather than with 1.
+        both = tiers[tiers["pair_tier"].isin([2.0, 3.0, 4.0])]
         mm = both[both["outcome"] == "merged"]
         rr = both[both["outcome"] == "rejected"]
         if len(mm) >= 30 and len(rr) >= 30:
@@ -325,7 +331,7 @@ def outcome_contrast(sub: pd.DataFrame, flag_col: str, indent: str = "  ") -> No
             kr, nr = int(rr[flag_col].fillna(False).sum()), len(rr)
             lom, him = wilson(km, nm_)
             lor, hir = wilson(kr, nr)
-            print("%s  TIER-MATCHED (tiers 2+3 only -- QUOTE THIS ONE, the pooled"
+            print("%s  TIER-MATCHED (tiers 2+3+4 -- QUOTE THIS ONE, the pooled"
                   % indent)
             print("%s    contrast above is confounded by reconstruction method):"
                   % indent)
