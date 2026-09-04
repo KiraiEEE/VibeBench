@@ -1,0 +1,406 @@
+row 267   opencb/opencga#2636
+============================================================================
+CLASS org.opencb.opencga.catalog.managers.FileManager   loc=4374 methods=102 wmc=619 lcom=0.0693069306930693 c3=0.2604299670651608
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       85  public class FileManager extends AnnotationSetManager<File> {
+       86  
+       87      public static final QueryOptions INCLUDE_FILE_IDS;
+       88      public static final QueryOptions INCLUDE_FILE_URI;
+       89      public static final QueryOptions INCLUDE_FILE_URI_PATH;
+       90      public static final QueryOptions EXCLUDE_FILE_ATTRIBUTES;
+       91      private static final QueryOptions INCLUDE_STUDY_URI;
+       92      private static final Comparator<File> ROOT_FIRST_COMPARATOR;
+       93      private static final Comparator<File> ROOT_LAST_COMPARATOR;
+       94  
+       95      protected static Logger logger;
+       96  
+       97      static {
+       98          INCLUDE_FILE_IDS = new QueryOptions(QueryOptions.INCLUDE, Arrays.asList(FileDBAdaptor.QueryParams.ID.key(),
+       99                  FileDBAdaptor.QueryParams.NAME.key(), FileDBAdaptor.QueryParams.UID.key(), FileDBAdaptor.QueryParams.UUID.key(),
+      100                  FileDBAdaptor.QueryParams.RESOURCE.key(), FileDBAdaptor.QueryParams.STUDY_UID.key(),
+      101                  FileDBAdaptor.QueryParams.TYPE.key()));
+      102          INCLUDE_FILE_URI = keepFieldInQueryOptions(INCLUDE_FILE_IDS, FileDBAdaptor.QueryParams.URI.key());
+      103          INCLUDE_FILE_URI_PATH = keepFieldsInQueryOptions(INCLUDE_FILE_URI, Arrays.asList(FileDBAdaptor.QueryParams.INTERNAL_STATUS.key(),
+      104                  FileDBAdaptor.QueryParams.FORMAT.key(), FileDBAdaptor.QueryParams.URI.key(), FileDBAdaptor.QueryParams.PATH.key(),
+      105                  FileDBAdaptor.QueryParams.EXTERNAL.key(), FileDBAdaptor.QueryParams.SIZE.key()));
+      106          EXCLUDE_FILE_ATTRIBUTES = new QueryOptions(QueryOptions.EXCLUDE, Arrays.asList(FileDBAdaptor.QueryParams.ATTRIBUTES.key(),
+      107                  FileDBAdaptor.QueryParams.ANNOTATION_SETS.key(), FileDBAdaptor.QueryParams.STATS.key()));
+      108          INCLUDE_STUDY_URI = new QueryOptions(QueryOptions.INCLUDE, StudyDBAdaptor.QueryParams.URI.key());
+      109  
+      110          ROOT_FIRST_COMPARATOR = (f1, f2) -> (f1.getId() == null ? 0 : f1.getId().length())
+      111                  - (f2.getId() == null ? 0 : f2.getId().length());
+      112          ROOT_LAST_COMPARATOR = (f1, f2) -> (f2.getId() == null ? 0 : f2.getId().length())
+      113                  - (f1.getId() == null ? 0 : f1.getId().length());
+      114  
+      115          logger = LoggerFactory.getLogger(FileManager.class);
+      116      }
+      117  
+      118      private final String defaultFacet = "creationYear>>creationMonth;format;bioformat;format>>bioformat;status;"
+      119              + "size[0..214748364800]:10737418240;numSamples[0..10]:1";
+      120      private FileMetadataReader fileMetadataReader;
+      121      private UserManager userManager;
+      122      private StudyManager studyManager;
+      123      private IOManagerFactory ioManagerFactory;
+      124  
+      125      FileManager(AuthorizationManager authorizationManager, AuditManager auditManager, CatalogManager catalogManager,
+      126                  DBAdaptorFactory catalogDBAdaptorFactory, IOManagerFactory ioManagerFactory, Configuration configuration) {
+      127          super(authorizationManager, auditManager, catalogManager, catalogDBAdaptorFactory, configuration);
+      128  
+      129          this.userManager = catalogManager.getUserManager();
+      130          this.studyManager = catalogManager.getStudyManager();
+      131          this.ioManagerFactory = ioManagerFactory;
+      132          this.fileMetadataReader = new FileMetadataReader(this.catalogManager);
+      133      }
+      134  
+      135      @Override
+      136      Enums.Resource getEntity() {
+      137          return Enums.Resource.FILE;
+      138      }
+      139  
+      140      @Override
+      141      OpenCGAResult<File> internalGet(String organizationId, long studyUid, String entry, @Nullable Query query, QueryOptions options,
+      142                                      String user) throws CatalogException {
+      143          // We make this comparison because in File, the absence of a fileName means the user is actually looking for the / directory
+      144          if (StringUtils.isNotEmpty(entry) || entry == null) {
+      145              ParamUtils.checkIsSingleID(entry);
+      146          }
+      147          return internalGet(organizationId, studyUid, Collections.singletonList(entry), query, options, user, false);
+      148      }
+      149  
+      150      @Override
+      151      InternalGetDataResult<File> internalGet(String organizationId, long studyUid, List<String> entryList, @Nullable Query query,
+      152                                              QueryOptions options, String user, boolean ignoreException) throws CatalogException {
+      153          if (org.apache.commons.collections4.CollectionUtils.isEmpty(entryList)) {
+      154              throw new CatalogException("Missing file entries.");
+      155          }
+      156          List<String> uniqueList = ListUtils.unique(entryList);
+      157  
+      158          QueryOptions queryOptions = options != null ? new QueryOptions(options) : new QueryOptions();
+      159          Query queryCopy = query == null ? new Query() : new Query(query);
+      160          queryCopy.append(FileDBAdaptor.QueryParams.STUDY_UID.key(), studyUid);
+      161  
+      162          // TODO: This should be using getFieldFilter method.
+      163          Function<File, String> fileStringFunction = File::getPath;
+      164          boolean canBeSearchedAsName = true;
+      165          List<String> correctedFileList = new ArrayList<>(uniqueList.size());
+      166          Map<String, String> entriesIdMap = new HashMap<>();
+      167          FileDBAdaptor.QueryParams idQueryParam = null;
+      168          for (String entry : uniqueList) {
+      169              final String correctedEntryId;
+      170              FileDBAdaptor.QueryParams param = FileDBAdaptor.QueryParams.PATH;
+      171              if (UuidUtils.isOpenCgaUuid(entry)) {
+      172                  correctedEntryId = entry;
+      173                  param = FileDBAdaptor.QueryParams.UUID;
+      174                  fileStringFunction = File::getUuid;
+      175              } else {
+      176                  String fileName = entry;
+      177                  if (!entry.contains("/")) {
+      178                      // Treat as a file so we may need to revert the usage of ":" as part of the path
+      179                      fileName = entry
+      180                              .replace("\\:", "__OPENCGA__") // Pre-replacement to preserve original ":" from subpath
+      181                              .replace(":", "/")             // Replace ":" by "/"
+      182                              .replace("__OPENCGA__", ":");  // Revert replacement to original ":"
+      183                  }
+      184                  if (fileName.startsWith("/")) {
+      185                      // Remove the starting /. Absolute paths are not supported.
+      186                      fileName = fileName.substring(1);
+      187                  }
+      188                  correctedEntryId = fileName;
+      189  
+      190                  if (fileName.contains("/")) {
+      191                      canBeSearchedAsName = false;
+      192                  }
+      193              }
+      194              if (idQueryParam == null) {
+      195                  idQueryParam = param;
+      196              }
+      197              correctedFileList.add(correctedEntryId);
+      198              entriesIdMap.put(correctedEntryId, entry);
+      199  
+      200              if (idQueryParam != param) {
+      201                  throw new CatalogException("Found uuids and paths in the same query. Please, choose one or do two different queries.");
+      202              }
+      203          }
+      204          queryCopy.put(idQueryParam.key(), correctedFileList);
+      205  
+      206          // Ensure the field by which we are querying for will be kept in the results
+      207          queryOptions = keepFieldInQueryOptions(queryOptions, idQueryParam.key());
+      208  
+      209          OpenCGAResult<File> fileDataResult = getFileDBAdaptor(organizationId).get(studyUid, queryCopy, queryOptions, user);
+      210          if (fileDataResult.getNumResults() != correctedFileList.size() && idQueryParam == FileDBAdaptor.QueryParams.PATH
+      211                  && canBeSearchedAsName) {
+      212              // We also search by name
+      213              queryCopy = query == null ? new Query() : new Query(query);
+      214              queryCopy.append(FileDBAdaptor.QueryParams.STUDY_UID.key(), studyUid)
+      215                      .append(FileDBAdaptor.QueryParams.NAME.key(), correctedFileList);
+      216  
+      217              // Ensure the field by which we are querying for will be kept in the results
+      218              queryOptions = keepFieldInQueryOptions(queryOptions, FileDBAdaptor.QueryParams.NAME.key());
+      219  
+      220              OpenCGAResult<File> nameDataResult = getFileDBAdaptor(organizationId).get(studyUid, queryCopy, queryOptions, user);
+      221              if (nameDataResult.getNumResults() > fileDataResult.getNumResults()) {
+      222                  fileDataResult = nameDataResult;
+      223                  fileStringFunction = File::getName;
+      224              }
+      225          }
+      226  
+      227          if (fileDataResult.getNumResults() > correctedFileList.size()) {
+      228              throw new CatalogException("Error: More than one file found for at least one of the files introduced");
+      229          } else if (ignoreException || fileDataResult.getNumResults() == correctedFileList.size()) {
+      230              InternalGetDataResult<File> result = keepOriginalOrder(correctedFileList, fileStringFunction, fileDataResult,
+      231                      ignoreException, false);
+      232              if (result.getMissing() != null) {
+      233                  for (InternalGetDataResult.Missing missing : result.getMissing()) {
+      234                      String inputId = entriesIdMap.getOrDefault(missing.getId(), missing.getId());
+      235                      // Ensure input Ids are preserved on "missing" object.
+      236                      missing.setId(inputId);
+      237                  }
+      238              }
+      239              return result;
+      240          } else {
+      241              // The file could not be found or the user does not have permissions to see it
+      242              // Check if the file can be found without adding the user restriction
+      243              OpenCGAResult<File> resultsNoCheck = getFileDBAdaptor(organizationId).get(queryCopy, queryOptions);
+      244              if (resultsNoCheck.getNumResults() == correctedFileList.size()) {
+      245                  throw new CatalogAuthorizationException("Permission denied. " + user + " is not allowed to see some or none of the files.");
+      246              }
+      247              if (canBeSearchedAsName) {
+      248                  // The last query was performed by name, so we now search by path
+      249                  queryCopy = query == null ? new Query() : new Query(query);
+      250                  queryCopy.append(FileDBAdaptor.QueryParams.STUDY_UID.key(), studyUid)
+      251                          .append(FileDBAdaptor.QueryParams.PATH.key(), correctedFileList);
+      252                  resultsNoCheck = getFileDBAdaptor(organizationId).get(queryCopy, queryOptions);
+      253                  if (resultsNoCheck.getNumResults() == correctedFileList.size()) {
+      254                      throw new CatalogAuthorizationException("Permission denied. " + user + " is not allowed to see some or none of the "
+      255                              + "files.");
+      256                  }
+      257              }
+      258  
+      259              throw CatalogException.notFound("files at " + studyUid, getMissingFields(uniqueList, fileDataResult.getResults(),
+      260                      fileStringFunction));
+      261          }
+      262      }
+      263  
+      264      FileDBAdaptor.QueryParams getFieldFilter(List<String> idList) throws CatalogException {
+      265          FileDBAdaptor.QueryParams idQueryParam = null;
+      266          for (String entry : idList) {
+      267              FileDBAdaptor.QueryParams param;
+      268              if (UuidUtils.isOpenCgaUuid(entry)) {
+      269                  param = FileDBAdaptor.QueryParams.UUID;
+      270              } else if (entry.contains(":") && !entry.contains("/")) {
+      271                  param = FileDBAdaptor.QueryParams.ID;
+      272              } else if (entry.contains("/")) {
+      273                  param = FileDBAdaptor.QueryParams.PATH;
+      274              } else {
+      275                  param = FileDBAdaptor.QueryParams.NAME;
+      276              }
+      277              if (idQueryParam == null) {
+      278                  idQueryParam = param;
+      279              }
+      280              if (idQueryParam != param) {
+      281                  throw new CatalogException("Found uuids and paths in the same query. Please, choose one or do two different queries.");
+      282              }
+      283          }
+      284          return idQueryParam;
+      285      }
+      286  
+      287      private OpenCGAResult<File> getFile(String organizationId, long studyUid, String fileUuid, QueryOptions options)
+      288              throws CatalogException {
+      289          Query query = new Query()
+      290                  .append(FileDBAdaptor.QueryParams.STUDY_UID.key(), studyUid)
+      291                  .append(FileDBAdaptor.QueryParams.UUID.key(), fileUuid);
+      292          return getFileDBAdaptor(organizationId).get(query, options);
+      293      }
+      294  
+      295      public URI getUri(String organizationId, File file) throws CatalogException {
+      296          ParamUtils.checkObj(file, "File");
+      297          if (file.getUri() != null) {
+      298              return file.getUri();
+      299          } else {
+      300              OpenCGAResult<File> fileDataResult = getFileDBAdaptor(organizationId).get(file.getUid(), INCLUDE_STUDY_URI);
+      301              if (fileDataResult.getNumResults() == 0) {
+      302                  throw new CatalogException("File " + file.getUid() + " not found");
+      303              }
+      304              return fileDataResult.first().getUri();
+      305          }
+      306      }
+      307  
+      308      public Study getStudy(String organizationId, File file, String token) throws CatalogException {
+      309          ParamUtils.checkObj(file, "file");
+      310          ParamUtils.checkObj(token, "token");
+      311  
+      312          if (file.getStudyUid() <= 0) {
+      313              throw new CatalogException("Missing study uid field in file");
+      314          }
+      315  
+      316          JwtPayload payload = userManager.validateToken(token);
+      317          String user = payload.getUserId(organizationId);
+      318  
+      319          Query query = new Query(StudyDBAdaptor.QueryParams.UID.key(), file.getStudyUid());
+      320          OpenCGAResult<Study> studyDataResult = getStudyDBAdaptor(organizationId).get(query, QueryOptions.empty(), user);
+      321          if (studyDataResult.getNumResults() == 1) {
+      322              return studyDataResult.first();
+      323          } else {
+      324              authorizationManager.checkCanViewStudy(organizationId, file.getStudyUid(), user);
+      325              throw new CatalogException("Incorrect study uid");
+      326          }
+      327      }
+      328  
+      329      public void matchUpVariantFiles(String studyStr, List<File> transformedFiles, String token) throws CatalogException {
+      330          JwtPayload tokenPayload = catalogManager.getUserManager().validateToken(token);
+      331          CatalogFqn studyFqn = CatalogFqn.extractFqnFromStudy(studyStr, tokenPayload);
+      332          String organizationId = studyFqn.getOrganizationId();
+      333          String userId = tokenPayload.getUserId(organizationId);
+      334          Study study = studyManager.resolveId(studyStr, userId, organizationId);
+      335  
+      336          for (File transformedFile : transformedFiles) {
+      337              authorizationManager.checkFilePermission(organizationId, study.getUid(), transformedFile.getUid(), userId,
+      338                      FilePermissions.WRITE);
+      339              String variantPathName = getMainVariantFile(transformedFile.getPath());
+      340              if (variantPathName == null) {
+      341                  // Skip the file.
+      342                  logger.debug("The file {} is not a variant transformed file", transformedFile.getName());
+      343                  continue;
+      344              }
+      345  
+      346              // Search in the same path
+      347              logger.info("Looking for vcf file in path {}", variantPathName);
+      348              Query query = new Query()
+      349                      .append(FileDBAdaptor.QueryParams.STUDY_UID.key(), study.getUid())
+      350                      .append(FileDBAdaptor.QueryParams.PATH.key(), variantPathName)
+      351                      .append(FileDBAdaptor.QueryParams.BIOFORMAT.key(), File.Bioformat.VARIANT);
+      352  
+      353              List<File> fileList = getFileDBAdaptor(organizationId).get(query, new QueryOptions()).getResults();
+      354  
+      355              if (fileList.isEmpty()) {
+      356                  // Search by name in the whole study
+      357                  String variantFileName = getMainVariantFile(transformedFile.getName());
+      358                  logger.info("Looking for vcf file by name {}", variantFileName);
+      359                  query = new Query()
+      360                          .append(FileDBAdaptor.QueryParams.STUDY_UID.key(), study.getUid())
+      361                          .append(FileDBAdaptor.QueryParams.NAME.key(), variantFileName)
+      362                          .append(FileDBAdaptor.QueryParams.BIOFORMAT.key(), File.Bioformat.VARIANT);
+      363                  fileList = new ArrayList<>(getFileDBAdaptor(organizationId).get(query, new QueryOptions()).getResults());
+      364  
+      365                  // In case of finding more than one file, try to find the proper one.
+      366                  if (fileList.size() > 1) {
+      367                      // Discard files already with a transformed file.
+      368                      fileList.removeIf(file -> file.getInternal().getVariant().getIndex() != null
+      369                              && file.getInternal().getVariant().getIndex().hasTransform()
+      370                              && !file.getInternal().getVariant().getIndex().getTransform().getFileId().equals(transformedFile.getId()));
+      371                  }
+      372                  if (fileList.size() > 1) {
+      373                      // Discard files not transformed nor indexed.
+      374                      fileList.removeIf(file -> FileInternal.getVariantIndexStatusId(file.getInternal()).equals(VariantIndexStatus.NONE));
+      375                  }
+      376              }
+      377  
+      378              if (fileList.size() != 1) {
+      379                  // VCF file not found
+      380                  logger.warn("The vcf file corresponding to the file " + transformedFile.getName() + " could not be found");
+      381                  continue;
+      382              }
+      383              File vcf = fileList.get(0);
+      384  
+      385              // Look for the json file. It should be in the same directory where the transformed file is.
+      386              String jsonPathName = getVariantMetadataFile(transformedFile.getPath());
+      387              query = new Query()
+      388                      .append(FileDBAdaptor.QueryParams.STUDY_UID.key(), study.getUid())
+      389                      .append(FileDBAdaptor.QueryParams.PATH.key(), jsonPathName)
+      390                      .append(FileDBAdaptor.QueryParams.FORMAT.key(), File.Format.JSON);
+      391              fileList = getFileDBAdaptor(organizationId).get(query, new QueryOptions()).getResults();
+      392              if (fileList.size() != 1) {
+      393                  // Skip. This should not ever happen
+      394                  logger.warn("The json file corresponding to the file " + transformedFile.getName() + " could not be found");
+      395                  continue;
+      396              }
+      397              File json = fileList.get(0);
+      398  
+      399              /* Update relations */
+      400              FileRelatedFile producedFromRelation = new FileRelatedFile(vcf, FileRelatedFile.Relation.PRODUCED_FROM);
+      401  
+      402              // Update json file
+      403              logger.debug("Updating json relation");
+      404              List<FileRelatedFile> relatedFiles = ParamUtils.defaultObject(json.getRelatedFiles(), ArrayList::new);
+      405              // Do not add twice the same relation
+      406              if (!relatedFiles.contains(producedFromRelation)) {
+      407                  relatedFiles.add(producedFromRelation);
+      408                  ObjectMap params = new ObjectMap(FileDBAdaptor.QueryParams.RELATED_FILES.key(), relatedFiles);
+      409                  getFileDBAdaptor(organizationId).update(json.getUid(), params, QueryOptions.empty());
+      410              }
+      411  
+      412              // Update transformed file
+      413              logger.debug("Updating transformed relation");
+      414              relatedFiles = ParamUtils.defaultObject(transformedFile.getRelatedFiles(), ArrayList::new);
+      415              // Do not add twice the same relation
+      416              if (!relatedFiles.contains(producedFromRelation)) {
+      417                  relatedFiles.add(producedFromRelation);
+      418                  transformedFile.setRelatedFiles(relatedFiles);
+      419                  ObjectMap params = new ObjectMap(FileDBAdaptor.QueryParams.RELATED_FILES.key(), relatedFiles);
+      420                  getFileDBAdaptor(organizationId).update(transformedFile.getUid(), params, QueryOptions.empty());
+      421              }
+      422  
+      423              // Update vcf file
+      424              logger.debug("Updating vcf relation");
+      425              FileInternalVariantIndex index = vcf.getInternal().getVariant().getIndex();
+      426              if (!index.hasTransform()) {
+      427                  index.setTransform(new FileInternalVariantIndex.Transform(transformedFile.getId(), json.getId()));
+      428              }
+      429              String status;
+      430              if (index.getStatus() != null && index.getStatus().getId() != null) {
+      431                  status = index.getStatus().getId();
+      432              } else {
+      433                  status = VariantIndexStatus.NONE;
+      434              }
+      435              if (VariantIndexStatus.NONE.equals(status)) {
+      436                  // If TRANSFORMED, TRANSFORMING, etc, do not modify the index status
+      437                  index.setStatus(new VariantIndexStatus(VariantIndexStatus.TRANSFORMED, "Found transformed file"));
+      438              }
+      439              ObjectMap params = new ObjectMap(FileDBAdaptor.QueryParams.INTERNAL_VARIANT_INDEX.key(), index);
+      440              getFileDBAdaptor(organizationId).update(vcf.getUid(), params, QueryOptions.empty());
+      441  
+      442              // Update variant stats
+      443              Path statsFile = Paths.get(json.getUri().getRawPath());
+      444              try (InputStream is = FileUtils.newInputStream(statsFile)) {
+      445                  VariantFileMetadata fileMetadata = getDefaultObjectMapper().readValue(is, VariantFileMetadata.class);
+      446                  VariantSetStats stats = fileMetadata.getStats();
+      447  
+      448                  catalogManager.getFileManager()
+      449                          .update(studyStr, vcf.getPath(),
+      450                                  new FileUpdateParams().setQualityControl(
+      451                                          new FileQualityControl().setVariant(
+      452                                                  new VariantFileQualityControl(stats, null))),
+      453                                  new QueryOptions(),
+      454                                  token);
+      455              } catch (IOException e) {
+      456                  throw new CatalogException("Error reading file \"" + statsFile + "\"", e);
+      457              }
+      458          }
+      459      }
+      460  
+      461      public OpenCGAResult<?> updateFileInternalVariantIndex(String studyFqn, File file, FileInternalVariantIndex index, String token)
+      462              throws CatalogException {
+      463          return updateFileInternalField(studyFqn, file, index, FileDBAdaptor.QueryParams.INTERNAL_VARIANT_INDEX.key(), token);
+      464      }
+      465  
+      466      public OpenCGAResult<?> updateFileInternalVariantAnnotationIndex(String studyFqn, File file,
+      467                                                                       FileInternalVariantAnnotationIndex index, String token)
+      468              throws CatalogException {
+      469          return updateFileInternalField(studyFqn, file, index, FileDBAdaptor.QueryParams.INTERNAL_VARIANT_ANNOTATION_INDEX.key(),
+      470                  token);
+      471      }
+      472  
+      473      public OpenCGAResult<?> updateFileInternalVariantSecondaryAnnotationIndex(String studyFqn, File file,
+      474                                                                                FileInternalVariantSecondaryAnnotationIndex index,
+      475                                                                                String token) throws CatalogException {
+      476          return updateFileInternalField(studyFqn, file, index, Arrays.asList(
+      477                  FileDBAdaptor.QueryParams.INTERNAL_VARIANT_SECONDARY_ANNOTATION_INDEX.key(),
+      478                  FileDBAdaptor.QueryParams.INTERNAL_VARIANT_SECONDARY_INDEX.key()
+      479          ), token);
+      480      }
+      481  
+      482      public OpenCGAResult<?> updateFileInternalAlignmentIndex(String studyFqn, File file, FileInternalAlignmentIndex index,
+      483                                                               String token) throws CatalogException {
+      484          return updateFileInternalField(studyFqn, file, index, FileDBAdaptor.QueryParams.INTERNAL_ALIGNMENT_INDEX.key(), token);
+       ... truncated at 400 lines ...

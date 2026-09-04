@@ -1,0 +1,406 @@
+row 66   apache/iotdb#17293
+============================================================================
+CLASS org.apache.iotdb.db.pipe.receiver.protocol.iotconsensusv2.IoTConsensusV2Receiver   loc=1637 methods=31 wmc=114 lcom=0.0333333333333333 c3=0.2047684789788417
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       99  public class IoTConsensusV2Receiver {
+      100    private static final Logger LOGGER = LoggerFactory.getLogger(IoTConsensusV2Receiver.class);
+      101    private static final IoTDBConfig IOTDB_CONFIG = IoTDBDescriptor.getInstance().getConfig();
+      102    private static final long IOT_CONSENSUS_V2_RECEIVER_MAX_WAITING_TIME_IN_MS =
+      103        (long) IOTDB_CONFIG.getConnectionTimeoutInMS()
+      104            / 3
+      105            * IOTDB_CONFIG.getIotConsensusV2PipelineSize();
+      106    private static final long CLOSE_TSFILE_WRITER_MAX_WAIT_TIME_IN_MS = 5000;
+      107    private static final long RETRY_WAIT_TIME = 500;
+      108    private final RequestExecutor requestExecutor;
+      109    private final IoTConsensusV2 iotConsensusV2;
+      110    private final ConsensusGroupId consensusGroupId;
+      111    private final ConsensusPipeName consensusPipeName;
+      112    // Used to buffer TsFile when transfer TsFile asynchronously.
+      113    private final IoTConsensusV2TsFileWriterPool iotConsensusV2TsFileWriterPool;
+      114    private final ScheduledExecutorService scheduledTsFileWriterCheckerPool =
+      115        IoTDBThreadPoolFactory.newSingleThreadScheduledExecutor(
+      116            ThreadName.IOT_CONSENSUS_V2_TSFILE_WRITER_CHECKER.getName());
+      117    private Future<?> tsFileWriterCheckerFuture;
+      118    private final List<String> receiveDirs = new ArrayList<>();
+      119    private final IoTConsensusV2ReceiverMetrics iotConsensusV2ReceiverMetrics;
+      120    private final FolderManager folderManager;
+      121    private final AtomicBoolean isClosed = new AtomicBoolean(false);
+      122    private final ReadWriteLock tsFilePieceReadWriteLock = new ReentrantReadWriteLock(true);
+      123  
+      124    public IoTConsensusV2Receiver(
+      125        IoTConsensusV2 iotConsensusV2,
+      126        ConsensusGroupId consensusGroupId,
+      127        ConsensusPipeName consensusPipeName) {
+      128      this.iotConsensusV2 = iotConsensusV2;
+      129      this.consensusGroupId = consensusGroupId;
+      130      this.iotConsensusV2ReceiverMetrics = new IoTConsensusV2ReceiverMetrics(this);
+      131      this.consensusPipeName = consensusPipeName;
+      132  
+      133      // Each iotConsensusV2Receiver has its own base directories. for example, a default dir path is
+      134      // data/datanode/system/pipe/consensus/receiver/__consensus.{consensusGroupId}_{leaderDataNodeId}_{followerDataNodeId}
+      135      List<String> receiverBaseDirsName =
+      136          Arrays.asList(
+      137              IoTDBDescriptor.getInstance().getConfig().getIotConsensusV2ReceiverFileDirs());
+      138  
+      139      try {
+      140        initiateTsFileBufferFolder(receiverBaseDirsName);
+      141      } catch (Exception e) {
+      142        LOGGER.error("Fail to initiate file buffer folder, Error msg: {}", e.getMessage());
+      143        throw new RuntimeException(e);
+      144      }
+      145  
+      146      try {
+      147        this.folderManager = new FolderManager(receiveDirs, DirectoryStrategyType.SEQUENCE_STRATEGY);
+      148        this.iotConsensusV2TsFileWriterPool = new IoTConsensusV2TsFileWriterPool(consensusPipeName);
+      149      } catch (Exception e) {
+      150        LOGGER.error(
+      151            "Fail to create iotConsensusV2 receiver file folders allocation strategy because all disks of folders are full.",
+      152            e);
+      153        throw new RuntimeException(e);
+      154      }
+      155  
+      156      this.requestExecutor =
+      157          new RequestExecutor(iotConsensusV2ReceiverMetrics, iotConsensusV2TsFileWriterPool);
+      158      MetricService.getInstance().addMetricSet(iotConsensusV2ReceiverMetrics);
+      159    }
+      160  
+      161    /**
+      162     * This method cannot be set to synchronize. Receive events can be concurrent since reqBuffer but
+      163     * load event must be synchronized.
+      164     */
+      165    public TIoTConsensusV2TransferResp receive(final TIoTConsensusV2TransferReq req) {
+      166      long startNanos = System.nanoTime();
+      167      // PreCheck: if there are these cases: read-only; null impl; inactive impl, etc. The receiver
+      168      // will reject synchronization.
+      169      TIoTConsensusV2TransferResp resp = preCheckForReceiver(req);
+      170      if (resp != null) {
+      171        // release tsFileWriter if pre-check failed as leader will resend the whole tsFileEvent
+      172        releaseTsFileWriter(
+      173            iotConsensusV2TsFileWriterPool.tryToFindCorrespondingWriter(req.getCommitId()), false);
+      174        return resp;
+      175      }
+      176  
+      177      final short rawRequestType = req.getType();
+      178      if (IoTConsensusV2RequestType.isValidatedRequestType(rawRequestType)) {
+      179        switch (IoTConsensusV2RequestType.valueOf(rawRequestType)) {
+      180          case TRANSFER_TS_FILE_PIECE:
+      181          case TRANSFER_TS_FILE_PIECE_WITH_MOD:
+      182            // Just take a place in requestExecutor's buffer, the further seal request will remove
+      183            // its place from buffer.
+      184            requestExecutor.onRequest(req, true, false);
+      185            resp = loadEvent(req);
+      186            break;
+      187          case TRANSFER_TS_FILE_SEAL:
+      188          case TRANSFER_TS_FILE_SEAL_WITH_MOD:
+      189            resp = requestExecutor.onRequest(req, false, true);
+      190            break;
+      191          case TRANSFER_DELETION:
+      192          case TRANSFER_TABLET_BINARY:
+      193          case TRANSFER_TABLET_INSERT_NODE:
+      194          case TRANSFER_TABLET_BATCH:
+      195          default:
+      196            resp = requestExecutor.onRequest(req, false, false);
+      197            break;
+      198        }
+      199        // update receive an event's duration
+      200        long durationNanos = System.nanoTime() - startNanos;
+      201        iotConsensusV2ReceiverMetrics.recordReceiveEventTimer(durationNanos);
+      202        return resp;
+      203      }
+      204      // Unknown request type, which means the request can not be handled by this receiver,
+      205      // maybe the version of the receiver is not compatible with the sender
+      206      final TSStatus status =
+      207          RpcUtils.getStatus(
+      208              TSStatusCode.PIPE_TYPE_ERROR,
+      209              String.format("IoTConsensusV2 Unknown PipeRequestType %s.", rawRequestType));
+      210      if (LOGGER.isWarnEnabled()) {
+      211        LOGGER.warn("IoTConsensusV2 Unknown PipeRequestType, response status = {}.", status);
+      212      }
+      213      return new TIoTConsensusV2TransferResp(status);
+      214    }
+      215  
+      216    private TIoTConsensusV2TransferResp preCheckForReceiver(final TIoTConsensusV2TransferReq req) {
+      217      ConsensusGroupId groupId =
+      218          ConsensusGroupId.Factory.createFromTConsensusGroupId(req.getConsensusGroupId());
+      219      IoTConsensusV2ServerImpl impl = iotConsensusV2.getImpl(groupId);
+      220  
+      221      if (impl == null) {
+      222        String message =
+      223            String.format(
+      224                "IoTConsensusV2-PipeName-%s: unexpected consensusGroupId %s",
+      225                consensusPipeName, groupId);
+      226        if (LOGGER.isErrorEnabled()) {
+      227          LOGGER.error(message);
+      228        }
+      229        return new TIoTConsensusV2TransferResp(
+      230            RpcUtils.getStatus(TSStatusCode.INTERNAL_SERVER_ERROR.getStatusCode(), message));
+      231      }
+      232      if (impl.isReadOnly()) {
+      233        String message =
+      234            String.format(
+      235                "IoTConsensusV2-PipeName-%s: fail to receive because system is read-only.",
+      236                consensusPipeName);
+      237        if (LOGGER.isErrorEnabled()) {
+      238          LOGGER.error(message);
+      239        }
+      240        return new TIoTConsensusV2TransferResp(
+      241            RpcUtils.getStatus(TSStatusCode.SYSTEM_READ_ONLY.getStatusCode(), message));
+      242      }
+      243  
+      244      return null;
+      245    }
+      246  
+      247    private TIoTConsensusV2TransferResp loadEvent(final TIoTConsensusV2TransferReq req) {
+      248      if (isClosed.get()) {
+      249        return IoTConsensusV2ReceiverAgent.closedResp(
+      250            consensusPipeName.toString(), req.getCommitId());
+      251      }
+      252      // synchronized load event, ensured by upper caller's lock.
+      253      try {
+      254        final short rawRequestType = req.getType();
+      255        if (IoTConsensusV2RequestType.isValidatedRequestType(rawRequestType)) {
+      256          switch (IoTConsensusV2RequestType.valueOf(rawRequestType)) {
+      257            case TRANSFER_TABLET_INSERT_NODE:
+      258              return handleTransferTabletInsertNode(
+      259                  IoTConsensusV2TabletInsertNodeReq.fromTIoTConsensusV2TransferReq(req));
+      260            case TRANSFER_TABLET_BINARY:
+      261              return handleTransferTabletBinary(
+      262                  IoTConsensusV2TabletBinaryReq.fromTIoTConsensusV2TransferReq(req));
+      263            case TRANSFER_DELETION:
+      264              return handleTransferDeletion(
+      265                  IoTConsensusV2DeleteNodeReq.fromTIoTConsensusV2TransferReq(req));
+      266            case TRANSFER_TS_FILE_PIECE:
+      267              return handleTransferFilePiece(
+      268                  IoTConsensusV2TsFilePieceReq.fromTIoTConsensusV2TransferReq(req), true);
+      269            case TRANSFER_TS_FILE_SEAL:
+      270              return handleTransferFileSeal(
+      271                  IoTConsensusV2TsFileSealReq.fromTIoTConsensusV2TransferReq(req));
+      272            case TRANSFER_TS_FILE_PIECE_WITH_MOD:
+      273              return handleTransferFilePiece(
+      274                  IoTConsensusV2TsFilePieceReq.fromTIoTConsensusV2TransferReq(req), false);
+      275            case TRANSFER_TS_FILE_SEAL_WITH_MOD:
+      276              return handleTransferFileSealWithMods(
+      277                  IoTConsensusV2TsFileSealWithModReq.fromTIoTConsensusV2TransferReq(req));
+      278            case TRANSFER_TABLET_BATCH:
+      279              LOGGER.info("IoTConsensusV2 transfer batch hasn't been implemented yet.");
+      280            default:
+      281              break;
+      282          }
+      283        }
+      284        // Unknown request type, which means the request can not be handled by this receiver,
+      285        // maybe the version of the receiver is not compatible with the sender
+      286        final TSStatus status =
+      287            RpcUtils.getStatus(
+      288                TSStatusCode.IOT_CONSENSUS_V2_TYPE_ERROR,
+      289                String.format("Unknown IoTConsensusV2RequestType %s.", rawRequestType));
+      290        LOGGER.warn(
+      291            "IoTConsensusV2-PipeName-{}: Unknown PipeRequestType, response status = {}.",
+      292            consensusPipeName,
+      293            status);
+      294        return new TIoTConsensusV2TransferResp(status);
+      295      } catch (Exception e) {
+      296        final String error = String.format("Serialization error during pipe receiving, %s", e);
+      297        LOGGER.warn("IoTConsensusV2-PipeName-{}: {}", consensusPipeName, error, e);
+      298        return new TIoTConsensusV2TransferResp(RpcUtils.getStatus(TSStatusCode.PIPE_ERROR, error));
+      299      }
+      300    }
+      301  
+      302    private TIoTConsensusV2TransferResp handleTransferTabletInsertNode(
+      303        final IoTConsensusV2TabletInsertNodeReq req) throws ConsensusGroupNotExistException {
+      304      IoTConsensusV2ServerImpl impl =
+      305          Optional.ofNullable(iotConsensusV2.getImpl(consensusGroupId))
+      306              .orElseThrow(() -> new ConsensusGroupNotExistException(consensusGroupId));
+      307      final InsertNode insertNode = req.getInsertNode();
+      308      insertNode.markAsGeneratedByRemoteConsensusLeader();
+      309      insertNode.setProgressIndex(
+      310          ProgressIndexType.deserializeFrom(ByteBuffer.wrap(req.getProgressIndex())));
+      311      return new TIoTConsensusV2TransferResp(impl.writeOnFollowerReplica(insertNode));
+      312    }
+      313  
+      314    private TIoTConsensusV2TransferResp handleTransferTabletBinary(
+      315        final IoTConsensusV2TabletBinaryReq req) throws ConsensusGroupNotExistException {
+      316      IoTConsensusV2ServerImpl impl =
+      317          Optional.ofNullable(iotConsensusV2.getImpl(consensusGroupId))
+      318              .orElseThrow(() -> new ConsensusGroupNotExistException(consensusGroupId));
+      319      final InsertNode insertNode = req.convertToInsertNode();
+      320      insertNode.markAsGeneratedByRemoteConsensusLeader();
+      321      insertNode.setProgressIndex(
+      322          ProgressIndexType.deserializeFrom(ByteBuffer.wrap(req.getProgressIndex())));
+      323      return new TIoTConsensusV2TransferResp(impl.writeOnFollowerReplica(insertNode));
+      324    }
+      325  
+      326    private TIoTConsensusV2TransferResp handleTransferDeletion(final IoTConsensusV2DeleteNodeReq req)
+      327        throws ConsensusGroupNotExistException {
+      328      IoTConsensusV2ServerImpl impl =
+      329          Optional.ofNullable(iotConsensusV2.getImpl(consensusGroupId))
+      330              .orElseThrow(() -> new ConsensusGroupNotExistException(consensusGroupId));
+      331      final AbstractDeleteDataNode planNode = req.getDeleteDataNode();
+      332      planNode.markAsGeneratedByRemoteConsensusLeader();
+      333      planNode.setProgressIndex(
+      334          ProgressIndexType.deserializeFrom(ByteBuffer.wrap(req.getProgressIndex())));
+      335      return new TIoTConsensusV2TransferResp(impl.writeOnFollowerReplica(planNode));
+      336    }
+      337  
+      338    private TIoTConsensusV2TransferResp handleTransferFilePiece(
+      339        final IoTConsensusV2TransferFilePieceReq req, final boolean isSingleFile) {
+      340      tsFilePieceReadWriteLock.readLock().lock();
+      341      try {
+      342        if (LOGGER.isDebugEnabled()) {
+      343          LOGGER.debug(
+      344              "IoTConsensusV2-PipeName-{}: starting to receive tsFile pieces", consensusPipeName);
+      345        }
+      346        long startBorrowTsFileWriterNanos = System.nanoTime();
+      347        IoTConsensusV2TsFileWriter tsFileWriter =
+      348            iotConsensusV2TsFileWriterPool.borrowCorrespondingWriter(req.getCommitId());
+      349        long startPreCheckNanos = System.nanoTime();
+      350        iotConsensusV2ReceiverMetrics.recordBorrowTsFileWriterTimer(
+      351            startPreCheckNanos - startBorrowTsFileWriterNanos);
+      352  
+      353        try {
+      354          updateWritingFileIfNeeded(tsFileWriter, req.getFileName(), isSingleFile);
+      355          final File writingFile = tsFileWriter.getWritingFile();
+      356          final RandomAccessFile writingFileWriter = tsFileWriter.getWritingFileWriter();
+      357  
+      358          if (isWritingFileOffsetNonCorrect(tsFileWriter, req.getStartWritingOffset())) {
+      359            if (!writingFile.getName().endsWith(TsFileConstant.TSFILE_SUFFIX)) {
+      360              // If the file is a tsFile, then the content will not be changed for a specific
+      361              // filename. However, for other files (mod, snapshot, etc.) the content varies for the
+      362              // same name in different times, then we must rewrite the file to apply the newest
+      363              // version.
+      364              writingFileWriter.setLength(0);
+      365            }
+      366  
+      367            final TSStatus status =
+      368                RpcUtils.getStatus(
+      369                    TSStatusCode.IOT_CONSENSUS_V2_TRANSFER_FILE_OFFSET_RESET,
+      370                    String.format(
+      371                        "Request sender to reset file reader's offset from %s to %s.",
+      372                        req.getStartWritingOffset(), writingFileWriter.length()));
+      373            LOGGER.warn(
+      374                "IoTConsensusV2-PipeName-{}: File offset reset requested by receiver, response status = {}.",
+      375                consensusPipeName,
+      376                status);
+      377            return IoTConsensusV2TransferFilePieceResp.toTIoTConsensusV2TransferResp(
+      378                status, writingFileWriter.length());
+      379          }
+      380  
+      381          long endPreCheckNanos = System.nanoTime();
+      382          iotConsensusV2ReceiverMetrics.recordTsFilePiecePreCheckTime(
+      383              endPreCheckNanos - startPreCheckNanos);
+      384          writingFileWriter.write(req.getFilePiece());
+      385          iotConsensusV2ReceiverMetrics.recordTsFilePieceWriteTime(
+      386              System.nanoTime() - endPreCheckNanos);
+      387          return IoTConsensusV2TransferFilePieceResp.toTIoTConsensusV2TransferResp(
+      388              RpcUtils.SUCCESS_STATUS, writingFileWriter.length());
+      389        } catch (Exception e) {
+      390          LOGGER.warn(
+      391              "IoTConsensusV2-PipeName-{}: Failed to write file piece from req {}.",
+      392              consensusPipeName,
+      393              req,
+      394              e);
+      395          final TSStatus status =
+      396              RpcUtils.getStatus(
+      397                  TSStatusCode.IOT_CONSENSUS_V2_TRANSFER_FILE_ERROR,
+      398                  String.format("Failed to write file piece, because %s", e.getMessage()));
+      399          try {
+      400            return IoTConsensusV2TransferFilePieceResp.toTIoTConsensusV2TransferResp(
+      401                status, PipeTransferFilePieceResp.ERROR_END_OFFSET);
+      402          } catch (IOException ex) {
+      403            return IoTConsensusV2TransferFilePieceResp.toTIoTConsensusV2TransferResp(status);
+      404          } finally {
+      405            // Exception may occur when disk system go wrong. At this time, we may reset all resource
+      406            // and receive this file from scratch when leader will try to resend this file from
+      407            // scratch as well.
+      408            releaseTsFileWriter(tsFileWriter, false);
+      409          }
+      410        }
+      411      } finally {
+      412        tsFilePieceReadWriteLock.readLock().unlock();
+      413      }
+      414    }
+      415  
+      416    private TIoTConsensusV2TransferResp handleTransferFileSeal(
+      417        final IoTConsensusV2TsFileSealReq req) {
+      418      LOGGER.info("IoTConsensusV2-PipeName-{}: starting to receive tsFile seal", consensusPipeName);
+      419      long startBorrowTsFileWriterNanos = System.nanoTime();
+      420      IoTConsensusV2TsFileWriter tsFileWriter =
+      421          iotConsensusV2TsFileWriterPool.borrowCorrespondingWriter(req.getCommitId());
+      422      long startPreCheckNanos = System.nanoTime();
+      423      iotConsensusV2ReceiverMetrics.recordBorrowTsFileWriterTimer(
+      424          startPreCheckNanos - startBorrowTsFileWriterNanos);
+      425      File writingFile = tsFileWriter.getWritingFile();
+      426      RandomAccessFile writingFileWriter = tsFileWriter.getWritingFileWriter();
+      427  
+      428      try {
+      429        if (isWritingFileNonAvailable(tsFileWriter)) {
+      430          final TSStatus status =
+      431              RpcUtils.getStatus(
+      432                  TSStatusCode.IOT_CONSENSUS_V2_TRANSFER_FILE_ERROR,
+      433                  String.format(
+      434                      "Failed to seal file, because writing file %s is not available.", writingFile));
+      435          LOGGER.warn(status.getMessage());
+      436          return new TIoTConsensusV2TransferResp(status);
+      437        }
+      438  
+      439        final TIoTConsensusV2TransferResp resp =
+      440            checkFinalFileSeal(tsFileWriter, req.getFileName(), req.getFileLength());
+      441        if (Objects.nonNull(resp)) {
+      442          return resp;
+      443        }
+      444  
+      445        final String fileAbsolutePath = writingFile.getAbsolutePath();
+      446  
+      447        // Sync here is necessary to ensure that the data is written to the disk. Or data region may
+      448        // load the file before the data is written to the disk and cause unexpected behavior after
+      449        // system restart. (e.g., empty file in data region's data directory)
+      450        writingFileWriter.getFD().sync();
+      451        // 1. The writing file writer must be closed, otherwise it may cause concurrent errors during
+      452        // the process of loading tsfile when parsing tsfile.
+      453        // 2. writingFileWriter and writingFile will be reset in `releaseTsFileWriter`
+      454        writingFileWriter.close();
+      455  
+      456        long endPreCheckNanos = System.nanoTime();
+      457        iotConsensusV2ReceiverMetrics.recordTsFileSealPreCheckTimer(
+      458            endPreCheckNanos - startPreCheckNanos);
+      459        updateWritePointCountMetrics(req.getPointCount(), fileAbsolutePath);
+      460        final TSStatus status =
+      461            loadFileToDataRegion(
+      462                fileAbsolutePath,
+      463                ProgressIndexType.deserializeFrom(ByteBuffer.wrap(req.getProgressIndex())));
+      464        iotConsensusV2ReceiverMetrics.recordTsFileSealLoadTimer(System.nanoTime() - endPreCheckNanos);
+      465  
+      466        if (status.getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+      467          LOGGER.info(
+      468              "IoTConsensusV2-PipeName-{}: Seal file {} successfully.",
+      469              consensusPipeName,
+      470              fileAbsolutePath);
+      471        } else {
+      472          LOGGER.warn(
+      473              "IoTConsensusV2-PipeName-{}: Failed to seal file {}, because {}.",
+      474              consensusPipeName,
+      475              fileAbsolutePath,
+      476              status.getMessage());
+      477        }
+      478        return new TIoTConsensusV2TransferResp(status);
+      479      } catch (IOException e) {
+      480        LOGGER.warn(
+      481            "IoTConsensusV2-PipeName-{}: Failed to seal file {} from req {}.",
+      482            consensusPipeName,
+      483            writingFile,
+      484            req,
+      485            e);
+      486        return new TIoTConsensusV2TransferResp(
+      487            RpcUtils.getStatus(
+      488                TSStatusCode.IOT_CONSENSUS_V2_TRANSFER_FILE_ERROR,
+      489                String.format("Failed to seal file %s because %s", writingFile, e.getMessage())));
+      490      } catch (LoadFileException e) {
+      491        LOGGER.warn(
+      492            "IoTConsensusV2-PipeName-{}: Failed to load file {} from req {}.",
+      493            consensusPipeName,
+      494            writingFile,
+      495            req,
+      496            e);
+      497        return new TIoTConsensusV2TransferResp(
+      498            RpcUtils.getStatus(
+       ... truncated at 400 lines ...

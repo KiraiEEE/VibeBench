@@ -1,0 +1,217 @@
+row 7   apache/doris#61292
+============================================================================
+CHAIN in org.apache.doris.master.ReportHandler.addReplica(long,TabletMeta,TTabletInfo,long)   kind=value_switch subject='status' branches=3 closed_set=False
+cases: TabletStatus.VERSION_INCOMPLETE;TabletStatus.REPLICA_MISSING;TabletStatus.UNRECOVERABLE
+QUESTION: is the set of variants OPEN (a new one is expected, and
+          would force editing this chain) or CLOSED by nature?
+SHOWING THE WHOLE ENCLOSING METHOD -- a branch count alone cannot answer this.
+>>> marks the dispatch chain itself.
+
+     1407      private static boolean addReplica(long tabletId, TabletMeta tabletMeta, TTabletInfo backendTabletInfo,
+     1408              long backendId) {
+     1409          long dbId = tabletMeta.getDbId();
+     1410          long tableId = tabletMeta.getTableId();
+     1411          long partitionId = tabletMeta.getPartitionId();
+     1412          long indexId = tabletMeta.getIndexId();
+     1413  
+     1414          int schemaHash = backendTabletInfo.getSchemaHash();
+     1415          long version = backendTabletInfo.getVersion();
+     1416          long dataSize = backendTabletInfo.getDataSize();
+     1417          long remoteDataSize = backendTabletInfo.getRemoteDataSize();
+     1418          long rowCount = backendTabletInfo.getRowCount();
+     1419  
+     1420          Database db;
+     1421          OlapTable olapTable;
+     1422          try {
+     1423              db = Env.getCurrentInternalCatalog().getDbOrMetaException(dbId);
+     1424              olapTable = (OlapTable) db.getTableOrMetaException(tableId, Table.TableType.OLAP);
+     1425              olapTable.writeLockOrMetaException();
+     1426          } catch (MetaNotFoundException e) {
+     1427              LOG.warn(e);
+     1428              return false;
+     1429          }
+     1430  
+     1431          try {
+     1432              Partition partition = olapTable.getPartition(partitionId);
+     1433              if (partition == null) {
+     1434                  LOG.warn("partition[{}] does not exist", partitionId);
+     1435                  return false;
+     1436              }
+     1437              ReplicaAllocation replicaAlloc = olapTable.getPartitionInfo().getReplicaAllocation(partition.getId());
+     1438  
+     1439              MaterializedIndex materializedIndex = partition.getIndex(indexId);
+     1440              if (materializedIndex == null) {
+     1441                  LOG.warn("index[{}] does not exist", indexId);
+     1442                  return false;
+     1443              }
+     1444  
+     1445              Tablet tablet = materializedIndex.getTablet(tabletId);
+     1446              if (tablet == null) {
+     1447                  LOG.warn("tablet[{}] does not exist", tabletId);
+     1448                  return false;
+     1449              }
+     1450  
+     1451              // check replica id
+     1452              long replicaId = backendTabletInfo.getReplicaId();
+     1453              if (replicaId <= 0) {
+     1454                  LOG.warn("replica id is invalid");
+     1455                  return false;
+     1456              }
+     1457  
+     1458              long visibleVersion = partition.getVisibleVersion();
+     1459  
+     1460              // check replica version
+     1461              if (version < visibleVersion) {
+     1462                  LOG.warn("version is invalid. tablet[{}], visible[{}]", version, visibleVersion);
+     1463                  return false;
+     1464              }
+     1465  
+     1466              // check schema hash
+     1467              if (schemaHash != olapTable.getSchemaHashByIndexId(indexId)) {
+     1468                  LOG.warn("schema hash is diff[{}-{}]", schemaHash, olapTable.getSchemaHashByIndexId(indexId));
+     1469                  return false;
+     1470              }
+     1471  
+     1472              // colocate table will delete Replica in meta when balance
+     1473              // but we need to rely on MetaNotFoundException to decide whether delete the tablet in backend
+     1474              // if the tablet is healthy, delete it.
+     1475              boolean isColocateBackend = false;
+     1476              ColocateTableIndex colocateTableIndex = Env.getCurrentColocateIndex();
+     1477              if (colocateTableIndex.isColocateTable(olapTable.getId())) {
+     1478                  ColocateTableIndex.GroupId groupId = colocateTableIndex.getGroup(tableId);
+     1479                  Preconditions.checkState(groupId != null,
+     1480                          "can not get colocate group for %s", tableId);
+     1481                  int tabletOrderIdx = materializedIndex.getTabletOrderIdx(tabletId);
+     1482                  Preconditions.checkState(tabletOrderIdx != -1, "get tablet materializedIndex for %s fail", tabletId);
+     1483                  Set<Long> backendsSet = colocateTableIndex.getTabletBackendsByGroup(groupId, tabletOrderIdx);
+     1484                  ColocateGroupSchema groupSchema = colocateTableIndex.getGroupSchema(groupId);
+     1485                  if (groupSchema != null) {
+     1486                      replicaAlloc = groupSchema.getReplicaAlloc();
+     1487                  }
+     1488                  TabletStatus status = tablet.getColocateHealth(visibleVersion, replicaAlloc, backendsSet).status;
+     1489                  if (status == TabletStatus.HEALTHY) {
+     1490                      return false;
+     1491                  }
+     1492  
+     1493                  if (backendsSet.contains(backendId)) {
+     1494                      isColocateBackend = true;
+     1495                  }
+     1496              }
+     1497  
+     1498              SystemInfoService infoService = Env.getCurrentSystemInfo();
+     1499              List<Long> aliveBeIds = infoService.getAllBackendIds(true);
+     1500              TabletStatus status = tablet.getHealth(infoService, visibleVersion, replicaAlloc, aliveBeIds).status;
+     1501  
+     1502              // FORCE_REDUNDANT is a specific missing case.
+     1503              // So it can add replica when it's in FORCE_REDUNDANT.
+     1504              // But must be careful to avoid: delete a replica then add it back, then repeat forever.
+     1505              // If this replica is sched available and existing another replica is sched unavailable,
+     1506              // it's safe to add this replica.
+     1507              // Because if the tablet scheduler want to delete a replica, it will choose the sched
+     1508              // unavailable replica and avoid the repeating loop as above.
+     1509              boolean canAddForceRedundant = status == TabletStatus.FORCE_REDUNDANT
+     1510                      && infoService.checkBackendScheduleAvailable(backendId)
+     1511                      && tablet.getReplicas().stream().anyMatch(
+     1512                              r -> !infoService.checkBackendScheduleAvailable(r.getBackendIdWithoutException()));
+     1513  
+>>>  1514              if (isColocateBackend
+     1515                      || canAddForceRedundant
+     1516                      || status == TabletStatus.VERSION_INCOMPLETE
+     1517                      || status == TabletStatus.REPLICA_MISSING
+     1518                      || status == TabletStatus.UNRECOVERABLE) {
+     1519                  long lastFailedVersion = -1L;
+     1520  
+     1521                  // For some partition created by old version's Doris
+     1522                  // The init partition's version in FE is (1-0), the tablet's version in BE is (2-0)
+     1523                  // If the BE report version is (2-0) and partition's version is (1-0),
+     1524                  // we should add the tablet to meta.
+     1525                  // But old version doris is too old, we should not consider them any more,
+     1526                  // just throw exception in this case
+     1527                  if (version > partition.getNextVersion() - 1) {
+     1528                      // this is a fatal error
+     1529                      LOG.warn("version is invalid. tablet[{}], partition's max version [{}]", version,
+     1530                              partition.getNextVersion() - 1);
+     1531                      return false;
+     1532                  } else if (version < partition.getCommittedVersion()) {
+     1533                      lastFailedVersion = partition.getCommittedVersion();
+     1534                  }
+     1535  
+     1536                  if (backendTabletInfo.isSetCooldownMetaId()) {
+     1537                      // replica has cooldowned data
+     1538                      do {
+     1539                          Pair<Long, Long> cooldownConf = tablet.getCooldownConf();
+     1540                          if (backendTabletInfo.getCooldownTerm() > cooldownConf.second) {
+     1541                              // should not be here
+     1542                              LOG.warn("report cooldownTerm({}) > cooldownTerm in TabletMeta({}), tabletId={}",
+     1543                                      backendTabletInfo.getCooldownTerm(), cooldownConf.second, tabletId);
+     1544                              return false;
+     1545                          }
+     1546                          if (backendTabletInfo.getReplicaId() == cooldownConf.first) {
+     1547                              // this replica is true cooldown replica, so replica's cooldowned data must not be deleted
+     1548                              break;
+     1549                          }
+     1550                          List<Replica> replicas = Env.getCurrentInvertedIndex().getReplicas(tabletId);
+     1551                          if (backendTabletInfo.getCooldownTerm() <= 0) {
+     1552                              if (replicas.stream().anyMatch(
+     1553                                      r -> backendTabletInfo.getCooldownMetaId().equals(r.getCooldownMetaId()))) {
+     1554                                  // this backend is just restarted, and shares same cooldowned data with others replica,
+     1555                                  // so replica's cooldowned data must not be deleted
+     1556                                  break;
+     1557                              }
+     1558                          }
+     1559                          long minCooldownTerm = Long.MAX_VALUE;
+     1560                          for (Replica r : replicas) {
+     1561                              minCooldownTerm = Math.min(r.getCooldownTerm(), minCooldownTerm);
+     1562                          }
+     1563                          if (backendTabletInfo.getCooldownTerm() >= minCooldownTerm) {
+     1564                              if (replicas.stream().anyMatch(
+     1565                                      r -> backendTabletInfo.getCooldownMetaId().equals(r.getCooldownMetaId()))) {
+     1566                                  // this replica shares same cooldowned data with others replica, and won't follow data
+     1567                                  // of lower cooldown term, so replica's cooldowned data must not be deleted
+     1568                                  break;
+     1569                              }
+     1570                          }
+     1571                          LOG.warn("replica's cooldowned data may have been deleted. tabletId={}, replicaId={}", tabletId,
+     1572                                  replicaId);
+     1573                          return false;
+     1574                      } while (false);
+     1575                  }
+     1576  
+     1577                  // use replicaId reported by BE to maintain replica meta consistent between FE and BE
+     1578                  Replica replica = new LocalReplica(replicaId, backendId, version, schemaHash,
+     1579                          dataSize, remoteDataSize, rowCount, ReplicaState.NORMAL,
+     1580                          lastFailedVersion, version);
+     1581                  tablet.addReplica(replica);
+     1582  
+     1583                  // write edit log
+     1584                  ReplicaPersistInfo info = ReplicaPersistInfo.createForAdd(dbId, tableId, partitionId, indexId,
+     1585                          tabletId, backendId, replicaId,
+     1586                          version, schemaHash, dataSize, remoteDataSize, rowCount,
+     1587                          lastFailedVersion,
+     1588                          version);
+     1589  
+     1590                  Env.getCurrentEnv().getEditLog().logAddReplica(info);
+     1591  
+     1592                  LOG.info("add replica[{}-{}] to catalog. backend[{}], tablet status {}, tablet size {}, "
+     1593                          + "is colocate backend {}",
+     1594                          tabletId, replicaId, backendId, status.name(), tablet.getReplicas().size(),
+     1595                          isColocateBackend);
+     1596                  return true;
+     1597              } else {
+     1598                  // replica is enough. check if this tablet is already in meta
+     1599                  // (status changed between 'tabletReport()' and 'addReplica()')
+     1600                  for (Replica replica : tablet.getReplicas()) {
+     1601                      if (replica.getBackendIdWithoutException() == backendId) {
+     1602                          // tablet is already in meta. return true
+     1603                          return true;
+     1604                      }
+     1605                  }
+     1606                  LOG.warn("no add replica [{}-{}] cause it is enough[{}-{}], tablet status {}",
+     1607                          tabletId, replicaId, tablet.getReplicas().size(), replicaAlloc.toCreateStmt(),
+     1608                          status.name());
+     1609                  return false;
+     1610              }
+     1611          } finally {
+     1612              olapTable.writeUnlock();
+     1613          }
+     1614      }

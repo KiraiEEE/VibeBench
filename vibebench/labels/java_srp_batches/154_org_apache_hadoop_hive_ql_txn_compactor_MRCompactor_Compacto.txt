@@ -1,0 +1,125 @@
+row 154   mr3project/hive-mr3#78
+============================================================================
+CLASS org.apache.hadoop.hive.ql.txn.compactor.MRCompactor.CompactorInputFormat   loc=120 methods=4 wmc=23 lcom=0.3333333333333333 c3=0.2216849119472111
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      663    static class CompactorInputFormat implements InputFormat<NullWritable, CompactorInputSplit> {
+      664  
+      665      @Override
+      666      public InputSplit[] getSplits(JobConf entries, int i) throws IOException {
+      667        Path baseDir = null;
+      668        if (entries.get(BASE_DIR) != null) baseDir = new Path(entries.get(BASE_DIR));
+      669        StringableList tmpDeltaDirs = new StringableList(entries.get(DELTA_DIRS));
+      670        Path[] deltaDirs = tmpDeltaDirs.toArray(new Path[tmpDeltaDirs.size()]);
+      671        StringableList dirsToSearch = new StringableList(entries.get(DIRS_TO_SEARCH));
+      672        Map<Integer, BucketTracker> splitToBucketMap = new HashMap<Integer, BucketTracker>();
+      673        for (Path dir : dirsToSearch) {
+      674          FileSystem fs = dir.getFileSystem(entries);
+      675          // When we have split-update and there are two kinds of delta directories-
+      676          // the delta_x_y/ directory one which has only insert events and
+      677          // the delete_delta_x_y/ directory which has only the delete events.
+      678          // The clever thing about this kind of splitting is that everything in the delta_x_y/
+      679          // directory can be processed as base files. However, this is left out currently
+      680          // as an improvement for the future.
+      681  
+      682          if (dir.getName().startsWith(AcidUtils.BASE_PREFIX) ||
+      683              dir.getName().startsWith(AcidUtils.DELTA_PREFIX) ||
+      684              dir.getName().startsWith(AcidUtils.DELETE_DELTA_PREFIX)) {
+      685            boolean sawBase = dir.getName().startsWith(AcidUtils.BASE_PREFIX);
+      686            boolean isRawFormat = !dir.getName().startsWith(AcidUtils.DELETE_DELTA_PREFIX)
+      687              && AcidUtils.MetaDataFile.isRawFormat(dir, fs, null);//deltes can't be raw format
+      688  
+      689            FileStatus[] files = fs.listStatus(dir, isRawFormat ? AcidUtils.originalBucketFilter
+      690              : AcidUtils.bucketFileFilter);
+      691            for(FileStatus f : files) {
+      692              // For each file, figure out which bucket it is.
+      693              Matcher matcher = isRawFormat ?
+      694                AcidUtils.LEGACY_BUCKET_DIGIT_PATTERN.matcher(f.getPath().getName())
+      695                : AcidUtils.BUCKET_PATTERN.matcher(f.getPath().getName());
+      696              addFileToMap(matcher, f.getPath(), sawBase, splitToBucketMap);
+      697            }
+      698          } else {
+      699            // Legacy file, see if it's a bucket file
+      700            Matcher matcher = AcidUtils.LEGACY_BUCKET_DIGIT_PATTERN.matcher(dir.getName());
+      701            addFileToMap(matcher, dir, true, splitToBucketMap);
+      702          }
+      703        }
+      704  
+      705        boolean isTableBucketed = entries.getInt(NUM_BUCKETS, -1) != -1;
+      706  
+      707        List<InputSplit> splits = new ArrayList<InputSplit>(splitToBucketMap.size());
+      708        for (Map.Entry<Integer, BucketTracker> e : splitToBucketMap.entrySet()) {
+      709          BucketTracker bt = e.getValue();
+      710          // For non-bucketed tables we might not have a 00000x_0 in all the delta dirs e.g. after
+      711          // multiple ingestions of various sizes.
+      712          Path[] deltasForSplit = isTableBucketed ? deltaDirs : getDeltaDirsFromBucketTracker(bt);
+      713          splits.add(new CompactorInputSplit(entries, e.getKey(), bt.buckets,
+      714              bt.sawBase ? baseDir : null, deltasForSplit, bt.deltasToAttemptId));
+      715        }
+      716  
+      717        LOG.debug("Returning " + splits.size() + " splits");
+      718        return splits.toArray(new InputSplit[splits.size()]);
+      719      }
+      720  
+      721      private static Path[] getDeltaDirsFromBucketTracker(BucketTracker bucketTracker) {
+      722        List<Path> resultList = new ArrayList<>(bucketTracker.buckets.size());
+      723  
+      724        for (int i = 0; i < bucketTracker.buckets.size(); ++i) {
+      725          Path p = bucketTracker.buckets.get(i).getParent();
+      726          if (p.getName().startsWith(AcidUtils.DELTA_PREFIX) ||
+      727              p.getName().startsWith(AcidUtils.DELETE_DELTA_PREFIX)) {
+      728            resultList.add(p);
+      729          }
+      730        }
+      731  
+      732        return resultList.toArray(new Path[0]);
+      733      }
+      734  
+      735      @Override
+      736      public RecordReader<NullWritable, CompactorInputSplit> getRecordReader(
+      737          InputSplit inputSplit,  JobConf entries, Reporter reporter) throws IOException {
+      738        return new CompactorRecordReader((CompactorInputSplit)inputSplit);
+      739      }
+      740  
+      741      private void addFileToMap(Matcher matcher, Path file, boolean sawBase,
+      742                                Map<Integer, BucketTracker> splitToBucketMap) {
+      743        if (!matcher.find()) {
+      744          String msg = "Found a non-bucket file that we thought matched the bucket pattern! " +
+      745            file.toString() + " Matcher=" + matcher.toString();
+      746          LOG.error(msg);
+      747          //following matcher.group() would fail anyway and we don't want to skip files since that
+      748          //may be a data loss scenario
+      749          throw new IllegalArgumentException(msg);
+      750        }
+      751        int bucketNum = -1;
+      752        Integer attemptId = null;
+      753        if (matcher.groupCount() > 0) {
+      754          bucketNum = Integer.parseInt(matcher.group(1));
+      755          attemptId = matcher.group(2) != null ? Integer.valueOf(matcher.group(2).substring(1)) : null;
+      756        } else {
+      757          bucketNum = Integer.valueOf(matcher.group());
+      758        }
+      759  
+      760        BucketTracker bt = splitToBucketMap.get(bucketNum);
+      761        if (bt == null) {
+      762          bt = new BucketTracker();
+      763          splitToBucketMap.put(bucketNum, bt);
+      764        }
+      765        LOG.debug("Adding " + file.toString() + " to list of files for splits");
+      766        bt.buckets.add(file);
+      767        bt.sawBase |= sawBase;
+      768        bt.deltasToAttemptId.put(file.getParent().getName(), attemptId);
+      769      }
+      770  
+      771      private static class BucketTracker {
+      772        BucketTracker() {
+      773          sawBase = false;
+      774          buckets = new ArrayList<Path>();
+      775          deltasToAttemptId = new HashMap<>();
+      776        }
+      777  
+      778        boolean sawBase;
+      779        List<Path> buckets;
+      780        Map<String, Integer> deltasToAttemptId;
+      781      }
+      782    }

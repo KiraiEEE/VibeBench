@@ -1,0 +1,406 @@
+row 98   open-metadata/OpenMetadata#24234
+============================================================================
+CLASS org.openmetadata.service.jdbi3.DatabaseRepository   loc=608 methods=26 wmc=68 lcom=0.4 c3=0.1935543922744332
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       70  @Slf4j
+       71  public class DatabaseRepository extends EntityRepository<Database> {
+       72  
+       73    public static final String DATABASE_PROFILER_CONFIG_EXTENSION = "database.databaseProfilerConfig";
+       74  
+       75    public static final String DATABASE_PROFILER_CONFIG = "databaseProfilerConfig";
+       76  
+       77    public DatabaseRepository() {
+       78      super(
+       79          DatabaseResource.COLLECTION_PATH,
+       80          Entity.DATABASE,
+       81          Database.class,
+       82          Entity.getCollectionDAO().databaseDAO(),
+       83          "",
+       84          "");
+       85      supportsSearch = true;
+       86  
+       87      // Register bulk field fetchers for efficient database operations
+       88      fieldFetchers.put("databaseSchemas", this::fetchAndSetDatabaseSchemas);
+       89      fieldFetchers.put(DATABASE_PROFILER_CONFIG, this::fetchAndSetDatabaseProfilerConfigs);
+       90      fieldFetchers.put("usageSummary", this::fetchAndSetUsageSummaries);
+       91    }
+       92  
+       93    @Override
+       94    public void setFullyQualifiedName(Database database) {
+       95      database.setFullyQualifiedName(
+       96          FullyQualifiedName.add(database.getService().getFullyQualifiedName(), database.getName()));
+       97    }
+       98  
+       99    @Override
+      100    public void prepare(Database database, boolean update) {
+      101      populateService(database);
+      102    }
+      103  
+      104    @Override
+      105    public void storeEntity(Database database, boolean update) {
+      106      // Relationships and fields such as service are not stored as part of json
+      107      EntityReference service = database.getService();
+      108      database.withService(null);
+      109      store(database, update);
+      110      database.withService(service);
+      111    }
+      112  
+      113    @Override
+      114    public void storeRelationships(Database database) {
+      115      addServiceRelationship(database, database.getService());
+      116    }
+      117  
+      118    private List<EntityReference> getSchemas(Database database) {
+      119      return database == null
+      120          ? null
+      121          : findTo(database.getId(), Entity.DATABASE, Relationship.CONTAINS, Entity.DATABASE_SCHEMA);
+      122    }
+      123  
+      124    @Override
+      125    public EntityInterface getParentEntity(Database entity, String fields) {
+      126      if (entity.getService() == null) {
+      127        return null;
+      128      }
+      129      return Entity.getEntity(entity.getService(), fields, Include.ALL);
+      130    }
+      131  
+      132    @Override
+      133    public void entityRelationshipReindex(Database original, Database updated) {
+      134      super.entityRelationshipReindex(original, updated);
+      135  
+      136      // Update search indexes of assets and entity on database displayName change
+      137      if (!Objects.equals(original.getDisplayName(), updated.getDisplayName())) {
+      138        searchRepository
+      139            .getSearchClient()
+      140            .reindexAcrossIndices("database.fullyQualifiedName", original.getEntityReference());
+      141      }
+      142    }
+      143  
+      144    @Override
+      145    public String exportToCsv(String name, String user, boolean recursive) throws IOException {
+      146      Database database = getByName(null, name, Fields.EMPTY_FIELDS); // Validate database name
+      147  
+      148      // Get schemas
+      149      DatabaseSchemaRepository schemaRepository =
+      150          (DatabaseSchemaRepository) Entity.getEntityRepository(DATABASE_SCHEMA);
+      151      List<DatabaseSchema> schemas =
+      152          schemaRepository.listAllForCSV(
+      153              schemaRepository.getFields("owners,tags,domains,extension"),
+      154              database.getFullyQualifiedName());
+      155      schemas.sort(Comparator.comparing(EntityInterface::getFullyQualifiedName));
+      156  
+      157      // Export schemas and all their child entities
+      158      return new DatabaseCsv(database, user, recursive).exportAllCsv(schemas, recursive);
+      159    }
+      160  
+      161    @Override
+      162    public CsvImportResult importFromCsv(
+      163        String name, String csv, boolean dryRun, String user, boolean recursive) throws IOException {
+      164      Database database = null;
+      165      try {
+      166        database = getByName(null, name, getFields("service"));
+      167      } catch (EntityNotFoundException e) {
+      168        if (!dryRun) {
+      169          throw e;
+      170        } else {
+      171          LOG.warn("Dry run mode: Database '{}' not found. Skipping existence validation.", name);
+      172          database = new Database().withName(name);
+      173        }
+      174      }
+      175      DatabaseCsv databaseCsv = new DatabaseCsv(database, user, recursive);
+      176  
+      177      List<CSVRecord> records;
+      178      if (recursive) {
+      179        records = databaseCsv.parse(csv, recursive);
+      180      } else {
+      181        records = databaseCsv.parse(csv);
+      182      }
+      183      return databaseCsv.importCsv(records, dryRun);
+      184    }
+      185  
+      186    public void setFields(Database database, Fields fields) {
+      187      database.setService(getContainer(database.getId()));
+      188      database.setDatabaseSchemas(
+      189          fields.contains("databaseSchemas") ? getSchemas(database) : database.getDatabaseSchemas());
+      190      database.setDatabaseProfilerConfig(
+      191          fields.contains(DATABASE_PROFILER_CONFIG)
+      192              ? getDatabaseProfilerConfig(database)
+      193              : database.getDatabaseProfilerConfig());
+      194      if (database.getUsageSummary() == null) {
+      195        database.setUsageSummary(
+      196            fields.contains("usageSummary")
+      197                ? EntityUtil.getLatestUsage(daoCollection.usageDAO(), database.getId())
+      198                : null);
+      199      }
+      200    }
+      201  
+      202    @Override
+      203    public void setFieldsInBulk(Fields fields, List<Database> entities) {
+      204      // Always set default service field for all databases
+      205      fetchAndSetDefaultService(entities);
+      206  
+      207      fetchAndSetFields(entities, fields);
+      208      fetchAndSetDatabaseSpecificFields(entities, fields);
+      209      setInheritedFields(entities, fields);
+      210  
+      211      entities.forEach(entity -> clearFieldsInternal(entity, fields));
+      212    }
+      213  
+      214    private void fetchAndSetDatabaseSpecificFields(List<Database> databases, Fields fields) {
+      215      if (databases == null || databases.isEmpty()) {
+      216        return;
+      217      }
+      218  
+      219      if (fields.contains("databaseSchemas")) {
+      220        fetchAndSetDatabaseSchemas(databases, fields);
+      221      }
+      222  
+      223      if (fields.contains(DATABASE_PROFILER_CONFIG)) {
+      224        fetchAndSetDatabaseProfilerConfigs(databases, fields);
+      225      }
+      226  
+      227      if (fields.contains("usageSummary")) {
+      228        fetchAndSetUsageSummaries(databases, fields);
+      229      }
+      230    }
+      231  
+      232    private void fetchAndSetDatabaseSchemas(List<Database> databases, Fields fields) {
+      233      if (!fields.contains("databaseSchemas") || databases == null || databases.isEmpty()) {
+      234        return;
+      235      }
+      236      setFieldFromMap(
+      237          true, databases, batchFetchDatabaseSchemas(databases), Database::setDatabaseSchemas);
+      238    }
+      239  
+      240    private void fetchAndSetDatabaseProfilerConfigs(List<Database> databases, Fields fields) {
+      241      if (!fields.contains(DATABASE_PROFILER_CONFIG) || databases == null || databases.isEmpty()) {
+      242        return;
+      243      }
+      244      setFieldFromMap(
+      245          true,
+      246          databases,
+      247          batchFetchDatabaseProfilerConfigs(databases),
+      248          Database::setDatabaseProfilerConfig);
+      249    }
+      250  
+      251    private void fetchAndSetUsageSummaries(List<Database> databases, Fields fields) {
+      252      if (!fields.contains("usageSummary") || databases == null || databases.isEmpty()) {
+      253        return;
+      254      }
+      255      setFieldFromMap(
+      256          true,
+      257          databases,
+      258          EntityUtil.getLatestUsageForEntities(daoCollection.usageDAO(), entityListToUUID(databases)),
+      259          Database::setUsageSummary);
+      260    }
+      261  
+      262    public void clearFields(Database database, Fields fields) {
+      263      database.setDatabaseSchemas(
+      264          fields.contains("databaseSchemas") ? database.getDatabaseSchemas() : null);
+      265      database.setDatabaseProfilerConfig(
+      266          fields.contains(DATABASE_PROFILER_CONFIG) ? database.getDatabaseProfilerConfig() : null);
+      267      database.withUsageSummary(fields.contains("usageSummary") ? database.getUsageSummary() : null);
+      268    }
+      269  
+      270    @Override
+      271    public void restorePatchAttributes(Database original, Database updated) {
+      272      // Patch can't make changes to following fields. Ignore the changes
+      273      super.restorePatchAttributes(original, updated);
+      274      updated.withService(original.getService());
+      275    }
+      276  
+      277    @Override
+      278    public EntityRepository<Database>.EntityUpdater getUpdater(
+      279        Database original, Database updated, Operation operation, ChangeSource changeSource) {
+      280      return new DatabaseUpdater(original, updated, operation);
+      281    }
+      282  
+      283    private void populateService(Database database) {
+      284      DatabaseService service = Entity.getEntity(database.getService(), "", Include.NON_DELETED);
+      285      database.setService(service.getEntityReference());
+      286      database.setServiceType(service.getServiceType());
+      287    }
+      288  
+      289    public Database addDatabaseProfilerConfig(
+      290        UUID databaseId, DatabaseProfilerConfig databaseProfilerConfig) {
+      291      // Validate the request content
+      292      Database database = find(databaseId, Include.NON_DELETED);
+      293      if (databaseProfilerConfig.getProfileSampleType() != null
+      294          && databaseProfilerConfig.getProfileSample() != null) {
+      295        EntityUtil.validateProfileSample(
+      296            databaseProfilerConfig.getProfileSampleType().toString(),
+      297            databaseProfilerConfig.getProfileSample());
+      298      }
+      299  
+      300      daoCollection
+      301          .entityExtensionDAO()
+      302          .insert(
+      303              databaseId,
+      304              DATABASE_PROFILER_CONFIG_EXTENSION,
+      305              DATABASE_PROFILER_CONFIG,
+      306              JsonUtils.pojoToJson(databaseProfilerConfig));
+      307      clearFields(database, Fields.EMPTY_FIELDS);
+      308      return database.withDatabaseProfilerConfig(databaseProfilerConfig);
+      309    }
+      310  
+      311    public DatabaseProfilerConfig getDatabaseProfilerConfig(Database database) {
+      312      return JsonUtils.readValue(
+      313          daoCollection
+      314              .entityExtensionDAO()
+      315              .getExtension(database.getId(), DATABASE_PROFILER_CONFIG_EXTENSION),
+      316          DatabaseProfilerConfig.class);
+      317    }
+      318  
+      319    public Database deleteDatabaseProfilerConfig(UUID databaseId) {
+      320      // Validate the request content
+      321      Database database = find(databaseId, Include.NON_DELETED);
+      322      daoCollection.entityExtensionDAO().delete(databaseId, DATABASE_PROFILER_CONFIG_EXTENSION);
+      323      clearFieldsInternal(database, Fields.EMPTY_FIELDS);
+      324      return database;
+      325    }
+      326  
+      327    private Map<UUID, List<EntityReference>> batchFetchDatabaseSchemas(List<Database> databases) {
+      328      var schemasMap = new HashMap<UUID, List<EntityReference>>();
+      329      if (databases == null || databases.isEmpty()) {
+      330        return schemasMap;
+      331      }
+      332  
+      333      // Initialize empty lists for all databases
+      334      databases.forEach(database -> schemasMap.put(database.getId(), new ArrayList<>()));
+      335  
+      336      // Single batch query to get all schemas for all databases
+      337      // Use Include.ALL to get all relationships including those for soft-deleted entities
+      338      var records =
+      339          daoCollection
+      340              .relationshipDAO()
+      341              .findToBatch(
+      342                  entityListToStrings(databases),
+      343                  Relationship.CONTAINS.ordinal(),
+      344                  DATABASE_SCHEMA,
+      345                  Include.ALL);
+      346  
+      347      // Collect all unique schema IDs first
+      348      var schemaIds = records.stream().map(rec -> UUID.fromString(rec.getToId())).distinct().toList();
+      349  
+      350      // Batch fetch all schema entity references
+      351      var schemaRefs = Entity.getEntityReferencesByIds(DATABASE_SCHEMA, schemaIds, Include.ALL);
+      352      var schemaRefMap =
+      353          schemaRefs.stream().collect(Collectors.toMap(EntityReference::getId, ref -> ref));
+      354  
+      355      // Group schemas by database ID
+      356      records.forEach(
+      357          record -> {
+      358            var databaseId = UUID.fromString(record.getFromId());
+      359            var schemaId = UUID.fromString(record.getToId());
+      360            var schemaRef = schemaRefMap.get(schemaId);
+      361            if (schemaRef != null) {
+      362              schemasMap.get(databaseId).add(schemaRef);
+      363            }
+      364          });
+      365  
+      366      return schemasMap;
+      367    }
+      368  
+      369    private Map<UUID, DatabaseProfilerConfig> batchFetchDatabaseProfilerConfigs(
+      370        List<Database> databases) {
+      371      var configMap = new HashMap<UUID, DatabaseProfilerConfig>();
+      372      if (databases == null || databases.isEmpty()) {
+      373        return configMap;
+      374      }
+      375  
+      376      // Use batch extension query for profiler configs
+      377      var records =
+      378          daoCollection
+      379              .entityExtensionDAO()
+      380              .getExtensionsBatch(entityListToStrings(databases), DATABASE_PROFILER_CONFIG_EXTENSION);
+      381  
+      382      records.forEach(
+      383          record -> {
+      384            try {
+      385              var config = JsonUtils.readValue(record.extensionJson(), DatabaseProfilerConfig.class);
+      386              configMap.put(record.id(), config);
+      387            } catch (Exception e) {
+      388              configMap.put(record.id(), null);
+      389            }
+      390          });
+      391  
+      392      // Ensure all databases have an entry (null if no config found)
+      393      databases.forEach(
+      394          database -> {
+      395            if (!configMap.containsKey(database.getId())) {
+      396              configMap.put(database.getId(), null);
+      397            }
+      398          });
+      399  
+      400      return configMap;
+      401    }
+      402  
+      403    private void fetchAndSetDefaultService(List<Database> databases) {
+      404      if (databases == null || databases.isEmpty()) {
+      405        return;
+      406      }
+      407  
+      408      // Batch fetch service references for all databases
+      409      var serviceMap = batchFetchServices(databases);
+      410  
+      411      // Set service for all databases
+      412      databases.forEach(database -> database.setService(serviceMap.get(database.getId())));
+      413    }
+      414  
+      415    private Map<UUID, EntityReference> batchFetchServices(List<Database> databases) {
+      416      var serviceMap = new HashMap<UUID, EntityReference>();
+      417      if (databases == null || databases.isEmpty()) {
+      418        return serviceMap;
+      419      }
+      420  
+      421      // Single batch query to get all services for all databases
+      422      // Use Include.ALL to get all relationships including those for soft-deleted entities
+      423      var records =
+      424          daoCollection
+      425              .relationshipDAO()
+      426              .findFromBatch(
+      427                  entityListToStrings(databases), Relationship.CONTAINS.ordinal(), Include.ALL);
+      428  
+      429      // Collect all unique service IDs first
+      430      var serviceIds =
+      431          records.stream()
+      432              .filter(rec -> Entity.DATABASE_SERVICE.equals(rec.getFromEntity()))
+      433              .map(rec -> UUID.fromString(rec.getFromId()))
+      434              .distinct()
+      435              .toList();
+      436  
+      437      // Batch fetch all service entity references
+      438      var serviceRefs =
+      439          Entity.getEntityReferencesByIds(Entity.DATABASE_SERVICE, serviceIds, Include.ALL);
+      440      var serviceRefMap =
+      441          serviceRefs.stream().collect(Collectors.toMap(EntityReference::getId, ref -> ref));
+      442  
+      443      // Map databases to their services
+      444      records.forEach(
+      445          record -> {
+      446            if (Entity.DATABASE_SERVICE.equals(record.getFromEntity())) {
+      447              var databaseId = UUID.fromString(record.getToId());
+      448              var serviceId = UUID.fromString(record.getFromId());
+      449              var serviceRef = serviceRefMap.get(serviceId);
+      450              if (serviceRef != null) {
+      451                serviceMap.put(databaseId, serviceRef);
+      452              }
+      453            }
+      454          });
+      455  
+      456      return serviceMap;
+      457    }
+      458  
+      459    public class DatabaseUpdater extends EntityUpdater {
+      460      public DatabaseUpdater(Database original, Database updated, Operation operation) {
+      461        super(original, updated, operation);
+      462      }
+      463  
+      464      @Transaction
+      465      @Override
+      466      public void entitySpecificUpdate(boolean consolidatingChanges) {
+      467        recordChange("retentionPeriod", original.getRetentionPeriod(), updated.getRetentionPeriod());
+      468        recordChange("sourceUrl", original.getSourceUrl(), updated.getSourceUrl());
+      469        recordChange("sourceHash", original.getSourceHash(), updated.getSourceHash());
+       ... truncated at 400 lines ...

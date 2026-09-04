@@ -1,0 +1,406 @@
+row 196   StarRocks/starrocks#70983
+============================================================================
+CLASS com.starrocks.scheduler.mv.ivm.MVIVMBasedRefreshProcessor   loc=401 methods=12 wmc=57 lcom=0.1818181818181818 c3=0.2583704862816293
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       82  public final class MVIVMBasedRefreshProcessor extends BaseMVRefreshProcessor {
+       83      // This map is used to store the temporary tvr version range for each base table
+       84      private final Map<BaseTableInfo, TvrVersionRange> tempMvTvrVersionRangeMap = Maps.newConcurrentMap();
+       85      // whether the next task run is needed
+       86      private boolean hasNextTaskRun = false;
+       87  
+       88      public MVIVMBasedRefreshProcessor(Database db, MaterializedView mv,
+       89                                        MvTaskRunContext mvContext,
+       90                                        IMaterializedViewMetricsEntity mvEntity,
+       91                                        MaterializedView.RefreshMode refreshMode) {
+       92          super(db, mv, mvContext, mvEntity, refreshMode, MVIVMBasedRefreshProcessor.class);
+       93      }
+       94  
+       95      @Override
+       96      public ProcessExecPlan getProcessExecPlan(TaskRunContext taskRunContext) throws Exception {
+       97          if (!mvRefreshParams.isCompleteRefresh()) {
+       98              throw new SemanticException("IVM based refresh only supports complete refresh, but got partial refresh");
+       99          }
+      100          syncAndCheckPCTPartitions(taskRunContext);
+      101  
+      102          // collect change snapshots
+      103          try (Timer ignored = Tracers.watchScope("MVRefreshCheckChangedVersionRanges")) {
+      104              final Map<BaseTableInfo, TvrVersionRange> mvTvrVersionRangeMap =
+      105                      mv.getRefreshScheme().getAsyncRefreshContext().getBaseTableInfoTvrVersionRangeMap();
+      106              for (BaseTableSnapshotInfo snapshotInfo : snapshotBaseTables.values()) {
+      107                  TvrVersionRange changedVersionRange =
+      108                          getBaseTableChangedVersionRange(snapshotInfo, mvTvrVersionRangeMap, currentRefreshMode);
+      109                  logger.info("Base table: {}, changed version range: {}",
+      110                          snapshotInfo.getBaseTableInfo().getTableName(), changedVersionRange);
+      111                  // collect changed version range
+      112                  TvrTableSnapshotInfo tvrTableSnapshotInfo = (TvrTableSnapshotInfo) snapshotInfo;
+      113  
+      114                  tempMvTvrVersionRangeMap.put(snapshotInfo.getBaseTableInfo(), changedVersionRange);
+      115                  // update the snapshot info with the changed version range
+      116                  tvrTableSnapshotInfo.setTvrSnapshot(changedVersionRange);
+      117              }
+      118          }
+      119          boolean isTaskRunSkipped = snapshotBaseTables.values().stream()
+      120                  .map(snapshotInfo -> (TvrTableSnapshotInfo) snapshotInfo)
+      121                  .map(TvrTableSnapshotInfo::getTvrSnapshot)
+      122                  .allMatch(TvrVersionRange::isEmpty);
+      123          if (isTaskRunSkipped) {
+      124              if (mvRefreshParams.isNonTentativeForce()) {
+      125                  logger.info("No base table has changed, but force refresh is requested, " +
+      126                          "proceed with refresh for materialized view: {}", mv.getName());
+      127              } else {
+      128                  logger.info("No base table has changed, skip the refresh for materialized view: {}",
+      129                          mv.getName());
+      130                  return new ProcessExecPlan(Constants.TaskRunState.SKIPPED, null, null);
+      131              }
+      132          }
+      133  
+      134          try (Timer ignored = Tracers.watchScope("MVRefreshCheckMVToRefreshPartitions")) {
+      135              try {
+      136                  updatePCTToRefreshMetas(taskRunContext);
+      137              } catch (Exception e) {
+      138                  // if the check failed, we should not throw exception here
+      139                  // because this check only affects mv refresh rather than mv refresh.
+      140                  logger.warn("Failed to check PCT partitions for materialized view: {}, error: {}",
+      141                          mv.getName(), e.getMessage(), e);
+      142              }
+      143          }
+      144  
+      145          InsertStmt insertStmt = null;
+      146          try (Timer ignored = Tracers.watchScope("MVRefreshPrepareRefreshPlan")) {
+      147              insertStmt = prepareRefreshPlan();
+      148          }
+      149          return new ProcessExecPlan(Constants.TaskRunState.SUCCESS, mvContext.getExecPlan(), insertStmt);
+      150      }
+      151  
+      152      @Override
+      153      public Constants.TaskRunState execProcessExecPlan(TaskRunContext taskRunContext,
+      154                                                        ProcessExecPlan processExecPlan,
+      155                                                        MVRefreshExecutor executor) throws Exception {
+      156          final InsertStmt insertStmt = processExecPlan.insertStmt();
+      157          final ExecPlan execPlan = processExecPlan.execPlan();
+      158          try (Timer ignored = Tracers.watchScope("MVRefreshMaterializedView")) {
+      159              MaterializedView.AsyncRefreshContext mvRefreshContext =
+      160                      mv.getRefreshScheme().getAsyncRefreshContext();
+      161              logger.info("temp tvr version range map: {}", tempMvTvrVersionRangeMap);
+      162              mvRefreshContext.getTempBaseTableInfoTvrDeltaMap().putAll(tempMvTvrVersionRangeMap);
+      163              executor.executePlan(execPlan, insertStmt);
+      164          }
+      165  
+      166          try (Timer ignored = Tracers.watchScope("MVRefreshUpdateMeta")) {
+      167              updatePCTMeta(execPlan, pctMVToRefreshedPartitions, pctRefTableRefreshPartitions, Maps.newHashMap());
+      168          }
+      169  
+      170          return Constants.TaskRunState.SUCCESS;
+      171      }
+      172  
+      173      @Override
+      174      public void updateVersionMeta(ExecPlan execPlan,
+      175                                    PCellSortedSet mvRefreshedPartitions,
+      176                                    Map<BaseTableSnapshotInfo, PCellSortedSet> refTableAndPartitionNames) {
+      177          // ivm's meta has already been commited in the transaction of executing the plan,
+      178          // update the meta for pct-based refresh
+      179          try {
+      180              updatePCTMeta(execPlan, pctMVToRefreshedPartitions, pctRefTableRefreshPartitions, Maps.newHashMap());
+      181          } catch (Exception e) {
+      182              // if the update meta failed, we should not throw exception here
+      183              // because this meta-update only affects pct-based refresh rather than ivm-based mv refresh, which means only
+      184              // affect mv rewrite only.
+      185              logger.warn("Failed to update meta for materialized view: {}, error: {}",
+      186                      mv.getName(), e.getMessage(), e);
+      187          }
+      188      }
+      189  
+      190      public TvrTableDelta getBaseTableChangedVersionRange(BaseTableSnapshotInfo snapshotInfo,
+      191                                                           Map<BaseTableInfo, TvrVersionRange> mvTvrVersionRangeMap,
+      192                                                           MaterializedView.RefreshMode refreshMode) {
+      193          final BaseTableInfo baseTableInfo = snapshotInfo.getBaseTableInfo();
+      194          final Table snapshotTable = snapshotInfo.getBaseTable();
+      195          final TvrTableDelta maxTvrDelta = getBaseTableMaxChangedDelta(snapshotInfo, mvTvrVersionRangeMap);
+      196          // if no change, return empty
+      197          if (maxTvrDelta.isEmpty()) {
+      198              return maxTvrDelta;
+      199          }
+      200  
+      201          // check the delta traits between the max delta
+      202          List<TvrTableDeltaTrait> tableDeltaTraits = GlobalStateMgr.getCurrentState().getMetadataMgr()
+      203                  .listTableDeltaTraits(baseTableInfo.getDbName(), snapshotTable,
+      204                          maxTvrDelta.fromSnapshot(), maxTvrDelta.toSnapshot());
+      205          if (CollectionUtils.isEmpty(tableDeltaTraits)) {
+      206              logger.warn("No tvr delta traits found for base table: {}, db: {}", baseTableInfo.getTableName(),
+      207                      baseTableInfo.getDbName());
+      208              throw new SemanticException("No tvr delta traits found for base table: %s.%s",
+      209                      baseTableInfo.getDbName(), baseTableInfo.getTableName());
+      210          }
+      211          // check whether the last delta trait is equal to the max delta
+      212          TvrTableDeltaTrait lastTvrDeltaTrait = tableDeltaTraits.get(tableDeltaTraits.size() - 1);
+      213          TvrTableSnapshot lastTvrDeltaSnapshot = lastTvrDeltaTrait.getTvrDelta().toSnapshot();
+      214          if (!lastTvrDeltaSnapshot.equals(maxTvrDelta.toSnapshot())) {
+      215              logger.warn("The last tvr delta snapshot: {} is not equal to the max tvr delta snapshot: {}, " +
+      216                      "use the max tvr delta instead", lastTvrDeltaSnapshot, maxTvrDelta.toSnapshot());
+      217              throw new SemanticException("The last tvr delta snapshot: %s is not equal to the max tvr delta snapshot: %s",
+      218                      lastTvrDeltaSnapshot, maxTvrDelta.toSnapshot());
+      219          }
+      220          for (TvrTableDeltaTrait deltaTrait : tableDeltaTraits) {
+      221              if (!deltaTrait.isAppendOnly()) {
+      222                  if (refreshMode.isIncremental()) {
+      223                      throw new SemanticException("TvrTableDeltaTrait is not append-only for base table: %s.%s, delta:%s",
+      224                              baseTableInfo.getDbName(), baseTableInfo.getTableName(), deltaTrait);
+      225                  } else {
+      226                      logger.info("TvrTableDeltaTrait is not append-only for base table: {}, db: {}, delta:{}, " +
+      227                                      "use the max tvr delta instead", baseTableInfo.getTableName(),
+      228                              baseTableInfo.getDbName(), deltaTrait);
+      229                  }
+      230              }
+      231          }
+      232          if (isGenerateNextTaskRun()) {
+      233              return getBaseTableChangedDeltaAdaptive(baseTableInfo, tableDeltaTraits, maxTvrDelta);
+      234          } else {
+      235              logger.info("Base table: {}, db: {}, use the max tvr delta: {} for sync refresh",
+      236                      baseTableInfo.getTableName(), baseTableInfo.getDbName(), maxTvrDelta);
+      237              return maxTvrDelta;
+      238          }
+      239      }
+      240  
+      241      public TvrTableDelta getBaseTableMaxChangedDelta(BaseTableSnapshotInfo snapshotInfo,
+      242                                                       Map<BaseTableInfo, TvrVersionRange> mvTvrVersionRangeMap) {
+      243          Table snapshotTable = snapshotInfo.getBaseTable();
+      244          BaseTableInfo baseTableInfo = snapshotInfo.getBaseTableInfo();
+      245          Optional<Table> optTable = MvUtils.getTableWithIdentifier(baseTableInfo);
+      246          if (optTable.isEmpty()) {
+      247              throw new SemanticException("Base table %s.%s does not exist",
+      248                      baseTableInfo.getDbName(), baseTableInfo.getTableName());
+      249          }
+      250          if (!IVMAnalyzer.isTableTypeIVMSupported(snapshotTable.getType())) {
+      251              throw new SemanticException(String.format("Only support %s tables for MVIVMBasedRefreshProcessor, " +
+      252                              "but got: %s", Joiner.on(",").join(IVMAnalyzer.SUPPORTED_TABLE_TYPES),
+      253                      snapshotTable.getType()));
+      254          }
+      255          // For now, we always refresh the latest snapshot from the last refresh.
+      256          // current tvr snapshot
+      257          TvrVersionRange currentTvrSnapshot = GlobalStateMgr.getCurrentState().getMetadataMgr()
+      258                  .getCurrentTvrSnapshot(baseTableInfo.getDbName(), snapshotTable);
+      259          if (currentTvrSnapshot == null || !(currentTvrSnapshot instanceof TvrTableSnapshot)) {
+      260              logger.warn("Current tvr snapshot is null for base table: {}, db: {}",
+      261                      baseTableInfo.getTableName(), baseTableInfo.getDbName());
+      262              throw new SemanticException("Current tvr snapshot is null for base table: %s.%s",
+      263                      baseTableInfo.getDbName(), baseTableInfo.getTableName());
+      264          }
+      265          if (currentTvrSnapshot.to.isMax()) {
+      266              throw new SemanticException("Current tvr snapshot is max for base table: %s.%s, "
+      267                              + "this means the table is empty or not ready for refresh",
+      268                      baseTableInfo.getDbName(), baseTableInfo.getTableName());
+      269          }
+      270          TvrVersion currentVersion = currentTvrSnapshot.to;
+      271          if (!mvTvrVersionRangeMap.containsKey(baseTableInfo)) {
+      272              // mv has not refreshed yet, so we need to refresh it
+      273              logger.info("Materialized view {} does not have a tvr version range for base table: {}, "
+      274                              + "current tvr snapshot: {}, so we need to refresh it",
+      275                      mv.getName(), baseTableInfo.getTableName(), currentTvrSnapshot);
+      276              return TvrTableDelta.of(TvrVersion.MIN, currentVersion);
+      277          }
+      278  
+      279          TvrVersionRange beforeTvrVersionRange = mvTvrVersionRangeMap.get(baseTableInfo);
+      280          logger.info("Base table: {}, before tvr version range: {}, current tvr snapshot: {}",
+      281                  baseTableInfo.getTableName(), beforeTvrVersionRange, currentTvrSnapshot);
+      282          if (beforeTvrVersionRange == null || !(beforeTvrVersionRange instanceof TvrTableSnapshot)) {
+      283              throw new SemanticException("Materialized view " + mv.getName()
+      284                      + " does not have a valid tvr version range for base table: " + baseTableInfo.getTableName());
+      285          }
+      286          TvrVersion beforeVersion = beforeTvrVersionRange.to;
+      287          if (beforeVersion.equals(currentVersion)) {
+      288              // no change, so we can skip the refresh
+      289              logger.info("Base table {} has not changed, skip to refresh", baseTableInfo.getTableName());
+      290              return TvrTableDelta.of(beforeVersion, currentVersion);
+      291          }
+      292          return TvrTableDelta.of(beforeVersion, currentVersion);
+      293      }
+      294  
+      295      public boolean isGenerateNextTaskRun() {
+      296          if (Config.mv_max_rows_per_refresh <= 0) {
+      297              return false;
+      298          }
+      299          // for sync refresh, we always use the max changed delta
+      300          ExecuteOption executeOption = mvContext.getExecuteOption();
+      301          boolean isSyncRefresh = executeOption != null && executeOption.getIsSync();
+      302          return !isSyncRefresh;
+      303      }
+      304  
+      305      // TODO: We may introduce a smarter way to determine which incremental snapshot to refresh later.
+      306      private TvrTableDelta getBaseTableChangedDeltaAdaptive(BaseTableInfo baseTableInfo,
+      307                                                             List<TvrTableDeltaTrait> tableDeltaTraits,
+      308                                                             TvrTableDelta maxTvrDelta) {
+      309          TvrTableSnapshot fromSnapshot = maxTvrDelta.fromSnapshot();
+      310          TvrTableSnapshot toSnapshot = maxTvrDelta.toSnapshot();
+      311          long addedRows = 0;
+      312          long addedFileSize = 0;
+      313          for (TvrTableDeltaTrait deltaTrait : tableDeltaTraits) {
+      314              // TODO: We may need to handle the case where the deltaTrait is not append-only.
+      315              if (!deltaTrait.isAppendOnly()) {
+      316                  throw new SemanticException("TvrTableDeltaTrait is not append-only for base table: %s.%s",
+      317                          baseTableInfo.getDbName(), baseTableInfo.getTableName());
+      318              }
+      319              addedRows += deltaTrait.getTvrDeltaStats().getAddedRows();
+      320              addedFileSize += deltaTrait.getTvrDeltaStats().getAddedFileSize();
+      321  
+      322              if (addedRows >= Config.mv_max_rows_per_refresh || addedFileSize >= Config.mv_max_bytes_per_refresh) {
+      323                  logger.info("Base table: {}, db: {}, added rows: {}, added file size:{}, snapshot:{}" +
+      324                                  "reached the max rows per refresh, stop processing further deltas",
+      325                          baseTableInfo.getTableName(), baseTableInfo.getDbName(), addedRows, addedFileSize, deltaTrait);
+      326                  break;
+      327              }
+      328              logger.info("Base table: {}, db: {}, deltaTrait: {}, added rows: {}, fromSnapshot: {}, toSnapshot: {}",
+      329                      baseTableInfo.getTableName(), baseTableInfo.getDbName(), deltaTrait, addedRows,
+      330                      fromSnapshot, toSnapshot);
+      331              toSnapshot = deltaTrait.getTvrDelta().toSnapshot();
+      332          }
+      333          TvrTableDelta result = TvrTableDelta.of(fromSnapshot.to, toSnapshot.to);
+      334          // if the adaptive tvr delta is different from the max tvr delta, generate the next task run
+      335          hasNextTaskRun |= addedRows >= Config.mv_max_rows_per_refresh
+      336                  && !toSnapshot.equals(maxTvrDelta.toSnapshot())
+      337                  && !toSnapshot.to.isMax();
+      338          logger.info("Base table: {}, db: {}, max tvr delta: {}, adaptive tvr delta: {}, " +
+      339                          "toSnapshot:{}, hasNextTaskRun:{}", baseTableInfo.getTableName(), baseTableInfo.getDbName(),
+      340                  maxTvrDelta, result, toSnapshot, hasNextTaskRun);
+      341          return result;
+      342      }
+      343  
+      344      @Override
+      345      public void generateNextTaskRunIfNeeded() {
+      346          if (!hasNextTaskRun || mvContext.getTaskRun().isKilled()) {
+      347              return;
+      348          }
+      349          TaskManager taskManager = GlobalStateMgr.getCurrentState().getTaskManager();
+      350          Map<String, String> properties = mvContext.getProperties();
+      351          long mvId = Long.parseLong(properties.get(MV_ID));
+      352          String taskName = TaskBuilder.getMvTaskName(mvId);
+      353          Map<String, String> newProperties = Maps.newHashMap();
+      354          for (Map.Entry<String, String> proEntry : properties.entrySet()) {
+      355              // skip uncopyable properties: partition_values/... which only can be set specifically.
+      356              if (proEntry.getKey() == null || proEntry.getValue() == null
+      357                      || MV_UNCOPYABLE_PROPERTIES.contains(proEntry.getKey())) {
+      358                  continue;
+      359              }
+      360              newProperties.put(proEntry.getKey(), proEntry.getValue());
+      361          }
+      362  
+      363          if (mvContext.getStatus() != null) {
+      364              newProperties.put(TaskRun.START_TASK_RUN_ID, mvContext.getStatus().getStartTaskRunId());
+      365          }
+      366          // warehouse
+      367          if (properties.containsKey(PropertyAnalyzer.PROPERTIES_WAREHOUSE)) {
+      368              newProperties.put(PropertyAnalyzer.PROPERTIES_WAREHOUSE, properties.get(PropertyAnalyzer.PROPERTIES_WAREHOUSE));
+      369          }
+      370          // Partition refreshing task run should have the HIGHER priority, and be scheduled before other tasks
+      371          // Otherwise this round of partition refreshing would be staved and never got finished
+      372          ExecuteOption executeOption = mvContext.getExecuteOption();
+      373          int priority = executeOption.getPriority() > Constants.TaskRunPriority.LOWEST.value() ?
+      374                  executeOption.getPriority() : Constants.TaskRunPriority.HIGHER.value();
+      375          ExecuteOption option = new ExecuteOption(priority, true, newProperties);
+      376          logger.info("[MV] Generate a task to refresh next batches of partitions for MV {}-{}, start={}, end={}, " +
+      377                          "priority={}, properties={}", mv.getName(), mv.getId(),
+      378                  mvContext.getNextPartitionStart(), mvContext.getNextPartitionEnd(), priority, newProperties);
+      379          if (properties.containsKey(TaskRun.IS_TEST) && properties.get(TaskRun.IS_TEST).equalsIgnoreCase("true")) {
+      380              // for testing
+      381              TaskRun taskRun = TaskRunBuilder
+      382                      .newBuilder(taskManager.getTask(taskName))
+      383                      .properties(option.getTaskRunProperties())
+      384                      .setExecuteOption(option)
+      385                      .build();
+      386              nextTaskRun = taskRun;
+      387          } else {
+      388              taskManager.executeTask(taskName, option);
+      389          }
+      390      }
+      391  
+      392      private InsertStmt prepareRefreshPlan() throws AnalysisException, LockTimeoutException {
+      393          ConnectContext ctx = mvContext.getCtx();
+      394          ctx.getAuditEventBuilder().reset();
+      395          ctx.getAuditEventBuilder()
+      396                  .setTimestamp(System.currentTimeMillis())
+      397                  .setClientIp(mvContext.getRemoteIp())
+      398                  .setUser(ctx.getQualifiedUser())
+      399                  .setDb(ctx.getDatabase())
+      400                  .setWarehouse(ctx.getCurrentWarehouseName())
+      401                  .setQuerySource(QueryDetail.QuerySource.MV.name())
+      402                  .setCNGroup(ctx.getCurrentComputeResourceName());
+      403  
+      404          // set tvr target mvid
+      405          ctx.getSessionVariable().setEnableIVMRefresh(true);
+      406          ctx.getSessionVariable().setTvrTargetMvid(GsonUtils.GSON.toJson(mv.getMvId()));
+      407  
+      408          final Set<Table> baseTables = snapshotBaseTables.values()
+      409                  .stream()
+      410                  .map(BaseTableSnapshotInfo::getBaseTable)
+      411                  .collect(Collectors.toSet());
+      412          changeDefaultConnectContextIfNeeded(ctx, baseTables);
+      413  
+      414          InsertStmt insertStmt = null;
+      415          try (Timer ignored = Tracers.watchScope("MVRefreshParser")) {
+      416              // generate insert statement from defined query
+      417              insertStmt = generateInsertAst(ctx, PCellSortedSet.of(), mv.getIVMTaskDefinition());
+      418          }
+      419  
+      420          PlannerMetaLocker locker = new PlannerMetaLocker(ctx, insertStmt);
+      421          if (!locker.tryLock(Config.mv_refresh_try_lock_timeout_ms, TimeUnit.MILLISECONDS)) {
+      422              throw new LockTimeoutException("Failed to lock database in prepareRefreshPlan");
+      423          }
+      424          try (ConnectContext.ScopeGuard guard = ctx.bindScope()) {
+      425              // analyze the insert statement
+      426              try (Timer ignored = Tracers.watchScope("MVRefreshAnalyzer")) {
+      427                  analyzeInsertStmt(insertStmt);
+      428                  // build the insert plan
+      429                  insertStmt = buildInsertPlan(insertStmt);
+      430                  ctx.setExecutionId(UUIDUtil.toTUniqueId(ctx.getQueryId()));
+      431              }
+      432          } finally {
+      433              locker.unlock();
+      434          }
+      435  
+      436          try (Timer ignored = Tracers.watchScope("MVRefreshPlanner")) {
+      437              ctx.getSessionVariable().setEnableInsertSelectExternalAutoRefresh(false); //already refreshed before
+      438              ExecPlan execPlan = StatementPlanner.plan(insertStmt, ctx);
+      439              mvContext.setExecPlan(execPlan);
+      440          }
+      441          return insertStmt;
+      442      }
+      443  
+      444      private void analyzeInsertStmt(InsertStmt insertStmt) throws AnalysisException {
+      445          ConnectContext ctx = mvContext.getCtx();
+      446          Analyzer.analyze(insertStmt, ctx);
+      447      }
+      448  
+      449      private InsertStmt buildInsertPlan(InsertStmt insertStmt) throws AnalysisException {
+      450          QueryStatement queryStatement = insertStmt.getQueryStatement();
+      451          Multimap<String, TableRelation> tableRelations = AnalyzerUtils.collectAllTableRelation(queryStatement);
+      452          Map<String, TvrVersionRange> baseTableNameToTvrVersionRangeMap = snapshotBaseTables.values()
+      453                  .stream()
+      454                  .map(snapshotInfo -> (TvrTableSnapshotInfo) snapshotInfo)
+      455                  .map(snapshotInfo -> {
+      456                      BaseTableInfo baseTableInfo = snapshotInfo.getBaseTableInfo();
+      457                      TvrVersionRange tvrVersionRange = snapshotInfo.getTvrSnapshot();
+      458                      if (tvrVersionRange == null) {
+      459                          throw new SemanticException("Base table %s.%s does not have a valid tvr version range",
+      460                                  baseTableInfo.getDbName(), baseTableInfo.getTableName());
+      461                      }
+      462                      return Maps.immutableEntry(baseTableInfo.getTableName(), tvrVersionRange);
+      463                  })
+      464                  .collect(Collectors.toMap(entry -> entry.getKey(), Map.Entry::getValue));
+      465          for (Map.Entry<String, TableRelation> entry : tableRelations.entries()) {
+      466              TableRelation tableRelation = entry.getValue();
+      467              Table table = tableRelation.getTable();
+      468              if (!baseTableNameToTvrVersionRangeMap.containsKey(table.getName())) {
+      469                  throw new SemanticException("Base table %s.%s is not found in the changed version ranges",
+      470                          tableRelation.getName().getDb(), tableRelation.getName().getTbl());
+      471              }
+      472              TvrVersionRange tvrVersionRange = baseTableNameToTvrVersionRangeMap.get(table.getName());
+      473              tableRelation.setTvrVersionRange(tvrVersionRange);
+      474          }
+      475          return insertStmt;
+      476      }
+      477  
+      478      @Override
+      479      public BaseTableSnapshotInfo buildBaseTableSnapshotInfo(BaseTableInfo baseTableInfo, Table table) {
+      480          return new TvrTableSnapshotInfo(baseTableInfo, table);
+      481      }
+       ... truncated at 400 lines ...

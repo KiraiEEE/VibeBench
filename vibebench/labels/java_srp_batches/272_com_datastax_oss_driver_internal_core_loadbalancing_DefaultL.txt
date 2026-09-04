@@ -1,0 +1,281 @@
+row 272   scylladb/java-driver#832
+============================================================================
+CLASS com.datastax.oss.driver.internal.core.loadbalancing.DefaultLoadBalancingPolicy   loc=276 methods=14 wmc=49 lcom=0.0769230769230769 c3=0.1341935722731378
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       94  @ThreadSafe
+       95  public class DefaultLoadBalancingPolicy extends BasicLoadBalancingPolicy implements RequestTracker {
+       96  
+       97    private static final Logger LOG = LoggerFactory.getLogger(DefaultLoadBalancingPolicy.class);
+       98  
+       99    private static final long NEWLY_UP_INTERVAL_NANOS = MINUTES.toNanos(1);
+      100    private static final int MAX_IN_FLIGHT_THRESHOLD = 10;
+      101    private static final long RESPONSE_COUNT_RESET_INTERVAL_NANOS = MILLISECONDS.toNanos(200);
+      102  
+      103    protected final ConcurrentMap<Node, NodeResponseRateSample> responseTimes;
+      104    protected final Map<Node, Long> upTimes = new ConcurrentHashMap<>();
+      105    private final boolean avoidSlowReplicas;
+      106  
+      107    public DefaultLoadBalancingPolicy(@NonNull DriverContext context, @NonNull String profileName) {
+      108      super(context, profileName);
+      109      this.avoidSlowReplicas =
+      110          profile.getBoolean(DefaultDriverOption.LOAD_BALANCING_POLICY_SLOW_AVOIDANCE, true);
+      111      this.responseTimes = new MapMaker().weakKeys().makeMap();
+      112    }
+      113  
+      114    @NonNull
+      115    @Override
+      116    public Optional<RequestTracker> getRequestTracker() {
+      117      if (avoidSlowReplicas) {
+      118        return Optional.of(this);
+      119      } else {
+      120        return Optional.empty();
+      121      }
+      122    }
+      123  
+      124    @NonNull
+      125    @Override
+      126    protected Optional<String> discoverLocalDc(@NonNull Map<UUID, Node> nodes) {
+      127      return new MandatoryLocalDcHelper(context, profile, logPrefix).discoverLocalDc(nodes);
+      128    }
+      129  
+      130    /**
+      131     * Builds a query plan that prioritizes local replicas, shuffles them for balance, and then
+      132     * round-robins the remaining local nodes.
+      133     */
+      134    @NonNull
+      135    @Override
+      136    protected Queue<Node> newQueryPlanRegular(@Nullable Request request, @Nullable Session session) {
+      137      List<Node> replicas = getReplicas(request, session);
+      138      Object[] currentNodes = getLiveNodes().dc(getLocalDatacenter()).toArray();
+      139      int replicaCount = 0; // in currentNodes
+      140      if (!replicas.isEmpty()) {
+      141        int[] counts = moveReplicasToFront(currentNodes, replicas);
+      142        replicaCount = counts[0];
+      143  
+      144        int localRackReplicaCount = counts[1]; // in currentNodes
+      145  
+      146        if (replicaCount > 1) {
+      147          shuffleLocalRackReplicasAndReplicas(currentNodes, replicaCount, localRackReplicaCount);
+      148  
+      149          if (replicaCount > 2 && avoidSlowReplicas) {
+      150            avoidSlowReplicas(Objects.requireNonNull(session), currentNodes, replicaCount);
+      151          }
+      152        }
+      153      }
+      154  
+      155      LOG.trace("[{}] Prioritizing {} local replicas", logPrefix, replicaCount);
+      156  
+      157      // Round-robin the remaining nodes
+      158      ArrayUtils.rotate(
+      159          currentNodes,
+      160          replicaCount,
+      161          currentNodes.length - replicaCount,
+      162          roundRobinAmount.getAndUpdate(INCREMENT));
+      163  
+      164      QueryPlan plan = currentNodes.length == 0 ? QueryPlan.EMPTY : new SimpleQueryPlan(currentNodes);
+      165      return maybeAddDcFailover(request, plan);
+      166    }
+      167  
+      168    private int[] moveReplicasToFront(Object[] currentNodes, List<Node> allReplicas) {
+      169      int replicaCount = 0, localRackReplicaCount = 0;
+      170      for (int i = 0; i < currentNodes.length; i++) {
+      171        Node node = (Node) currentNodes[i];
+      172        if (allReplicas.contains(node)) {
+      173          if (Objects.equals(node.getRack(), getLocalRack())
+      174              && Objects.equals(node.getDatacenter(), getLocalDatacenter())) {
+      175            ArrayUtils.bubbleUp(currentNodes, i, localRackReplicaCount);
+      176            localRackReplicaCount++;
+      177          } else {
+      178            ArrayUtils.bubbleUp(currentNodes, i, replicaCount);
+      179          }
+      180          replicaCount++;
+      181        }
+      182      }
+      183      return new int[] {replicaCount, localRackReplicaCount};
+      184    }
+      185  
+      186    private void shuffleLocalRackReplicasAndReplicas(
+      187        Object[] currentNodes, int replicaCount, int localRackReplicaCount) {
+      188      if (getLocalRack() != null && localRackReplicaCount > 0) {
+      189        // Shuffle only replicas that are in the local rack
+      190        shuffleHead(currentNodes, localRackReplicaCount);
+      191        // Shuffles only replicas that are not in local rack
+      192        shuffleInRange(currentNodes, localRackReplicaCount, replicaCount - 1);
+      193      } else {
+      194        shuffleHead(currentNodes, replicaCount);
+      195      }
+      196    }
+      197  
+      198    private void avoidSlowReplicas(
+      199        @NonNull Session session, Object[] currentNodes, int replicaCount) {
+      200      // Test replicas health
+      201      Node newestUpReplica = null;
+      202      BitSet unhealthyReplicas = null; // bit mask storing indices of unhealthy replicas
+      203      long mostRecentUpTimeNanos = -1;
+      204      long now = nanoTime();
+      205      for (int i = 0; i < replicaCount; i++) {
+      206        Node node = (Node) currentNodes[i];
+      207        assert node != null;
+      208        Long upTimeNanos = upTimes.get(node);
+      209        if (upTimeNanos != null
+      210            && now - upTimeNanos - NEWLY_UP_INTERVAL_NANOS < 0
+      211            && upTimeNanos - mostRecentUpTimeNanos > 0) {
+      212          newestUpReplica = node;
+      213          mostRecentUpTimeNanos = upTimeNanos;
+      214        }
+      215        if (newestUpReplica == null && isUnhealthy(node, session, now)) {
+      216          if (unhealthyReplicas == null) {
+      217            unhealthyReplicas = new BitSet(replicaCount);
+      218          }
+      219          unhealthyReplicas.set(i);
+      220        }
+      221      }
+      222  
+      223      // When:
+      224      // - there isn't any newly UP replica and
+      225      // - there is one or more unhealthy replicas and
+      226      // - there is a majority of healthy replicas
+      227      int unhealthyReplicasCount = unhealthyReplicas == null ? 0 : unhealthyReplicas.cardinality();
+      228      if (newestUpReplica == null
+      229          && unhealthyReplicasCount > 0
+      230          && unhealthyReplicasCount < (replicaCount / 2.0)) {
+      231  
+      232        // Reorder the unhealthy replicas to the back of the list
+      233        // Start from the back of the replicas, then move backwards;
+      234        // stop once all unhealthy replicas are moved to the back.
+      235        int counter = 0;
+      236        for (int i = replicaCount - 1; i >= 0 && counter < unhealthyReplicasCount; i--) {
+      237          if (unhealthyReplicas.get(i)) {
+      238            ArrayUtils.bubbleDown(currentNodes, i, replicaCount - 1 - counter);
+      239            counter++;
+      240          }
+      241        }
+      242      }
+      243  
+      244      // When:
+      245      // - there is a newly UP replica and
+      246      // - the replica in first or second position is the most recent replica marked as UP and
+      247      // - dice roll 1d4 != 1
+      248      else if ((newestUpReplica == currentNodes[0] || newestUpReplica == currentNodes[1])
+      249          && randomNextInt(4) != 1) {
+      250  
+      251        // Send it to the back of the replicas
+      252        ArrayUtils.bubbleDown(
+      253            currentNodes, newestUpReplica == currentNodes[0] ? 0 : 1, replicaCount - 1);
+      254      }
+      255  
+      256      // Reorder the first two replicas in the shuffled list based on the number of
+      257      // in-flight requests
+      258      if (getInFlight((Node) currentNodes[0], session)
+      259          > getInFlight((Node) currentNodes[1], session)) {
+      260        ArrayUtils.swap(currentNodes, 0, 1);
+      261      }
+      262    }
+      263  
+      264    @Override
+      265    public void onNodeSuccess(
+      266        @NonNull Request request,
+      267        long latencyNanos,
+      268        @NonNull DriverExecutionProfile executionProfile,
+      269        @NonNull Node node,
+      270        @NonNull String logPrefix) {
+      271      updateResponseTimes(node);
+      272    }
+      273  
+      274    @Override
+      275    public void onNodeError(
+      276        @NonNull Request request,
+      277        @NonNull Throwable error,
+      278        long latencyNanos,
+      279        @NonNull DriverExecutionProfile executionProfile,
+      280        @NonNull Node node,
+      281        @NonNull String logPrefix) {
+      282      updateResponseTimes(node);
+      283    }
+      284  
+      285    /** Exposed as a protected method so that it can be accessed by tests */
+      286    protected long nanoTime() {
+      287      return System.nanoTime();
+      288    }
+      289  
+      290    protected boolean isUnhealthy(@NonNull Node node, @NonNull Session session, long now) {
+      291      return isBusy(node, session) && isResponseRateInsufficient(node, now);
+      292    }
+      293  
+      294    protected boolean isBusy(@NonNull Node node, @NonNull Session session) {
+      295      return getInFlight(node, session) >= MAX_IN_FLIGHT_THRESHOLD;
+      296    }
+      297  
+      298    protected boolean isResponseRateInsufficient(@NonNull Node node, long now) {
+      299      NodeResponseRateSample sample = responseTimes.get(node);
+      300      return !(sample == null || sample.hasSufficientResponses(now));
+      301    }
+      302  
+      303    /**
+      304     * Synchronously updates the response times for the given node. It is synchronous because the
+      305     * {@link #DefaultLoadBalancingPolicy(com.datastax.oss.driver.api.core.context.DriverContext,
+      306     * java.lang.String) CacheLoader.load} assigned is synchronous.
+      307     *
+      308     * @param node The node to update.
+      309     */
+      310    protected void updateResponseTimes(@NonNull Node node) {
+      311      this.responseTimes.compute(node, (k, v) -> v == null ? new NodeResponseRateSample() : v.next());
+      312    }
+      313  
+      314    protected int getInFlight(@NonNull Node node, @NonNull Session session) {
+      315      // The cast will always succeed because there's no way to replace the internal session impl
+      316      ChannelPool pool = ((DefaultSession) session).getPools().get(node);
+      317      // Note: getInFlight() includes orphaned ids, which is what we want as we need to account
+      318      // for requests that were cancelled or timed out (since the node is likely to still be
+      319      // processing them).
+      320      return (pool == null) ? 0 : pool.getInFlight();
+      321    }
+      322  
+      323    protected class NodeResponseRateSample {
+      324  
+      325      @VisibleForTesting protected final long oldest;
+      326      @VisibleForTesting protected final OptionalLong newest;
+      327  
+      328      private NodeResponseRateSample() {
+      329        this.oldest = nanoTime();
+      330        this.newest = OptionalLong.empty();
+      331      }
+      332  
+      333      private NodeResponseRateSample(long oldestSample) {
+      334        this(oldestSample, nanoTime());
+      335      }
+      336  
+      337      private NodeResponseRateSample(long oldestSample, long newestSample) {
+      338        this.oldest = oldestSample;
+      339        this.newest = OptionalLong.of(newestSample);
+      340      }
+      341  
+      342      @VisibleForTesting
+      343      protected NodeResponseRateSample(AtomicLongArray times) {
+      344        assert times.length() >= 1;
+      345        this.oldest = times.get(0);
+      346        this.newest = (times.length() > 1) ? OptionalLong.of(times.get(1)) : OptionalLong.empty();
+      347      }
+      348  
+      349      // Our newest sample becomes the oldest in the next generation
+      350      private NodeResponseRateSample next() {
+      351        return new NodeResponseRateSample(this.getNewestValidSample(), nanoTime());
+      352      }
+      353  
+      354      // If we have a pair of values return the newest, otherwise we have just one value... so just
+      355      // return it
+      356      private long getNewestValidSample() {
+      357        return this.newest.orElse(this.oldest);
+      358      }
+      359  
+      360      // response rate is considered insufficient when less than 2 responses were obtained in
+      361      // the past interval delimited by RESPONSE_COUNT_RESET_INTERVAL_NANOS.
+      362      private boolean hasSufficientResponses(long now) {
+      363        // If we only have one sample it's an automatic failure
+      364        if (!this.newest.isPresent()) return true;
+      365        long threshold = now - RESPONSE_COUNT_RESET_INTERVAL_NANOS;
+      366        return this.oldest - threshold >= 0;
+      367      }
+      368    }
+      369  }

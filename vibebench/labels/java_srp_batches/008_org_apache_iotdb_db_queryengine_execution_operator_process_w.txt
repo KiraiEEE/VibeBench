@@ -1,0 +1,270 @@
+row 8   apache/iotdb#17293
+============================================================================
+CLASS org.apache.iotdb.db.queryengine.execution.operator.process.window.TableWindowOperator   loc=265 methods=16 wmc=45 lcom=0.1333333333333333 c3=0.1479224420563903
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       54  public class TableWindowOperator implements ProcessOperator {
+       55    private static final long INSTANCE_SIZE =
+       56        RamUsageEstimator.shallowSizeOfInstance(TableWindowOperator.class);
+       57  
+       58    // Common fields
+       59    private final OperatorContext operatorContext;
+       60    private final Operator inputOperator;
+       61    private final List<TSDataType> inputDataTypes;
+       62    private final List<Integer> outputChannels;
+       63    private final TsBlockBuilder tsBlockBuilder;
+       64    private final MemoryReservationManager memoryReservationManager;
+       65  
+       66    // Basic information about window operator
+       67    private final List<WindowFunction> windowFunctions;
+       68    private final List<FrameInfo> frameInfoList;
+       69  
+       70    // Partition
+       71    private final PartitionRecognizer partitionRecognizer;
+       72    private final PartitionCache partitionCache;
+       73  
+       74    // Sort
+       75    private final List<Integer> sortChannels;
+       76  
+       77    // Transformation
+       78    private LinkedList<PartitionExecutor> cachedPartitionExecutors;
+       79  
+       80    // Misc
+       81    private long totalMemorySize;
+       82    private long maxUsedMemory;
+       83    private final long maxRuntime;
+       84    private boolean noMoreDataSignaled;
+       85  
+       86    public TableWindowOperator(
+       87        OperatorContext operatorContext,
+       88        Operator inputOperator,
+       89        List<TSDataType> inputDataTypes,
+       90        List<TSDataType> outputDataTypes,
+       91        List<Integer> outputChannels,
+       92        List<WindowFunction> windowFunctions,
+       93        List<FrameInfo> frameInfoList,
+       94        List<Integer> partitionChannels,
+       95        List<Integer> sortChannels) {
+       96      this.operatorContext = operatorContext;
+       97      this.inputOperator = inputOperator;
+       98      this.inputDataTypes = ImmutableList.copyOf(inputDataTypes);
+       99      this.outputChannels = ImmutableList.copyOf(outputChannels);
+      100      this.tsBlockBuilder = new TsBlockBuilder(outputDataTypes);
+      101  
+      102      this.windowFunctions = ImmutableList.copyOf(windowFunctions);
+      103      this.frameInfoList = ImmutableList.copyOf(frameInfoList);
+      104  
+      105      List<Integer> requiredChannels = new ArrayList<>(inputDataTypes.size());
+      106      for (int i = 0; i < inputDataTypes.size(); i++) {
+      107        requiredChannels.add(i);
+      108      }
+      109      this.partitionRecognizer =
+      110          new PartitionRecognizer(
+      111              partitionChannels, requiredChannels, Collections.emptyList(), inputDataTypes);
+      112      this.partitionCache = new PartitionCache();
+      113  
+      114      this.sortChannels = ImmutableList.copyOf(sortChannels);
+      115  
+      116      this.cachedPartitionExecutors = new LinkedList<>();
+      117  
+      118      this.maxRuntime = this.operatorContext.getMaxRunTime().roundTo(TimeUnit.NANOSECONDS);
+      119      this.totalMemorySize = 0;
+      120      this.maxUsedMemory = 0;
+      121      this.noMoreDataSignaled = false;
+      122      this.memoryReservationManager =
+      123          operatorContext
+      124              .getDriverContext()
+      125              .getFragmentInstanceContext()
+      126              .getMemoryReservationContext();
+      127    }
+      128  
+      129    @Override
+      130    public OperatorContext getOperatorContext() {
+      131      return operatorContext;
+      132    }
+      133  
+      134    @Override
+      135    public ListenableFuture<?> isBlocked() {
+      136      return inputOperator.isBlocked();
+      137    }
+      138  
+      139    @Override
+      140    public TsBlock next() throws Exception {
+      141      long startTime = System.nanoTime();
+      142  
+      143      if (!cachedPartitionExecutors.isEmpty()) {
+      144        TsBlock tsBlock = transform(startTime);
+      145        if (tsBlock != null) {
+      146          return tsBlock;
+      147        }
+      148      }
+      149  
+      150      if (inputOperator.hasNextWithTimer()) {
+      151        TsBlock preSortedBlock = inputOperator.nextWithTimer();
+      152        if (preSortedBlock == null || preSortedBlock.isEmpty()) {
+      153          return null;
+      154        }
+      155  
+      156        partitionRecognizer.addTsBlock(preSortedBlock);
+      157        processRecognizerStates();
+      158  
+      159        if (!cachedPartitionExecutors.isEmpty()) {
+      160          return transform(startTime);
+      161        }
+      162        return null;
+      163      } else if (!noMoreDataSignaled) {
+      164        partitionRecognizer.noMoreData();
+      165        noMoreDataSignaled = true;
+      166        processRecognizerStates();
+      167  
+      168        if (!cachedPartitionExecutors.isEmpty()) {
+      169          TsBlock tsBlock = transform(startTime);
+      170          if (tsBlock == null && !tsBlockBuilder.isEmpty()) {
+      171            tsBlock = getTsBlockFromTsBlockBuilder();
+      172          }
+      173          return tsBlock;
+      174        }
+      175      } else if (!tsBlockBuilder.isEmpty()) {
+      176        return getTsBlockFromTsBlockBuilder();
+      177      }
+      178  
+      179      return null;
+      180    }
+      181  
+      182    private void processRecognizerStates() {
+      183      while (true) {
+      184        PartitionState state = partitionRecognizer.nextState();
+      185        switch (state.getStateType()) {
+      186          case INIT:
+      187          case NEED_MORE_DATA:
+      188            return;
+      189          case FINISHED:
+      190            finalizeCurrentPartition();
+      191            return;
+      192          case NEW_PARTITION:
+      193            finalizeCurrentPartition();
+      194            addSliceToCache(state.getSlice());
+      195            break;
+      196          case ITERATING:
+      197            addSliceToCache(state.getSlice());
+      198            break;
+      199          default:
+      200            break;
+      201        }
+      202      }
+      203    }
+      204  
+      205    private void finalizeCurrentPartition() {
+      206      if (!partitionCache.isEmpty()) {
+      207        Partition partition = new Partition(partitionCache.getSlices());
+      208        PartitionExecutor partitionExecutor =
+      209            new PartitionExecutor(
+      210                partition,
+      211                inputDataTypes,
+      212                outputChannels,
+      213                windowFunctions,
+      214                frameInfoList,
+      215                sortChannels);
+      216        cachedPartitionExecutors.addLast(partitionExecutor);
+      217        releasePartitionCacheMemory();
+      218        partitionCache.clear();
+      219      }
+      220    }
+      221  
+      222    private TsBlock transform(long startTime) {
+      223      while (!cachedPartitionExecutors.isEmpty()) {
+      224        PartitionExecutor partitionExecutor = cachedPartitionExecutors.getFirst();
+      225        partitionExecutor.resetWindowFunctions();
+      226  
+      227        while (System.nanoTime() - startTime < maxRuntime
+      228            && !tsBlockBuilder.isFull()
+      229            && partitionExecutor.hasNext()) {
+      230          partitionExecutor.processNextRow(tsBlockBuilder);
+      231        }
+      232  
+      233        if (!partitionExecutor.hasNext()) {
+      234          cachedPartitionExecutors.removeFirst();
+      235        }
+      236  
+      237        if (System.nanoTime() - startTime >= maxRuntime || tsBlockBuilder.isFull()) {
+      238          return getTsBlockFromTsBlockBuilder();
+      239        }
+      240      }
+      241  
+      242      return null;
+      243    }
+      244  
+      245    private TsBlock getTsBlockFromTsBlockBuilder() {
+      246      TsBlock result =
+      247          tsBlockBuilder.build(
+      248              new RunLengthEncodedColumn(TIME_COLUMN_TEMPLATE, tsBlockBuilder.getPositionCount()));
+      249      tsBlockBuilder.reset();
+      250      return result;
+      251    }
+      252  
+      253    @Override
+      254    public boolean hasNext() throws Exception {
+      255      return !cachedPartitionExecutors.isEmpty()
+      256          || inputOperator.hasNext()
+      257          || !partitionCache.isEmpty()
+      258          || !tsBlockBuilder.isEmpty();
+      259    }
+      260  
+      261    @Override
+      262    public void close() throws Exception {
+      263      inputOperator.close();
+      264      partitionCache.close();
+      265      if (totalMemorySize != 0) {
+      266        memoryReservationManager.releaseMemoryCumulatively(totalMemorySize);
+      267      }
+      268    }
+      269  
+      270    @Override
+      271    public boolean isFinished() throws Exception {
+      272      return !this.hasNextWithTimer();
+      273    }
+      274  
+      275    private void addSliceToCache(Slice slice) {
+      276      long reserved = slice.getEstimatedSize();
+      277      memoryReservationManager.reserveMemoryCumulatively(reserved);
+      278      totalMemorySize += reserved;
+      279      maxUsedMemory = Math.max(maxUsedMemory, totalMemorySize);
+      280      operatorContext.recordSpecifiedInfo(MAX_RESERVED_MEMORY, Long.toString(maxUsedMemory));
+      281      partitionCache.addSlice(slice);
+      282    }
+      283  
+      284    private void releasePartitionCacheMemory() {
+      285      long released = partitionCache.getEstimatedSize();
+      286      memoryReservationManager.releaseMemoryCumulatively(released);
+      287      totalMemorySize -= released;
+      288      operatorContext.recordSpecifiedInfo(MAX_RESERVED_MEMORY, Long.toString(maxUsedMemory));
+      289    }
+      290  
+      291    @Override
+      292    public long calculateMaxPeekMemory() {
+      293      long maxPeekMemoryFromInput = inputOperator.calculateMaxPeekMemoryWithCounter();
+      294      long maxPeekMemoryFromCurrent =
+      295          TSFileDescriptor.getInstance().getConfig().getMaxTsBlockSizeInBytes();
+      296      return Math.max(maxPeekMemoryFromInput, maxPeekMemoryFromCurrent)
+      297          + inputOperator.calculateRetainedSizeAfterCallingNext();
+      298    }
+      299  
+      300    @Override
+      301    public long calculateMaxReturnSize() {
+      302      return TSFileDescriptor.getInstance().getConfig().getMaxTsBlockSizeInBytes();
+      303    }
+      304  
+      305    @Override
+      306    public long calculateRetainedSizeAfterCallingNext() {
+      307      return inputOperator.calculateRetainedSizeAfterCallingNext();
+      308    }
+      309  
+      310    @Override
+      311    public long ramBytesUsed() {
+      312      return INSTANCE_SIZE
+      313          + MemoryEstimationHelper.getEstimatedSizeOfAccountableObject(inputOperator)
+      314          + MemoryEstimationHelper.getEstimatedSizeOfAccountableObject(operatorContext)
+      315          + tsBlockBuilder.getRetainedSizeInBytes()
+      316          + partitionCache.getEstimatedSize();
+      317    }
+      318  }

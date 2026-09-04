@@ -1,0 +1,359 @@
+row 142   StarRocks/starrocks#70757
+============================================================================
+CLASS com.starrocks.qe.scheduler.slot.BaseSlotTracker   loc=354 methods=26 wmc=52 lcom=0.08 c3=0.1678416975865875
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       55  public abstract class BaseSlotTracker {
+       56      private static final Logger LOG = LogManager.getLogger(BaseSlotTracker.class);
+       57  
+       58      protected final ConcurrentMap<TUniqueId, LogicalSlot> slots = new ConcurrentHashMap<>();
+       59      protected final Set<LogicalSlot> slotsOrderByExpiredTime = new TreeSet<>(
+       60              Comparator.comparingLong(LogicalSlot::getExpiredPendingTimeMs)
+       61                      .thenComparing(LogicalSlot::getSlotId));
+       62  
+       63      protected final Map<TUniqueId, LogicalSlot> pendingSlots = new HashMap<>();
+       64      protected final Map<TUniqueId, LogicalSlot> allocatedSlots = new HashMap<>();
+       65      protected final ResourceUsageMonitor resourceUsageMonitor;
+       66      protected final long warehouseId;
+       67  
+       68      protected int numAllocatedSlots = 0;
+       69      protected Optional<String> warehouseName = Optional.empty();
+       70  
+       71      protected List<BaseSlotTracker.Listener> listeners;
+       72      protected SlotSelectionStrategy slotSelectionStrategy;
+       73      // history slots to record the slots which have been released for monitoring
+       74      private final Queue<LogicalSlot> historySlots = new ConcurrentLinkedQueue();
+       75  
+       76      public BaseSlotTracker(ResourceUsageMonitor resourceUsageMonitor, long warehouseId) {
+       77          this.resourceUsageMonitor = resourceUsageMonitor;
+       78          this.warehouseId = warehouseId;
+       79      }
+       80  
+       81      public String getWarehouseName() {
+       82          try {
+       83              if (warehouseName.isEmpty()) {
+       84                  WarehouseManager warehouseManager = GlobalStateMgr.getCurrentState().getWarehouseMgr();
+       85                  Warehouse warehouse = warehouseManager.getWarehouse(this.warehouseId);
+       86                  this.warehouseName = Optional.of(warehouse.getName());
+       87              }
+       88              return warehouseName.orElse("");
+       89          } catch (Exception e) {
+       90              LOG.warn("Failed to get warehouse name for warehouseId: {}", warehouseId, e);
+       91              return "";
+       92          }
+       93      }
+       94  
+       95      public long getQueuePendingLength() {
+       96          return pendingSlots.size();
+       97      }
+       98  
+       99      public Optional<Integer> getMaxRequiredSlots() {
+      100          return pendingSlots.values().stream()
+      101                  .map(LogicalSlot::getNumPhysicalSlots)
+      102                  .max(Integer::compareTo);
+      103      }
+      104  
+      105      public Optional<Integer> getSumRequiredSlots() {
+      106          return pendingSlots.values().stream()
+      107                  .map(LogicalSlot::getNumPhysicalSlots)
+      108                  .reduce(Integer::sum);
+      109      }
+      110  
+      111  
+      112      public Optional<Integer> getRemainSlots() {
+      113          return getMaxSlots().map(s -> Math.max(0, s - numAllocatedSlots));
+      114      }
+      115  
+      116      public long getMaxQueueQueueLength() {
+      117          final BaseSlotManager slotManager = GlobalStateMgr.getCurrentState().getSlotManager();
+      118          return slotManager.getQueryQueueMaxQueuedQueries(warehouseId);
+      119      }
+      120  
+      121      public long getMaxQueuePendingTimeSecond() {
+      122          final BaseSlotManager slotManager = GlobalStateMgr.getCurrentState().getSlotManager();
+      123          return slotManager.getQueryQueuePendingTimeoutSecond(warehouseId);
+      124      }
+      125  
+      126      /**
+      127       * Return the max slots of the slot tracker if query queuen is supported.
+      128       */
+      129      public abstract Optional<Integer> getMaxSlots();
+      130  
+      131      /**
+      132       * Check if the slot tracker is beyond the capacity limit.
+      133       * @param slot : The slot to be checked.
+      134       * @return True if the slot tracker is beyond the capacity limit, false otherwise.
+      135       */
+      136      protected boolean isResourceCapacityEnough(LogicalSlot slot) {
+      137          final BaseSlotManager slotManager = GlobalStateMgr.getCurrentState().getSlotManager();
+      138          if (GlobalVariable.isQueryQueueMaxQueuedQueriesEffective() &&
+      139                  pendingSlots.size() >= slotManager.getQueryQueueMaxQueuedQueries(slot.getWarehouseId())) {
+      140              return false;
+      141          }
+      142          return true;
+      143      }
+      144  
+      145      /**
+      146       * Get the extra message of the slot tracker.
+      147       */
+      148      public Optional<ExtraMessage> getExtraMessage() {
+      149          return Optional.empty();
+      150      }
+      151  
+      152      /**
+      153       * Add a slot requirement.
+      154       * @param slot The required slot.
+      155       * @return True if the slot is required successfully or already required , false if the query queue is full.
+      156       */
+      157      public boolean requireSlot(LogicalSlot slot) {
+      158          if (!isResourceCapacityEnough(slot)) {
+      159              return false;
+      160          }
+      161  
+      162          if (slots.containsKey(slot.getSlotId())) {
+      163              return true;
+      164          }
+      165  
+      166          slots.put(slot.getSlotId(), slot);
+      167          slotsOrderByExpiredTime.add(slot);
+      168          pendingSlots.put(slot.getSlotId(), slot);
+      169  
+      170          MetricRepo.COUNTER_QUERY_QUEUE_SLOT_PENDING.increase((long) slot.getNumPhysicalSlots());
+      171  
+      172          listeners.forEach(listener -> listener.onRequireSlot(slot));
+      173          slot.onRequire();
+      174  
+      175          // try to register the slot to the connected context
+      176          tryRegisterConnectContext(slot);
+      177  
+      178          return true;
+      179      }
+      180  
+      181      /**
+      182       * Allocate a slot which has already been required.
+      183       * If the slot has not been required, this method has no effect.
+      184       * @param slot The slot to be allocated.
+      185       */
+      186      public void allocateSlot(LogicalSlot slot) {
+      187          TUniqueId slotId = slot.getSlotId();
+      188          if (!slots.containsKey(slotId)) {
+      189              return;
+      190          }
+      191  
+      192          if (pendingSlots.remove(slotId) == null) {
+      193              return;
+      194          }
+      195          MetricRepo.COUNTER_QUERY_QUEUE_SLOT_PENDING.increase((long) -slot.getNumPhysicalSlots());
+      196  
+      197          if (allocatedSlots.put(slotId, slot) != null) {
+      198              return;
+      199          }
+      200  
+      201          MetricRepo.COUNTER_QUERY_QUEUE_SLOT_RUNNING.increase((long) slot.getNumPhysicalSlots());
+      202          numAllocatedSlots += slot.getNumPhysicalSlots();
+      203  
+      204          listeners.forEach(listener -> listener.onAllocateSlot(slot));
+      205          slot.onAllocate();
+      206      }
+      207  
+      208      /**
+      209       * Release a slot which has already been allocated or required.
+      210       * @param slotId The slot id to be released.
+      211       * @return The released slot, or null if the slot has not been required or allocated.
+      212       */
+      213      public LogicalSlot releaseSlot(TUniqueId slotId) {
+      214          LogicalSlot slot = releaseSlotImpl(slotId);
+      215          if (slot != null) {
+      216              tryAddIntoHistorySlots(slot);
+      217          }
+      218          return slot;
+      219      }
+      220  
+      221      protected void tryAddIntoHistorySlots(LogicalSlot slot) {
+      222          if (Config.max_query_queue_history_slots_number <= 0) {
+      223              return;
+      224          }
+      225          while (historySlots.size() > Config.max_query_queue_history_slots_number) {
+      226              historySlots.poll();
+      227          }
+      228          historySlots.add(slot);
+      229      }
+      230  
+      231      /**
+      232       * Try to register the slot to the connected context for more observing information.
+      233       * @param slot: The slot to be registered.
+      234       */
+      235      protected void tryRegisterConnectContext(LogicalSlot slot) {
+      236          // ignore the slot is null or slot's extra message has been set
+      237          if (Config.max_query_queue_history_slots_number <= 0 ||
+      238                  slot == null || (slot.getExtraMessage() != null && slot.getExtraMessage().isPresent())) {
+      239              return;
+      240          }
+      241          // find the connected context and register the logical slot
+      242          try {
+      243              TUniqueId slotId = slot.getSlotId();
+      244              UUID queryId = UUIDUtil.fromTUniqueid(slotId);
+      245              ConnectContext ctx = ExecuteEnv.getInstance().getScheduler().findContextByQueryId(queryId.toString());
+      246              if (ctx == null) {
+      247                  LOG.debug("Failed to find the context for queryId: {}", queryId);
+      248                  return;
+      249              }
+      250              LOG.debug("Registering the slot {} to context {}", slot, ctx);
+      251          } catch (Exception e) {
+      252              LOG.warn("Failed to register the slot to context", e);
+      253          }
+      254      }
+      255  
+      256      protected LogicalSlot releaseSlotImpl(TUniqueId slotId) {
+      257          LogicalSlot slot = slots.remove(slotId);
+      258          if (slot == null) {
+      259              return null;
+      260          }
+      261  
+      262          slotsOrderByExpiredTime.remove(slot);
+      263  
+      264          if (allocatedSlots.remove(slotId) != null) {
+      265              numAllocatedSlots -= slot.getNumPhysicalSlots();
+      266              MetricRepo.COUNTER_QUERY_QUEUE_SLOT_RUNNING.increase((long) -slot.getNumPhysicalSlots());
+      267          } else {
+      268              if (pendingSlots.remove(slotId) != null) {
+      269                  MetricRepo.COUNTER_QUERY_QUEUE_SLOT_PENDING.increase((long) -slot.getNumPhysicalSlots());
+      270              }
+      271          }
+      272  
+      273          listeners.forEach(listener -> listener.onReleaseSlot(slot));
+      274          slot.onRelease();
+      275  
+      276          return slot;
+      277      }
+      278  
+      279      /**
+      280       * Peak the slots to be allocated from slot manager.
+      281       */
+      282      public Collection<LogicalSlot> peakSlotsToAllocate() {
+      283          return slotSelectionStrategy.peakSlotsToAllocate(this);
+      284      }
+      285  
+      286      /**
+      287       * Peak all the expired slots.
+      288       *
+      289       * <p> Note that this method does not remove the expired slots from the tracker,
+      290       * and {@link #releaseSlot} should be called to release these slots after peaking.
+      291       * @return The expired slots.
+      292       */
+      293      public List<LogicalSlot> peakExpiredSlots() {
+      294          final long nowMs = System.currentTimeMillis();
+      295          List<LogicalSlot> expiredSlots = new ArrayList<>();
+      296          for (LogicalSlot slot : slotsOrderByExpiredTime) {
+      297              if (!slot.isAllocatedExpired(nowMs)) {
+      298                  break;
+      299              }
+      300              expiredSlots.add(slot);
+      301          }
+      302          return expiredSlots;
+      303      }
+      304  
+      305      public long getMinExpiredTimeMs() {
+      306          if (slotsOrderByExpiredTime.isEmpty()) {
+      307              return 0;
+      308          }
+      309          return slotsOrderByExpiredTime.iterator().next().getExpiredPendingTimeMs();
+      310      }
+      311  
+      312      public double getEarliestQueryWaitTimeSecond() {
+      313          return slots.values().stream()
+      314                  .filter(slot -> slot.getState() == LogicalSlot.State.REQUIRING) // only consider requiring slots
+      315                  .map(LogicalSlot::getStartTimeMs)
+      316                  .min(Long::compareTo)
+      317                  .map(t -> (System.currentTimeMillis() - t) / 1000.0).orElse(0.0);
+      318      }
+      319  
+      320      public Collection<LogicalSlot> getSlots() {
+      321          if (Config.max_query_queue_history_slots_number > 0) {
+      322              List<LogicalSlot> result = Lists.newArrayList();
+      323              // the newest slots are in the front
+      324              result.addAll(slots.values());
+      325              List<LogicalSlot> histories = Lists.newArrayList(historySlots);
+      326              if (!histories.isEmpty()) {
+      327                  Collections.reverse(histories);
+      328                  result.addAll(histories);
+      329              }
+      330              return result;
+      331          } else {
+      332              return slots.values();
+      333          }
+      334      }
+      335  
+      336      @VisibleForTesting
+      337      public Collection<LogicalSlot> getHistorySlots() {
+      338          return historySlots;
+      339      }
+      340  
+      341      public LogicalSlot getSlot(TUniqueId slotId) {
+      342          return slots.get(slotId);
+      343      }
+      344  
+      345      // allocated slots that mean the slots which have been allocated and not released.
+      346      public int getNumAllocatedSlots() {
+      347          return numAllocatedSlots;
+      348      }
+      349  
+      350      // return the number of allocated slots which is the current concurrency in the query queue
+      351      public int getCurrentCurrency() {
+      352          return allocatedSlots.size();
+      353      }
+      354  
+      355      public long getWarehouseId() {
+      356          return warehouseId;
+      357      }
+      358  
+      359      public interface Listener {
+      360          void onRequireSlot(LogicalSlot slot);
+      361  
+      362          void onAllocateSlot(LogicalSlot slot);
+      363  
+      364          void onReleaseSlot(LogicalSlot slot);
+      365      }
+      366  
+      367      public static class SlotListenerForPipelineDriverAllocator implements BaseSlotTracker.Listener {
+      368          private final PipelineDriverAllocator pipelineDriverAllocator = new PipelineDriverAllocator();
+      369  
+      370          @Override
+      371          public void onRequireSlot(LogicalSlot slot) {
+      372              // Do nothing.
+      373          }
+      374  
+      375          @Override
+      376          public void onAllocateSlot(LogicalSlot slot) {
+      377              pipelineDriverAllocator.allocate(slot);
+      378          }
+      379  
+      380          @Override
+      381          public void onReleaseSlot(LogicalSlot slot) {
+      382              pipelineDriverAllocator.release(slot);
+      383          }
+      384      }
+      385  
+      386      /**
+      387       * Extra message for the slot tracker.
+      388       */
+      389      public static class ExtraMessage {
+      390          @SerializedName("Concurrency")
+      391          private final long concurrency;
+      392          @SerializedName("QueryQueueOption")
+      393          private final QueryQueueOptions.V2 v2;
+      394  
+      395          public ExtraMessage(long concurrency, QueryQueueOptions.V2 v2) {
+      396              this.concurrency = concurrency;
+      397              this.v2 = v2;
+      398          }
+      399  
+      400          public long getConcurrency() {
+      401              return concurrency;
+      402          }
+      403  
+      404          public QueryQueueOptions.V2 getV2() {
+      405              return v2;
+      406          }
+      407      }
+      408  }

@@ -1,0 +1,406 @@
+row 192   ls1intum/Artemis#11991
+============================================================================
+CLASS de.tum.cit.aet.artemis.buildagent.service.BuildAgentDockerService   loc=495 methods=11 wmc=62 lcom=0.1 c3=0.1511613227060489
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       76  @Lazy(false)
+       77  @Service
+       78  @Profile(PROFILE_BUILDAGENT)
+       79  public class BuildAgentDockerService {
+       80  
+       81      /**
+       82       * Lock to serialize Docker image pull operations.
+       83       * Prevents multiple concurrent pulls of the same image.
+       84       */
+       85      private final ReentrantLock lock = new ReentrantLock();
+       86  
+       87      private static final Logger log = LoggerFactory.getLogger(BuildAgentDockerService.class);
+       88  
+       89      private final BuildAgentConfiguration buildAgentConfiguration;
+       90  
+       91      private final DistributedDataAccessService distributedDataAccessService;
+       92  
+       93      private final BuildJobContainerService buildJobContainerService;
+       94  
+       95      private final TaskScheduler taskScheduler;
+       96  
+       97      private boolean isFirstCleanup = true;
+       98  
+       99      @Value("${artemis.continuous-integration.image-cleanup.enabled:false}")
+      100      private Boolean imageCleanupEnabled;
+      101  
+      102      @Value("${artemis.continuous-integration.image-cleanup.expiry-days:2}")
+      103      private int imageExpiryDays;
+      104  
+      105      @Value("${artemis.continuous-integration.image-cleanup.disk-space-threshold-mb:2000}")
+      106      private int imageCleanupDiskSpaceThresholdMb;
+      107  
+      108      @Value("${artemis.continuous-integration.build-container-prefix:local-ci-}")
+      109      private String buildContainerPrefix;
+      110  
+      111      // with the default value, containers running for longer than 5 minutes when the cleanup starts
+      112      @Value("${artemis.continuous-integration.container-cleanup.expiry-minutes:5}")
+      113      private int containerExpiryMinutes;
+      114  
+      115      // With the default value, the cleanup is triggered every 60 minutes
+      116      @Value("${artemis.continuous-integration.container-cleanup.cleanup-schedule-minutes:60}")
+      117      private int containerCleanupScheduleMinutes;
+      118  
+      119      // The image architecture that is supported by the build agent
+      120      // amd64 is the default value, as this is the architecture of Intel and AMD CPUs, which most systems still use
+      121      @Value("${artemis.continuous-integration.image-architecture:amd64}")
+      122      private String imageArchitecture;
+      123  
+      124      @Value("${artemis.continuous-integration.build-agent.short-name}")
+      125      private String buildAgentShortName;
+      126  
+      127      private static final String AMD64_ARCHITECTURE = "amd64";
+      128  
+      129      private static final String ARM64_ARCHITECTURE = "arm64";
+      130  
+      131      public BuildAgentDockerService(BuildAgentConfiguration buildAgentConfiguration, DistributedDataAccessService distributedDataAccessService,
+      132              BuildJobContainerService buildJobContainerService, @Qualifier("taskScheduler") TaskScheduler taskScheduler) {
+      133          this.buildAgentConfiguration = buildAgentConfiguration;
+      134          this.distributedDataAccessService = distributedDataAccessService;
+      135          this.buildJobContainerService = buildJobContainerService;
+      136          this.taskScheduler = taskScheduler;
+      137      }
+      138  
+      139      // EventListener cannot be used here, as the bean is lazy
+      140      // https://docs.spring.io/spring-framework/reference/core/beans/context-introduction.html#context-functionality-events-annotation
+      141      @PostConstruct
+      142      public void applicationReady() {
+      143          // Schedule the cleanup of dangling build containers once 10 seconds after the application has started and then every containerCleanupScheduleMinutes minutes
+      144          taskScheduler.scheduleAtFixedRate(this::cleanUpContainers, Instant.now().plusSeconds(10), Duration.ofMinutes(containerCleanupScheduleMinutes));
+      145      }
+      146  
+      147      /**
+      148       * Cleans up dangling build containers from the system. This method differentiates between the initial cleanup
+      149       * and subsequent cleanups to handle containers differently based on their age and status.
+      150       * <p>
+      151       * For the initial cleanup, it removes all containers that match the build container prefix, assuming these containers
+      152       * are left from before the application started. For subsequent cleanups, it only removes containers that are older
+      153       * than a specified age threshold (defaulted to 5 minutes), targeting containers likely stuck or inactive.
+      154       * <p>
+      155       * Detailed steps include:
+      156       * - Logging the start of the cleanup process.
+      157       * - Determining whether it's the initial or a subsequent cleanup.
+      158       * - Listing all containers, filtering them based on name prefix and, for subsequent cleanups, their age.
+      159       * - Forcibly removing the identified dangling containers.
+      160       * - Logging the results and completion of the cleanup process.
+      161       *
+      162       * @implNote The method uses Docker commands to list and remove containers. It handles state changes using a flag
+      163       *           (`isFirstCleanup`) to toggle the cleanup logic between the initial and subsequent runs.
+      164       */
+      165      public void cleanUpContainers() {
+      166          List<Container> danglingBuildContainers;
+      167          log.info("Start cleanup dangling build containers");
+      168  
+      169          if (dockerClientNotAvailable("Cannot clean up dangling build containers.")) {
+      170              return;
+      171          }
+      172  
+      173          DockerClient dockerClient = buildAgentConfiguration.getDockerClient();
+      174          if (isFirstCleanup) {
+      175              // Cleanup all dangling build containers after the application has started
+      176              try {
+      177                  danglingBuildContainers = dockerClient.listContainersCmd().withShowAll(true).exec().stream()
+      178                          .filter(container -> container.getNames() != null && container.getNames().length > 0 && container.getNames()[0].startsWith("/" + buildContainerPrefix))
+      179                          .toList();
+      180              }
+      181              catch (Exception ex) {
+      182                  if (DockerUtil.isDockerNotAvailable(ex)) {
+      183                      log.error("Cannot connect to Docker Host. Make sure Docker is running and configured properly! Error while listing containers for cleanup: {}",
+      184                              ex.getMessage());
+      185                      return;
+      186                  }
+      187                  log.error("Make sure Docker is running and configured properly! Error while listing containers for cleanup: {}", ex.getMessage(), ex);
+      188                  return;
+      189              }
+      190              finally {
+      191                  isFirstCleanup = false;
+      192              }
+      193          }
+      194          else {
+      195              // Cleanup all containers that are older than 5 minutes (or ageThreshold) for all subsequent cleanups
+      196              // Get current time in seconds
+      197              long now = Instant.now().getEpochSecond();
+      198  
+      199              // Threshold for "stuck" containers in seconds
+      200              long ageThreshold = containerExpiryMinutes * 60L;
+      201  
+      202              try {
+      203                  danglingBuildContainers = dockerClient.listContainersCmd().withShowAll(true).exec().stream()
+      204                          .filter(container -> container.getNames()[0].startsWith("/" + buildContainerPrefix)).filter(container -> (now - container.getCreated()) > ageThreshold)
+      205                          .toList();
+      206              }
+      207              catch (Exception ex) {
+      208                  log.error("Make sure Docker is running! Error while listing containers for cleanup: {}", ex.getMessage(), ex);
+      209                  return;
+      210              }
+      211          }
+      212  
+      213          if (!danglingBuildContainers.isEmpty()) {
+      214              log.info("Found {} dangling build containers", danglingBuildContainers.size());
+      215              danglingBuildContainers.forEach(container -> buildJobContainerService.stopUnresponsiveContainer(container.getId()));
+      216          }
+      217          log.info("Cleanup dangling build containers done");
+      218      }
+      219  
+      220      /**
+      221       * Callback that allows us to provide more information about the docker pull operation results
+      222       */
+      223      public static class MyPullImageResultCallback extends PullImageResultCallback {
+      224  
+      225          @Override
+      226          public void onNext(PullResponseItem item) {
+      227              String msg = "~~~~~~~~~~~~~~~~~~~~ Pull image progress: " + item.getStatus() + " ~~~~~~~~~~~~~~~~~~~~";
+      228              log.debug(msg);
+      229              super.onNext(item);
+      230          }
+      231  
+      232          @Override
+      233          public void onComplete() {
+      234              String msg = "~~~~~~~~~~~~~~~~~~~~ Pull image complete ~~~~~~~~~~~~~~~~~~~~";
+      235              log.debug(msg);
+      236              super.onComplete();
+      237          }
+      238      }
+      239  
+      240      /**
+      241       * Attempts to pull a specified Docker image associated with a build job if it is not already present on the local system.
+      242       * This method uses a locking mechanism to ensure that the Docker image is not concurrently pulled by multiple threads.
+      243       * <p>
+      244       * The process includes:
+      245       * - Checking if the Docker image is already available locally.
+      246       * - If not available, acquiring a lock to prevent concurrent pulls.
+      247       * - Checking for usable disk space and triggering image cleanup if the threshold is exceeded.
+      248       * - Re-inspecting the image to confirm its absence after acquiring the lock.
+      249       * - Pulling the image if both checks confirm its absence.
+      250       * - Logging the operations and their outcomes to build logs for user visibility.
+      251       * <p>
+      252       * This method handles specific exceptions that might occur during the Docker operations, such as NotFoundException or BadRequestException,
+      253       * by attempting to pull the image within a locked section. Other exceptions, including interruptions during the pull process,
+      254       * are caught and rethrown as a LocalCIException with appropriate messages.
+      255       *
+      256       * @param buildJob     the build job that includes the configuration with the name of the Docker image.
+      257       * @param buildLogsMap a map for appending log entries related to the build process, facilitating real-time logging for end users.
+      258       * @throws LocalCIException if the image pull is interrupted or fails due to other exceptions.
+      259       */
+      260      public void pullDockerImage(BuildJobQueueItem buildJob, BuildLogsMap buildLogsMap) {
+      261          DockerClient dockerClient = buildAgentConfiguration.getDockerClient();
+      262          final String imageName = buildJob.buildConfig().dockerImage();
+      263          try (var inspectImageCommand = dockerClient.inspectImageCmd(imageName)) {
+      264              // First check if the image is already available
+      265              String msg = "~~~~~~~~~~~~~~~~~~~~ Inspecting docker image " + imageName + " ~~~~~~~~~~~~~~~~~~~~";
+      266              log.info(msg);
+      267              buildLogsMap.appendBuildLogEntry(buildJob.id(), msg);
+      268              var inspectImageResponse = inspectImageCommand.exec();
+      269              checkImageArchitecture(imageName, inspectImageResponse, buildJob, buildLogsMap);
+      270          }
+      271          catch (NotFoundException | BadRequestException e) {
+      272              lock.lock();
+      273  
+      274              // Check again if image was pulled in the meantime
+      275              try {
+      276                  String msg = "~~~~~~~~~~~~~~~~~~~~ Inspecting docker image " + imageName + " again with a lock due to error " + e.getMessage() + " ~~~~~~~~~~~~~~~~~~~~";
+      277                  log.info(msg);
+      278                  buildLogsMap.appendBuildLogEntry(buildJob.id(), msg);
+      279                  var inspectImageResponse = dockerClient.inspectImageCmd(imageName).exec();
+      280                  checkImageArchitecture(imageName, inspectImageResponse, buildJob, buildLogsMap);
+      281              }
+      282              catch (NotFoundException | BadRequestException e2) {
+      283                  checkUsableDiskSpaceThenCleanUp();
+      284  
+      285                  long start = System.nanoTime();
+      286                  String msg = "~~~~~~~~~~~~~~~~~~~~ Pulling docker image " + imageName + " with a lock after error " + e.getMessage() + " ~~~~~~~~~~~~~~~~~~~~";
+      287                  log.info(msg);
+      288                  buildLogsMap.appendBuildLogEntry(buildJob.id(), msg);
+      289  
+      290                  try {
+      291                      // Only pull the image if the inspect command failed
+      292                      var command = dockerClient.pullImageCmd(imageName).withPlatform(imageArchitecture);
+      293                      var exec = command.exec(new MyPullImageResultCallback());
+      294                      exec.awaitCompletion();
+      295  
+      296                      // Check if the image is compatible with the current architecture
+      297                      var inspectImageResponse = dockerClient.inspectImageCmd(imageName).exec();
+      298                      checkImageArchitecture(imageName, inspectImageResponse, buildJob, buildLogsMap);
+      299                  }
+      300                  catch (InterruptedException ie) {
+      301                      throw new LocalCIException("Interrupted while pulling docker image " + imageName, ie);
+      302                  }
+      303                  catch (Exception ex) {
+      304                      // On macOS ARM, if the ARM image is not available, fall back to amd64 (Rosetta emulation)
+      305                      if (isMacOS() && ARM64_ARCHITECTURE.equals(imageArchitecture) && isNoMatchingManifestError(ex)) {
+      306                          String fallbackMsg = "~~~~~~~~~~~~~~~~~~~~ No ARM image available for " + imageName + ", falling back to amd64 (Rosetta emulation) ~~~~~~~~~~~~~~~~~~~~";
+      307                          log.warn(fallbackMsg);
+      308                          buildLogsMap.appendBuildLogEntry(buildJob.id(), fallbackMsg);
+      309  
+      310                          try {
+      311                              var fallbackCommand = dockerClient.pullImageCmd(imageName).withPlatform(AMD64_ARCHITECTURE);
+      312                              var fallbackExec = fallbackCommand.exec(new MyPullImageResultCallback());
+      313                              fallbackExec.awaitCompletion();
+      314  
+      315                              // Verify the fallback image was pulled successfully
+      316                              var inspectImageResponse = dockerClient.inspectImageCmd(imageName).exec();
+      317                              checkImageArchitecture(imageName, inspectImageResponse, buildJob, buildLogsMap);
+      318                          }
+      319                          catch (InterruptedException ie) {
+      320                              throw new LocalCIException("Interrupted while pulling docker image " + imageName + " with amd64 fallback", ie);
+      321                          }
+      322                          catch (Exception fallbackEx) {
+      323                              throw new LocalCIException("Error while pulling docker image " + imageName + " with amd64 fallback", fallbackEx);
+      324                          }
+      325                      }
+      326                      else {
+      327                          throw new LocalCIException("Error while pulling docker image " + imageName, ex);
+      328                      }
+      329                  }
+      330                  String msg2 = "~~~~~~~~~~~~~~~~~~~~ Pulling docker image " + imageName + " done after " + TimeLogUtil.formatDurationFrom(start) + " ~~~~~~~~~~~~~~~~~~~~";
+      331                  log.info(msg2);
+      332                  buildLogsMap.appendBuildLogEntry(buildJob.id(), msg2);
+      333              }
+      334              catch (Exception ex) {
+      335                  if (DockerUtil.isDockerNotAvailable(ex)) {
+      336                      log.error("Cannot connect to Docker Host. Make sure Docker is running and configured properly! Error while inspecting image: {}", ex.getMessage());
+      337                  }
+      338                  throw new LocalCIException("Cannot connect to Docker Host. Make sure Docker is running and configured properly!", ex);
+      339                  // Do not proceed if Docker is not running
+      340              }
+      341              finally {
+      342                  lock.unlock();
+      343              }
+      344          }
+      345      }
+      346  
+      347      /**
+      348       * Checks if the architecture of the Docker image is compatible with the current system.
+      349       * On macOS ARM, amd64 images are allowed as they can run via Rosetta 2 emulation.
+      350       *
+      351       * @param imageName            the name of the Docker image
+      352       * @param inspectImageResponse the response from the inspect image command
+      353       * @param buildJob             the build job that includes the configuration with the name of the Docker image
+      354       * @param buildLogsMap         a map for appending log entries related to the build process
+      355       */
+      356      private void checkImageArchitecture(String imageName, InspectImageResponse inspectImageResponse, BuildJobQueueItem buildJob, BuildLogsMap buildLogsMap) {
+      357          String actualArch = inspectImageResponse.getArch();
+      358          // Skip check if the image doesn't report its architecture (empty or null)
+      359          // This can happen with some multi-arch images or when architecture metadata is missing
+      360          if (actualArch == null || actualArch.isEmpty()) {
+      361              log.warn("Docker image {} does not report its architecture, skipping architecture check", imageName);
+      362              return;
+      363          }
+      364  
+      365          // Allow amd64 images on macOS ARM via Rosetta 2 emulation
+      366          if (isMacOS() && ARM64_ARCHITECTURE.equals(imageArchitecture) && AMD64_ARCHITECTURE.equals(actualArch)) {
+      367              log.info("Docker image {} is amd64, running on macOS ARM via Rosetta 2 emulation", imageName);
+      368              return;
+      369          }
+      370  
+      371          if (!imageArchitecture.equals(actualArch)) {
+      372              var msg = "Docker image " + imageName + " is not compatible with the current architecture. Needed 'linux/" + imageArchitecture + "', but got '" + actualArch + "'";
+      373              log.error(msg);
+      374              buildLogsMap.appendBuildLogEntry(buildJob.id(), msg);
+      375              throw new LocalCIException(msg);
+      376          }
+      377      }
+      378  
+      379      /**
+      380       * Schedules the deletion of Docker images that have not been used within a specified number of days, determined by {@link #imageExpiryDays}.
+      381       * The default schedule for this cleanup task is daily at 3:00 AM, configurable via the 'cleanup-schedule-time' property in the application settings.
+      382       * <p>
+      383       * The process involves:
+      384       * - Checking if image cleanup is enabled; if disabled, the operation is aborted.
+      385       * - Retrieving a map of Docker images and their last usage dates.
+      386       * - Getting a set of image names that are not associated with any running containers.
+      387       * - Removing images that have exceeded the configured expiry days and are not associated with any running containers.
+      388       * <p>
+      389       * Exception handling includes catching NotFoundException for cases where images are already deleted or not found during the cleanup process.
+      390       *
+      391       * @implNote This method relies on Docker commands to list images and containers, and uses Hazelcast for managing image usage data.
+      392       * @throws NotFoundException if an attempt is made to delete an image that no longer exists on the Docker host.
+      393       */
+      394  
+      395      @Scheduled(cron = "${artemis.continuous-integration.image-cleanup.cleanup-schedule-time:0 0 3 * * *}")
+      396      public void deleteOldDockerImages() {
+      397          if (!imageCleanupEnabled) {
+      398              log.info("Docker image cleanup is disabled");
+      399              return;
+      400          }
+      401  
+      402          Set<String> imageNames = getUnusedDockerImages();
+      403  
+      404          // Get map of docker images and their last build dates
+      405          Map<String, ZonedDateTime> dockerImageCleanupInfo = distributedDataAccessService.getDockerImageCleanupInfoMap();
+      406  
+      407          // Delete images that have not been used for more than imageExpiryDays days
+      408          for (String dockerImage : dockerImageCleanupInfo.keySet()) {
+      409              if (imageNames.contains(dockerImage)) {
+      410                  if (dockerImageCleanupInfo.get(dockerImage).isBefore(ZonedDateTime.now().minusDays(imageExpiryDays))) {
+      411                      log.info("Remove docker image {} because it was not used for at least {} days", dockerImage, imageExpiryDays);
+      412                      try (final var removeCommand = buildAgentConfiguration.getDockerClient().removeImageCmd(dockerImage)) {
+      413                          removeCommand.exec();
+      414                      }
+      415                      catch (NotFoundException e) {
+      416                          log.warn("Docker image {} not found during cleaning up old docker images", dockerImage);
+      417                      }
+      418                  }
+      419              }
+      420          }
+      421      }
+      422  
+      423      /**
+      424       * Checks for available disk space and triggers the cleanup of old Docker images if the available space falls below
+      425       * {@link BuildAgentDockerService#imageCleanupDiskSpaceThresholdMb}.
+      426       *
+      427       * @implNote - We use the Docker root directory to check disk space availability. This is in case the Docker images are stored on a separate partition.
+      428       *           - We need to iterate over the map entries since don't remove the oldest image from the map.
+      429       */
+      430  
+      431      @Scheduled(fixedRateString = "${artemis.continuous-integration.image-cleanup.disk-space-check-interval-minutes:60}", initialDelayString = "${artemis.continuous-integration.image-cleanup.disk-space-check-interval-minutes:60}", timeUnit = TimeUnit.MINUTES)
+      432      public void checkUsableDiskSpaceThenCleanUp() {
+      433          if (!imageCleanupEnabled || dockerClientNotAvailable("Cannot check disk space for Docker image cleanup.")) {
+      434              return;
+      435          }
+      436  
+      437          DockerClient dockerClient = buildAgentConfiguration.getDockerClient();
+      438          try {
+      439              // Get the Docker root directory to check disk space.
+      440              Path dockerRootDirectory = Path.of(Objects.requireNonNullElse(dockerClient.infoCmd().exec().getDockerRootDir(), "/"));
+      441              long usableSpace = Files.getFileStore(dockerRootDirectory).getUsableSpace();
+      442  
+      443              long threshold = convertMegabytesToBytes(imageCleanupDiskSpaceThresholdMb);
+      444  
+      445              if (usableSpace >= threshold) {
+      446                  return;
+      447              }
+      448  
+      449              // Get map of docker images and their last build dates
+      450              Map<String, ZonedDateTime> dockerImageCleanupInfo = distributedDataAccessService.getDockerImageCleanupInfoMap();
+      451  
+      452              // Get unused images
+      453              Set<String> unusedImages = getUnusedDockerImages();
+      454  
+      455              // Get a sorted list of images by last build date
+      456              // We cast to ArrayList since we need the list to be mutable
+      457              List<Map.Entry<String, ZonedDateTime>> sortedImagesByLastBuildDate = dockerImageCleanupInfo.entrySet().stream().sorted(Map.Entry.comparingByValue()).toList();
+      458              List<Map.Entry<String, ZonedDateTime>> mutableSortedImagesByLastBuildDate = new java.util.ArrayList<>(sortedImagesByLastBuildDate);
+      459  
+      460              if (mutableSortedImagesByLastBuildDate.isEmpty()) {
+      461                  return;
+      462              }
+      463  
+      464              int deleteAttempts = 5;
+      465              int totalAttempts = mutableSortedImagesByLastBuildDate.size(); // We limit the total number of attempts to avoid infinite loops
+      466              Map.Entry<String, ZonedDateTime> oldestImage = mutableSortedImagesByLastBuildDate.getFirst();
+      467              while (oldestImage != null && usableSpace < threshold && deleteAttempts > 0 && totalAttempts > 0) {
+      468                  if (unusedImages.contains(oldestImage.getKey())) {
+      469                      log.info("Remove oldest docker image {} to cleanup disk space to avoid filling up the hard disk", oldestImage.getKey());
+      470                      try {
+      471                          dockerClient.removeImageCmd(oldestImage.getKey()).exec();
+      472                          usableSpace = Files.getFileStore(dockerRootDirectory).getUsableSpace();
+      473                          deleteAttempts--;
+      474                      }
+      475                      catch (NotFoundException e) {
+       ... truncated at 400 lines ...

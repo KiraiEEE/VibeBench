@@ -1,0 +1,406 @@
+row 186   arcus-smart-home/arcusplatform#304
+============================================================================
+CLASS com.iris.agent.zwave.engine.ZWaveSerialEngine   loc=901 methods=61 wmc=174 lcom=0.1666666666666666 c3=0.1587928021098873
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       54  public class ZWaveSerialEngine implements ZWaveEngine {
+       55     private static final Logger logger = LoggerFactory.getLogger(ZWaveSerialEngine.class);
+       56  
+       57     private final String portPath;
+       58     private final Set<EngineListener> listeners = new CopyOnWriteArraySet<>();
+       59     private final Map<Integer, ZWaveSerialClient> clients = new ConcurrentHashMap<>();
+       60     private final Map<Integer, ZWaveEngineNodeInfo> nodeInfoCache = new ConcurrentHashMap<>();
+       61     private final AtomicInteger callbackIdCounter = new AtomicInteger(1);
+       62     private final AtomicReference<BlockingQueue<Object>> syncChannel = new AtomicReference<>();
+       63     private final ReentrantLock sendLock = new ReentrantLock();
+       64  
+       65     private ZWaveSerialPort serialPort;
+       66     private Thread readerThread;
+       67     private volatile boolean running = false;
+       68  
+       69     // Network state
+       70     private long homeId;
+       71     private int controllerNodeId = 1;
+       72     private String libraryVersion = "";
+       73     private String libraryType = "";
+       74     private boolean primaryController = true;
+       75     private boolean staticController = false;
+       76     private boolean bridgeController = false;
+       77     private int sucNodeId = 0;
+       78  
+       79     // Node capabilities bitmap from SERIAL_API_GET_INIT_DATA
+       80     private final boolean[] nodePresent = new boolean[232];
+       81  
+       82     public ZWaveSerialEngine(String portPath) {
+       83        this.portPath = portPath;
+       84     }
+       85  
+       86     @Override
+       87     public void bootstrap() {
+       88        logger.info("Bootstrapping Z-Wave serial engine on port {}", portPath);
+       89        try {
+       90           running = true;
+       91  
+       92           // Hardware reset the Z-Wave chip via GPIO BEFORE opening the serial
+       93           // port.  Opening first starts Netty's OIO read thread which hits I/O
+       94           // errors while the chip is resetting, killing the channel.
+       95           boolean gpioResetDone = IrisHal.resetZWaveChip();
+       96           if (gpioResetDone) {
+       97              logger.info("Z-Wave chip hardware reset complete");
+       98              // Give the chip a moment to finish booting after reset
+       99              Thread.sleep(500);
+      100           }
+      101  
+      102           serialPort = new ZWaveSerialPort(portPath);
+      103           serialPort.open();
+      104  
+      105           if (!gpioResetDone) {
+      106              // GPIO reset wasn't available, fall back to serial soft reset
+      107              // now that the port is open.
+      108              logger.warn("Z-Wave GPIO reset unavailable, falling back to serial soft reset");
+      109              serialPort.writeByte(CAN);
+      110              drainUntilQuiet();
+      111              serialPort.write(ZWaveSerialFrame.request(FUNC_ID_SERIAL_API_SOFT_RESET).toBytes());
+      112              Thread.sleep(1500);
+      113           }
+      114  
+      115           drainUntilQuiet();
+      116  
+      117           // Bootstrap reads directly from serial port (no reader thread)
+      118           performBootstrap();
+      119  
+      120           // Start reader thread only after bootstrap succeeds
+      121           readerThread = new Thread(this::readerLoop, "zwave-serial-reader");
+      122           readerThread.setDaemon(true);
+      123           readerThread.start();
+      124        } catch (Exception e) {
+      125           logger.error("Failed to bootstrap Z-Wave serial engine", e);
+      126           running = false;
+      127           notifyBootstrapFailure();
+      128        }
+      129     }
+      130  
+      131     /**
+      132      * Drain all pending controller frames until the line is quiet for 1 second.
+      133      * ACKs any data frames so the controller releases its queue.
+      134      */
+      135     private void drainUntilQuiet() throws InterruptedException {
+      136        logger.info("Draining pending Z-Wave controller frames...");
+      137        int drained = 0;
+      138        long lastActivity = System.currentTimeMillis();
+      139        while (System.currentTimeMillis() - lastActivity < 1000) {
+      140           Object msg = serialPort.poll(100, TimeUnit.MILLISECONDS);
+      141           if (msg != null) {
+      142              if (msg instanceof ZWaveSerialFrame) {
+      143                 serialPort.sendAck();
+      144              }
+      145              drained++;
+      146              lastActivity = System.currentTimeMillis();
+      147           }
+      148        }
+      149        logger.info("Startup drain complete, drained {} messages", drained);
+      150     }
+      151  
+      152     private void performBootstrap() {
+      153        try {
+      154           // Step 1: Get memory/home ID
+      155           ZWaveSerialFrame resp = sendAndWaitForResponse(
+      156              ZWaveSerialFrame.request(FUNC_ID_ZW_MEMORY_GET_ID));
+      157           if (resp != null && resp.getDataLength() >= 5) {
+      158              homeId = ((0xFFL & resp.getDataByte(0)) << 24) |
+      159                       ((0xFFL & resp.getDataByte(1)) << 16) |
+      160                       ((0xFFL & resp.getDataByte(2)) << 8) |
+      161                       (0xFFL & resp.getDataByte(3));
+      162              controllerNodeId = 0xFF & resp.getDataByte(4);
+      163              logger.info("Z-Wave Home ID: 0x{}, Controller Node: {}", String.format("%08X", homeId), controllerNodeId);
+      164           } else {
+      165              logger.error("Failed to get Z-Wave memory ID");
+      166              notifyBootstrapFailure();
+      167              return;
+      168           }
+      169  
+      170           // Step 2: Get version
+      171           resp = sendAndWaitForResponse(
+      172              ZWaveSerialFrame.request(FUNC_ID_ZW_GET_VERSION));
+      173           if (resp != null && resp.getDataLength() >= 12) {
+      174              byte[] verBytes = new byte[11];
+      175              for (int i = 0; i < 11; i++) {
+      176                 verBytes[i] = resp.getDataByte(i);
+      177              }
+      178              libraryVersion = new String(verBytes).trim();
+      179              libraryType = String.valueOf(0xFF & resp.getDataByte(11));
+      180              logger.info("Z-Wave Library: {} (type {})", libraryVersion, libraryType);
+      181           }
+      182  
+      183           // Step 3: Get SUC node ID
+      184           resp = sendAndWaitForResponse(
+      185              ZWaveSerialFrame.request(FUNC_ID_ZW_GET_SUC_NODE_ID));
+      186           if (resp != null && resp.getDataLength() >= 1) {
+      187              sucNodeId = 0xFF & resp.getDataByte(0);
+      188              logger.info("Z-Wave SUC Node ID: {}", sucNodeId);
+      189           }
+      190  
+      191           // Step 4: Get controller capabilities
+      192           resp = sendAndWaitForResponse(
+      193              ZWaveSerialFrame.request(FUNC_ID_ZW_GET_CONTROLLER_CAPABILITIES));
+      194           if (resp != null && resp.getDataLength() >= 1) {
+      195              int caps = 0xFF & resp.getDataByte(0);
+      196              primaryController = (caps & 0x04) == 0;
+      197              staticController = (caps & 0x08) != 0;
+      198              bridgeController = (caps & 0x80) != 0;
+      199              logger.info("Z-Wave Controller - primary: {}, static: {}, bridge: {}",
+      200                 primaryController, staticController, bridgeController);
+      201           }
+      202  
+      203           // Step 5: Get initial node list
+      204           resp = sendAndWaitForResponse(
+      205              ZWaveSerialFrame.request(FUNC_ID_SERIAL_API_GET_INIT_DATA));
+      206           if (resp != null && resp.getDataLength() >= 34) {
+      207              // Bytes [3..31] contain 29-byte node bitmask
+      208              int offset = 3;
+      209              for (int i = 0; i < NODE_BITMASK_LENGTH && (offset + i) < resp.getDataLength(); i++) {
+      210                 int bitmask = 0xFF & resp.getDataByte(offset + i);
+      211                 for (int bit = 0; bit < 8; bit++) {
+      212                    int nodeId = (i * 8) + bit + 1;
+      213                    if (nodeId <= 232 && (bitmask & (1 << bit)) != 0) {
+      214                       nodePresent[nodeId - 1] = true;
+      215                    }
+      216                 }
+      217              }
+      218              List<Integer> foundNodes = new ArrayList<>();
+      219              for (int i = 0; i < 232; i++) {
+      220                 if (nodePresent[i]) {
+      221                    foundNodes.add(i + 1);
+      222                 }
+      223              }
+      224              logger.info("Z-Wave nodes on network: {}", foundNodes);
+      225           }
+      226  
+      227           // Bootstrap complete
+      228           notifyBootstrapSuccess();
+      229  
+      230        } catch (Exception e) {
+      231           logger.error("Error during Z-Wave bootstrap", e);
+      232           notifyBootstrapFailure();
+      233        }
+      234     }
+      235  
+      236     /**
+      237      * Send a frame and wait for the response frame (synchronous).
+      238      * Handles ACK/NAK/CAN and retries.
+      239      */
+      240     private ZWaveSerialFrame sendAndWaitForResponse(ZWaveSerialFrame frame) {
+      241        sendLock.lock();
+      242        try {
+      243           return sendAndWaitForResponseImpl(frame);
+      244        } finally {
+      245           sendLock.unlock();
+      246        }
+      247     }
+      248  
+      249     private ZWaveSerialFrame sendAndWaitForResponseImpl(ZWaveSerialFrame frame) {
+      250        boolean useReaderThread = readerThread != null && readerThread.isAlive();
+      251        LinkedBlockingQueue<Object> ch = null;
+      252        if (useReaderThread) {
+      253           ch = new LinkedBlockingQueue<>();
+      254           syncChannel.set(ch);
+      255        }
+      256        try {
+      257           int retries = 3;
+      258           while (retries-- > 0) {
+      259              // Drain any pending unsolicited data before sending
+      260              drainPending(ch);
+      261  
+      262              if (logger.isDebugEnabled()) {
+      263                 byte[] rawBytes = frame.toBytes();
+      264                 StringBuilder hex = new StringBuilder();
+      265                 for (byte b : rawBytes) {
+      266                    hex.append(String.format("%02X ", 0xFF & b));
+      267                 }
+      268                 logger.debug("TX: {}", hex.toString().trim());
+      269              }
+      270              serialPort.write(frame.toBytes());
+      271  
+      272              try {
+      273                 Object ack = poll(ch, ACK_TIMEOUT_MS);
+      274                 if (ack instanceof Byte) {
+      275                    byte b = (Byte) ack;
+      276                    if (b == ACK) {
+      277                       Object resp = poll(ch, RESPONSE_TIMEOUT_MS);
+      278                       if (resp instanceof ZWaveSerialFrame) {
+      279                          ZWaveSerialFrame respFrame = (ZWaveSerialFrame) resp;
+      280                          // Reader already ACK'd if via syncChannel
+      281                          if (ch == null) {
+      282                             serialPort.sendAck();
+      283                          }
+      284                          return respFrame;
+      285                       } else {
+      286                          logger.warn("Expected response frame, got: {}", resp);
+      287                       }
+      288                    } else if (b == NAK) {
+      289                       logger.warn("NAK received, retrying ({} left)", retries);
+      290                       continue;
+      291                    } else if (b == CAN) {
+      292                       logger.warn("CAN received, retrying ({} left)", retries);
+      293                       drainAfterCan(ch);
+      294                       continue;
+      295                    }
+      296                 } else if (ack == null) {
+      297                    logger.warn("Timeout waiting for ACK, retrying ({} left)", retries);
+      298                 } else if (ack instanceof ZWaveSerialFrame) {
+      299                    // Unsolicited frame; reader already ACK'd if via syncChannel
+      300                    if (ch == null) {
+      301                       serialPort.sendAck();
+      302                    }
+      303                    handleUnsolicitedFrame((ZWaveSerialFrame) ack);
+      304                    retries++;
+      305                 }
+      306              } catch (InterruptedException e) {
+      307                 Thread.currentThread().interrupt();
+      308                 return null;
+      309              }
+      310           }
+      311           logger.error("Failed to get response after retries for {}", frame);
+      312           return null;
+      313        } finally {
+      314           syncChannel.set(null);
+      315        }
+      316     }
+      317  
+      318     /**
+      319      * Send a frame, wait for ACK only (no response expected).
+      320      */
+      321     private boolean sendAndWaitForAck(ZWaveSerialFrame frame) {
+      322        sendLock.lock();
+      323        try {
+      324           return sendAndWaitForAckImpl(frame);
+      325        } finally {
+      326           sendLock.unlock();
+      327        }
+      328     }
+      329  
+      330     private boolean sendAndWaitForAckImpl(ZWaveSerialFrame frame) {
+      331        boolean useReaderThread = readerThread != null && readerThread.isAlive();
+      332        LinkedBlockingQueue<Object> ch = null;
+      333        if (useReaderThread) {
+      334           ch = new LinkedBlockingQueue<>();
+      335           syncChannel.set(ch);
+      336        }
+      337        try {
+      338           int retries = 3;
+      339           while (retries-- > 0) {
+      340              drainPending(ch);
+      341              serialPort.write(frame.toBytes());
+      342              try {
+      343                 Object ack = poll(ch, ACK_TIMEOUT_MS);
+      344                 if (ack instanceof Byte) {
+      345                    byte b = (Byte) ack;
+      346                    if (b == ACK) {
+      347                       return true;
+      348                    } else if (b == CAN) {
+      349                       logger.warn("Got CAN waiting for ACK, retrying ({} left)", retries);
+      350                       drainAfterCan(ch);
+      351                       continue;
+      352                    } else if (b == NAK) {
+      353                       logger.warn("Got NAK waiting for ACK, retrying ({} left)", retries);
+      354                       continue;
+      355                    }
+      356                 } else if (ack == null) {
+      357                    logger.warn("Timeout waiting for ACK, retrying ({} left)", retries);
+      358                 }
+      359              } catch (InterruptedException e) {
+      360                 Thread.currentThread().interrupt();
+      361                 return false;
+      362              }
+      363           }
+      364           return false;
+      365        } finally {
+      366           syncChannel.set(null);
+      367        }
+      368     }
+      369  
+      370     /**
+      371      * Poll from either the sync channel (when reader thread is active)
+      372      * or directly from the serial port (during bootstrap).
+      373      */
+      374     private Object poll(BlockingQueue<Object> ch, long timeoutMs) throws InterruptedException {
+      375        if (ch != null) {
+      376           return ch.poll(timeoutMs, TimeUnit.MILLISECONDS);
+      377        }
+      378        return serialPort.poll(timeoutMs, TimeUnit.MILLISECONDS);
+      379     }
+      380  
+      381     /**
+      382      * Drain any pending messages before sending to avoid collisions
+      383      * with unsolicited controller frames.
+      384      */
+      385     private void drainPending(BlockingQueue<Object> ch) {
+      386        try {
+      387           // Wait briefly for any in-flight controller data (e.g. SEND_DATA
+      388           // callbacks from previous RF transmissions) to arrive
+      389           Object stale;
+      390           while ((stale = poll(ch, 50)) != null) {
+      391              if (stale instanceof ZWaveSerialFrame) {
+      392                 // Reader already ACK'd; just handle it
+      393                 handleUnsolicitedFrame((ZWaveSerialFrame) stale);
+      394              }
+      395           }
+      396        } catch (InterruptedException e) {
+      397           Thread.currentThread().interrupt();
+      398        }
+      399     }
+      400  
+      401     /**
+      402      * After receiving CAN, wait 150ms per Z-Wave spec, then receive and ACK
+      403      * any pending controller frame to clear the collision before retrying.
+      404      */
+      405     private void drainAfterCan(BlockingQueue<Object> ch) {
+      406        try {
+      407           Thread.sleep(150);
+      408           Object pending = poll(ch, 200);
+      409           if (pending instanceof ZWaveSerialFrame) {
+      410              // Reader already ACK'd if routed via syncChannel;
+      411              // ACK here only if reading directly (bootstrap)
+      412              if (ch == null) {
+      413                 serialPort.sendAck();
+      414              }
+      415              handleUnsolicitedFrame((ZWaveSerialFrame) pending);
+      416           }
+      417        } catch (InterruptedException e) {
+      418           Thread.currentThread().interrupt();
+      419        }
+      420     }
+      421  
+      422     /**
+      423      * Background reader thread that processes unsolicited inbound frames.
+      424      * Routes messages to syncChannel when a synchronous send is active.
+      425      */
+      426     private void readerLoop() {
+      427        logger.info("Z-Wave serial reader thread started");
+      428        while (running) {
+      429           try {
+      430              Object msg = serialPort.poll(100, TimeUnit.MILLISECONDS);
+      431              if (msg == null) {
+      432                 continue;
+      433              }
+      434  
+      435              // Always ACK data frames immediately so the controller
+      436              // doesn't retransmit and cause collisions
+      437              if (msg instanceof ZWaveSerialFrame) {
+      438                 serialPort.sendAck();
+      439              }
+      440  
+      441              // Route to sync channel if a synchronous send is waiting
+      442              BlockingQueue<Object> ch = syncChannel.get();
+      443              if (ch != null) {
+      444                 ch.offer(msg);
+      445                 continue;
+      446              }
+      447  
+      448              // Handle unsolicited messages
+      449              if (msg instanceof ZWaveSerialFrame) {
+      450                 handleUnsolicitedFrame((ZWaveSerialFrame) msg);
+      451              } else if (msg instanceof Byte) {
+      452                 logger.debug("Received idle signal byte: 0x{}", String.format("%02X", 0xFF & (Byte) msg));
+      453              }
+       ... truncated at 400 lines ...

@@ -1,0 +1,308 @@
+row 172   devoxx/DevoxxGenieIDEAPlugin#977
+============================================================================
+CLASS com.devoxx.genie.service.prompt.strategy.CliPromptStrategy   loc=303 methods=14 wmc=42 lcom=0.0769230769230769 c3=0.183457830246094
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       35  @Slf4j
+       36  public class CliPromptStrategy extends AbstractPromptExecutionStrategy {
+       37  
+       38      private final AtomicReference<Process> activeProcess = new AtomicReference<>();
+       39  
+       40      public CliPromptStrategy(@NotNull Project project) {
+       41          super(project);
+       42      }
+       43  
+       44      @Override
+       45      protected String getStrategyName() {
+       46          return "CLI Runner";
+       47      }
+       48  
+       49      private record CliExecutionParams(
+       50              @NotNull CliToolConfig cliTool,
+       51              @NotNull CliCommand cliCommand,
+       52              @NotNull List<String> command,
+       53              @NotNull String prompt) {}
+       54  
+       55      private record ProcessOutcome(
+       56              int exitCode,
+       57              long elapsed,
+       58              long startTime,
+       59              @NotNull StringBuilder accumulatedResponse,
+       60              @NotNull List<String> stderrLines) {}
+       61  
+       62      @Override
+       63      protected void executeStrategySpecific(@NotNull ChatMessageContext context,
+       64                                             @NotNull PromptOutputPanel panel,
+       65                                             @NotNull PromptTask<PromptResult> resultTask) {
+       66          String toolName = context.getLanguageModel().getModelName();
+       67          CliToolConfig cliTool = findCliTool(toolName);
+       68          if (cliTool == null) {
+       69              log.error("CLI tool not found: {}", toolName);
+       70              resultTask.complete(PromptResult.failure(context,
+       71                      new IllegalStateException("CLI tool not found: " + toolName)));
+       72              return;
+       73          }
+       74  
+       75          CliToolConfig.CliType cliType = cliTool.getType() != null ? cliTool.getType() : CliToolConfig.CliType.CUSTOM;
+       76          // Auto-detect type from tool name when stored type is CUSTOM (backwards compat)
+       77          if (cliType == CliToolConfig.CliType.CUSTOM) {
+       78              for (CliToolConfig.CliType t : CliToolConfig.CliType.values()) {
+       79                  if (t != CliToolConfig.CliType.CUSTOM &&
+       80                          t.getDisplayName().equalsIgnoreCase(cliTool.getName())) {
+       81                      cliType = t;
+       82                      break;
+       83                  }
+       84              }
+       85          }
+       86          CliCommand cliCommand = cliType.createCommand();
+       87  
+       88          String prompt = buildPromptWithHistory(context);
+       89          List<String> command = cliCommand.buildChatCommand(cliTool, prompt);
+       90  
+       91          log.info("CLI chat execute: tool={}, type={}, command={}", toolName, cliType, command);
+       92  
+       93          CliConsoleManager consoleManager = CliConsoleManager.getInstance(project);
+       94          consoleManager.printTaskHeader("chat", prompt.length() > 60 ? prompt.substring(0, 60) + "..." : prompt, toolName);
+       95          consoleManager.activateToolWindow();
+       96  
+       97          ConversationViewController viewController =
+       98                  panel.getConversationPanel() != null ? panel.getConversationPanel().viewController : null;
+       99  
+      100          CliExecutionParams params = new CliExecutionParams(cliTool, cliCommand, command, prompt);
+      101          threadPoolManager.getPromptExecutionPool().execute(() ->
+      102                  runCliProcess(context, params, consoleManager, viewController, resultTask));
+      103  
+      104          resultTask.whenComplete((result, error) -> {
+      105              if (resultTask.isCancelled()) {
+      106                  destroyProcess();
+      107              }
+      108          });
+      109      }
+      110  
+      111      private void runCliProcess(@NotNull ChatMessageContext context,
+      112                                 @NotNull CliExecutionParams params,
+      113                                 @NotNull CliConsoleManager consoleManager,
+      114                                 @Nullable ConversationViewController viewController,
+      115                                 @NotNull PromptTask<PromptResult> resultTask) {
+      116          long startTime = System.currentTimeMillis();
+      117          try {
+      118              Process process = startProcess(params.command(), params.cliTool());
+      119              activeProcess.set(process);
+      120              log.info("CLI chat process started (pid={})", process.pid());
+      121  
+      122              params.cliCommand().writePrompt(process, params.prompt());
+      123  
+      124              StringBuilder accumulatedResponse = new StringBuilder();
+      125              List<String> stderrLines = Collections.synchronizedList(new ArrayList<>());
+      126  
+      127              Thread stderrThread = startStderrReader(process, stderrLines, consoleManager);
+      128              streamStdoutToViews(process, params.cliCommand(), accumulatedResponse, consoleManager, viewController, context, resultTask);
+      129  
+      130              log.info("CLI stdout captured {} chars: [{}]", accumulatedResponse.length(),
+      131                      accumulatedResponse.length() > 300 ? accumulatedResponse.substring(0, 300) + "..." : accumulatedResponse);
+      132  
+      133              int exitCode = process.waitFor();
+      134              stderrThread.join(5000);
+      135              activeProcess.set(null);
+      136  
+      137              long elapsed = System.currentTimeMillis() - startTime;
+      138              log.info("CLI chat process exited: exitCode={}, elapsed={}ms", exitCode, elapsed);
+      139  
+      140              ProcessOutcome outcome = new ProcessOutcome(exitCode, elapsed, startTime, accumulatedResponse, stderrLines);
+      141              finalizeProcessResult(outcome, consoleManager, viewController, context, resultTask);
+      142  
+      143          } catch (IOException e) {
+      144              activeProcess.set(null);
+      145              handleProcessStartFailure(e, consoleManager, context, resultTask);
+      146          } catch (InterruptedException e) {
+      147              activeProcess.set(null);
+      148              handleProcessInterrupted(consoleManager, resultTask);
+      149          }
+      150      }
+      151  
+      152      private @NotNull Process startProcess(@NotNull List<String> command,
+      153                                            @NotNull CliToolConfig cliTool) throws IOException {
+      154          ProcessBuilder pb = new ProcessBuilder(command);
+      155          pb.redirectErrorStream(false);
+      156  
+      157          String basePath = project.getBasePath();
+      158          if (basePath != null) {
+      159              pb.directory(new java.io.File(basePath));
+      160          }
+      161  
+      162          pb.environment().putAll(com.intellij.util.EnvironmentUtil.getEnvironmentMap());
+      163  
+      164          if (cliTool.getEnvVars() != null && !cliTool.getEnvVars().isEmpty()) {
+      165              pb.environment().putAll(cliTool.getEnvVars());
+      166          }
+      167  
+      168          return pb.start();
+      169      }
+      170  
+      171      private @NotNull Thread startStderrReader(@NotNull Process process,
+      172                                                @NotNull List<String> stderrLines,
+      173                                                @NotNull CliConsoleManager consoleManager) {
+      174          Thread stderrThread = new Thread(() -> {
+      175              try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+      176                      process.getErrorStream(), StandardCharsets.UTF_8))) {
+      177                  String line;
+      178                  while ((line = reader.readLine()) != null) {
+      179                      stderrLines.add(line);
+      180                      log.debug("CLI stderr raw line: [{}]", line);
+      181                      final String text = line;
+      182                      ApplicationManager.getApplication().invokeLater(() ->
+      183                              consoleManager.printError(text));
+      184                  }
+      185              } catch (IOException e) {
+      186                  log.debug("CLI stderr reader ended: {}", e.getMessage());
+      187              }
+      188          }, "cli-chat-stderr-reader");
+      189          stderrThread.setDaemon(true);
+      190          stderrThread.start();
+      191          return stderrThread;
+      192      }
+      193  
+      194      private void streamStdoutToViews(@NotNull Process process,
+      195                                       @NotNull CliCommand cliCommand,
+      196                                       @NotNull StringBuilder accumulatedResponse,
+      197                                       @NotNull CliConsoleManager consoleManager,
+      198                                       @Nullable ConversationViewController viewController,
+      199                                       @NotNull ChatMessageContext context,
+      200                                       @NotNull PromptTask<PromptResult> resultTask) throws IOException {
+      201          try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+      202                  process.getInputStream(), StandardCharsets.UTF_8))) {
+      203              String line;
+      204              while ((line = reader.readLine()) != null) {
+      205                  if (resultTask.isCancelled()) {
+      206                      destroyProcess();
+      207                      return;
+      208                  }
+      209  
+      210                  final String consoleLine = line;
+      211                  log.debug("CLI stdout raw line: [{}]", line);
+      212  
+      213                  String filtered = cliCommand.filterResponseLine(line);
+      214                  log.debug("CLI stdout filtered: [{}]", filtered);
+      215                  if (filtered != null) {
+      216                      accumulatedResponse.append(filtered).append("\n");
+      217                  }
+      218                  final String fullText = accumulatedResponse.toString();
+      219  
+      220                  ApplicationManager.getApplication().invokeLater(() -> {
+      221                      consoleManager.printOutput(consoleLine);
+      222  
+      223                      if (viewController != null && !fullText.isEmpty()) {
+      224                          context.setAiMessage(AiMessage.from(fullText));
+      225                          viewController.updateAiMessageContent(context);
+      226                      }
+      227                  });
+      228              }
+      229          }
+      230      }
+      231  
+      232      private void finalizeProcessResult(@NotNull ProcessOutcome outcome,
+      233                                         @NotNull CliConsoleManager consoleManager,
+      234                                         @Nullable ConversationViewController viewController,
+      235                                         @NotNull ChatMessageContext context,
+      236                                         @NotNull PromptTask<PromptResult> resultTask) {
+      237          String exitMsg = "\n=== Process exited with code " + outcome.exitCode() + " (after " + outcome.elapsed() + "ms) ===\n";
+      238  
+      239          ApplicationManager.getApplication().invokeLater(() -> {
+      240              if (outcome.exitCode() == 0) {
+      241                  finalizeSuccess(exitMsg, outcome.startTime(), outcome.accumulatedResponse(), consoleManager,
+      242                          viewController, context, resultTask);
+      243              } else {
+      244                  finalizeError(outcome.exitCode(), exitMsg, outcome.stderrLines(), consoleManager, context, resultTask);
+      245              }
+      246          });
+      247      }
+      248  
+      249      private void finalizeSuccess(@NotNull String exitMsg,
+      250                                   long startTime,
+      251                                   @NotNull StringBuilder accumulatedResponse,
+      252                                   @NotNull CliConsoleManager consoleManager,
+      253                                   @Nullable ConversationViewController viewController,
+      254                                   @NotNull ChatMessageContext context,
+      255                                   @NotNull PromptTask<PromptResult> resultTask) {
+      256          consoleManager.printSystem(exitMsg);
+      257  
+      258          context.setExecutionTimeMs(System.currentTimeMillis() - startTime);
+      259          String finalText = accumulatedResponse.toString();
+      260          if (!finalText.isEmpty()) {
+      261              context.setAiMessage(AiMessage.from(finalText));
+      262          }
+      263  
+      264          if (viewController != null) {
+      265              viewController.updateAiMessageContent(context);
+      266              viewController.markMCPLogsAsCompleted(context.getId());
+      267          }
+      268  
+      269          ChatMemoryManager.getInstance().addAiResponse(context);
+      270  
+      271          // Persist to conversation history (matching Streaming/NonStreaming strategies)
+      272          project.getMessageBus()
+      273                  .syncPublisher(AppTopics.CONVERSATION_TOPIC)
+      274                  .onNewConversation(context);
+      275  
+      276          resultTask.complete(PromptResult.success(context));
+      277      }
+      278  
+      279      private void finalizeError(int exitCode,
+      280                                 @NotNull String exitMsg,
+      281                                 @NotNull List<String> stderrLines,
+      282                                 @NotNull CliConsoleManager consoleManager,
+      283                                 @NotNull ChatMessageContext context,
+      284                                 @NotNull PromptTask<PromptResult> resultTask) {
+      285          consoleManager.printError(exitMsg);
+      286          String errorOutput = String.join("\n", stderrLines).trim();
+      287          resultTask.complete(PromptResult.failure(context,
+      288                  new RuntimeException("CLI process exited with code " + exitCode +
+      289                          (errorOutput.isEmpty() ? "" : ": " + errorOutput))));
+      290      }
+      291  
+      292      private void handleProcessStartFailure(@NotNull IOException e,
+      293                                             @NotNull CliConsoleManager consoleManager,
+      294                                             @NotNull ChatMessageContext context,
+      295                                             @NotNull PromptTask<PromptResult> resultTask) {
+      296          log.error("CLI chat failed to start process: {}", e.getMessage(), e);
+      297          ApplicationManager.getApplication().invokeLater(() -> {
+      298              consoleManager.printError("Failed to start process: " + e.getMessage());
+      299              resultTask.complete(PromptResult.failure(context, e));
+      300          });
+      301      }
+      302  
+      303      private void handleProcessInterrupted(@NotNull CliConsoleManager consoleManager,
+      304                                            @NotNull PromptTask<PromptResult> resultTask) {
+      305          Thread.currentThread().interrupt();
+      306          log.info("CLI chat process interrupted");
+      307          ApplicationManager.getApplication().invokeLater(() -> {
+      308              consoleManager.printSystem("Process interrupted");
+      309              resultTask.cancel(true);
+      310          });
+      311      }
+      312  
+      313      @Override
+      314      public void cancel() {
+      315          log.info("Cancelling CLI Runner strategy");
+      316          destroyProcess();
+      317      }
+      318  
+      319      private void destroyProcess() {
+      320          Process process = activeProcess.getAndSet(null);
+      321          if (process != null && process.isAlive()) {
+      322              log.info("Destroying CLI chat process (pid={})", process.pid());
+      323              process.destroyForcibly();
+      324              ApplicationManager.getApplication().invokeLater(() ->
+      325                      CliConsoleManager.getInstance(project).printSystem("\n=== Process cancelled ===\n"));
+      326          }
+      327      }
+      328  
+      329      private @Nullable CliToolConfig findCliTool(String toolName) {
+      330          return DevoxxGenieStateService.getInstance().getCliTools().stream()
+      331                  .filter(CliToolConfig::isEnabled)
+      332                  .filter(tool -> tool.getName().equals(toolName))
+      333                  .findFirst()
+      334                  .orElse(null);
+      335      }
+      336  
+      337  }

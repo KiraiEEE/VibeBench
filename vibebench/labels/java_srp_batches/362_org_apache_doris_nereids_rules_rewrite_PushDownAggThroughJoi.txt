@@ -1,0 +1,176 @@
+row 362   apache/doris#61565
+============================================================================
+CLASS org.apache.doris.nereids.rules.rewrite.PushDownAggThroughJoin   loc=171 methods=2 wmc=41 lcom=0.0 c3=0.2095437392152677
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       70  public class PushDownAggThroughJoin implements RewriteRuleFactory {
+       71      @Override
+       72      public List<Rule> buildRules() {
+       73          return ImmutableList.of(
+       74                  logicalAggregate(innerLogicalJoin())
+       75                          .when(agg -> agg.child().getOtherJoinConjuncts().isEmpty())
+       76                          .whenNot(agg -> agg.child().children().stream().anyMatch(p -> p instanceof LogicalAggregate))
+       77                          .when(agg -> agg.getGroupByExpressions().stream().allMatch(e -> e instanceof Slot))
+       78                          .when(agg -> {
+       79                              Set<AggregateFunction> funcs = agg.getAggregateFunctions();
+       80                              return !funcs.isEmpty() && funcs.stream()
+       81                                      .allMatch(f -> !f.isDistinct()
+       82                                              && (f instanceof Count && (((Count) f).isCountStar() || f.child(
+       83                                              0) instanceof Slot)
+       84                                              || (f instanceof Sum && f.child(0) instanceof Slot))
+       85                                      );
+       86                          })
+       87                          .thenApply(ctx -> {
+       88                              Set<Integer> enableNereidsRules = ctx.cascadesContext.getConnectContext()
+       89                                      .getSessionVariable().getEnableNereidsRules();
+       90                              if (!enableNereidsRules.contains(RuleType.PUSH_DOWN_AGG_THROUGH_JOIN.type())) {
+       91                                  return null;
+       92                              }
+       93                              LogicalAggregate<LogicalJoin<Plan, Plan>> agg = ctx.root;
+       94                              return pushAgg(agg, agg.child(), ImmutableList.of());
+       95                          })
+       96                          .toRule(RuleType.PUSH_DOWN_AGG_THROUGH_JOIN),
+       97                  logicalAggregate(logicalProject(innerLogicalJoin()))
+       98                          .when(agg -> agg.child().isAllSlots())
+       99                          .when(agg -> agg.child().child().getOtherJoinConjuncts().isEmpty())
+      100                          .whenNot(agg -> agg.child().children().stream().anyMatch(p -> p instanceof LogicalAggregate))
+      101                          .when(agg -> agg.getGroupByExpressions().stream().allMatch(e -> e instanceof Slot))
+      102                          .when(agg -> {
+      103                              Set<AggregateFunction> funcs = agg.getAggregateFunctions();
+      104                              return !funcs.isEmpty() && funcs.stream()
+      105                                      .allMatch(f -> !f.isDistinct()
+      106                                              && (f instanceof Count && (((Count) f).isCountStar() || f.child(
+      107                                              0) instanceof Slot)
+      108                                              || (f instanceof Sum && f.child(0) instanceof Slot))
+      109                                      );
+      110                          })
+      111                          .thenApply(ctx -> {
+      112                              Set<Integer> enableNereidsRules = ctx.cascadesContext.getConnectContext()
+      113                                      .getSessionVariable().getEnableNereidsRules();
+      114                              if (!enableNereidsRules.contains(RuleType.PUSH_DOWN_AGG_THROUGH_JOIN.type())) {
+      115                                  return null;
+      116                              }
+      117                              LogicalAggregate<LogicalProject<LogicalJoin<Plan, Plan>>> agg = ctx.root;
+      118                              return pushAgg(agg, agg.child().child(), agg.child().getProjects());
+      119                          })
+      120                          .toRule(RuleType.PUSH_DOWN_AGG_THROUGH_JOIN)
+      121          );
+      122      }
+      123  
+      124      private static LogicalAggregate<Plan> pushAgg(LogicalAggregate<? extends Plan> agg,
+      125              LogicalJoin<Plan, Plan> join, List<NamedExpression> projects) {
+      126          List<Slot> leftOutput = join.left().getOutput();
+      127          List<Slot> rightOutput = join.right().getOutput();
+      128  
+      129          List<AggregateFunction> leftAggs = new ArrayList<>();
+      130          List<AggregateFunction> rightAggs = new ArrayList<>();
+      131          List<Count> countStars = new ArrayList<>();
+      132          for (AggregateFunction f : agg.getAggregateFunctions()) {
+      133              if (f instanceof Count && ((Count) f).isCountStar()) {
+      134                  countStars.add((Count) f);
+      135              } else {
+      136                  Slot slot = (Slot) f.child(0);
+      137                  if (leftOutput.contains(slot)) {
+      138                      leftAggs.add(f);
+      139                  } else if (rightOutput.contains(slot)) {
+      140                      rightAggs.add(f);
+      141                  } else {
+      142                      throw new IllegalStateException("Slot " + slot + " not found in join output");
+      143                  }
+      144              }
+      145          }
+      146  
+      147          Set<Slot> leftGroupBy = new HashSet<>();
+      148          Set<Slot> rightGroupBy = new HashSet<>();
+      149          for (Expression e : agg.getGroupByExpressions()) {
+      150              Slot slot = (Slot) e;
+      151              if (leftOutput.contains(slot)) {
+      152                  leftGroupBy.add(slot);
+      153              } else if (rightOutput.contains(slot)) {
+      154                  rightGroupBy.add(slot);
+      155              } else {
+      156                  return null;
+      157              }
+      158          }
+      159  
+      160          if (!countStars.isEmpty() && leftGroupBy.isEmpty() && rightGroupBy.isEmpty()) {
+      161              return null;
+      162          }
+      163  
+      164          join.getHashJoinConjuncts().forEach(e -> e.getInputSlots().forEach(slot -> {
+      165              if (leftOutput.contains(slot)) {
+      166                  leftGroupBy.add(slot);
+      167              } else if (rightOutput.contains(slot)) {
+      168                  rightGroupBy.add(slot);
+      169              } else {
+      170                  throw new IllegalStateException("Slot " + slot + " not found in join output");
+      171              }
+      172          }));
+      173  
+      174          Alias leftCnt = null;
+      175          Alias rightCnt = null;
+      176          // left agg
+      177          Map<Slot, NamedExpression> leftSlotToOutput = new HashMap<>();
+      178          Builder<NamedExpression> leftAggOutputBuilder = ImmutableList.<NamedExpression>builder().addAll(leftGroupBy);
+      179          leftAggs.forEach(func -> {
+      180              Alias alias = func.alias(func.getName());
+      181              leftSlotToOutput.put((Slot) func.child(0), alias);
+      182              leftAggOutputBuilder.add(alias);
+      183          });
+      184          if (!rightAggs.isEmpty() || !countStars.isEmpty()) {
+      185              leftCnt = new Count().alias("leftCntStar");
+      186              leftAggOutputBuilder.add(leftCnt);
+      187          }
+      188          LogicalAggregate<Plan> leftAgg = new LogicalAggregate<>(
+      189                  ImmutableList.copyOf(leftGroupBy), leftAggOutputBuilder.build(), join.left());
+      190          // right agg
+      191          Map<Slot, NamedExpression> rightSlotToOutput = new HashMap<>();
+      192          Builder<NamedExpression> rightAggOutputBuilder = ImmutableList.<NamedExpression>builder().addAll(rightGroupBy);
+      193          rightAggs.forEach(func -> {
+      194              Alias alias = func.alias(func.getName());
+      195              rightSlotToOutput.put((Slot) func.child(0), alias);
+      196              rightAggOutputBuilder.add(alias);
+      197          });
+      198          if (!leftAggs.isEmpty() || !countStars.isEmpty()) {
+      199              rightCnt = new Count().alias("rightCntStar");
+      200              rightAggOutputBuilder.add(rightCnt);
+      201          }
+      202          LogicalAggregate<Plan> rightAgg = new LogicalAggregate<>(
+      203                  ImmutableList.copyOf(rightGroupBy), rightAggOutputBuilder.build(), join.right());
+      204  
+      205          Plan newJoin = join.withChildren(leftAgg, rightAgg);
+      206  
+      207          // top Sum agg
+      208          // count(slot) -> sum( count(slot) * cntStar )
+      209          // count(*) -> sum( leftCntStar * leftCntStar )
+      210          List<NamedExpression> newOutputExprs = new ArrayList<>();
+      211          for (NamedExpression ne : agg.getOutputExpressions()) {
+      212              if (ne instanceof Alias && ((Alias) ne).child() instanceof AggregateFunction) {
+      213                  AggregateFunction func = (AggregateFunction) ((Alias) ne).child();
+      214                  if (func instanceof Count && ((Count) func).isCountStar()) {
+      215                      Preconditions.checkState(rightCnt != null && leftCnt != null);
+      216                      Expression expr = new Sum(new Multiply(leftCnt.toSlot(), rightCnt.toSlot()));
+      217                      newOutputExprs.add((NamedExpression) ne.withChildren(expr));
+      218                  } else {
+      219                      Slot slot = (Slot) func.child(0);
+      220                      if (leftSlotToOutput.containsKey(slot)) {
+      221                          Preconditions.checkState(rightCnt != null);
+      222                          Expression expr = new Sum(
+      223                                  new Multiply(leftSlotToOutput.get(slot).toSlot(), rightCnt.toSlot()));
+      224                          newOutputExprs.add((NamedExpression) ne.withChildren(expr));
+      225                      } else if (rightSlotToOutput.containsKey(slot)) {
+      226                          Preconditions.checkState(leftCnt != null);
+      227                          Expression expr = new Sum(
+      228                                  new Multiply(rightSlotToOutput.get(slot).toSlot(), leftCnt.toSlot()));
+      229                          newOutputExprs.add((NamedExpression) ne.withChildren(expr));
+      230                      } else {
+      231                          throw new IllegalStateException("Slot " + slot + " not found in join output");
+      232                      }
+      233                  }
+      234              } else {
+      235                  newOutputExprs.add(ne);
+      236              }
+      237          }
+      238          return agg.withAggOutputChild(newOutputExprs, newJoin);
+      239      }
+      240  }

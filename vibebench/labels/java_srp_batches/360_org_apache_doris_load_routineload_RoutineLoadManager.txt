@@ -1,0 +1,406 @@
+row 360   apache/doris#61292
+============================================================================
+CLASS org.apache.doris.load.routineload.RoutineLoadManager   loc=900 methods=51 wmc=157 lcom=0.0 c3=0.212275869274971
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       80  public class RoutineLoadManager implements Writable {
+       81      private static final Logger LOG = LogManager.getLogger(RoutineLoadManager.class);
+       82  
+       83      // Long is beId, integer is the size of tasks in be
+       84      private Map<Long, Integer> beIdToMaxConcurrentTasks = Maps.newHashMap();
+       85  
+       86      // routine load job meta
+       87      private Map<Long, RoutineLoadJob> idToRoutineLoadJob = Maps.newConcurrentMap();
+       88      private Map<Long, Map<String, List<RoutineLoadJob>>> dbToNameToRoutineLoadJob = Maps.newConcurrentMap();
+       89  
+       90      private ConcurrentLong2LongHashMap multiLoadTaskTxnIdToRoutineLoadJobId = new ConcurrentLong2LongHashMap();
+       91  
+       92      private ReentrantReadWriteLock lock = new ReentrantReadWriteLock(true);
+       93  
+       94      // Map<beId, timestamp when added to blacklist>
+       95      private ConcurrentLong2LongHashMap blacklist = new ConcurrentLong2LongHashMap();
+       96  
+       97      private void readLock() {
+       98          lock.readLock().lock();
+       99      }
+      100  
+      101      private void readUnlock() {
+      102          lock.readLock().unlock();
+      103      }
+      104  
+      105      private void writeLock() {
+      106          lock.writeLock().lock();
+      107      }
+      108  
+      109      private void writeUnlock() {
+      110          lock.writeLock().unlock();
+      111      }
+      112  
+      113      public RoutineLoadManager() {
+      114      }
+      115  
+      116      public Map<Long, Long> getBlacklist() {
+      117          return blacklist;
+      118      }
+      119  
+      120      public List<RoutineLoadJob> getAllRoutineLoadJobs() {
+      121          return new ArrayList<>(idToRoutineLoadJob.values());
+      122      }
+      123  
+      124      public List<RoutineLoadJob> getActiveRoutineLoadJobs() {
+      125          return idToRoutineLoadJob.values().stream()
+      126                  .filter(job -> !job.state.isFinalState())
+      127                  .collect(Collectors.toList());
+      128      }
+      129  
+      130      public void addMultiLoadTaskTxnIdToRoutineLoadJobId(long txnId, long routineLoadJobId) {
+      131          multiLoadTaskTxnIdToRoutineLoadJobId.put(txnId, routineLoadJobId);
+      132      }
+      133  
+      134      public RoutineLoadJob getRoutineLoadJobByMultiLoadTaskTxnId(long txnId) {
+      135          long routineLoadJobId = multiLoadTaskTxnIdToRoutineLoadJobId.get(txnId);
+      136          if (routineLoadJobId == 0) {
+      137              return null;
+      138          }
+      139          return idToRoutineLoadJob.get(routineLoadJobId);
+      140      }
+      141  
+      142      public void removeMultiLoadTaskTxnIdToRoutineLoadJobId(long txnId) {
+      143          multiLoadTaskTxnIdToRoutineLoadJobId.remove(txnId);
+      144      }
+      145  
+      146      public void updateBeIdToMaxConcurrentTasks() {
+      147          beIdToMaxConcurrentTasks = Env.getCurrentSystemInfo().getAllBackendIds(true).stream().collect(
+      148                  Collectors.toMap(beId -> beId, beId -> Config.max_routine_load_task_num_per_be));
+      149      }
+      150  
+      151      // this is not real-time number
+      152      public int getTotalMaxConcurrentTaskNum() {
+      153          return beIdToMaxConcurrentTasks.values().stream().mapToInt(i -> i).sum();
+      154      }
+      155  
+      156      // return the map of be id -> running tasks num
+      157      private Map<Long, Integer> getBeCurrentTasksNumMap() {
+      158          Map<Long, Integer> beCurrentTaskNumMap = Maps.newHashMap();
+      159          for (RoutineLoadJob routineLoadJob : getRoutineLoadJobByState(
+      160                  Sets.newHashSet(RoutineLoadJob.JobState.RUNNING))) {
+      161              Map<Long, Integer> jobBeCurrentTasksNumMap = routineLoadJob.getBeCurrentTasksNumMap();
+      162              for (Map.Entry<Long, Integer> entry : jobBeCurrentTasksNumMap.entrySet()) {
+      163                  if (beCurrentTaskNumMap.containsKey(entry.getKey())) {
+      164                      beCurrentTaskNumMap.put(entry.getKey(), beCurrentTaskNumMap.get(entry.getKey()) + entry.getValue());
+      165                  } else {
+      166                      beCurrentTaskNumMap.put(entry.getKey(), entry.getValue());
+      167                  }
+      168              }
+      169          }
+      170          return beCurrentTaskNumMap;
+      171  
+      172      }
+      173  
+      174      public void createRoutineLoadJob(CreateRoutineLoadInfo info, ConnectContext ctx)
+      175              throws UserException {
+      176          // check load auth
+      177          if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(),
+      178                  InternalCatalog.INTERNAL_CATALOG_NAME,
+      179                  info.getDBName(),
+      180                  info.getTableName(),
+      181                  PrivPredicate.LOAD)) {
+      182              ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "LOAD",
+      183                      ConnectContext.get().getQualifiedUser(),
+      184                      ConnectContext.get().getRemoteIP(),
+      185                      info.getDBName(),
+      186                      info.getDBName() + ": " + info.getTableName());
+      187          }
+      188  
+      189          RoutineLoadJob routineLoadJob = null;
+      190          LoadDataSourceType type = LoadDataSourceType.valueOf(info.getTypeName());
+      191          switch (type) {
+      192              case KAFKA:
+      193                  routineLoadJob = KafkaRoutineLoadJob.fromCreateInfo(info, ctx);
+      194                  break;
+      195              default:
+      196                  throw new UserException("Unknown data source type: " + type);
+      197          }
+      198  
+      199          routineLoadJob.setOrigStmt(ctx.getStatementContext().getOriginStatement());
+      200          routineLoadJob.setComment(info.getComment());
+      201          addRoutineLoadJob(routineLoadJob, info.getDBName(),
+      202                  info.getTableName());
+      203      }
+      204  
+      205      public void addRoutineLoadJob(RoutineLoadJob routineLoadJob, String dbName, String tableName)
+      206                      throws UserException {
+      207          writeLock();
+      208          try {
+      209              // check if db.routineLoadName has been used
+      210              if (isNameUsed(routineLoadJob.getDbId(), routineLoadJob.getName())) {
+      211                  throw new DdlException("Name " + routineLoadJob.getName() + " already used in db "
+      212                          + dbName);
+      213              }
+      214              if (getRoutineLoadJobByState(Sets.newHashSet(RoutineLoadJob.JobState.NEED_SCHEDULE,
+      215                      RoutineLoadJob.JobState.RUNNING, RoutineLoadJob.JobState.PAUSED)).size()
+      216                      > Config.max_routine_load_job_num) {
+      217                  throw new DdlException("There are more than " + Config.max_routine_load_job_num
+      218                          + " routine load jobs are running. exceed limit.");
+      219              }
+      220  
+      221              unprotectedAddJob(routineLoadJob);
+      222              Env.getCurrentEnv().getEditLog().logCreateRoutineLoadJob(routineLoadJob);
+      223          } finally {
+      224              writeUnlock();
+      225          }
+      226  
+      227          LOG.info("create routine load job: id: {}, job name: {}, db name: {}, table name: {}",
+      228                   routineLoadJob.getId(), routineLoadJob.getName(), dbName, tableName);
+      229      }
+      230  
+      231      private void unprotectedAddJob(RoutineLoadJob routineLoadJob) {
+      232          idToRoutineLoadJob.put(routineLoadJob.getId(), routineLoadJob);
+      233  
+      234          Map<String, List<RoutineLoadJob>> nameToRoutineLoadJob = dbToNameToRoutineLoadJob
+      235                  .computeIfAbsent(routineLoadJob.getDbId(), k -> Maps.newConcurrentMap());
+      236          List<RoutineLoadJob> routineLoadJobList = nameToRoutineLoadJob
+      237                  .computeIfAbsent(routineLoadJob.getName(), k -> Lists.newArrayList());
+      238          routineLoadJobList.add(routineLoadJob);
+      239          // add txn state callback in factory
+      240          Env.getCurrentGlobalTransactionMgr().getCallbackFactory().addCallback(routineLoadJob);
+      241      }
+      242  
+      243      // TODO(ml): Idempotency
+      244      private boolean isNameUsed(Long dbId, String name) {
+      245          if (dbToNameToRoutineLoadJob.containsKey(dbId)) {
+      246              Map<String, List<RoutineLoadJob>> labelToRoutineLoadJob = dbToNameToRoutineLoadJob.get(dbId);
+      247              if (labelToRoutineLoadJob.containsKey(name)) {
+      248                  List<RoutineLoadJob> routineLoadJobList = labelToRoutineLoadJob.get(name);
+      249                  Optional<RoutineLoadJob> optional = routineLoadJobList.stream()
+      250                          .filter(entity -> entity.getName().equals(name))
+      251                          .filter(entity -> !entity.getState().isFinalState()).findFirst();
+      252                  return optional.isPresent();
+      253              }
+      254          }
+      255          return false;
+      256      }
+      257  
+      258      public RoutineLoadJob checkPrivAndGetJob(String dbName, String jobName)
+      259              throws MetaNotFoundException, DdlException, AnalysisException {
+      260          RoutineLoadJob routineLoadJob = getJob(dbName, jobName);
+      261          if (routineLoadJob == null) {
+      262              throw new DdlException("There is not operable routine load job with name " + jobName);
+      263          }
+      264          // check auth
+      265          String dbFullName;
+      266          String tableName;
+      267          try {
+      268              dbFullName = routineLoadJob.getDbFullName();
+      269              tableName = routineLoadJob.getTableName();
+      270          } catch (MetaNotFoundException e) {
+      271              throw new DdlException("The metadata of job has been changed. The job will be cancelled automatically", e);
+      272          }
+      273          if (routineLoadJob.isMultiTable()) {
+      274              if (!Env.getCurrentEnv().getAccessManager().checkDbPriv(ConnectContext.get(),
+      275                      InternalCatalog.INTERNAL_CATALOG_NAME,
+      276                      dbFullName,
+      277                      PrivPredicate.LOAD)) {
+      278                  // todo add new error code
+      279                  ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "LOAD",
+      280                          ConnectContext.get().getQualifiedUser(),
+      281                          ConnectContext.get().getRemoteIP(),
+      282                          dbFullName);
+      283              }
+      284              return routineLoadJob;
+      285          }
+      286          if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(),
+      287                  InternalCatalog.INTERNAL_CATALOG_NAME,
+      288                  dbFullName,
+      289                  tableName,
+      290                  PrivPredicate.LOAD)) {
+      291              ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "LOAD",
+      292                      ConnectContext.get().getQualifiedUser(),
+      293                      ConnectContext.get().getRemoteIP(),
+      294                      dbFullName + ": " + tableName);
+      295          }
+      296          return routineLoadJob;
+      297      }
+      298  
+      299      // get all jobs which state is not in final state from specified database
+      300      public List<RoutineLoadJob> checkPrivAndGetAllJobs(String dbName)
+      301              throws MetaNotFoundException, DdlException {
+      302  
+      303          List<RoutineLoadJob> result = Lists.newArrayList();
+      304          Database database = Env.getCurrentInternalCatalog().getDbOrDdlException(dbName);
+      305          long dbId = database.getId();
+      306          Map<String, List<RoutineLoadJob>> jobMap = dbToNameToRoutineLoadJob.get(dbId);
+      307          if (jobMap == null) {
+      308              // return empty result
+      309              return result;
+      310          }
+      311  
+      312          for (List<RoutineLoadJob> jobs : jobMap.values()) {
+      313              for (RoutineLoadJob job : jobs) {
+      314                  if (!job.getState().isFinalState()) {
+      315                      String tableName = job.getTableName();
+      316                      if (!job.isMultiTable() && !Env.getCurrentEnv().getAccessManager()
+      317                              .checkTblPriv(ConnectContext.get(), InternalCatalog.INTERNAL_CATALOG_NAME, dbName,
+      318                                      tableName, PrivPredicate.LOAD)) {
+      319                          continue;
+      320                      }
+      321                      result.add(job);
+      322                  }
+      323              }
+      324          }
+      325  
+      326          return result;
+      327      }
+      328  
+      329      public void pauseRoutineLoadJob(PauseRoutineLoadCommand pauseRoutineLoadCommand)
+      330              throws UserException {
+      331          List<RoutineLoadJob> jobs = Lists.newArrayList();
+      332          // it needs lock when getting routine load job,
+      333          // otherwise, it may cause the editLog out of order in the following scenarios:
+      334          // thread A: create job and record job meta
+      335          // thread B: change job state and persist in editlog according to meta
+      336          // thread A: persist in editlog
+      337          // which will cause the null pointer exception when replaying editLog
+      338          readLock();
+      339          try {
+      340              if (pauseRoutineLoadCommand.isAll()) {
+      341                  jobs = checkPrivAndGetAllJobs(pauseRoutineLoadCommand.getDbFullName());
+      342              } else {
+      343                  RoutineLoadJob routineLoadJob = checkPrivAndGetJob(pauseRoutineLoadCommand.getDbFullName(),
+      344                          pauseRoutineLoadCommand.getLabel());
+      345                  jobs.add(routineLoadJob);
+      346              }
+      347          } finally {
+      348              readUnlock();
+      349          }
+      350  
+      351          for (RoutineLoadJob routineLoadJob : jobs) {
+      352              try {
+      353                  routineLoadJob.updateState(RoutineLoadJob.JobState.PAUSED,
+      354                      new ErrorReason(InternalErrorCode.MANUAL_PAUSE_ERR,
+      355                          "User " + ConnectContext.get().getQualifiedUser() + " pauses routine load job"),
+      356                          false /* not replay */);
+      357                  LOG.info(new LogBuilder(LogKey.ROUTINE_LOAD_JOB, routineLoadJob.getId()).add("current_state",
+      358                          routineLoadJob.getState()).add("user", ConnectContext.get().getQualifiedUser()).add("msg",
+      359                          "routine load job has been paused by user").build());
+      360              } catch (UserException e) {
+      361                  LOG.warn("failed to pause routine load job {}", routineLoadJob.getName(), e);
+      362                  // if user want to pause a certain job and failed, return error.
+      363                  // if user want to pause all possible jobs, skip error jobs.
+      364                  if (!pauseRoutineLoadCommand.isAll()) {
+      365                      throw e;
+      366                  }
+      367              }
+      368          }
+      369      }
+      370  
+      371      public void resumeRoutineLoadJob(ResumeRoutineLoadCommand resumeRoutineLoadCommand)
+      372              throws UserException {
+      373          List<RoutineLoadJob> jobs = Lists.newArrayList();
+      374          if (resumeRoutineLoadCommand.isAll()) {
+      375              jobs = checkPrivAndGetAllJobs(resumeRoutineLoadCommand.getDbFullName());
+      376          } else {
+      377              RoutineLoadJob routineLoadJob = checkPrivAndGetJob(resumeRoutineLoadCommand.getDbFullName(),
+      378                      resumeRoutineLoadCommand.getLabel());
+      379              jobs.add(routineLoadJob);
+      380          }
+      381  
+      382          for (RoutineLoadJob routineLoadJob : jobs) {
+      383              try {
+      384                  routineLoadJob.jobStatistic.errorRowsAfterResumed = 0;
+      385                  routineLoadJob.autoResumeCount = 0;
+      386                  routineLoadJob.latestResumeTimestamp = 0;
+      387                  routineLoadJob.updateState(RoutineLoadJob.JobState.NEED_SCHEDULE, null, false /* not replay */);
+      388                  LOG.info(new LogBuilder(LogKey.ROUTINE_LOAD_JOB, routineLoadJob.getId())
+      389                          .add("current_state", routineLoadJob.getState())
+      390                          .add("user", ConnectContext.get().getQualifiedUser())
+      391                          .add("msg", "routine load job has been resumed by user")
+      392                          .build());
+      393              } catch (UserException e) {
+      394                  LOG.warn("failed to resume routine load job {}", routineLoadJob.getName(), e);
+      395                  // if user want to resume a certain job and failed, return error.
+      396                  // if user want to resume all possible jobs, skip error jobs.
+      397                  if (!resumeRoutineLoadCommand.isAll()) {
+      398                      throw e;
+      399                  }
+      400              }
+      401          }
+      402      }
+      403  
+      404      public void stopRoutineLoadJob(StopRoutineLoadCommand stopRoutineLoadCommand)
+      405              throws UserException {
+      406          RoutineLoadJob routineLoadJob;
+      407          // it needs lock when getting routine load job,
+      408          // otherwise, it may cause the editLog out of order in the following scenarios:
+      409          // thread A: create job and record job meta
+      410          // thread B: change job state and persist in editlog according to meta
+      411          // thread A: persist in editlog
+      412          // which will cause the null pointer exception when replaying editLog
+      413          readLock();
+      414          try {
+      415              routineLoadJob = checkPrivAndGetJob(stopRoutineLoadCommand.getDbFullName(),
+      416                  stopRoutineLoadCommand.getLabel());
+      417          } finally {
+      418              readUnlock();
+      419          }
+      420          routineLoadJob.updateState(RoutineLoadJob.JobState.STOPPED,
+      421              new ErrorReason(InternalErrorCode.MANUAL_STOP_ERR,
+      422                  "User  " + ConnectContext.get().getQualifiedUser() + " stop routine load job"),
+      423                  false /* not replay */);
+      424          LOG.info(new LogBuilder(LogKey.ROUTINE_LOAD_JOB, routineLoadJob.getId())
+      425                  .add("current_state", routineLoadJob.getState())
+      426                  .add("user", ConnectContext.get().getQualifiedUser())
+      427                  .add("msg", "routine load job has been stopped by user")
+      428                  .build());
+      429      }
+      430  
+      431      public int getSizeOfIdToRoutineLoadTask() {
+      432          int sizeOfTasks = 0;
+      433          for (RoutineLoadJob routineLoadJob : idToRoutineLoadJob.values()) {
+      434              sizeOfTasks += routineLoadJob.getSizeOfRoutineLoadTaskInfoList();
+      435          }
+      436          return sizeOfTasks;
+      437      }
+      438  
+      439      public int getClusterIdleSlotNum() {
+      440          readLock();
+      441          try {
+      442              int result = 0;
+      443              Map<Long, Integer> beIdToConcurrentTasks = getBeCurrentTasksNumMap();
+      444              for (Map.Entry<Long, Integer> entry : beIdToMaxConcurrentTasks.entrySet()) {
+      445                  if (beIdToConcurrentTasks.containsKey(entry.getKey())) {
+      446                      result += entry.getValue() - beIdToConcurrentTasks.get(entry.getKey());
+      447                  } else {
+      448                      result += entry.getValue();
+      449                  }
+      450              }
+      451              return result;
+      452          } finally {
+      453              readUnlock();
+      454          }
+      455      }
+      456  
+      457      // get the BE id with minimum running task on it
+      458      // return -1 if no BE is available.
+      459      // throw exception if unrecoverable errors happen.
+      460      // ATTN: this is only used for unit test now.
+      461      public long getMinTaskBeId(String clusterName) throws LoadException {
+      462          List<Long> beIdsInCluster = Env.getCurrentSystemInfo().getAllBackendIds(true);
+      463          if (beIdsInCluster == null) {
+      464              throw new LoadException("The " + clusterName + " has been deleted");
+      465          }
+      466  
+      467          readLock();
+      468          try {
+      469              long result = -1L;
+      470              int maxIdleSlotNum = 0;
+      471              updateBeIdToMaxConcurrentTasks();
+      472              Map<Long, Integer> beIdToConcurrentTasks = getBeCurrentTasksNumMap();
+      473              for (Long beId : beIdsInCluster) {
+      474                  if (beIdToMaxConcurrentTasks.containsKey(beId)) {
+      475                      int idleTaskNum = 0;
+      476                      if (beIdToConcurrentTasks.containsKey(beId)) {
+      477                          idleTaskNum = beIdToMaxConcurrentTasks.get(beId) - beIdToConcurrentTasks.get(beId);
+      478                      } else {
+      479                          idleTaskNum = Config.max_routine_load_task_num_per_be;
+       ... truncated at 400 lines ...

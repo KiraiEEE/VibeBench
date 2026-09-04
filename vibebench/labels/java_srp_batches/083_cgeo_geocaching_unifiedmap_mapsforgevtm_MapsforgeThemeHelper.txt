@@ -1,0 +1,360 @@
+row 83   cgeo/cgeo#17761
+============================================================================
+CLASS cgeo.geocaching.unifiedmap.mapsforgevtm.MapsforgeThemeHelper   loc=355 methods=16 wmc=64 lcom=0.0666666666666666 c3=0.1951530530343207
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       56  public class MapsforgeThemeHelper implements XmlRenderThemeMenuCallback {
+       57  
+       58      private static final PersistableFolder MAP_THEMES_FOLDER = PersistableFolder.OFFLINE_MAP_THEMES;
+       59      private static final File MAP_THEMES_INTERNAL_FOLDER = LocalStorage.getMapThemeInternalSyncDir();
+       60  
+       61      private static final String ZIP_THEME_SEPARATOR = ":";
+       62  
+       63      private static final int ZIP_FILE_SIZE_LIMIT = 5 * 1024 * 1024; // 5 MB
+       64      private static final int ZIP_RESOURCE_READ_LIMIT = 1024 * 1024; // 1 MB
+       65  
+       66      private static final int AVAILABLE_THEMES_SCAN_MAXDEPTH = 2;
+       67  
+       68      private static final Object availableThemesMutex = new Object();
+       69      private static final List<ThemeData> availableThemes = new ArrayList<>();
+       70      private static boolean availableThemesInitialized = false;
+       71  
+       72      private static final Object cachedZipMutex = new Object();
+       73  
+       74      private final SharedPreferences sharedPreferences;
+       75      private IRenderTheme mTheme;
+       76  
+       77      //current Theme style menu settings
+       78      private XmlRenderThemeStyleMenu themeStyleMenu;
+       79  
+       80      //the last used Zip Resource Provider is cached.
+       81      private static String cachedZipProviderFilename = null;
+       82      private static ZipXmlThemeResourceProvider cachedZipProvider = null;
+       83  
+       84      private static class ThemeData {
+       85          public final String id;
+       86          public final String userDisplayableName;
+       87          public final FileInformation fileInfo;
+       88          public final Folder containingFolder;
+       89  
+       90          private ThemeData(final String id, final String userDisplayableName, final FileInformation fileInfo, final Folder containingFolder) {
+       91              this.id = id;
+       92              this.userDisplayableName = userDisplayableName;
+       93              this.fileInfo = fileInfo;
+       94              this.containingFolder = containingFolder;
+       95          }
+       96      }
+       97  
+       98      public enum RenderThemeType {
+       99          RTT_NONE("", new String[]{}),
+      100          RTT_ELEVATE("", new String[]{"elevate", "elements"}),
+      101          RTT_FZK_BASE("freizeitkarte-v5", new String[]{"freizeitkarte"}),
+      102          RTT_FZK_OUTDOOR_CONTRAST("fzk-outdoor-contrast-v5", new String[]{"fzk-outdoor-contrast"}),
+      103          RTT_FZK_OUTDOOR_SOFT("fzk-outdoor-soft-v5", new String[]{"fzk-outdoor-soft"}),
+      104          RTT_PAWS("paws_4", new String[]{"paws_4"}),
+      105          RTT_VOLUNTARY("", new String[]{"voluntary v5", "velocity v5"});
+      106  
+      107          public final String relPath;
+      108          public final String[] searchPaths;
+      109  
+      110          RenderThemeType(final String relPath, final String[] searchPaths) {
+      111              this.relPath = relPath;
+      112              this.searchPaths = searchPaths;
+      113          }
+      114      }
+      115  
+      116      protected MapsforgeThemeHelper(final Activity activity) {
+      117          this.sharedPreferences = PreferenceManager.getDefaultSharedPreferences(activity);
+      118      }
+      119  
+      120      protected void reapplyMapTheme(final Map map, final AbstractTileProvider tileProvider) {
+      121          if (mTheme != null) {
+      122              disposeTheme();
+      123          }
+      124          if (!tileProvider.supportsThemes()) {
+      125              return;
+      126          }
+      127  
+      128          //try to apply stored value
+      129          ThemeData selectedTheme = setSelectedMapThemeInternal(Settings.getSelectedMapRenderTheme(Settings.getTileProvider()));
+      130  
+      131          if (selectedTheme == null) {
+      132              applyDefaultTheme(map, tileProvider);
+      133          } else {
+      134              try {
+      135                  //get the theme
+      136                  final ThemeFile xmlRenderTheme = createThemeFor(selectedTheme);
+      137  
+      138                  // Validate the theme
+      139                  /* @todo
+      140                  org.mapsforge.map.rendertheme.rule.RenderThemeHandler.getRenderTheme(AndroidGraphicFactory.INSTANCE, new DisplayModel(), xmlRenderTheme);
+      141                  rendererLayer.setXmlRenderTheme(xmlRenderTheme);
+      142                  */
+      143                  mTheme = map.setTheme(xmlRenderTheme);
+      144              } catch (final Exception e) {
+      145                  Log.w("render theme invalid", e);
+      146                  ActivityMixin.showApplicationToast(LocalizationUtils.getString(R.string.err_rendertheme_invalid));
+      147                  applyDefaultTheme(map, tileProvider);
+      148                  selectedTheme = null;
+      149              }
+      150          }
+      151          setSelectedTheme(selectedTheme);
+      152  
+      153          if (tileProvider instanceof AbstractMapsforgeVTMOfflineTileProvider) {
+      154              ((AbstractMapsforgeVTMOfflineTileProvider) tileProvider).switchBuildingLayer(Settings.getBuildings3D());
+      155          }
+      156  
+      157          map.updateMap(true);
+      158          map.render();
+      159      }
+      160  
+      161      private void applyDefaultTheme(final Map map, final AbstractTileProvider tileProvider) {
+      162          if (tileProvider.supportsThemes()) {
+      163              mTheme = map.setTheme(VtmThemes.getDefaultVariant());
+      164          }
+      165      }
+      166  
+      167      protected void disposeTheme() {
+      168          if (mTheme != null) {
+      169              mTheme.dispose();
+      170          }
+      171      }
+      172  
+      173      private ThemeFile createThemeFor(@NonNull final ThemeData theme) {
+      174          final String[] themeIdTokens = theme.id.split(ZIP_THEME_SEPARATOR);
+      175          final boolean isZipTheme = themeIdTokens.length == 2;
+      176  
+      177          if (theme.fileInfo == null || theme.fileInfo.uri == null || theme.containingFolder == null) {
+      178              return null;
+      179          }
+      180  
+      181          ThemeFile xmlRenderTheme = null;
+      182          try {
+      183              if (!isZipTheme) {
+      184                  if (UriUtils.isFileUri(theme.fileInfo.uri)) {
+      185                      xmlRenderTheme = new ExternalRenderTheme(theme.fileInfo.uri.toString(), this);
+      186                  } else {
+      187                      //this is the SLOW THEME path. Show OneTimeDialog to warn user about this
+      188                      Dialogs.basicOneTimeMessage(CgeoApplication.getInstance(), OneTimeDialogs.DialogType.MAP_THEME_FIX_SLOWNESS);
+      189                      xmlRenderTheme = new ContentRenderTheme(getContentResolver(), theme.fileInfo.uri, this);
+      190                      xmlRenderTheme.setResourceProvider(new ContentResolverResourceProvider(getContentResolver(), ContentStorage.get().getUriForFolder(theme.containingFolder), true));
+      191                  }
+      192              } else {
+      193                  //always cache the last used ZipResourceProvider. Check if current one can be reused, if not then reload
+      194                  synchronized (cachedZipMutex) {
+      195                      if (cachedZipProvider == null || !themeIdTokens[0].equals(cachedZipProviderFilename)) {
+      196                          if (theme.fileInfo.size > ZIP_FILE_SIZE_LIMIT) {
+      197                              cachedZipProvider = null;
+      198                              cachedZipProviderFilename = null;
+      199                          } else {
+      200                              cachedZipProvider = new ZipXmlThemeResourceProvider(new ZipInputStream(ContentStorage.get().openForRead(theme.fileInfo.uri)), ZIP_RESOURCE_READ_LIMIT);
+      201                              cachedZipProviderFilename = themeIdTokens[0];
+      202                          }
+      203                      }
+      204                      xmlRenderTheme = cachedZipProvider == null ? null : new ZipRenderTheme(themeIdTokens[1], cachedZipProvider, this);
+      205                  }
+      206              }
+      207          } catch (Exception ex) {
+      208              Log.w("Problem loading Theme [" + theme.id + "]'" + theme.fileInfo.uri + "'", ex);
+      209              xmlRenderTheme = null;
+      210              cachedZipProvider = null;
+      211              cachedZipProviderFilename = null;
+      212          }
+      213          return xmlRenderTheme;
+      214      }
+      215  
+      216      protected void selectMapTheme(final Activity activity, final Map map, final AbstractTileProvider tileProvider) {
+      217          if (!tileProvider.supportsThemes()) {
+      218              return;
+      219          }
+      220          final String currentThemeId = Settings.getSelectedMapRenderTheme(tileProvider);
+      221  
+      222          final List<String> names = new ArrayList<>();
+      223          names.add(LocalizationUtils.getString(R.string.switch_default));
+      224          int currentItem = 0;
+      225          int idx = 1;
+      226          final List<ThemeData> selectableAvThemes = getAvailableThemes();
+      227          for (final ThemeData theme : selectableAvThemes) {
+      228              names.add(theme.userDisplayableName);
+      229              if (StringUtils.equals(currentThemeId, theme.id)) {
+      230                  currentItem = idx;
+      231              }
+      232              idx++;
+      233          }
+      234  
+      235          final AlertDialog.Builder builder = Dialogs.newBuilder(activity);
+      236          builder.setTitle(LocalizationUtils.getString(R.string.map_theme_select));
+      237          builder.setSingleChoiceItems(names.toArray(new String[0]), currentItem, (dialog, newItem) -> {
+      238              // Adjust index because of <default> selection
+      239              setSelectedTheme(newItem > 0 ? selectableAvThemes.get(newItem - 1) : null);
+      240              reapplyMapTheme(map, tileProvider);
+      241              dialog.cancel();
+      242          });
+      243  
+      244          builder.show();
+      245      }
+      246  
+      247      public void selectMapThemeOptions(final Activity activity, final AbstractTileProvider tileProvider) {
+      248          if (!tileProvider.supportsThemeOptions()) {
+      249              return;
+      250          }
+      251  
+      252          final Intent intent = new Intent(activity, MapsforgeThemeSettings.class);
+      253          intent.setFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT);
+      254          if (themeOptionsAvailable() && themeStyleMenu != null) {
+      255              intent.putExtra(MapsforgeThemeSettingsFragment.RENDERTHEME_MENU, themeStyleMenu);
+      256              intent.putExtra(MapsforgeThemeSettingsFragment.SHOW3DOPTION, tileProvider instanceof AbstractMapsforgeVTMOfflineTileProvider);
+      257          }
+      258          activity.startActivity(intent);
+      259      }
+      260  
+      261      public boolean themeOptionsAvailable() {
+      262          return StringUtils.isNotBlank(Settings.getSelectedMapRenderTheme(Settings.getTileProvider()));
+      263      }
+      264  
+      265      /**
+      266       * Callback handling for theme settings upon MapsforgeVTM theme options selection
+      267       * Note: map theme settings are "spilled" into c:geo shared preferences
+      268       * (Observation: when using OpenAndroMaps Elevate, those settings usually related settings start with "elmt-")
+      269       */
+      270      @Override
+      271      public Set<String> getCategories(final XmlRenderThemeStyleMenu menu) {
+      272          themeStyleMenu = menu;
+      273          final String id = this.sharedPreferences.getString(themeStyleMenu.getId(), themeStyleMenu.getDefaultValue());
+      274          final XmlRenderThemeStyleLayer baseLayer = themeStyleMenu.getLayer(id);
+      275          if (baseLayer == null) {
+      276              Log.w("Invalid style " + id);
+      277              return null;
+      278          }
+      279          final Set<String> result = baseLayer.getCategories();
+      280  
+      281          // add the categories from overlays that are enabled
+      282          for (final XmlRenderThemeStyleLayer overlay : baseLayer.getOverlays()) {
+      283              if (this.sharedPreferences.getBoolean(overlay.getId(), overlay.isEnabled())) {
+      284                  result.addAll(overlay.getCategories());
+      285              }
+      286          }
+      287  
+      288          return result;
+      289      }
+      290  
+      291      /**
+      292       * Set a new map theme. The theme is evaluated against available themes and possibly corrected.
+      293       * Next time a map viewer is opened, the theme will be evaluated and used if possible
+      294       */
+      295      private static ThemeData setSelectedMapThemeInternal(final String themeIdCandidate) {
+      296          //try to apply stored value
+      297          ThemeData selectedTheme = null;
+      298          final List<ThemeData> avThemes = getAvailableThemes();
+      299          //search for exact match first
+      300          for (ThemeData avTheme : avThemes) {
+      301              if (avTheme.id.equals(themeIdCandidate)) {
+      302                  selectedTheme = avTheme;
+      303                  break;
+      304              }
+      305          }
+      306  
+      307          //if no exact match found, check special cases
+      308          if (selectedTheme == null) {
+      309              for (ThemeData avTheme : avThemes) {
+      310                  final String avThemeId = avTheme.id;
+      311  
+      312                  //might be a legacy value. Try to find a matching theme ending with stored value
+      313                  if (themeIdCandidate.endsWith("/" + avThemeId)) {
+      314                      selectedTheme = avTheme;
+      315                      break;
+      316                  }
+      317                  //might be an incomplete ZIP value (only Zip name without a selected inside theme). Then use first found value
+      318                  if (avThemeId.startsWith(themeIdCandidate + ZIP_THEME_SEPARATOR)) {
+      319                      selectedTheme = avTheme;
+      320                      break;
+      321                  }
+      322              }
+      323          }
+      324          setSelectedTheme(selectedTheme);
+      325          return selectedTheme;
+      326      }
+      327  
+      328      private static void setSelectedTheme(final ThemeData theme) {
+      329          Settings.setSelectedMapRenderTheme(Settings.getTileProvider().getId(), theme == null ? StringUtils.EMPTY : theme.id);
+      330      }
+      331  
+      332      /**
+      333       * recalculate available themes out of the currently active folder
+      334       */
+      335      private static void recalculateAvailableThemes() {
+      336          final List<ThemeData> newAvailableThemes = new ArrayList<>();
+      337          addAvailableThemes(isThemeSynchronizationActive() ? Folder.fromFile(MAP_THEMES_INTERNAL_FOLDER) : MAP_THEMES_FOLDER.getFolder(), newAvailableThemes, "", 0);
+      338  
+      339          Collections.sort(newAvailableThemes, (t1, t2) -> TextUtils.COLLATOR.compare(t1.userDisplayableName, t2.userDisplayableName));
+      340  
+      341          synchronized (availableThemesMutex) {
+      342              availableThemes.clear();
+      343              availableThemes.addAll(newAvailableThemes);
+      344              availableThemesInitialized = true;
+      345          }
+      346  
+      347          synchronized (cachedZipMutex) {
+      348              cachedZipProvider = null;
+      349              cachedZipProviderFilename = null;
+      350          }
+      351      }
+      352  
+      353      private static List<ThemeData> getAvailableThemes() {
+      354          synchronized (availableThemesMutex) {
+      355              if (!availableThemesInitialized) {
+      356                  //async scan not finished -> rescan synchronized and GUI-blocking!
+      357                  recalculateAvailableThemes();
+      358              }
+      359              //make a copy to be thread-safe
+      360              return new ArrayList<>(availableThemes);
+      361          }
+      362      }
+      363  
+      364      private static void addAvailableThemes(@NonNull final Folder dir, final List<ThemeData> themes, final String prefix, final int level) {
+      365          for (FileInformation candidate : Objects.requireNonNull(ContentStorage.get().list(dir))) {
+      366              if (candidate.isDirectory && (AVAILABLE_THEMES_SCAN_MAXDEPTH < 0 || level < AVAILABLE_THEMES_SCAN_MAXDEPTH)) {
+      367                  addAvailableThemes(candidate.dirLocation, themes, prefix + candidate.name + "/", level + 1);
+      368              } else if (candidate.name.endsWith(".xml")) {
+      369                  final String themeId = prefix + candidate.name;
+      370                  themes.add(new ThemeData(themeId, toUserDisplayableName(candidate, null), candidate, dir));
+      371              } else if (candidate.name.endsWith(".zip") && candidate.size <= ZIP_FILE_SIZE_LIMIT) {
+      372                  try (InputStream is = ContentStorage.get().openForRead(candidate.uri)) {
+      373                      for (String zipXmlTheme : ZipXmlThemeResourceProvider.scanXmlThemes(new ZipInputStream(is))) {
+      374                          final String themeId = prefix + candidate.name + ZIP_THEME_SEPARATOR + zipXmlTheme;
+      375                          themes.add(new ThemeData(themeId, toUserDisplayableName(candidate, zipXmlTheme), candidate, dir));
+      376                      }
+      377                  } catch (IOException ioe) {
+      378                      Log.w("Map Theme ZIP '" + candidate + "' could not be read", ioe);
+      379                  } catch (Exception e) {
+      380                      Log.w("Problem opening map Theme ZIP '" + candidate + "'", e);
+      381                  }
+      382              }
+      383          }
+      384      }
+      385  
+      386      /**
+      387       * Calculates a xml theme name fit for user display (in dropdown etc)
+      388       *
+      389       * @param file    theme file name
+      390       * @param zipPath if theme file is a ZIP, then this contains the zip-internal path to the xml. Otherwise null
+      391       * @return user display theme name
+      392       */
+      393      private static String toUserDisplayableName(final FileInformation file, final String zipPath) {
+      394          String userDisplay = StringUtils.removeEnd(file.name, ".xml");
+      395          if (zipPath != null) {
+      396              final int idx = zipPath.lastIndexOf("/");
+      397              userDisplay = userDisplay + "/" + StringUtils.removeEnd(idx < 0 ? zipPath : zipPath.substring(idx + 1), ".xml");
+      398          }
+      399          return userDisplay;
+      400      }
+      401  
+      402      private static ContentResolver getContentResolver() {
+      403          return CgeoApplication.getInstance().getContentResolver();
+      404      }
+      405  
+      406      public static boolean isThemeSynchronizationActive() {
+      407          return Settings.getSyncMapRenderThemeFolder();
+      408      }
+      409  
+      410  }

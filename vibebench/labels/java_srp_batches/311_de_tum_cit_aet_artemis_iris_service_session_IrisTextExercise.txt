@@ -1,0 +1,164 @@
+row 311   ls1intum/Artemis#11991
+============================================================================
+CLASS de.tum.cit.aet.artemis.iris.service.session.IrisTextExerciseChatSessionService   loc=159 methods=7 wmc=13 lcom=0.1666666666666666 c3=0.222348984975155
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       41  @Lazy
+       42  @Service
+       43  @Conditional(IrisEnabled.class)
+       44  public class IrisTextExerciseChatSessionService
+       45          implements IrisChatBasedFeatureInterface<IrisTextExerciseChatSession>, IrisRateLimitedFeatureInterface<IrisTextExerciseChatSession> {
+       46  
+       47      private final IrisSettingsService irisSettingsService;
+       48  
+       49      private final IrisSessionRepository irisSessionRepository;
+       50  
+       51      private final IrisRateLimitService rateLimitService;
+       52  
+       53      private final IrisMessageService irisMessageService;
+       54  
+       55      private final Optional<TextRepositoryApi> textRepositoryApi;
+       56  
+       57      private final StudentParticipationRepository studentParticipationRepository;
+       58  
+       59      private final PyrisPipelineService pyrisPipelineService;
+       60  
+       61      private final PyrisJobService pyrisJobService;
+       62  
+       63      private final IrisChatWebsocketService irisChatWebsocketService;
+       64  
+       65      private final AuthorizationCheckService authCheckService;
+       66  
+       67      private final UserRepository userRepository;
+       68  
+       69      public IrisTextExerciseChatSessionService(IrisSettingsService irisSettingsService, IrisSessionRepository irisSessionRepository, IrisRateLimitService rateLimitService,
+       70              IrisMessageService irisMessageService, Optional<TextRepositoryApi> textRepositoryApi, StudentParticipationRepository studentParticipationRepository,
+       71              PyrisPipelineService pyrisPipelineService, PyrisJobService pyrisJobService, IrisChatWebsocketService irisChatWebsocketService,
+       72              AuthorizationCheckService authCheckService, UserRepository userRepository) {
+       73          this.irisSettingsService = irisSettingsService;
+       74          this.irisSessionRepository = irisSessionRepository;
+       75          this.rateLimitService = rateLimitService;
+       76          this.irisMessageService = irisMessageService;
+       77          this.textRepositoryApi = textRepositoryApi;
+       78          this.studentParticipationRepository = studentParticipationRepository;
+       79          this.pyrisPipelineService = pyrisPipelineService;
+       80          this.pyrisJobService = pyrisJobService;
+       81          this.irisChatWebsocketService = irisChatWebsocketService;
+       82          this.authCheckService = authCheckService;
+       83          this.userRepository = userRepository;
+       84      }
+       85  
+       86      @Override
+       87      public void sendOverWebsocket(IrisTextExerciseChatSession session, IrisMessage message) {
+       88          irisChatWebsocketService.sendMessage(session, message, null);
+       89      }
+       90  
+       91      @Override
+       92      public void requestAndHandleResponse(IrisTextExerciseChatSession irisSession) {
+       93          var session = (IrisTextExerciseChatSession) irisSessionRepository.findByIdWithMessagesAndContents(irisSession.getId());
+       94          var exercise = textRepositoryApi.orElseThrow(() -> new TextApiNotPresentException(TextApi.class)).findByIdElseThrow(session.getExerciseId());
+       95          if (exercise.isExamExercise()) {
+       96              throw new ConflictException("Iris is not supported for exam exercises", "Iris", "irisExamExercise");
+       97          }
+       98          var course = exercise.getCourseViaExerciseGroupOrCourseMember();
+       99          var settings = irisSettingsService.getSettingsForCourse(course);
+      100          if (!settings.enabled()) {
+      101              throw new ConflictException("Iris is not enabled for this exercise", "Iris", "irisDisabled");
+      102          }
+      103          var user = userRepository.findByIdElseThrow(session.getUserId());
+      104          // TODO: Once we can receive client form data through the IrisMessageResource, we should use that instead of fetching the latest submission to get the text
+      105          var participation = studentParticipationRepository.findWithEagerSubmissionsByExerciseIdAndStudentLogin(exercise.getId(), user.getLogin());
+      106          var latestSubmission = participation.flatMap(p -> p.getSubmissions().stream().max(Comparator.comparingLong(Submission::getId))).orElse(null);
+      107          String latestSubmissionText;
+      108          if (latestSubmission instanceof TextSubmission textSubmission) {
+      109              latestSubmissionText = textSubmission.getText();
+      110          }
+      111          else {
+      112              latestSubmissionText = null;
+      113          }
+      114          var chatHistory = session.getMessages().stream().map(PyrisMessageDTO::of).toList();
+      115          // @formatter:off
+      116          pyrisPipelineService.executePipeline(
+      117                  "text-exercise-chat",
+      118                  user.getSelectedLLMUsage(),
+      119                  settings.variant().jsonValue(),
+      120                  Optional.empty(),
+      121                  pyrisJobService.createTokenForJob(token -> new TextExerciseChatJob(token, course.getId(), exercise.getId(), session.getId())),
+      122                  dto -> new PyrisTextExerciseChatPipelineExecutionDTO(PyrisTextExerciseDTO.of(exercise), session.getTitle(), chatHistory, new PyrisUserDTO(user), latestSubmissionText, dto.settings(), dto.initialStages(), settings.customInstructions()),
+      123                  stages -> irisChatWebsocketService.sendMessage(session, null, stages)
+      124          );
+      125      }
+      126  
+      127      /**
+      128       * Handles the status update of a text exercise chat job.
+      129       *
+      130       * @param job          The job that is updated
+      131       * @param statusUpdate The status update
+      132       * @return The same job that was passed in
+      133       */
+      134      public TextExerciseChatJob handleStatusUpdate(TextExerciseChatJob job, PyrisTextExerciseChatStatusUpdateDTO statusUpdate) {
+      135          // TODO: LLM Token Tracking - or better, make this class a subclass of AbstractIrisChatSessionService
+      136          var session = (IrisTextExerciseChatSession) irisSessionRepository.findByIdElseThrow(job.sessionId());
+      137          String sessionTitle = AbstractIrisChatSessionService.setSessionTitle(session, statusUpdate.sessionTitle(), irisSessionRepository);
+      138          if (statusUpdate.result() != null) {
+      139              var message = session.newMessage();
+      140              message.addContent(new IrisTextMessageContent(statusUpdate.result()));
+      141              IrisMessage savedMessage = irisMessageService.saveMessage(message, session, IrisMessageSender.LLM);
+      142              irisChatWebsocketService.sendMessage(session, savedMessage, statusUpdate.stages(), sessionTitle);
+      143          }
+      144          else {
+      145              irisChatWebsocketService.sendMessage(session, null, statusUpdate.stages(), sessionTitle);
+      146          }
+      147  
+      148          return job;
+      149      }
+      150  
+      151      /**
+      152       * Checks if the user has access to the Iris session.
+      153       * A user has access if they have access to the exercise and the session belongs to them.
+      154       *
+      155       * @param user    The user to check
+      156       * @param session The session to check
+      157       */
+      158      @Override
+      159      public void checkHasAccessTo(User user, IrisTextExerciseChatSession session) {
+      160          // TODO: This check is probably unnecessary since we are fetching the sessions from the database with the user ID already
+      161          if (session.getUserId() != user.getId()) {
+      162              throw new AccessForbiddenException("Iris Text Exercise Chat Session", session.getId());
+      163          }
+      164          var exercise = textRepositoryApi.orElseThrow(() -> new TextApiNotPresentException(TextApi.class)).findByIdElseThrow(session.getExerciseId());
+      165          // TODO: This check is probably unnecessary as the endpoint already checks it via the @EnforceAtLeastStudentInExercise annotation
+      166          authCheckService.checkHasAtLeastRoleForExerciseElseThrow(Role.STUDENT, exercise, user);
+      167      }
+      168  
+      169      /**
+      170       * This method returns true if the user has access to the given session.
+      171       * The user has access iff the user is a student in the exercise's course,
+      172       * and they are the same user that created the session.
+      173       *
+      174       * @param user    The user to check
+      175       * @param session The session to check
+      176       * @return True if the user has access, false otherwise
+      177       */
+      178      public boolean hasAccess(User user, IrisTextExerciseChatSession session) {
+      179          try {
+      180              checkHasAccessTo(user, session);
+      181              return true;
+      182          }
+      183          catch (AccessForbiddenException e) {
+      184              return false;
+      185          }
+      186      }
+      187  
+      188      @Override
+      189      public void checkIrisEnabledFor(IrisTextExerciseChatSession session) {
+      190          var exercise = textRepositoryApi.orElseThrow(() -> new TextApiNotPresentException(TextApi.class)).findByIdElseThrow(session.getExerciseId());
+      191          var course = exercise.getCourseViaExerciseGroupOrCourseMember();
+      192          irisSettingsService.ensureEnabledForCourseOrElseThrow(course);
+      193      }
+      194  
+      195      @Override
+      196      public void checkRateLimit(User user, IrisTextExerciseChatSession session) {
+      197          rateLimitService.checkRateLimitElseThrow(session, user);
+      198      }
+      199  }

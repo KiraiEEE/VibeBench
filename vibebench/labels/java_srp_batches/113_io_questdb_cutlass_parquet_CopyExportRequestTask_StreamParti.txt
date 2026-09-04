@@ -1,0 +1,364 @@
+row 113   questdb/questdb#6865
+============================================================================
+CLASS io.questdb.cutlass.parquet.CopyExportRequestTask.StreamPartitionParquetExporter   loc=359 methods=18 wmc=55 lcom=0.0 c3=0.1496155738326324
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      421      public class StreamPartitionParquetExporter implements Mutable, QuietCloseable {
+      422          // Buffer header size: [8 bytes data_len][8 bytes rows_written_to_row_groups]
+      423          private static final int BUFFER_HEADER_SIZE = 2 * Long.BYTES;
+      424          private DirectIntList bloomFilterColumnIndexes = new DirectIntList(16, MemoryTag.NATIVE_PARQUET_EXPORTER, true);
+      425          private DirectLongList columnData = new DirectLongList(32, MemoryTag.NATIVE_PARQUET_EXPORTER, true);
+      426          private DirectLongList columnMetadata = new DirectLongList(32, MemoryTag.NATIVE_PARQUET_EXPORTER, true);
+      427          private DirectUtf8Sink columnNames = new DirectUtf8Sink(32, false, MemoryTag.NATIVE_PARQUET_EXPORTER);
+      428          private long currentFrameRowCount = 0;
+      429          private long currentPartitionIndex = -1;
+      430          private boolean exportFinished = false;
+      431          // Cumulative count of rows written to Parquet row groups by Rust.
+      432          // Used to determine when partition memory can be safely released.
+      433          private long rowsWrittenToRowGroups = 0;
+      434          private long streamExportCurrentPtr;
+      435          private long streamExportCurrentSize;
+      436          private long streamWriter = -1;
+      437          private long totalRows;
+      438  
+      439          @Override
+      440          public void clear() {
+      441              // free memory after one query finished, will re-malloc on next query
+      442              Misc.free(columnNames);
+      443              Misc.free(columnData);
+      444              Misc.free(columnMetadata);
+      445              Misc.free(bloomFilterColumnIndexes);
+      446              closeWriter();
+      447              streamExportCurrentPtr = 0;
+      448              streamExportCurrentSize = 0;
+      449              rowsWrittenToRowGroups = 0;
+      450              totalRows = 0;
+      451              freeOwnedPageFrameCursor();
+      452              exportFinished = false;
+      453          }
+      454  
+      455          @Override
+      456          public void close() {
+      457              closeWriter();
+      458              freeOwnedPageFrameCursor();
+      459              columnNames = Misc.free(columnNames);
+      460              columnData = Misc.free(columnData);
+      461              columnMetadata = Misc.free(columnMetadata);
+      462              bloomFilterColumnIndexes = Misc.free(bloomFilterColumnIndexes);
+      463          }
+      464  
+      465          public void finishExport() throws Exception {
+      466              if (exportFinished) {
+      467                  clear();
+      468                  return;
+      469              }
+      470              long buffer = finishStreamingParquetWrite(streamWriter);
+      471              exportFinished = true;
+      472              streamExportCurrentPtr = buffer + BUFFER_HEADER_SIZE;
+      473              streamExportCurrentSize = Unsafe.getUnsafe().getLong(buffer);
+      474              rowsWrittenToRowGroups = Unsafe.getUnsafe().getLong(buffer + Long.BYTES);
+      475              assert writeCallback != null;
+      476              writeCallback.onWrite(streamExportCurrentPtr, streamExportCurrentSize);
+      477              clear();
+      478              streamWriter = -1;
+      479          }
+      480  
+      481          public void freeOwnedPageFrameCursor() {
+      482              if (tempTableFactory != null) {
+      483                  tempTableFactory = Misc.free(tempTableFactory);
+      484                  pageFrameCursor = Misc.free(pageFrameCursor);
+      485              }
+      486          }
+      487  
+      488          public long getCurrentFrameRowCount() {
+      489              return currentFrameRowCount;
+      490          }
+      491  
+      492          public long getCurrentPartitionIndex() {
+      493              return currentPartitionIndex;
+      494          }
+      495  
+      496          public long getRowsWrittenToRowGroups() {
+      497              return rowsWrittenToRowGroups;
+      498          }
+      499  
+      500          public long getTotalRows() {
+      501              return totalRows;
+      502          }
+      503  
+      504          public boolean onResume() throws Exception {
+      505              if (streamExportCurrentPtr != 0) {
+      506                  assert writeCallback != null;
+      507                  while (streamExportCurrentPtr != 0) {
+      508                      writeCallback.onWrite(streamExportCurrentPtr, streamExportCurrentSize);
+      509                      long buffer = writeStreamingParquetChunk(streamWriter, 0, 0);
+      510                      if (buffer != 0) {
+      511                          streamExportCurrentPtr = buffer + BUFFER_HEADER_SIZE;
+      512                          streamExportCurrentSize = Unsafe.getUnsafe().getLong(buffer);
+      513                          rowsWrittenToRowGroups = Unsafe.getUnsafe().getLong(buffer + Long.BYTES);
+      514                      } else {
+      515                          streamExportCurrentPtr = 0;
+      516                          streamExportCurrentSize = 0;
+      517                      }
+      518                  }
+      519  
+      520                  if (!exportFinished) {
+      521                      totalRows += currentFrameRowCount;
+      522                      entry.setStreamingSendRowCount(totalRows);
+      523                  }
+      524                  return true;
+      525              }
+      526              return false;
+      527          }
+      528  
+      529          public void setCurrentPartitionIndex(long currentPartitionIndex, long frameRowCount) {
+      530              this.currentPartitionIndex = currentPartitionIndex;
+      531              this.currentFrameRowCount = frameRowCount;
+      532          }
+      533  
+      534          public void setUp() {
+      535              setUp(metadata, pageFrameCursor, null);
+      536          }
+      537  
+      538          public void setUp(RecordMetadata adjustedMetadata) {
+      539              setUp(adjustedMetadata, null, null);
+      540          }
+      541  
+      542          /**
+      543           * Unified writer setup for all export modes.
+      544           *
+      545           * @param meta          column metadata to encode
+      546           * @param pfc           page frame cursor for SYMBOL table lookup (null when cursor-based)
+      547           * @param baseColumnMap per-output-column base index for hybrid path, or null for
+      548           *                      direct/temp-table path (where every column is a real table column)
+      549           */
+      550          public void setUp(RecordMetadata meta, PageFrameCursor pfc, IntList baseColumnMap) {
+      551              metadata = meta;
+      552              pageFrameCursor = pfc;
+      553              columnNames.reopen();
+      554              columnMetadata.reopen();
+      555              columnData.reopen();
+      556  
+      557              for (int i = 0, n = meta.getColumnCount(); i < n; i++) {
+      558                  CharSequence columnName = meta.getColumnName(i);
+      559                  final int startSize = columnNames.size();
+      560                  columnNames.put(columnName);
+      561                  columnMetadata.add(columnNames.size() - startSize);
+      562                  final int columnType = meta.getColumnType(i);
+      563                  // GenericRecordMetadata (hybrid/cursor paths) returns i;
+      564                  // table metadata returns the physical writer column index.
+      565                  final int writerIdx = meta.getWriterIndex(i);
+      566  
+      567                  // A SYMBOL column needs symbol-table metadata when it is a
+      568                  // real table column.  In the hybrid path (baseColumnMap != null)
+      569                  // only pass-through columns (baseColumnMap >= 0) qualify;
+      570                  // in the direct path (baseColumnMap == null) every column is real.
+      571                  boolean isPassThroughSymbol = ColumnType.isSymbol(columnType)
+      572                          && (baseColumnMap == null || baseColumnMap.getQuick(i) >= 0);
+      573  
+      574                  if (isPassThroughSymbol) {
+      575                      assert pfc != null;
+      576                      int symbolTableIdx = baseColumnMap != null ? baseColumnMap.getQuick(i) : i;
+      577                      StaticSymbolTable symbolTable = pfc.getSymbolTable(symbolTableIdx);
+      578                      assert symbolTable != null;
+      579                      int symbolColumnType = columnType;
+      580                      if (!symbolTable.containsNullValue()) {
+      581                          symbolColumnType |= 1 << 31;
+      582                      }
+      583                      // Mask to 32 bits: symbolColumnType can have bit 31 set (no-null flag),
+      584                      // making it negative. Without the mask, Java sign-extends it to 64 bits
+      585                      // before the OR, clobbering writerIdx in the upper 32 bits.
+      586                      columnMetadata.add((long) writerIdx << 32 | (symbolColumnType & 0xFFFFFFFFL));
+      587                  } else {
+      588                      columnMetadata.add((long) writerIdx << 32 | (columnType & 0xFFFFFFFFL));
+      589                  }
+      590              }
+      591  
+      592              long bloomFilterIndexesPtr = 0;
+      593              int bloomFilterCount = 0;
+      594              double fpp = Double.isNaN(bloomFilterFpp) ? DEFAULT_BLOOM_FILTER_FPP : bloomFilterFpp;
+      595  
+      596              if (bloomFilterColumns != null && !bloomFilterColumns.isEmpty()) {
+      597                  bloomFilterColumnIndexes.reopen();
+      598                  parseBloomFilterColumnIndexes(bloomFilterColumns, metadata, bloomFilterColumnIndexes, bloomFilterColumnsPosition);
+      599                  if (bloomFilterColumnIndexes.size() > 0) {
+      600                      bloomFilterIndexesPtr = bloomFilterColumnIndexes.getAddress();
+      601                      bloomFilterCount = (int) bloomFilterColumnIndexes.size();
+      602                  }
+      603              }
+      604  
+      605              streamWriter = createStreamingParquetWriter(
+      606                      Unsafe.getNativeAllocator(MemoryTag.NATIVE_PARQUET_EXPORTER),
+      607                      meta.getColumnCount(),
+      608                      columnNames.ptr(),
+      609                      columnNames.size(),
+      610                      columnMetadata.getAddress(),
+      611                      meta.getTimestampIndex(),
+      612                      descending,
+      613                      ParquetCompression.packCompressionCodecLevel(compressionCodec, compressionLevel),
+      614                      statisticsEnabled,
+      615                      rawArrayEncoding,
+      616                      rowGroupSize,
+      617                      dataPageSize,
+      618                      parquetVersion,
+      619                      bloomFilterIndexesPtr,
+      620                      bloomFilterCount,
+      621                      fpp
+      622              );
+      623          }
+      624  
+      625          public void writeHybridFrame(DirectLongList prebuiltColumnData, long frameRowCount) throws Exception {
+      626              assert streamWriter != -1 && writeCallback != null;
+      627              currentFrameRowCount = frameRowCount;
+      628              long buffer = writeStreamingParquetChunk(streamWriter, prebuiltColumnData.getAddress(), frameRowCount);
+      629              while (buffer != 0) {
+      630                  streamExportCurrentPtr = buffer + BUFFER_HEADER_SIZE;
+      631                  streamExportCurrentSize = Unsafe.getUnsafe().getLong(buffer);
+      632                  rowsWrittenToRowGroups = Unsafe.getUnsafe().getLong(buffer + Long.BYTES);
+      633                  writeCallback.onWrite(streamExportCurrentPtr, streamExportCurrentSize);
+      634                  buffer = writeStreamingParquetChunk(streamWriter, 0, 0);
+      635              }
+      636              totalRows += frameRowCount;
+      637              entry.setStreamingSendRowCount(totalRows);
+      638              streamExportCurrentPtr = 0;
+      639              streamExportCurrentSize = 0;
+      640          }
+      641  
+      642          public void writePageFrame(PageFrameCursor frameCursor, PageFrame frame) throws Exception {
+      643              assert streamWriter != -1 && writeCallback != null;
+      644              if (frame.getFormat() == PartitionFormat.NATIVE) {
+      645                  columnData.clear();
+      646                  final long frameRowCount = frame.getPartitionHi() - frame.getPartitionLo();
+      647  
+      648                  for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
+      649                      long localColTop = frame.getPageAddress(i) > 0 ? 0 : frameRowCount;
+      650                      final int columnType = metadata.getColumnType(i);
+      651                      final long pageAddress = frame.getPageAddress(i);
+      652  
+      653                      // Assert alignment for SIMD operations in Rust parquet encoder
+      654                      assert pageAddress == 0 || isAlignedForColumnType(pageAddress, columnType)
+      655                              : "Unaligned address " + pageAddress + " for column type " + ColumnType.nameOf(columnType);
+      656  
+      657                      if (ColumnType.isSymbol(columnType)) {
+      658                          SymbolMapReader symbolMapReader = (SymbolMapReader) frameCursor.getSymbolTable(i);
+      659                          final MemoryR symbolValuesMem = symbolMapReader.getSymbolValuesColumn();
+      660                          final MemoryR symbolOffsetsMem = symbolMapReader.getSymbolOffsetsColumn();
+      661  
+      662                          columnData.add(localColTop);
+      663                          columnData.add(pageAddress);
+      664                          columnData.add(frame.getPageSize(i));
+      665                          columnData.add(symbolValuesMem.addressOf(0));
+      666                          columnData.add(symbolValuesMem.size());
+      667                          columnData.add(symbolOffsetsMem.addressOf(HEADER_SIZE));
+      668                          columnData.add(symbolMapReader.getSymbolCount());
+      669                      } else {
+      670                          columnData.add(localColTop);
+      671                          columnData.add(pageAddress);
+      672                          columnData.add(frame.getPageSize(i));
+      673                          columnData.add(frame.getAuxPageAddress(i));
+      674                          columnData.add(frame.getAuxPageSize(i));
+      675                          columnData.add(0L);
+      676                          columnData.add(0L);
+      677                      }
+      678                  }
+      679  
+      680                  long buffer = writeStreamingParquetChunk(streamWriter, columnData.getAddress(), frameRowCount);
+      681                  while (buffer != 0) {
+      682                      streamExportCurrentPtr = buffer + BUFFER_HEADER_SIZE;
+      683                      streamExportCurrentSize = Unsafe.getUnsafe().getLong(buffer);
+      684                      rowsWrittenToRowGroups = Unsafe.getUnsafe().getLong(buffer + Long.BYTES);
+      685                      writeCallback.onWrite(streamExportCurrentPtr, streamExportCurrentSize);
+      686                      buffer = writeStreamingParquetChunk(
+      687                              streamWriter,
+      688                              0,
+      689                              0
+      690                      );
+      691                  }
+      692              } else {
+      693                  columnData.clear();
+      694  
+      695                  for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
+      696                      final int columnType = metadata.getColumnType(i);
+      697                      if (ColumnType.isSymbol(columnType)) {
+      698                          SymbolMapReader symbolMapReader = (SymbolMapReader) frameCursor.getSymbolTable(i);
+      699                          final MemoryR symbolValuesMem = symbolMapReader.getSymbolValuesColumn();
+      700                          final MemoryR symbolOffsetsMem = symbolMapReader.getSymbolOffsetsColumn();
+      701                          columnData.add(symbolValuesMem.addressOf(0));
+      702                          columnData.add(symbolValuesMem.size());
+      703                          columnData.add(symbolOffsetsMem.addressOf(HEADER_SIZE));
+      704                          columnData.add(symbolMapReader.getSymbolCount());
+      705                      }
+      706                  }
+      707  
+      708                  long allocator = Unsafe.getNativeAllocator(MemoryTag.NATIVE_PARQUET_EXPORTER);
+      709                  long buffer = writeStreamingParquetChunkFromRowGroup(
+      710                          streamWriter,
+      711                          allocator,
+      712                          columnData.getAddress(),
+      713                          frame.getParquetPartitionDecoder().getFileAddr(),
+      714                          frame.getParquetPartitionDecoder().getFileSize(),
+      715                          frame.getParquetRowGroup(),
+      716                          frame.getParquetRowGroupLo(),
+      717                          frame.getParquetRowGroupHi()
+      718                  );
+      719                  while (buffer != 0) {
+      720                      streamExportCurrentPtr = buffer + BUFFER_HEADER_SIZE;
+      721                      streamExportCurrentSize = Unsafe.getUnsafe().getLong(buffer);
+      722                      rowsWrittenToRowGroups = Unsafe.getUnsafe().getLong(buffer + Long.BYTES);
+      723                      writeCallback.onWrite(streamExportCurrentPtr, streamExportCurrentSize);
+      724                      buffer = writeStreamingParquetChunkFromRowGroup(
+      725                              streamWriter,
+      726                              allocator,
+      727                              0,
+      728                              0,
+      729                              0,
+      730                              0,
+      731                              0,
+      732                              0
+      733                      );
+      734                  }
+      735              }
+      736              totalRows += currentFrameRowCount;
+      737              entry.setStreamingSendRowCount(totalRows);
+      738              streamExportCurrentPtr = 0;
+      739              streamExportCurrentSize = 0;
+      740          }
+      741  
+      742          private static int getRequiredAlignmentForSimd(int columnType) {
+      743              switch (ColumnType.tagOf(columnType)) {
+      744                  // Types using Simd<i64, 8> or Simd<f64, 8>
+      745                  case ColumnType.LONG:
+      746                  case ColumnType.DOUBLE:
+      747                  case ColumnType.TIMESTAMP:
+      748                  case ColumnType.DATE:
+      749                      return 8;
+      750                  // Types using Simd<i32, 16> or Simd<f32, 16>
+      751                  case ColumnType.INT:
+      752                  case ColumnType.FLOAT:
+      753                  case ColumnType.SYMBOL:
+      754                      return 4;
+      755                  // All other types use scalar paths - no SIMD alignment required
+      756                  default:
+      757                      return 1;
+      758              }
+      759          }
+      760  
+      761          /**
+      762           * Checks if the given address is properly aligned for SIMD operations.
+      763           * Only types that use SIMD in Rust parquet encoder require alignment:
+      764           * - LONG, DOUBLE, TIMESTAMP: 8-byte alignment (Simd<i64, 8>, Simd<f64, 8>)
+      765           * - INT, FLOAT, SYMBOL: 4-byte alignment (Simd<i32, 16>, Simd<f32, 16>)
+      766           * Other types (SHORT, BYTE, etc.) use scalar paths and don't require SIMD alignment.
+      767           */
+      768          private static boolean isAlignedForColumnType(long address, int columnType) {
+      769              int alignment = getRequiredAlignmentForSimd(columnType);
+      770              return alignment <= 1 || (address & (alignment - 1)) == 0;
+      771          }
+      772  
+      773          private void closeWriter() {
+      774              if (streamWriter != -1) {
+      775                  closeStreamingParquetWriter(streamWriter);
+      776                  streamWriter = -1;
+      777              }
+      778          }
+      779      }

@@ -1,0 +1,406 @@
+row 236   apache/pulsar#24592
+============================================================================
+CLASS org.apache.pulsar.broker.service.nonpersistent.NonPersistentSubscription   loc=541 methods=41 wmc=86 lcom=0.45 c3=0.0848187772779181
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       53  public class NonPersistentSubscription extends AbstractSubscription {
+       54      private final NonPersistentTopic topic;
+       55      private volatile NonPersistentDispatcher dispatcher;
+       56      private final String topicName;
+       57      private final String subName;
+       58      private final String fullName;
+       59  
+       60      private static final int FALSE = 0;
+       61      private static final int TRUE = 1;
+       62      private static final AtomicIntegerFieldUpdater<NonPersistentSubscription> IS_FENCED_UPDATER =
+       63              AtomicIntegerFieldUpdater
+       64                      .newUpdater(NonPersistentSubscription.class, "isFenced");
+       65      @SuppressWarnings("unused")
+       66      private volatile int isFenced = FALSE;
+       67  
+       68      private volatile Map<String, String> subscriptionProperties;
+       69  
+       70      private KeySharedMode keySharedMode = null;
+       71  
+       72      public NonPersistentSubscription(NonPersistentTopic topic, String subscriptionName,
+       73                                       Map<String, String> properties) {
+       74          this.topic = topic;
+       75          this.topicName = topic.getName();
+       76          this.subName = subscriptionName;
+       77          this.fullName = MoreObjects.toStringHelper(this).add("topic", topicName).add("name", subName).toString();
+       78          IS_FENCED_UPDATER.set(this, FALSE);
+       79          this.subscriptionProperties = properties != null
+       80                  ? Collections.unmodifiableMap(properties) : Collections.emptyMap();
+       81      }
+       82  
+       83      @Override
+       84      public BrokerInterceptor interceptor() {
+       85          return this.topic.getBrokerService().getInterceptor();
+       86      }
+       87  
+       88      @Override
+       89      public String getName() {
+       90          return this.subName;
+       91      }
+       92  
+       93      @Override
+       94      public Topic getTopic() {
+       95          return topic;
+       96      }
+       97  
+       98      @Override
+       99      public boolean isReplicated() {
+      100          return false;
+      101      }
+      102  
+      103      @Override
+      104      public synchronized CompletableFuture<Void> addConsumer(Consumer consumer) {
+      105          if (IS_FENCED_UPDATER.get(this) == TRUE) {
+      106              log.warn("Attempting to add consumer {} on a fenced subscription", consumer);
+      107              return FutureUtil.failedFuture(new SubscriptionFencedException("Subscription is fenced"));
+      108          }
+      109  
+      110          if (dispatcher == null || !dispatcher.isConsumerConnected()) {
+      111              Dispatcher previousDispatcher = null;
+      112  
+      113              switch (consumer.subType()) {
+      114              case Exclusive:
+      115                  if (dispatcher == null || dispatcher.getType() != SubType.Exclusive) {
+      116                      previousDispatcher = dispatcher;
+      117                      dispatcher = new NonPersistentDispatcherSingleActiveConsumer(SubType.Exclusive, 0, topic, this);
+      118                  }
+      119                  break;
+      120              case Shared:
+      121                  if (dispatcher == null || dispatcher.getType() != SubType.Shared) {
+      122                      previousDispatcher = dispatcher;
+      123                      dispatcher = new NonPersistentDispatcherMultipleConsumers(topic, this);
+      124                  }
+      125                  break;
+      126              case Failover:
+      127                  int partitionIndex = TopicName.getPartitionIndex(topicName);
+      128                  if (partitionIndex < 0) {
+      129                      // For non partition topics, assume index 0 to pick a predictable consumer
+      130                      partitionIndex = 0;
+      131                  }
+      132  
+      133                  if (dispatcher == null || dispatcher.getType() != SubType.Failover) {
+      134                      previousDispatcher = dispatcher;
+      135                      dispatcher = new NonPersistentDispatcherSingleActiveConsumer(SubType.Failover, partitionIndex,
+      136                              topic, this);
+      137                  }
+      138                  break;
+      139              case Key_Shared:
+      140                  KeySharedMeta ksm = consumer.getKeySharedMeta();
+      141                  if (dispatcher == null || dispatcher.getType() != SubType.Key_Shared
+      142                          || !((NonPersistentStickyKeyDispatcherMultipleConsumers) dispatcher)
+      143                                  .hasSameKeySharedPolicy(ksm)) {
+      144                      previousDispatcher = dispatcher;
+      145                      this.dispatcher = new NonPersistentStickyKeyDispatcherMultipleConsumers(topic, this, ksm);
+      146                  }
+      147                  break;
+      148              default:
+      149                  return FutureUtil.failedFuture(new ServerMetadataException("Unsupported subscription type"));
+      150              }
+      151  
+      152              if (previousDispatcher != null) {
+      153                  previousDispatcher.close().thenRun(() -> {
+      154                      log.info("[{}][{}] Successfully closed previous dispatcher", topicName, subName);
+      155                  }).exceptionally(ex -> {
+      156                      log.error("[{}][{}] Failed to close previous dispatcher", topicName, subName, ex);
+      157                      return null;
+      158                  });
+      159              }
+      160          } else {
+      161              Optional<CompletableFuture<Void>> compatibilityError =
+      162                      checkForConsumerCompatibilityErrorWithDispatcher(dispatcher, consumer);
+      163              if (compatibilityError.isPresent()) {
+      164                  return compatibilityError.get();
+      165              }
+      166          }
+      167  
+      168          return dispatcher.addConsumer(consumer);
+      169      }
+      170  
+      171      @Override
+      172      public synchronized void removeConsumer(Consumer consumer, boolean isResetCursor) throws BrokerServiceException {
+      173          if (dispatcher != null) {
+      174              dispatcher.removeConsumer(consumer);
+      175          }
+      176          // preserve accumulative stats form removed consumer
+      177          ConsumerStatsImpl stats = consumer.getStats();
+      178          bytesOutFromRemovedConsumers.add(stats.bytesOutCounter);
+      179          msgOutFromRemovedConsumer.add(stats.msgOutCounter);
+      180          // Unsubscribe when all the consumers disconnected.
+      181          if (dispatcher != null && CollectionUtils.isEmpty(dispatcher.getConsumers())) {
+      182              topic.unsubscribe(subName);
+      183          }
+      184  
+      185          // invalid consumer remove will throw an exception
+      186          // decrement usage is triggered only for valid consumer close
+      187          topic.decrementUsageCount();
+      188          if (log.isDebugEnabled()) {
+      189              log.debug("[{}] [{}] [{}] Removed consumer -- count: {}", topic.getName(), subName, consumer.consumerName(),
+      190                      topic.currentUsageCount());
+      191          }
+      192      }
+      193  
+      194      @Override
+      195      public void consumerFlow(Consumer consumer, int additionalNumberOfMessages) {
+      196          dispatcher.consumerFlow(consumer, additionalNumberOfMessages);
+      197      }
+      198  
+      199      @Override
+      200      public void acknowledgeMessage(List<Position> position, AckType ackType, Map<String, Long> properties) {
+      201          // No-op
+      202      }
+      203  
+      204      @Override
+      205      public String toString() {
+      206          return fullName;
+      207      }
+      208  
+      209      @Override
+      210      public String getTopicName() {
+      211          return this.topicName;
+      212      }
+      213  
+      214      @Override
+      215      public SubType getType() {
+      216          return dispatcher != null ? dispatcher.getType() : null;
+      217      }
+      218  
+      219      @Override
+      220      public String getTypeString() {
+      221          SubType type = getType();
+      222          if (type == null) {
+      223              return "None";
+      224          }
+      225  
+      226          switch (type) {
+      227          case Exclusive:
+      228              return "Exclusive";
+      229          case Failover:
+      230              return "Failover";
+      231          case Shared:
+      232              return "Shared";
+      233          case Key_Shared:
+      234              return "Key_Shared";
+      235          }
+      236  
+      237          return "Null";
+      238      }
+      239  
+      240      @Override
+      241      public CompletableFuture<Void> clearBacklog() {
+      242          // No-op
+      243          return CompletableFuture.completedFuture(null);
+      244      }
+      245  
+      246      @Override
+      247      public CompletableFuture<Void> skipMessages(int numMessagesToSkip) {
+      248          // No-op
+      249          return CompletableFuture.completedFuture(null);
+      250      }
+      251  
+      252      @Override
+      253      public CompletableFuture<Void> resetCursor(long timestamp) {
+      254          // No-op
+      255          return CompletableFuture.completedFuture(null);
+      256      }
+      257  
+      258      @Override
+      259      public CompletableFuture<Entry> peekNthMessage(int messagePosition) {
+      260          // No-op
+      261          return CompletableFuture.completedFuture(null); // TODO: throw exception
+      262      }
+      263  
+      264      @Override
+      265      public long getNumberOfEntriesInBacklog(boolean getPreciseBacklog) {
+      266          // No-op
+      267          return 0;
+      268      }
+      269  
+      270      @Override
+      271      public NonPersistentDispatcher getDispatcher() {
+      272          return this.dispatcher;
+      273      }
+      274  
+      275      @Override
+      276      public boolean isSubscriptionMigrated() {
+      277          return topic.isMigrated();
+      278      }
+      279  
+      280      /**
+      281       * Disconnect all consumers from this subscription.
+      282       *
+      283       * @return CompletableFuture indicating the completion of the operation.
+      284       */
+      285      @Override
+      286      public synchronized CompletableFuture<Void> disconnect(Optional<BrokerLookupData> assignedBrokerLookupData) {
+      287          CompletableFuture<Void> closeFuture = new CompletableFuture<>();
+      288  
+      289          (dispatcher != null
+      290                  ? dispatcher.disconnectAllConsumers(false, assignedBrokerLookupData)
+      291                  : CompletableFuture.completedFuture(null))
+      292                  .thenRun(() -> {
+      293                      log.info("[{}][{}] Successfully disconnected subscription consumers", topicName, subName);
+      294                      closeFuture.complete(null);
+      295                  }).exceptionally(exception -> {
+      296                      log.error("[{}][{}] Error disconnecting subscription consumers", topicName, subName, exception);
+      297                      closeFuture.completeExceptionally(exception);
+      298                      return null;
+      299                  });
+      300  
+      301          return closeFuture;
+      302  
+      303      }
+      304  
+      305      private CompletableFuture<Void> fence() {
+      306          IS_FENCED_UPDATER.set(this, TRUE);
+      307          return CompletableFuture.completedFuture(null);
+      308      }
+      309  
+      310  
+      311      /**
+      312       * Fence this subscription and optionally disconnect all consumers.
+      313       *
+      314       * @return CompletableFuture indicating the completion of the operation.
+      315       */
+      316      @Override
+      317      public synchronized CompletableFuture<Void> close(boolean disconnectConsumers,
+      318                                                        Optional<BrokerLookupData> assignedBrokerLookupData) {
+      319          CompletableFuture<Void> closeFuture = new CompletableFuture<>();
+      320  
+      321          // block any further consumers on this subscription
+      322          IS_FENCED_UPDATER.set(this, TRUE);
+      323  
+      324          (dispatcher != null
+      325                  ? dispatcher.close(disconnectConsumers, assignedBrokerLookupData)
+      326                  : CompletableFuture.completedFuture(null))
+      327                  .thenRun(() -> {
+      328                      log.info("[{}][{}] Successfully closed subscription", topicName, subName);
+      329                      closeFuture.complete(null);
+      330                  }).exceptionally(exception -> {
+      331                      IS_FENCED_UPDATER.set(this, FALSE);
+      332                      if (dispatcher != null) {
+      333                          dispatcher.reset();
+      334                      }
+      335                      log.error("[{}][{}] Error closing subscription", topicName, subName, exception);
+      336                      closeFuture.completeExceptionally(exception);
+      337                      return null;
+      338                  });
+      339  
+      340          return closeFuture;
+      341      }
+      342  
+      343      /**
+      344       * Delete the subscription by closing and deleting its managed cursor if no consumers are connected to it. Handle
+      345       * unsubscribe call from admin layer.
+      346       *
+      347       * @return CompletableFuture indicating the completion of delete operation
+      348       */
+      349      @Override
+      350      public CompletableFuture<Void> delete() {
+      351          return delete(false);
+      352      }
+      353  
+      354      /**
+      355       * Forcefully close all consumers and deletes the subscription.
+      356       * @return
+      357       */
+      358      @Override
+      359      public CompletableFuture<Void> deleteForcefully() {
+      360          return delete(true);
+      361      }
+      362  
+      363      /**
+      364       * Delete the subscription by closing and deleting its managed cursor. Handle unsubscribe call from admin layer.
+      365       *
+      366       * @param closeIfConsumersConnected
+      367       *            Flag indicate whether explicitly close connected consumers before trying to delete subscription. If
+      368       *            any consumer is connected to it and if this flag is disable then this operation fails.
+      369       * @return CompletableFuture indicating the completion of delete operation
+      370       */
+      371      private CompletableFuture<Void> delete(boolean closeIfConsumersConnected) {
+      372          CompletableFuture<Void> deleteFuture = new CompletableFuture<>();
+      373  
+      374          log.info("[{}][{}] Unsubscribing", topicName, subName);
+      375  
+      376          CompletableFuture<Void> closeSubscriptionFuture = new CompletableFuture<>();
+      377  
+      378          if (closeIfConsumersConnected) {
+      379              this.close(true, Optional.empty()).thenRun(() -> {
+      380                  closeSubscriptionFuture.complete(null);
+      381              }).exceptionally(ex -> {
+      382                  log.error("[{}][{}] Error disconnecting and closing subscription", topicName, subName, ex);
+      383                  closeSubscriptionFuture.completeExceptionally(ex);
+      384                  return null;
+      385              });
+      386          } else {
+      387              this.fence().thenRun(() -> {
+      388                  closeSubscriptionFuture.complete(null);
+      389              }).exceptionally(exception -> {
+      390                  log.error("[{}][{}] Error closing subscription", topicName, subName, exception);
+      391                  closeSubscriptionFuture.completeExceptionally(exception);
+      392                  return null;
+      393              });
+      394          }
+      395  
+      396          // cursor close handles pending delete (ack) operations
+      397          closeSubscriptionFuture.thenCompose(v -> topic.unsubscribe(subName)).thenAccept(v -> {
+      398              synchronized (this) {
+      399                  (dispatcher != null ? dispatcher.close() : CompletableFuture.completedFuture(null)).thenRun(() -> {
+      400                      log.info("[{}][{}] Successfully deleted subscription", topicName, subName);
+      401                      deleteFuture.complete(null);
+      402                  }).exceptionally(ex -> {
+      403                      IS_FENCED_UPDATER.set(this, FALSE);
+      404                      if (dispatcher != null) {
+      405                          dispatcher.reset();
+      406                      }
+      407                      log.error("[{}][{}] Error deleting subscription", topicName, subName, ex);
+      408                      deleteFuture.completeExceptionally(ex);
+      409                      return null;
+      410                  });
+      411              }
+      412          }).exceptionally(exception -> {
+      413              IS_FENCED_UPDATER.set(this, FALSE);
+      414              log.error("[{}][{}] Error deleting subscription", topicName, subName, exception);
+      415              deleteFuture.completeExceptionally(exception);
+      416              return null;
+      417          });
+      418  
+      419          return deleteFuture;
+      420      }
+      421  
+      422      /**
+      423       * Handle unsubscribe command from the client API Check with the dispatcher is this consumer can proceed with
+      424       * unsubscribe.
+      425       *
+      426       * @param consumer consumer object that is initiating the unsubscribe operation
+      427       * @return CompletableFuture indicating the completion of ubsubscribe operation
+      428       */
+      429      @Override
+      430      public CompletableFuture<Void> doUnsubscribe(Consumer consumer) {
+      431          return doUnsubscribe(consumer, false);
+      432      }
+      433  
+      434      /**
+      435       * Handle unsubscribe command from the client API Check with the dispatcher is this consumer can proceed with
+      436       * unsubscribe.
+      437       *
+      438       * @param consumer consumer object that is initiating the unsubscribe operation
+      439       * @param force unsubscribe forcefully by disconnecting consumers and closing subscription
+      440       * @return CompletableFuture indicating the completion of unsubscribe operation
+      441       */
+      442      @Override
+      443      public CompletableFuture<Void> doUnsubscribe(Consumer consumer, boolean force) {
+      444          CompletableFuture<Void> future = new CompletableFuture<>();
+      445          try {
+      446              if (force || dispatcher.canUnsubscribe(consumer)) {
+      447                  consumer.close();
+      448                  return delete(force);
+      449              }
+      450              future.completeExceptionally(
+      451                      new ServerMetadataException("Unconnected or shared consumer attempting to unsubscribe"));
+      452          } catch (BrokerServiceException e) {
+       ... truncated at 400 lines ...

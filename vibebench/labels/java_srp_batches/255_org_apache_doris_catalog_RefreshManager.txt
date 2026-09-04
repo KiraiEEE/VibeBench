@@ -1,0 +1,305 @@
+row 255   apache/doris#61725
+============================================================================
+CLASS org.apache.doris.catalog.RefreshManager   loc=300 methods=14 wmc=58 lcom=0.1538461538461538 c3=0.3475586348592973
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       47  public class RefreshManager {
+       48      private static final Logger LOG = LogManager.getLogger(RefreshManager.class);
+       49      private ScheduledThreadPoolExecutor refreshScheduler = ThreadPoolManager.newDaemonScheduledThreadPool(1,
+       50              "catalog-refresh-timer-pool", true);
+       51      // Unit:SECONDS
+       52      private static final int REFRESH_TIME_SEC = 5;
+       53      // key is the id of a catalog, value is an array of length 2, used to store
+       54      // the original refresh time and the current remaining time of the catalog
+       55      private Map<Long, Integer[]> refreshMap = Maps.newConcurrentMap();
+       56  
+       57      // Refresh catalog
+       58      public void handleRefreshCatalog(String catalogName, boolean invalidCache) throws UserException {
+       59          CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalogOrAnalysisException(catalogName);
+       60          refreshCatalogInternal(catalog, invalidCache);
+       61          CatalogLog log = CatalogLog.createForRefreshCatalog(catalog.getId(), invalidCache);
+       62          Env.getCurrentEnv().getEditLog().logCatalogLog(OperationType.OP_REFRESH_CATALOG, log);
+       63      }
+       64  
+       65      public void replayRefreshCatalog(CatalogLog log) {
+       66          CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(log.getCatalogId());
+       67          if (catalog == null) {
+       68              LOG.warn("failed to find catalog replaying refresh catalog {}", log.getCatalogId());
+       69              return;
+       70          }
+       71          refreshCatalogInternal(catalog, log.isInvalidCache());
+       72      }
+       73  
+       74      private void refreshCatalogInternal(CatalogIf catalog, boolean invalidCache) {
+       75          if (catalog.isInternalCatalog()) {
+       76              return;
+       77          }
+       78          ((ExternalCatalog) catalog).onRefreshCache(invalidCache);
+       79          LOG.info("refresh catalog {} with invalidCache {}", catalog.getName(), invalidCache);
+       80      }
+       81  
+       82      // Refresh database
+       83      public void handleRefreshDb(String catalogName, String dbName) throws DdlException {
+       84          Env env = Env.getCurrentEnv();
+       85          CatalogIf catalog = catalogName != null ? env.getCatalogMgr().getCatalog(catalogName) : env.getCurrentCatalog();
+       86          if (catalog == null) {
+       87              throw new DdlException("Catalog " + catalogName + " doesn't exist.");
+       88          }
+       89          if (!(catalog instanceof ExternalCatalog)) {
+       90              throw new DdlException("Only support refresh database in external catalog");
+       91          }
+       92          DatabaseIf db = catalog.getDbOrDdlException(dbName);
+       93          refreshDbInternal((ExternalDatabase) db);
+       94  
+       95          ExternalObjectLog log = ExternalObjectLog.createForRefreshDb(catalog.getId(), db.getFullName());
+       96          Env.getCurrentEnv().getEditLog().logRefreshExternalDb(log);
+       97      }
+       98  
+       99      public void replayRefreshDb(ExternalObjectLog log) {
+      100          ExternalCatalog catalog = (ExternalCatalog) Env.getCurrentEnv().getCatalogMgr().getCatalog(log.getCatalogId());
+      101          if (catalog == null) {
+      102              LOG.warn("failed to find catalog when replaying refresh db: {}", log.debugForRefreshDb());
+      103          }
+      104          Optional<ExternalDatabase<? extends ExternalTable>> db;
+      105          if (!Strings.isNullOrEmpty(log.getDbName())) {
+      106              db = catalog.getDbForReplay(log.getDbName());
+      107          } else {
+      108              db = catalog.getDbForReplay(log.getDbId());
+      109          }
+      110  
+      111          if (!db.isPresent()) {
+      112              LOG.warn("failed to find db when replaying refresh db: {}", log.debugForRefreshDb());
+      113          } else {
+      114              refreshDbInternal(db.get());
+      115          }
+      116      }
+      117  
+      118      private void refreshDbInternal(ExternalDatabase db) {
+      119          db.resetMetaToUninitialized();
+      120          LOG.info("refresh database {} in catalog {}", db.getFullName(), db.getCatalog().getName());
+      121      }
+      122  
+      123      // Refresh table
+      124      public void handleRefreshTable(String catalogName, String dbName, String tableName, boolean ignoreIfNotExists)
+      125              throws DdlException {
+      126          Env env = Env.getCurrentEnv();
+      127          CatalogIf catalog = catalogName != null ? env.getCatalogMgr().getCatalog(catalogName) : env.getCurrentCatalog();
+      128          if (catalog == null) {
+      129              throw new DdlException("Catalog " + catalogName + " doesn't exist.");
+      130          }
+      131          if (!(catalog instanceof ExternalCatalog)) {
+      132              throw new DdlException("Only support refresh ExternalCatalog Tables");
+      133          }
+      134  
+      135          DatabaseIf db = catalog.getDbNullable(dbName);
+      136          if (db == null) {
+      137              if (!ignoreIfNotExists) {
+      138                  throw new DdlException("Database " + dbName + " does not exist in catalog " + catalog.getName());
+      139              }
+      140              return;
+      141          }
+      142  
+      143          TableIf table = db.getTableNullable(tableName);
+      144          if (table == null) {
+      145              if (!ignoreIfNotExists) {
+      146                  throw new DdlException("Table " + tableName + " does not exist in db " + dbName);
+      147              }
+      148              return;
+      149          }
+      150          long updateTime = System.currentTimeMillis();
+      151          refreshTableInternal((ExternalDatabase) db, (ExternalTable) table, updateTime);
+      152          ExternalObjectLog log = ExternalObjectLog.createForRefreshTable(catalog.getId(), db.getFullName(),
+      153                  table.getName(), updateTime);
+      154          Env.getCurrentEnv().getEditLog().logRefreshExternalTable(log);
+      155      }
+      156  
+      157      public void replayRefreshTable(ExternalObjectLog log) {
+      158          ExternalCatalog catalog = (ExternalCatalog) Env.getCurrentEnv().getCatalogMgr().getCatalog(log.getCatalogId());
+      159          if (catalog == null) {
+      160              LOG.warn("failed to find catalog when replaying refresh table: {}", log.debugForRefreshTable());
+      161              return;
+      162          }
+      163          Optional<ExternalDatabase<? extends ExternalTable>> db;
+      164          if (!Strings.isNullOrEmpty(log.getDbName())) {
+      165              db = catalog.getDbForReplay(log.getDbName());
+      166          } else {
+      167              db = catalog.getDbForReplay(log.getDbId());
+      168          }
+      169          // See comment in refreshDbInternal for why db and table may be null.
+      170          if (!db.isPresent()) {
+      171              LOG.warn("failed to find db when replaying refresh table: {}", log.debugForRefreshTable());
+      172              return;
+      173          }
+      174          Optional<? extends ExternalTable> table;
+      175          if (!Strings.isNullOrEmpty(log.getTableName())) {
+      176              table = db.get().getTableForReplay(log.getTableName());
+      177          } else {
+      178              table = db.get().getTableForReplay(log.getTableId());
+      179          }
+      180          if (!table.isPresent()) {
+      181              LOG.warn("failed to find table when replaying refresh table: {}", log.debugForRefreshTable());
+      182              return;
+      183          }
+      184          if (!Strings.isNullOrEmpty(log.getNewTableName())) {
+      185              // this is a rename table op
+      186              db.get().unregisterTable(log.getTableName());
+      187              db.get().resetMetaCacheNames();
+      188          } else {
+      189              List<String> modifiedPartNames = log.getPartitionNames();
+      190              List<String> newPartNames = log.getNewPartitionNames();
+      191              if (catalog instanceof HMSExternalCatalog
+      192                      && ((modifiedPartNames != null && !modifiedPartNames.isEmpty())
+      193                      || (newPartNames != null && !newPartNames.isEmpty()))) {
+      194                  // Partition-level cache invalidation, only for hive catalog
+      195                  HiveExternalMetaCache cache = Env.getCurrentEnv().getExtMetaCacheMgr()
+      196                          .hive(catalog.getId());
+      197                  cache.refreshAffectedPartitionsCache((HMSExternalTable) table.get(), modifiedPartNames, newPartNames);
+      198                  if (table.get() instanceof HMSExternalTable && log.getLastUpdateTime() > 0) {
+      199                      ((HMSExternalTable) table.get()).setUpdateTime(log.getLastUpdateTime());
+      200                  }
+      201                  LOG.info("replay refresh partitions for table {}, "
+      202                                  + "modified partitions count: {}, "
+      203                                  + "new partitions count: {}",
+      204                          table.get().getName(), modifiedPartNames == null ? 0 : modifiedPartNames.size(),
+      205                          newPartNames == null ? 0 : newPartNames.size());
+      206              } else {
+      207                  // Full table cache invalidation
+      208                  refreshTableInternal(db.get(), table.get(), log.getLastUpdateTime());
+      209              }
+      210          }
+      211      }
+      212  
+      213      public void refreshExternalTableFromEvent(String catalogName, String dbName, String tableName,
+      214              long updateTime) throws DdlException {
+      215          CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(catalogName);
+      216          if (catalog == null) {
+      217              throw new DdlException("No catalog found with name: " + catalogName);
+      218          }
+      219          if (!(catalog instanceof ExternalCatalog)) {
+      220              throw new DdlException("Only support refresh ExternalCatalog Tables");
+      221          }
+      222          DatabaseIf db = catalog.getDbNullable(dbName);
+      223          if (db == null) {
+      224              return;
+      225          }
+      226  
+      227          TableIf table = db.getTableNullable(tableName);
+      228          if (table == null) {
+      229              return;
+      230          }
+      231          refreshTableInternal((ExternalDatabase) db, (ExternalTable) table, updateTime);
+      232      }
+      233  
+      234      public void refreshTableInternal(ExternalDatabase db, ExternalTable table, long updateTime) {
+      235          table.unsetObjectCreated();
+      236          // Iceberg partition evolution can change partition specs across FEs.
+      237          // Clear related-table validation cache to avoid stale partitioned/unpartitioned judgment.
+      238          if (table instanceof IcebergExternalTable) {
+      239              ((IcebergExternalTable) table).setIsValidRelatedTableCached(false);
+      240          }
+      241          if (updateTime > 0) {
+      242              table.setUpdateTime(updateTime);
+      243          }
+      244          Env.getCurrentEnv().getExtMetaCacheMgr().invalidateTableCache(table);
+      245          LOG.info("refresh table {}, id {} from db {} in catalog {}, update time: {}",
+      246                  table.getName(), table.getId(), db.getFullName(), db.getCatalog().getName(), updateTime);
+      247      }
+      248  
+      249      // Refresh partition
+      250      public void refreshPartitions(String catalogName, String dbName, String tableName,
+      251              List<String> partitionNames, long updateTime, boolean ignoreIfNotExists)
+      252              throws DdlException {
+      253          CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(catalogName);
+      254          if (catalog == null) {
+      255              if (!ignoreIfNotExists) {
+      256                  throw new DdlException("No catalog found with name: " + catalogName);
+      257              }
+      258              return;
+      259          }
+      260          if (!(catalog instanceof ExternalCatalog)) {
+      261              throw new DdlException("Only support ExternalCatalog");
+      262          }
+      263          DatabaseIf db = catalog.getDbNullable(dbName);
+      264          if (db == null) {
+      265              if (!ignoreIfNotExists) {
+      266                  throw new DdlException("Database " + dbName + " does not exist in catalog " + catalog.getName());
+      267              }
+      268              return;
+      269          }
+      270  
+      271          TableIf table = db.getTableNullable(tableName);
+      272          if (table == null) {
+      273              if (!ignoreIfNotExists) {
+      274                  throw new DdlException("Table " + tableName + " does not exist in db " + dbName);
+      275              }
+      276              return;
+      277          }
+      278  
+      279          ExternalTable externalTable = (ExternalTable) table;
+      280          HiveExternalMetaCache cache = Env.getCurrentEnv().getExtMetaCacheMgr().hive(externalTable.getCatalog().getId());
+      281          for (String partitionName : partitionNames) {
+      282              cache.invalidatePartitionCache(externalTable, partitionName);
+      283          }
+      284          ((HMSExternalTable) table).setUpdateTime(updateTime);
+      285      }
+      286  
+      287      public void addToRefreshMap(long catalogId, Integer[] sec) {
+      288          LOG.info("Add catalog id={} to scheduled refresh map, interval={}s", catalogId, sec[0]);
+      289          refreshMap.put(catalogId, sec);
+      290      }
+      291  
+      292      public void removeFromRefreshMap(long catalogId) {
+      293          LOG.info("Remove catalog (id={}) from scheduled refresh map", catalogId);
+      294          refreshMap.remove(catalogId);
+      295      }
+      296  
+      297      public void start() {
+      298          RefreshTask refreshTask = new RefreshTask();
+      299          this.refreshScheduler.scheduleAtFixedRate(refreshTask, 0, REFRESH_TIME_SEC,
+      300                  TimeUnit.SECONDS);
+      301      }
+      302  
+      303      private class RefreshTask implements Runnable {
+      304          @Override
+      305          public void run() {
+      306              for (Map.Entry<Long, Integer[]> entry : refreshMap.entrySet()) {
+      307                  Long catalogId = entry.getKey();
+      308                  Integer[] timeGroup = entry.getValue();
+      309                  Integer original = timeGroup[0];
+      310                  Integer current = timeGroup[1];
+      311                  if (current - REFRESH_TIME_SEC > 0) {
+      312                      timeGroup[1] = current - REFRESH_TIME_SEC;
+      313                      refreshMap.put(catalogId, timeGroup);
+      314                  } else {
+      315                      CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(catalogId);
+      316                      if (catalog != null) {
+      317                          String catalogName = catalog.getName();
+      318                          LOG.info("Scheduled refresh triggered for catalog {} (id={}), interval={}s, invalidCache=true",
+      319                                  catalogName, catalogId, original);
+      320                          /**
+      321                           * Now do not invoke
+      322                           * {@link org.apache.doris.analysis.RefreshCatalogStmt#analyze(Analyzer)} is ok,
+      323                           * because the default value of invalidCache is true.
+      324                           * */
+      325                          try {
+      326                              Env.getCurrentEnv().getRefreshManager().handleRefreshCatalog(catalogName, true);
+      327                              LOG.info("Scheduled refresh completed for catalog {} (id={}), next refresh in {}s",
+      328                                      catalogName, catalogId, original);
+      329                          } catch (Exception e) {
+      330                              LOG.warn("Failed to execute scheduled refresh for catalog {} (id={})",
+      331                                      catalogName, catalogId, e);
+      332                          }
+      333  
+      334                          // reset
+      335                          timeGroup[1] = original;
+      336                          refreshMap.put(catalogId, timeGroup);
+      337                      } else {
+      338                          LOG.warn("Scheduled refresh skipped: catalog id={} not found, removing from refresh map",
+      339                                  catalogId);
+      340                          refreshMap.remove(catalogId);
+      341                      }
+      342                  }
+      343              }
+      344          }
+      345      }
+      346  }

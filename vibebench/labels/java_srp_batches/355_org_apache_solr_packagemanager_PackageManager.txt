@@ -1,0 +1,406 @@
+row 355   apache/solr#4178
+============================================================================
+CLASS org.apache.solr.packagemanager.PackageManager   loc=1035 methods=19 wmc=154 lcom=0.0 c3=0.2267593467779719
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       73  public class PackageManager implements Closeable {
+       74  
+       75    final ToolRuntime runtime;
+       76    final String solrUrl;
+       77    final SolrClient solrClient;
+       78    final SolrZkClient zkClient;
+       79  
+       80    private Map<String, List<SolrPackageInstance>> packages = null;
+       81  
+       82    private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+       83  
+       84    public PackageManager(ToolRuntime runtime, SolrClient solrClient, String solrUrl, String zkHost) {
+       85      this.runtime = runtime;
+       86      this.solrUrl = solrUrl;
+       87      this.solrClient = solrClient;
+       88      this.zkClient =
+       89          new SolrZkClient.Builder()
+       90              .withUrl(zkHost)
+       91              .withTimeout(SolrZkClientTimeout.DEFAULT_ZK_CLIENT_TIMEOUT, TimeUnit.MILLISECONDS)
+       92              .build();
+       93      log.info("Done initializing a zkClient instance...");
+       94    }
+       95  
+       96    @Override
+       97    public void close() throws IOException {
+       98      if (zkClient != null) {
+       99        zkClient.close();
+      100      }
+      101    }
+      102  
+      103    public void uninstall(String packageName, String version)
+      104        throws IOException, SolrServerException {
+      105      SolrPackageInstance packageInstance = getPackageInstance(packageName, version);
+      106      if (packageInstance == null) {
+      107        runtime.printError(
+      108            "Package "
+      109                + packageName
+      110                + ":"
+      111                + version
+      112                + " doesn't exist. Use the install command to install this package version first.");
+      113        runtime.exit(1);
+      114      }
+      115  
+      116      // Make sure that this package instance is not deployed on any collection
+      117      Map<String, String> collectionsDeployedOn = getDeployedCollections(packageName);
+      118      for (String collection : collectionsDeployedOn.keySet()) {
+      119        if (version.equals(collectionsDeployedOn.get(collection))) {
+      120          runtime.printError(
+      121              "Package "
+      122                  + packageName
+      123                  + " is currently deployed on collection: "
+      124                  + collection
+      125                  + ". Undeploy the package with undeploy <package-name> --collections <collection1>[,<collection2>,...] before attempting to uninstall the package.");
+      126          runtime.exit(1);
+      127        }
+      128      }
+      129  
+      130      // Make sure that no plugin from this package instance has been deployed as cluster level
+      131      // plugins
+      132      Map<String, SolrPackageInstance> clusterPackages = getPackagesDeployedAsClusterLevelPlugins();
+      133      for (String clusterPackageName : clusterPackages.keySet()) {
+      134        SolrPackageInstance clusterPackageInstance = clusterPackages.get(clusterPackageName);
+      135        if (packageName.equals(clusterPackageName)
+      136            && version.equals(clusterPackageInstance.version)) {
+      137          runtime.printError(
+      138              "Package "
+      139                  + packageName
+      140                  + "is currently deployed as a cluster-level plugin ("
+      141                  + clusterPackageInstance.getCustomData()
+      142                  + "). Undeploy the package with undeploy <package-name> --collections <collection1>[,<collection2>,...] before uninstalling the package.");
+      143          runtime.exit(1);
+      144        }
+      145      }
+      146  
+      147      // Delete the package by calling the Package API and remove the Jar
+      148  
+      149      runtime.printSuccess("Executing Package API to remove this package...");
+      150      try {
+      151        new PackageApi.DeletePackageVersion(packageName, version).process(solrClient);
+      152        runtime.printSuccess("Package version deleted from Package API.");
+      153      } catch (SolrServerException | IOException e) {
+      154        throw new SolrException(ErrorCode.BAD_REQUEST, e);
+      155      }
+      156  
+      157      runtime.printSuccess(
+      158          "Executing Package Store API to remove the " + packageName + " package...");
+      159  
+      160      List<String> filesToDelete = new ArrayList<>(packageInstance.files);
+      161      filesToDelete.add(
+      162          String.format(Locale.ROOT, "/package/%s/%s/%s", packageName, version, "manifest.json"));
+      163      for (String filePath : filesToDelete) {
+      164        DistribFileStore.deleteZKFileEntry(zkClient, filePath);
+      165        runtime.printSuccess("Deleting " + filePath);
+      166        new FileStoreApi.DeleteFile(filePath).process(solrClient);
+      167      }
+      168  
+      169      runtime.printSuccess("Package uninstalled: " + packageName + ":" + version + ":-)");
+      170    }
+      171  
+      172    public List<SolrPackageInstance> fetchInstalledPackageInstances() throws SolrException {
+      173      log.info("Getting packages from packages.json...");
+      174      List<SolrPackageInstance> ret = new ArrayList<>();
+      175      packages = new HashMap<>();
+      176      try {
+      177        if (zkClient.exists(ZkStateReader.SOLR_PKGS_PATH)) {
+      178          @SuppressWarnings("unchecked")
+      179          Map<String, List<Map<?, ?>>> packagesZnodeMap =
+      180              (Map<String, List<Map<?, ?>>>)
+      181                  getMapper()
+      182                      .readValue(
+      183                          new String(
+      184                              zkClient.getData(ZkStateReader.SOLR_PKGS_PATH, null, null),
+      185                              StandardCharsets.UTF_8),
+      186                          Map.class)
+      187                      .get("packages");
+      188          for (String packageName : packagesZnodeMap.keySet()) {
+      189            List<Map<?, ?>> pkg = packagesZnodeMap.get(packageName);
+      190            for (Map<?, ?> pkgVersion : pkg) {
+      191              Manifest manifest =
+      192                  PackageUtils.fetchManifest(
+      193                      solrClient,
+      194                      pkgVersion.get("manifest").toString(),
+      195                      pkgVersion.get("manifestSHA512").toString());
+      196              List<Plugin> solrPlugins = manifest.plugins;
+      197              SolrPackageInstance pkgInstance =
+      198                  new SolrPackageInstance(
+      199                      packageName,
+      200                      null,
+      201                      pkgVersion.get("version").toString(),
+      202                      manifest,
+      203                      solrPlugins,
+      204                      manifest.parameterDefaults);
+      205              @SuppressWarnings("unchecked")
+      206              List<String> files = (List<String>) pkgVersion.get("files");
+      207              if (files != null) {
+      208                pkgInstance.files = files;
+      209              }
+      210              List<SolrPackageInstance> list =
+      211                  packages.computeIfAbsent(packageName, k -> new ArrayList<>());
+      212              list.add(pkgInstance);
+      213              ret.add(pkgInstance);
+      214            }
+      215          }
+      216        }
+      217      } catch (Exception e) {
+      218        throw new SolrException(ErrorCode.BAD_REQUEST, e);
+      219      }
+      220      log.info("Got packages: {}", ret);
+      221      return ret;
+      222    }
+      223  
+      224    @SuppressWarnings({"unchecked"})
+      225    public Map<String, SolrPackageInstance> getPackagesDeployed(String collection) {
+      226      Map<String, String> packages = null;
+      227      try {
+      228        NamedList<Object> result =
+      229            solrClient.request(
+      230                new GenericV2SolrRequest(
+      231                        SolrRequest.METHOD.GET,
+      232                        PackageUtils.getCollectionParamsPath(collection) + "/PKG_VERSIONS")
+      233                    .setRequiresCollection(
+      234                        false) /* Making a collection request, but already baked into path */);
+      235        packages =
+      236            (Map<String, String>)
+      237                Objects.requireNonNullElse(result._get("/response/params/PKG_VERSIONS"), Map.of());
+      238      } catch (PathNotFoundException ex) {
+      239        // Don't worry if PKG_VERSION wasn't found. It just means this collection was never touched by
+      240        // the package manager.
+      241      } catch (SolrServerException | IOException ex) {
+      242        throw new SolrException(ErrorCode.SERVER_ERROR, ex);
+      243      }
+      244      if (packages == null) return Map.of();
+      245      Map<String, SolrPackageInstance> ret = new HashMap<>();
+      246      for (String packageName : packages.keySet()) {
+      247        if (!StrUtils.isNullOrEmpty(packageName)
+      248            && // There can be an empty key, storing the version here
+      249            packages.get(packageName)
+      250                != null) { // null means the package was undeployed from this package before
+      251          ret.put(packageName, getPackageInstance(packageName, packages.get(packageName)));
+      252        }
+      253      }
+      254      return ret;
+      255    }
+      256  
+      257    /**
+      258     * Get a map of packages (key: package name, value: package instance) that have their plugins
+      259     * deployed as cluster level plugins. The returned packages also contain the "pluginMeta" from
+      260     * "clusterprops.json" as custom data.
+      261     */
+      262    @SuppressWarnings({"unchecked"})
+      263    public Map<String, SolrPackageInstance> getPackagesDeployedAsClusterLevelPlugins() {
+      264      Map<String, String> packageVersions = new HashMap<>();
+      265      // map of package name to multiple values of pluginMeta(Map<String, String>)
+      266      Map<String, Set<PluginMeta>> packagePlugins = new HashMap<>();
+      267      Object pluginsValue;
+      268      try {
+      269        NamedList<Object> response =
+      270            solrClient.request(
+      271                new GenericV2SolrRequest(SolrRequest.METHOD.GET, PackageUtils.CLUSTERPROPS_PATH));
+      272        Integer statusCode = (Integer) response._get(List.of("responseHeader", "status"), null);
+      273        if (statusCode == null || statusCode == ErrorCode.NOT_FOUND.code) {
+      274          // Cluster props doesn't exist, that means there are no cluster level plugins installed.
+      275          pluginsValue = null;
+      276        } else {
+      277          pluginsValue = response.get(ContainerPluginsApi.PLUGIN);
+      278        }
+      279      } catch (SolrServerException | IOException ex) {
+      280        throw new SolrException(ErrorCode.SERVER_ERROR, ex);
+      281      }
+      282      @SuppressWarnings({"unchecked"})
+      283      Map<String, Object> clusterPlugins =
+      284          pluginsValue != null ? (Map<String, Object>) pluginsValue : Map.of();
+      285      for (Map.Entry<String, Object> entry : clusterPlugins.entrySet()) {
+      286        PluginMeta pluginMeta;
+      287        try {
+      288          pluginMeta =
+      289              PackageUtils.getMapper().readValue(Utils.toJSON(entry.getValue()), PluginMeta.class);
+      290        } catch (IOException e) {
+      291          throw new SolrException(
+      292              ErrorCode.SERVER_ERROR,
+      293              "Exception while fetching plugins from /clusterprops.json in ZK.",
+      294              e);
+      295        }
+      296        if (pluginMeta.klass.contains(":")) {
+      297          String packageName = pluginMeta.klass.substring(0, pluginMeta.klass.indexOf(':'));
+      298          packageVersions.put(packageName, pluginMeta.version);
+      299          packagePlugins.computeIfAbsent(packageName, k -> new HashSet<>()).add(pluginMeta);
+      300        }
+      301      }
+      302      Map<String, SolrPackageInstance> ret = new HashMap<>();
+      303      for (Map.Entry<String, String> entry : packageVersions.entrySet()) {
+      304        String packageName = entry.getKey();
+      305        String packageVersion = entry.getValue();
+      306        // There can be an empty key, storing the version here
+      307        // null means the package was undeployed from this package before
+      308        if (!StrUtils.isNullOrEmpty(packageName) && packageVersion != null) {
+      309          ret.put(packageName, getPackageInstance(packageName, packageVersion));
+      310          ret.get(packageName).setCustomData(packagePlugins.get(packageName));
+      311        }
+      312      }
+      313      return ret;
+      314    }
+      315  
+      316    private void ensureCollectionsExist(List<String> collections) {
+      317      try {
+      318        List<String> existingCollections = zkClient.getChildren("/collections", null);
+      319        Set<String> nonExistent = new HashSet<>(collections);
+      320        nonExistent.removeAll(existingCollections);
+      321        if (!nonExistent.isEmpty()) {
+      322          throw new SolrException(
+      323              ErrorCode.BAD_REQUEST, "Collection(s) doesn't exist: " + nonExistent);
+      324        }
+      325      } catch (KeeperException | InterruptedException e) {
+      326        throw new SolrException(
+      327            ErrorCode.SERVER_ERROR, "Unable to fetch list of collections from ZK.");
+      328      }
+      329    }
+      330  
+      331    private boolean deployPackage(
+      332        SolrPackageInstance packageInstance,
+      333        boolean pegToLatest,
+      334        boolean isUpdate,
+      335        boolean noprompt,
+      336        List<String> collections,
+      337        boolean shouldDeployClusterPlugins,
+      338        String[] overrides) {
+      339  
+      340      // Install plugins of type "cluster"
+      341      boolean clusterSuccess = true;
+      342      if (shouldDeployClusterPlugins) {
+      343        clusterSuccess = deployClusterPackage(packageInstance, isUpdate, noprompt, overrides);
+      344      }
+      345  
+      346      // Install plugins of type "collection"
+      347      Pair<List<String>, List<String>> deployResult =
+      348          deployCollectionPackage(
+      349              packageInstance, pegToLatest, isUpdate, noprompt, collections, overrides);
+      350      List<String> deployedCollections = deployResult.first();
+      351      List<String> previouslyDeployedOnCollections = deployResult.second();
+      352  
+      353      // Verify that package was successfully deployed
+      354      boolean verifySuccess =
+      355          verify(packageInstance, deployedCollections, shouldDeployClusterPlugins, overrides);
+      356      if (verifySuccess) {
+      357        runtime.printSuccess(
+      358            "Deployed on "
+      359                + deployedCollections
+      360                + " and verified package: "
+      361                + packageInstance.name
+      362                + ", version: "
+      363                + packageInstance.version);
+      364      }
+      365  
+      366      return clusterSuccess && previouslyDeployedOnCollections.isEmpty() && verifySuccess;
+      367    }
+      368  
+      369    /**
+      370     * @return list of collections on which packages deployed on
+      371     */
+      372    private Pair<List<String>, List<String>> deployCollectionPackage(
+      373        SolrPackageInstance packageInstance,
+      374        boolean pegToLatest,
+      375        boolean isUpdate,
+      376        boolean noprompt,
+      377        List<String> collections,
+      378        String[] overrides) {
+      379      // collections where package is already deployed in
+      380      List<String> previouslyDeployed = new ArrayList<>();
+      381      for (String collection : collections) {
+      382        SolrPackageInstance deployedPackage =
+      383            getPackagesDeployed(collection).get(packageInstance.name);
+      384        if (packageInstance.equals(deployedPackage)) {
+      385          if (!pegToLatest) {
+      386            runtime.printError("Package " + packageInstance + " already deployed on " + collection);
+      387            previouslyDeployed.add(collection);
+      388            continue;
+      389          }
+      390        } else {
+      391          if (deployedPackage != null && !isUpdate) {
+      392            runtime.printError(
+      393                "Package "
+      394                    + deployedPackage
+      395                    + " already deployed on "
+      396                    + collection
+      397                    + ". To update to "
+      398                    + packageInstance
+      399                    + ", pass --update parameter.");
+      400            previouslyDeployed.add(collection);
+      401            continue;
+      402          }
+      403        }
+      404  
+      405        Map<String, String> collectionParameterOverrides =
+      406            getCollectionParameterOverrides(packageInstance, isUpdate, overrides, collection);
+      407  
+      408        // Get package params
+      409        try {
+      410          NamedList<Object> collectionParams =
+      411              solrClient.request(
+      412                  new GenericV2SolrRequest(
+      413                          SolrRequest.METHOD.GET,
+      414                          PackageUtils.getCollectionParamsPath(collection) + "/packages")
+      415                      .setRequiresCollection(
+      416                          false) /* Making a collection-request, but already baked into path */);
+      417          boolean packageParamsExist = collectionParams.get("params") != null;
+      418          SolrCLI.postJsonToSolr(
+      419              solrClient,
+      420              PackageUtils.getCollectionParamsPath(collection),
+      421              getMapper()
+      422                  .writeValueAsString(
+      423                      Map.of(
+      424                          packageParamsExist ? "update" : "set",
+      425                          Map.of(
+      426                              "packages",
+      427                              Map.of(packageInstance.name, collectionParameterOverrides)))));
+      428        } catch (Exception e) {
+      429          throw new SolrException(ErrorCode.SERVER_ERROR, e);
+      430        }
+      431  
+      432        // Set the package version in the collection's parameters
+      433        try {
+      434          SolrCLI.postJsonToSolr(
+      435              solrClient,
+      436              PackageUtils.getCollectionParamsPath(collection),
+      437              "{set:{PKG_VERSIONS:{"
+      438                  + packageInstance.name
+      439                  + ": '"
+      440                  + (pegToLatest ? SolrPackageLoader.LATEST : packageInstance.version)
+      441                  + "'}}}");
+      442        } catch (Exception ex) {
+      443          throw new SolrException(ErrorCode.SERVER_ERROR, ex);
+      444        }
+      445  
+      446        // If updating, refresh the package version for this to take effect
+      447        if (isUpdate || pegToLatest) {
+      448          try {
+      449            new PackageApi.RefreshPackage(packageInstance.name).process(solrClient);
+      450          } catch (Exception ex) {
+      451            throw new SolrException(ErrorCode.SERVER_ERROR, ex);
+      452          }
+      453        }
+      454  
+      455        // If it is a fresh deploy on a collection, run setup commands all the plugins in the package
+      456        if (!isUpdate) {
+      457          for (Plugin plugin : packageInstance.plugins) {
+      458            if (!"collection".equalsIgnoreCase(plugin.type) || collections.isEmpty()) continue;
+      459            Map<String, String> systemParams =
+      460                Map.of(
+      461                    "collection",
+      462                    collection,
+      463                    "package-name",
+      464                    packageInstance.name,
+      465                    "package-version",
+      466                    packageInstance.version,
+      467                    "plugin-name",
+      468                    plugin.name);
+      469  
+      470            Command cmd = plugin.setupCommand;
+      471            if (cmd != null && StrUtils.isNotNullOrEmpty(cmd.method)) {
+      472              if ("POST".equalsIgnoreCase(cmd.method)) {
+       ... truncated at 400 lines ...

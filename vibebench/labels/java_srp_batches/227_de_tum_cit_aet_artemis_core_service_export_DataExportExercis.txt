@@ -1,0 +1,406 @@
+row 227   ls1intum/Artemis#11991
+============================================================================
+CLASS de.tum.cit.aet.artemis.core.service.export.DataExportExerciseCreationService   loc=460 methods=14 wmc=75 lcom=0.0 c3=0.2588693525374346
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       64  @Profile(PROFILE_CORE)
+       65  @Lazy
+       66  @Service
+       67  public class DataExportExerciseCreationService {
+       68  
+       69      private static final String PDF_FILE_EXTENSION = ".pdf";
+       70  
+       71      private static final String EXERCISE_PREFIX = "exercise_";
+       72  
+       73      static final String CSV_FILE_EXTENSION = ".csv";
+       74  
+       75      private final Path repoClonePath;
+       76  
+       77      private static final Logger log = LoggerFactory.getLogger(DataExportExerciseCreationService.class);
+       78  
+       79      private final FileService fileService;
+       80  
+       81      private final ProgrammingExerciseExportService programmingExerciseExportService;
+       82  
+       83      private final DataExportQuizExerciseCreationService dataExportQuizExerciseCreationService;
+       84  
+       85      private final Optional<PlagiarismCaseApi> plagiarismCaseApi;
+       86  
+       87      // we define the field as optional to allow the application to start even if the apollon profile is not active
+       88      private final Optional<ModelingApollonApi> modelingApollonApi;
+       89  
+       90      private final ComplaintRepository complaintRepository;
+       91  
+       92      private final ExerciseRepository exerciseRepository;
+       93  
+       94      private final ResultService resultService;
+       95  
+       96      private final AuthorizationCheckService authCheckService;
+       97  
+       98      public DataExportExerciseCreationService(@Value("${artemis.repo-download-clone-path}") Path repoClonePath, FileService fileService,
+       99              ProgrammingExerciseExportService programmingExerciseExportService, DataExportQuizExerciseCreationService dataExportQuizExerciseCreationService,
+      100              Optional<PlagiarismCaseApi> plagiarismCaseApi, Optional<ModelingApollonApi> modelingApollonApi, ComplaintRepository complaintRepository,
+      101              ExerciseRepository exerciseRepository, ResultService resultService, AuthorizationCheckService authCheckService) {
+      102          this.fileService = fileService;
+      103          this.programmingExerciseExportService = programmingExerciseExportService;
+      104          this.dataExportQuizExerciseCreationService = dataExportQuizExerciseCreationService;
+      105          this.plagiarismCaseApi = plagiarismCaseApi;
+      106          this.modelingApollonApi = modelingApollonApi;
+      107          this.complaintRepository = complaintRepository;
+      108          this.exerciseRepository = exerciseRepository;
+      109          this.repoClonePath = repoClonePath;
+      110          this.resultService = resultService;
+      111          this.authCheckService = authCheckService;
+      112      }
+      113  
+      114      /**
+      115       * Creates the export for all exercises the user participated in.
+      116       *
+      117       * @param workingDirectory the directory the export should be created in
+      118       * @param user             the user for which the export should be created
+      119       * @throws IOException if an error occurs while accessing the file system
+      120       */
+      121      public void createExercisesExport(Path workingDirectory, User user) throws IOException {
+      122          // retrieve all exercises as we cannot retrieve the exercises by course because a user might have participated in a course they are no longer a member of (they have
+      123          // unenrolled)
+      124          var allExerciseParticipations = exerciseRepository.getAllExercisesUserParticipatedInWithEagerParticipationsSubmissionsResultsFeedbacksTestCasesByUserId(user.getId());
+      125          var exerciseParticipationsPerCourse = allExerciseParticipations.stream().collect(Collectors.groupingBy(Exercise::getCourseViaExerciseGroupOrCourseMember));
+      126          for (var entry : exerciseParticipationsPerCourse.entrySet()) {
+      127              var course = entry.getKey();
+      128              Path courseDir = retrieveCourseDirPath(workingDirectory, course);
+      129              var exercises = entry.getValue();
+      130              Path exercisesDir = courseDir.resolve("exercises");
+      131              if (!exercises.isEmpty()) {
+      132                  createDirectoryIfNotExistent(exercisesDir);
+      133              }
+      134              for (var exercise : exercises) {
+      135                  if (exercise instanceof ProgrammingExercise programmingExercise) {
+      136                      createProgrammingExerciseExport(programmingExercise, exercisesDir, user);
+      137                  }
+      138                  else {
+      139                      createNonProgrammingExerciseExport(exercise, exercisesDir, user);
+      140                  }
+      141              }
+      142          }
+      143      }
+      144  
+      145      /**
+      146       * Creates an export for a given programming exercise.
+      147       * <p>
+      148       * Includes submission information, the repository from the VCS and potential plagiarism cases.
+      149       *
+      150       * @param programmingExercise the programming exercise for which the export should be created
+      151       * @param exercisesDir        the directory where all exercises of a course should be stored
+      152       * @param user                the user for which the export should be created
+      153       * @throws IOException if an error occurs while accessing the file system
+      154       */
+      155      public void createProgrammingExerciseExport(ProgrammingExercise programmingExercise, Path exercisesDir, User user) throws IOException {
+      156          Path exerciseDir = exercisesDir.resolve(EXERCISE_PREFIX + programmingExercise.getSanitizedExerciseTitle());
+      157          if (!Files.exists(exerciseDir)) {
+      158              Files.createDirectory(exerciseDir);
+      159          }
+      160          createSubmissionsResultsExport(programmingExercise, exerciseDir, user);
+      161          RepositoryExportOptionsDTO repositoryExportOptions = new RepositoryExportOptionsDTO();
+      162          var listOfProgrammingExerciseParticipations = programmingExercise.getStudentParticipations().stream()
+      163                  .filter(studentParticipation -> studentParticipation instanceof ProgrammingExerciseStudentParticipation)
+      164                  .map(studentParticipation -> (ProgrammingExerciseStudentParticipation) studentParticipation).toList();
+      165  
+      166          // we use this directory only to clone the repository and don't do this in our current directory because the current directory is part of the final data export
+      167          // --> we can delete it after use
+      168          var tempRepoWorkingDir = fileService.getTemporaryUniqueSubfolderPath(repoClonePath, 10);
+      169          // NOTE: repositoryExportOptions.filterLateSubmissions must be false here because we do not want to filter any submissions for the data export
+      170          programmingExerciseExportService.exportStudentRepositories(programmingExercise, listOfProgrammingExerciseParticipations, Map.of(), tempRepoWorkingDir, exerciseDir,
+      171                  Collections.synchronizedList(new ArrayList<>()), repositoryExportOptions);
+      172  
+      173          createPlagiarismCaseInfoExport(programmingExercise, exerciseDir, user.getId());
+      174      }
+      175  
+      176      /**
+      177       * Creates an export for a text, modeling, file upload or quiz exercise. Includes submission information and potential plagiarism cases.
+      178       *
+      179       * @param exercise  the exercise for which the export should be created
+      180       * @param courseDir the directory that is used for the course the exercise belongs to
+      181       * @param user      the user for which the export should be created
+      182       * @throws IOException if an error occurs while accessing the file system
+      183       */
+      184      public void createNonProgrammingExerciseExport(Exercise exercise, Path courseDir, User user) throws IOException {
+      185          Path exercisePath = courseDir.resolve(EXERCISE_PREFIX + exercise.getSanitizedExerciseTitle());
+      186          if (!Files.exists(exercisePath)) {
+      187              Files.createDirectory(exercisePath);
+      188          }
+      189          createSubmissionsResultsExport(exercise, exercisePath, user);
+      190          createPlagiarismCaseInfoExport(exercise, exercisePath, user.getId());
+      191      }
+      192  
+      193      /**
+      194       * Creates the export for the submission of the user to the given exercise.
+      195       * <p>
+      196       * Includes the submission information and the submission content and the results if the results are
+      197       * published.
+      198       * For quiz exercises it delegates the creation of the export to {@link DataExportQuizExerciseCreationService}.
+      199       *
+      200       * @param exercise    the exercise for which the export should be created
+      201       * @param exerciseDir the directory in which the export should be created
+      202       * @param user        the user for which the export should be created
+      203       */
+      204      private void createSubmissionsResultsExport(Exercise exercise, Path exerciseDir, User user) throws IOException {
+      205          // quizzes do not have an assessment due date, so we need to check if they have ended according to their due date
+      206          boolean isInstructor = authCheckService.isAtLeastInstructorForExercise(exercise, user);
+      207          boolean includeResults = (exercise.isExamExercise() && exercise.getExam().resultsPublished())
+      208                  || (exercise.isCourseExercise() && ExerciseDateService.isAfterAssessmentDueDate(exercise) && !(exercise instanceof QuizExercise))
+      209                  || (exercise.isCourseExercise() && exercise instanceof QuizExercise quizExercise && quizExercise.isQuizEnded()) || isInstructor;
+      210          for (var participation : exercise.getStudentParticipations()) {
+      211              for (var submission : participation.getSubmissions()) {
+      212                  createSubmissionCsvFile(submission, exerciseDir);
+      213                  if (submission instanceof FileUploadSubmission fileUploadSubmission) {
+      214                      copyFileUploadSubmissionFile(FilePathConverter.buildFileUploadSubmissionPath(exercise.getId(), submission.getId()), exerciseDir, fileUploadSubmission);
+      215                  }
+      216                  else if (submission instanceof TextSubmission textSubmission) {
+      217                      storeTextSubmissionContent(textSubmission, exerciseDir);
+      218                  }
+      219                  else if (submission instanceof ModelingSubmission modelingSubmission) {
+      220                      storeModelingSubmissionContent(modelingSubmission, exerciseDir);
+      221                  }
+      222                  else if (submission instanceof QuizSubmission) {
+      223                      dataExportQuizExerciseCreationService.createQuizAnswersExport((QuizExercise) exercise, participation, exerciseDir, includeResults);
+      224                  }
+      225                  // for a programming exercise, we want to include the results that are visible before the assessment due date
+      226                  if (includeResults || exercise instanceof ProgrammingExercise) {
+      227                      boolean programmingExerciseBeforeAssessmentDueDate = exercise instanceof ProgrammingExercise && !ExerciseDateService.isAfterAssessmentDueDate(exercise);
+      228                      createResultsAndComplaintFiles(submission, exerciseDir, user, programmingExerciseBeforeAssessmentDueDate, isInstructor);
+      229                  }
+      230              }
+      231          }
+      232      }
+      233  
+      234      /**
+      235       * Stores the modeling submission as pdf if the apollon profile is active and the apollon conversion service works, otherwise stores it as json file.
+      236       *
+      237       * @param modelingSubmission the modeling submission for which the content should be stored
+      238       * @param outputDir          the directory in which the content should be stored
+      239       * @throws IOException if the file cannot be written
+      240       */
+      241      private void storeModelingSubmissionContent(ModelingSubmission modelingSubmission, Path outputDir) throws IOException {
+      242          if (modelingSubmission.getModel() == null) {
+      243              log.warn("Cannot include modeling submission content in data export because content is null for submission with id: {}", modelingSubmission.getId());
+      244              return;
+      245          }
+      246          var fileName = "submission_" + modelingSubmission.getId();
+      247          if (modelingApollonApi.isEmpty()) {
+      248              log.warn("Cannot include modeling submission content in data export as pdf because apollon profile is not active. Going to include the json file");
+      249              addModelJsonWithExplanationHowToView(modelingSubmission.getModel(), outputDir, fileName);
+      250              return;
+      251          }
+      252  
+      253          try (var modelAsPdf = modelingApollonApi.get().convertModel(modelingSubmission.getModel())) {
+      254              FileUtils.writeByteArrayToFile(outputDir.resolve(fileName + PDF_FILE_EXTENSION).toFile(), modelAsPdf.readAllBytes());
+      255          }
+      256          catch (Exception e) {
+      257              log.warn("Failed to include the model as pdf, going to include it as plain JSON file.", e);
+      258              addModelJsonWithExplanationHowToView(modelingSubmission.getModel(), outputDir, fileName);
+      259          }
+      260      }
+      261  
+      262      /**
+      263       * Stores the given model as json file and adds a markdown file with an explanation how to view the model.
+      264       * <p>
+      265       * Used if the Apollon Conversion Service is not available or an error occurs while using it.
+      266       *
+      267       * @param model     the model belonging to the submission as JSON string
+      268       * @param outputDir the directory in which the content should be stored
+      269       * @param fileName  the file name of the JSON file
+      270       * @throws IOException if the file cannot be written
+      271       */
+      272      private void addModelJsonWithExplanationHowToView(String model, Path outputDir, String fileName) throws IOException {
+      273          FileUtils.writeStringToFile(outputDir.resolve(fileName + ".md").toFile(), model, StandardCharsets.UTF_8);
+      274          String explanation = """
+      275                  You can view your model if you go to [Apollon Modeling Editor](https://www.apollon.ase.in.tum.de) and click on File --> Import and select the .json file.
+      276                  """;
+      277          FileUtils.writeStringToFile(outputDir.resolve("view_model.md").toFile(), explanation, StandardCharsets.UTF_8);
+      278      }
+      279  
+      280      /**
+      281       * Stores the text submission content as txt file.
+      282       *
+      283       * @param textSubmission the text submission for which the content should be stored
+      284       * @param outputDir      the directory in which the content should be stored
+      285       * @throws IOException if the file cannot be written
+      286       */
+      287      private void storeTextSubmissionContent(TextSubmission textSubmission, Path outputDir) throws IOException {
+      288          // text can be null which leads to an exception
+      289          if (textSubmission.getText() != null) {
+      290              FileUtils.writeStringToFile(outputDir.resolve("text_exercise_submission_" + textSubmission.getId() + "_text.txt").toFile(), textSubmission.getText(),
+      291                      StandardCharsets.UTF_8);
+      292          }
+      293          else {
+      294              log.warn("Cannot include text submission content in data export because content is null for submission with id: {}", textSubmission.getId());
+      295          }
+      296      }
+      297  
+      298      /**
+      299       * Creates a txt file containing the results with the score, the number of passed test cases if it is a programming exercise
+      300       * and the feedbacks (both manual and automatic).
+      301       *
+      302       * @param submission                                 the submission for which the results should be stored
+      303       * @param outputDir                                  the directory in which the results should be stored
+      304       * @param user                                       the user for which the export should be created
+      305       * @param programmingExerciseBeforeAssessmentDueDate whether the programming exercise is before the assessment due date
+      306       * @param isInstructor                               whether the user is an instructor in the course the exercise belongs to
+      307       * @throws IOException if the file cannot be written
+      308       */
+      309      private void createResultsAndComplaintFiles(Submission submission, Path outputDir, User user, boolean programmingExerciseBeforeAssessmentDueDate, boolean isInstructor)
+      310              throws IOException {
+      311          StringBuilder resultScoreAndFeedbacks = new StringBuilder();
+      312          for (var result : submission.getResults()) {
+      313              if (result != null) {
+      314                  // Do not include the results if the assessment due date is in the future and the assessment is not automatic and the user is not an instructor
+      315                  // We only consider programming exercises here because for other exercises this method is not called if the assessment due date is in the future
+      316                  if (programmingExerciseBeforeAssessmentDueDate && result.getAssessmentType() != AssessmentType.AUTOMATIC && !isInstructor) {
+      317                      continue;
+      318                  }
+      319                  resultService.filterSensitiveInformationIfNecessary(submission.getParticipation(), List.of(result), Optional.of(user));
+      320                  var score = result.getScore();
+      321                  if (score != null) {
+      322                      resultScoreAndFeedbacks.append("Score of submission: ").append(score).append("%").append(" ")
+      323                              .append(roundToNDecimalPlaces(score * submission.getParticipation().getExercise().getMaxPoints() / 100, 2)).append(" Points").append("\n");
+      324                  }
+      325                  if (submission instanceof ProgrammingSubmission && result.getPassedTestCaseCount() != null && result.getTestCaseCount() != null && result.getTestCaseCount() > 0) {
+      326                      resultScoreAndFeedbacks.append("Passed test cases: ").append(result.getPassedTestCaseCount()).append("/").append(result.getTestCaseCount()).append("\n");
+      327                  }
+      328                  if (submission instanceof ProgrammingSubmission programmingSubmission && programmingSubmission.isBuildFailed()) {
+      329                      resultScoreAndFeedbacks.append("Build failed").append("\n");
+      330                  }
+      331                  for (var feedback : result.getFeedbacks()) {
+      332                      if (feedback != null) {
+      333                          resultScoreAndFeedbacks.append("- Feedback: ");
+      334  
+      335                          // getTestCase() is null if it's manual feedback or if the test name was filtered out above
+      336                          if (feedback.getTestCase() != null && feedback.getTestCase().getTestName() != null) {
+      337                              resultScoreAndFeedbacks.append(feedback.getTestCase().getTestName()).append("\t");
+      338                          }
+      339                          // getText() contains, e.g., the file and line number for programming exercises
+      340                          if (feedback.getText() != null) {
+      341                              resultScoreAndFeedbacks.append(feedback.getText()).append("\t");
+      342                          }
+      343                          // getDetailText() contains the text message produced by the test case or written by the assessor.
+      344                          // Usually null if the test case passes
+      345                          if (feedback.getDetailText() != null) {
+      346                              resultScoreAndFeedbacks.append(feedback.getDetailText()).append("\t");
+      347                          }
+      348                          if (feedback.getCredits() != null) {
+      349                              resultScoreAndFeedbacks.append(feedback.getCredits());
+      350                          }
+      351                          resultScoreAndFeedbacks.append("\n");
+      352                      }
+      353                  }
+      354                  FileUtils.writeStringToFile(outputDir.resolve("submission_" + submission.getId() + "_result_" + result.getId() + TXT_FILE_EXTENSION).toFile(),
+      355                          resultScoreAndFeedbacks.toString(), StandardCharsets.UTF_8);
+      356              }
+      357              resultScoreAndFeedbacks = new StringBuilder();
+      358          }
+      359          var possibleComplaint = complaintRepository.findWithEagerComplaintResponseByResultSubmissionId(submission.getId());
+      360          if (possibleComplaint.isPresent()) {
+      361              addComplaintData(possibleComplaint.get(), outputDir);
+      362          }
+      363      }
+      364  
+      365      /**
+      366       * Creates a CSV file containing the complaint data.
+      367       * <p>
+      368       * Complaint can be either a complaint or a more feedback request.
+      369       *
+      370       * @param complaint the complaint for which the data should be stored
+      371       * @param outputDir the directory in which the data should be stored
+      372       * @throws IOException if the file cannot be written
+      373       */
+      374      private void addComplaintData(Complaint complaint, Path outputDir) throws IOException {
+      375          List<String> headers = new ArrayList<>();
+      376          var dataStreamBuilder = Stream.builder();
+      377          headers.add("id");
+      378          dataStreamBuilder.add(complaint.getId());
+      379          headers.add("submitted at");
+      380          dataStreamBuilder.add(complaint.getSubmittedTime());
+      381          headers.add("complaint type");
+      382          dataStreamBuilder.add(complaint.getComplaintType());
+      383          headers.add("complaint text");
+      384          dataStreamBuilder.add(complaint.getComplaintText());
+      385  
+      386          if (complaint.getComplaintResponse() != null) {
+      387              headers.add("complaint response");
+      388              dataStreamBuilder.add(complaint.getComplaintResponse().getResponseText());
+      389          }
+      390          if (complaint.isAccepted() != null && ComplaintType.COMPLAINT == complaint.getComplaintType()) {
+      391              headers.add("accepted");
+      392              dataStreamBuilder.add(complaint.isAccepted());
+      393          }
+      394          CSVFormat csvFormat = CSVFormat.DEFAULT.builder().setHeader(headers.toArray(String[]::new)).get();
+      395          var prefix = complaint.getComplaintType() == ComplaintType.COMPLAINT ? "complaint_" : "more_feedback_";
+      396  
+      397          try (final var printer = new CSVPrinter(Files.newBufferedWriter(outputDir.resolve(prefix + complaint.getId() + CSV_FILE_EXTENSION)), csvFormat)) {
+      398              printer.printRecord(dataStreamBuilder.build());
+      399              printer.flush();
+      400          }
+      401      }
+      402  
+      403      /**
+      404       * Creates a CSV file containing the plagiarism case information.
+      405       *
+      406       * @param exercise     the exercise for which the plagiarism case information should be stored
+      407       * @param exercisePath the directory in which the plagiarism case information should be stored
+      408       * @param userId       the id of the user that requested the export and that is involved in the plagiarism case
+      409       * @throws IOException if the file cannot be written
+      410       */
+      411      private void createPlagiarismCaseInfoExport(Exercise exercise, Path exercisePath, long userId) throws IOException {
+      412          if (plagiarismCaseApi.isEmpty()) {
+      413              return;
+      414          }
+      415  
+      416          var plagiarismCaseOptional = plagiarismCaseApi.get().findByStudentIdAndExerciseIdWithPostAndAnswerPost(userId, exercise.getId());
+      417          if (plagiarismCaseOptional.isEmpty()) {
+      418              return;
+      419          }
+      420          List<String> headers = new ArrayList<>();
+      421          var dataStreamBuilder = Stream.builder();
+      422          var plagiarismCase = plagiarismCaseOptional.get();
+      423          if (plagiarismCase.getVerdict() != null) {
+      424              headers.add("Verdict");
+      425              headers.add("Verdict Date");
+      426              dataStreamBuilder.add(plagiarismCase.getVerdict());
+      427              dataStreamBuilder.add(plagiarismCase.getVerdictDate());
+      428          }
+      429          if (plagiarismCase.getPost() != null) {
+      430              headers.add("Plagiarism case announcement");
+      431              dataStreamBuilder.add(plagiarismCase.getPost().getContent());
+      432          }
+      433          if (!plagiarismCase.getPost().getAnswers().isEmpty()) {
+      434              headers.add("Plagiarism case replies");
+      435              dataStreamBuilder.add(plagiarismCase.getPost().getAnswers().stream().map(AnswerPost::getContent).collect(Collectors.joining("\n")));
+      436          }
+      437          if (plagiarismCase.getVerdict() == PlagiarismVerdict.POINT_DEDUCTION) {
+      438              dataStreamBuilder.add(plagiarismCase.getVerdictPointDeduction());
+      439          }
+      440          else if (plagiarismCase.getVerdict() == PlagiarismVerdict.WARNING) {
+      441              dataStreamBuilder.add(plagiarismCase.getVerdictMessage());
+      442          }
+      443          CSVFormat csvFormat = CSVFormat.DEFAULT.builder().setHeader(headers.toArray(String[]::new)).get();
+      444  
+      445          try (final CSVPrinter printer = new CSVPrinter(Files.newBufferedWriter(exercisePath.resolve("plagiarism_case_" + plagiarismCase.getId() + CSV_FILE_EXTENSION)),
+      446                  csvFormat)) {
+      447              printer.printRecord(dataStreamBuilder.build());
+      448              printer.flush();
+      449          }
+      450      }
+      451  
+      452      /**
+      453       * Copies the file upload submission file to the data export working directory if it still exists.
+      454       *
+      455       * @param submissionFilePath   the path to the file upload submission file
+      456       * @param outputDir            the directory to which the file should be copied
+      457       * @param fileUploadSubmission the file upload submission for which the file should be copied
+      458       * @throws IOException if the file cannot be copied
+      459       */
+      460      private void copyFileUploadSubmissionFile(Path submissionFilePath, Path outputDir, FileUploadSubmission fileUploadSubmission) throws IOException {
+      461          try {
+      462              FileUtils.copyDirectory(submissionFilePath.toFile(), outputDir.toFile());
+      463          }
+       ... truncated at 400 lines ...

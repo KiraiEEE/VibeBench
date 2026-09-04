@@ -1,0 +1,195 @@
+row 38   deeplearning4j/deeplearning4j#10341
+============================================================================
+CLASS org.nd4j.nativeblas.OpaqueNDArrayArr   loc=190 methods=8 wmc=16 lcom=0.0 c3=0.3480633358382116
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       54  @Slf4j
+       55  public class OpaqueNDArrayArr extends PointerPointer<OpaqueNDArray> implements AutoCloseable {
+       56  
+       57      // Keep parent arrays alive to prevent use-after-free
+       58      private INDArray[] parentArrays;
+       59  
+       60      // CRITICAL: Keep OpaqueNDArray instances alive to prevent use-after-free!
+       61      // The PointerPointer only stores raw native pointers. Without this field,
+       62      // the OpaqueNDArray Java objects become GC-eligible immediately after createFrom()
+       63      // returns. When GC runs, DeallocatorService deletes the native sd::NDArray* objects
+       64      // that the PointerPointer's raw pointers still reference -> heap corruption!
+       65      private OpaqueNDArray[] opaqueArrays;
+       66  
+       67      // Track the deallocator for this instance
+       68      private OpaqueNDArrayArrDeallocator deallocator;
+       69  
+       70      /**
+       71       * Basic constructor for internal use.
+       72       * 
+       73       * @param array Array of OpaqueNDArray pointers
+       74       */
+       75      public OpaqueNDArrayArr(OpaqueNDArray... array) { 
+       76          super(array); 
+       77      }
+       78  
+       79      /**
+       80       * Creates an OpaqueNDArrayArr from a list of INDArrays.
+       81       * Parent INDArray references are held to ensure validity of the OpaqueNDArray pointers.
+       82       *
+       83       * <p><b>Memory Management:</b> The created OpaqueNDArrayArr is automatically registered
+       84       * with {@link DeallocatorService} for cleanup. You can also explicitly call {@link #close()}
+       85       * for immediate cleanup.</p>
+       86       *
+       87       * @param array List of INDArrays to convert
+       88       * @return A new OpaqueNDArrayArr registered with DeallocatorService
+       89       * @see #createFrom(INDArray...)
+       90       */
+       91      public static OpaqueNDArrayArr createFrom(List<INDArray> array) {
+       92          INDArray[] arrayArr = array.toArray(new INDArray[0]);
+       93          return createFrom(arrayArr);
+       94      }
+       95  
+       96      /**
+       97       * Creates an OpaqueNDArrayArr from an array of INDArrays.
+       98       * Parent INDArray references are held to ensure validity of the OpaqueNDArray pointers.
+       99       *
+      100       * <p><b>Memory Management:</b> The created OpaqueNDArrayArr is automatically registered
+      101       * with {@link DeallocatorService} for cleanup. You can also explicitly call {@link #close()}
+      102       * for immediate cleanup.</p>
+      103       *
+      104       * <p><b>Important:</b> This method uses cached OpaqueNDArray instances from parent INDArrays
+      105       * via {@link OpaqueNDArray#fromINDArray(INDArray)}. The parent arrays must remain alive
+      106       * while this OpaqueNDArrayArr is in use. This is ensured by storing strong references
+      107       * to the parent arrays.</p>
+      108       *
+      109       * @param array Array of INDArrays to convert
+      110       * @return A new OpaqueNDArrayArr registered with DeallocatorService
+      111       */
+      112      public static OpaqueNDArrayArr createFrom(INDArray... array) {
+      113          if (array == null || array.length == 0) {
+      114              throw new IllegalArgumentException("Cannot create OpaqueNDArrayArr from null or empty array");
+      115          }
+      116  
+      117          // Convert INDArrays to OpaqueNDArrays using CACHED instances.
+      118          // CRITICAL: We use fromINDArray() (cached) instead of fromINDArrayUncached() because:
+      119          // 1. Uncached instances are independently registered with DeallocatorService
+      120          // 2. OpaqueNDArrayArrDeallocator also tries to close them, causing double-registration
+      121          // 3. This creates complex timing issues and potential heap corruption
+      122          //
+      123          // The original concern (parent INDArray being closed causing dangling pointers) is
+      124          // addressed by storing parent references in parentArrays field below. As long as
+      125          // this OpaqueNDArrayArr is alive, the parent INDArrays are kept alive, and their
+      126          // cached OpaqueNDArrays remain valid.
+      127          OpaqueNDArray[] inputs = Arrays.stream(array)
+      128                  .map(OpaqueNDArray::fromINDArray)
+      129                  .toArray(OpaqueNDArray[]::new);
+      130  
+      131          // Create the OpaqueNDArrayArr using the constructor that properly handles native memory
+      132          OpaqueNDArrayArr inputsOpaque = new OpaqueNDArrayArr(inputs);
+      133  
+      134          // Store OpaqueNDArray references for access (these are cached and managed by parent INDArrays)
+      135          inputsOpaque.opaqueArrays = inputs;
+      136  
+      137          // Store parent references to keep them alive
+      138          inputsOpaque.parentArrays = array.clone(); // Clone to prevent external modification
+      139          
+      140          // Register with DeallocatorService for automatic cleanup
+      141          registerWithDeallocatorService(inputsOpaque, array);
+      142          
+      143          return inputsOpaque;
+      144      }
+      145  
+      146      /**
+      147       * Registers this OpaqueNDArrayArr with the DeallocatorService for automatic cleanup.
+      148       * This ensures parent INDArrays remain alive and provides reliable cleanup.
+      149       *
+      150       * @param arrayArr The array to register
+      151       * @param parentArrays The parent INDArrays to keep alive
+      152       * @throws RuntimeException if registration fails
+      153       */
+      154      private static void registerWithDeallocatorService(OpaqueNDArrayArr arrayArr, INDArray[] parentArrays) {
+      155          try {
+      156              DeallocatorService service = Nd4j.getDeallocatorService();
+      157              long uniqueId = service.nextValue();
+      158              int targetDevice = Nd4j.getAffinityManager().getDeviceForCurrentThread();
+      159              
+      160              OpaqueNDArrayArrDeallocator deallocator = new OpaqueNDArrayArrDeallocator(
+      161                  arrayArr, parentArrays, uniqueId, targetDevice
+      162              );
+      163              
+      164              arrayArr.deallocator = deallocator;
+      165              service.pickObject(deallocator);
+      166              
+      167              if (log.isTraceEnabled()) {
+      168                  log.trace("Registered OpaqueNDArrayArr {} with DeallocatorService (parent count: {})", 
+      169                          uniqueId, parentArrays.length);
+      170              }
+      171          } catch (Exception e) {
+      172              // LEAK FIX: If registration fails, caller must clean up the array
+      173              log.error("Failed to register OpaqueNDArrayArr with DeallocatorService", e);
+      174              throw new RuntimeException("Failed to register array with DeallocatorService", e);
+      175          }
+      176      }
+      177  
+      178      /**
+      179       * Closes the current OpaqueNDArrayArr, releasing any allocated resources.
+      180       * This method provides explicit cleanup and is preferred over waiting for
+      181       * automatic cleanup via DeallocatorService.
+      182       *
+      183       * <p><b>Note:</b> After calling close(), this OpaqueNDArrayArr should not be used.</p>
+      184       */
+      185      @Override
+      186      public void close() {
+      187          if (deallocator != null) {
+      188              // Only deallocate if not already done - prevents double-free
+      189              if (!deallocator.isDeallocated()) {
+      190                  deallocator.deallocate();
+      191              }
+      192              // If deallocator exists but is already deallocated, do nothing - already cleaned up
+      193          } else {
+      194              // Fallback cleanup ONLY if not registered with DeallocatorService at all
+      195              if (log.isTraceEnabled()) {
+      196                  log.trace("Fallback cleanup for unregistered OpaqueNDArrayArr");
+      197              }
+      198              if (!isNull()) {
+      199                  deallocate();
+      200                  setNull();
+      201              }
+      202              // Clear references to allow GC, but do NOT close the OpaqueNDArrays!
+      203              // They are CACHED instances managed by their parent INDArrays.
+      204              parentArrays = null;
+      205              opaqueArrays = null;
+      206          }
+      207      }
+      208  
+      209      /**
+      210       * Gets the deallocator associated with this OpaqueNDArrayArr.
+      211       * 
+      212       * @return The deallocator or null if not registered
+      213       */
+      214      public OpaqueNDArrayArrDeallocator getDeallocator() {
+      215          return deallocator;
+      216      }
+      217  
+      218      /**
+      219       * Gets the parent INDArrays being kept alive by this OpaqueNDArrayArr.
+      220       *
+      221       * @return The parent arrays or null if deallocated
+      222       */
+      223      public INDArray[] getParentArrays() {
+      224          return parentArrays;
+      225      }
+      226  
+      227      /**
+      228       * Gets the OpaqueNDArray instances being kept alive by this OpaqueNDArrayArr.
+      229       * These are the uncached OpaqueNDArray instances created from parent INDArrays.
+      230       *
+      231       * @return The OpaqueNDArray arrays or null if deallocated
+      232       */
+      233      public OpaqueNDArray[] getOpaqueArrays() {
+      234          return opaqueArrays;
+      235      }
+      236  
+      237      /**
+      238       * Clears the opaqueArrays reference (used by deallocator after closing them).
+      239       */
+      240      public void clearOpaqueArrays() {
+      241          opaqueArrays = null;
+      242      }
+      243  }

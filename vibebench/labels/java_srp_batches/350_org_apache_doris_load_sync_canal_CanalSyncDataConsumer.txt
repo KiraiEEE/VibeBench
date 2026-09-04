@@ -1,0 +1,406 @@
+row 350   apache/doris#61565
+============================================================================
+CLASS org.apache.doris.load.sync.canal.CanalSyncDataConsumer   loc=419 methods=18 wmc=84 lcom=0.0 c3=0.1446300003906308
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       58  public class CanalSyncDataConsumer extends SyncDataConsumer {
+       59      private static Logger logger = LogManager.getLogger(CanalSyncDataConsumer.class);
+       60  
+       61      private static final String DATE_FORMAT = "yyyy-MM-dd HH:mm:ss";
+       62      private static final long MIN_COMMIT_EVENT_SIZE = Config.min_sync_commit_size;
+       63      private static final long MIN_COMMIT_MEM_SIZE = Config.min_bytes_sync_commit;
+       64      private static final long MAX_COMMIT_MEM_SIZE = Config.max_bytes_sync_commit;
+       65  
+       66      private CanalSyncJob syncJob;
+       67      private CanalConnector connector;
+       68      private Map<Long, CanalSyncChannel> idToChannels;
+       69      private Set<Long> ackBatches;
+       70      private PositionMeta<EntryPosition> positionMeta;
+       71      private LinkedBlockingQueue<Events<CanalEntry.Entry, EntryPosition>> dataBlockingQueue;
+       72      private SyncChannelHandle handle;
+       73      private ReentrantLock getLock;
+       74      private int sleepTimeMs;
+       75      private long commitIntervalSecond;
+       76  
+       77      public void setChannels(Map<Long, CanalSyncChannel> idToChannels) {
+       78          for (CanalSyncChannel channel : idToChannels.values()) {
+       79              this.positionMeta.setCommitPosition(channel.getId(), EntryPosition.MIN_POS);
+       80              channel.setCallback(handle);
+       81          }
+       82          this.idToChannels = idToChannels;
+       83      }
+       84  
+       85      public CanalSyncDataConsumer(CanalSyncJob syncJob, CanalConnector connector, ReentrantLock getLock, boolean debug) {
+       86          super(debug);
+       87          this.syncJob = syncJob;
+       88          this.connector = connector;
+       89          this.dataBlockingQueue = Queues.newLinkedBlockingQueue(1024);
+       90          this.ackBatches = Sets.newHashSet();
+       91          this.positionMeta = new PositionMeta<>();
+       92          this.getLock = getLock;
+       93          this.handle = new SyncChannelHandle();
+       94          this.commitIntervalSecond = Config.sync_commit_interval_second;
+       95          this.sleepTimeMs = 500;
+       96      }
+       97  
+       98      public void stop(boolean needCleanUp) {
+       99          super.stop();
+      100          if (needCleanUp) {
+      101              cleanUp();
+      102          }
+      103      }
+      104  
+      105      @Override
+      106      public void beginForTxn() {
+      107          handle.reset(idToChannels.size());
+      108          for (CanalSyncChannel channel : idToChannels.values()) {
+      109              channel.initTxn(Config.max_stream_load_timeout_second);
+      110              handle.mark(channel);
+      111          }
+      112      }
+      113  
+      114      @Override
+      115      public void abortForTxn(String reason) {
+      116          abortForTxn(idToChannels.values(), reason);
+      117      }
+      118  
+      119      public void abortForTxn(Collection<CanalSyncChannel> channels, String reason) {
+      120          logger.info("client is aborting transactions. JobId: {}, reason: {}", syncJob.getId(), reason);
+      121          for (CanalSyncChannel channel : channels) {
+      122              if (channel.isTxnBegin()) {
+      123                  try {
+      124                      channel.abortTxn(reason);
+      125                  } catch (Exception e) {
+      126                      logger.warn("Abort channel failed. jobId: {}，channel: {}, target: {}, msg: {}",
+      127                              syncJob.getId(), channel.getId(), channel.getTargetTable(), e.getMessage());
+      128                  }
+      129              }
+      130          }
+      131          rollback();
+      132      }
+      133  
+      134      @Override
+      135      public void commitForTxn() {
+      136          logger.info("client is committing transactions. JobId: {}", syncJob.getId());
+      137          boolean success = true;
+      138          EntryPosition latestPosition = positionMeta.getLatestPosition();
+      139          for (CanalSyncChannel channel : idToChannels.values()) {
+      140              if (channel.isTxnBegin()) {
+      141                  try {
+      142                      channel.commitTxn();
+      143                      this.positionMeta.setCommitPosition(channel.getId(), latestPosition);
+      144                  } catch (Exception ce) {
+      145                      logger.warn("Commit channel failed. JobId: {}, channel: {}, target: {}, msg: {}",
+      146                              syncJob.getId(), channel.getId(), channel.getTargetTable(), ce.getMessage());
+      147                      try {
+      148                          channel.abortTxn(ce.getMessage());
+      149                      } catch (Exception ae) {
+      150                          logger.warn("Abort channel failed. JobId: {}，channel: {}, target: {}, msg: {}",
+      151                                  syncJob.getId(), channel.getId(), channel.getTargetTable(), ae.getMessage());
+      152                      }
+      153                      success = false;
+      154                  }
+      155              }
+      156          }
+      157          if (success) {
+      158              ack();
+      159          } else {
+      160              rollback();
+      161          }
+      162      }
+      163  
+      164      public Status waitForTxn() {
+      165          for (CanalSyncChannel channel : idToChannels.values()) {
+      166              channel.submitEOF();
+      167          }
+      168  
+      169          Status st = Status.CANCELLED;
+      170          try {
+      171              handle.join();
+      172              st = handle.getStatus();
+      173          } catch (InterruptedException e) {
+      174              logger.warn("InterruptedException: ", e);
+      175          }
+      176          return st;
+      177      }
+      178  
+      179      public void cleanForTxn() {
+      180          for (CanalSyncChannel channel : idToChannels.values()) {
+      181              if (channel.isTxnInit()) {
+      182                  channel.clearTxn();
+      183              }
+      184          }
+      185      }
+      186  
+      187      @Override
+      188      public void process() {
+      189          while (running) {
+      190              try {
+      191                  int totalSize = 0;
+      192                  long totalMemSize = 0L;
+      193                  long startTime = System.currentTimeMillis();
+      194                  beginForTxn();
+      195                  while (running) {
+      196                      Events<CanalEntry.Entry, EntryPosition> dataEvents = null;
+      197                      try {
+      198                          dataEvents = dataBlockingQueue.poll(CanalConfigs.pollWaitingTimeoutMs, TimeUnit.MILLISECONDS);
+      199                      } catch (InterruptedException e) {
+      200                          // do nothing
+      201                      }
+      202                      if (dataEvents == null) {
+      203                          // If not, continue to wait for the next batch of data
+      204                          if (totalSize >= MIN_COMMIT_EVENT_SIZE || totalMemSize >= MIN_COMMIT_MEM_SIZE) {
+      205                              break;
+      206                          }
+      207                          try {
+      208                              Thread.sleep(sleepTimeMs);
+      209                          } catch (InterruptedException e) {
+      210                              // do nothing
+      211                          }
+      212                      } else {
+      213                          if (debug) {
+      214                              // print summary of the batch
+      215                              CanalUtils.printSummary(dataEvents);
+      216                          }
+      217                          List<CanalEntry.Entry> entries = dataEvents.getDatas();
+      218                          int size = entries.size();
+      219                          ackBatches.add(dataEvents.getId());
+      220                          positionMeta.addBatch(dataEvents.getId(), dataEvents.getPositionRange());
+      221                          executeOneBatch(dataEvents);
+      222                          totalSize += size;
+      223                          totalMemSize += dataEvents.getMemSize();
+      224                          // size of bytes received so far is larger than max commit memory size.
+      225                          if (totalMemSize >= MAX_COMMIT_MEM_SIZE) {
+      226                              break;
+      227                          }
+      228                      }
+      229  
+      230                      if (System.currentTimeMillis() - startTime >= commitIntervalSecond * 1000) {
+      231                          break;
+      232                      }
+      233                  }
+      234  
+      235                  // wait all channels done
+      236                  Status st = waitForTxn();
+      237                  if (!running) {
+      238                      abortForTxn("stopping client");
+      239                      continue;
+      240                  }
+      241                  if (st.ok()) {
+      242                      commitForTxn();
+      243                  } else {
+      244                      abortForTxn(st.getErrorMsg());
+      245                      syncJob.cancel(SyncFailMsg.MsgType.RUN_FAIL, st.getErrorMsg());
+      246                  }
+      247              } catch (Exception e) {
+      248                  logger.error("Executor is error!", e);
+      249                  abortForTxn(e.getMessage());
+      250                  syncJob.cancel(SyncFailMsg.MsgType.SUBMIT_FAIL, e.getMessage());
+      251              } finally {
+      252                  cleanForTxn();
+      253              }
+      254          }
+      255      }
+      256  
+      257      public void put(Message message, int size) {
+      258          List<CanalEntry.Entry> entries;
+      259          if (message.isRaw()) {
+      260              entries = new ArrayList<>(message.getRawEntries().size());
+      261              for (ByteString rawEntry : message.getRawEntries()) {
+      262                  try {
+      263                      entries.add(CanalEntry.Entry.parseFrom(rawEntry));
+      264                  } catch (InvalidProtocolBufferException e) {
+      265                      throw new CanalException(e);
+      266                  }
+      267              }
+      268          } else {
+      269              entries = message.getEntries();
+      270          }
+      271  
+      272          int startIndex = 0;
+      273          // if last ack position is null, it is the first time to consume batch
+      274          EntryPosition lastAckPosition = positionMeta.getAckPosition();
+      275          if (lastAckPosition != null) {
+      276              EntryPosition firstPosition = EntryPosition.createPosition(entries.get(0));
+      277              // only get data after the last ack position
+      278              if (EntryPosition.min(firstPosition, lastAckPosition).equals(firstPosition)) {
+      279                  for (int i = 0; i <= entries.size() - 1; i++) {
+      280                      startIndex++;
+      281                      if (EntryPosition.checkPosition(entries.get(i), lastAckPosition)) {
+      282                          break;
+      283                      }
+      284                  }
+      285              }
+      286          }
+      287  
+      288          if (startIndex <= size - 1) {
+      289              Events<CanalEntry.Entry, EntryPosition> dataEvents = new Events<>(message.getId());
+      290              PositionRange<EntryPosition> range = new PositionRange<>();
+      291              dataEvents.setPositionRange(range);
+      292              range.setStart(EntryPosition.createPosition(entries.get(startIndex)));
+      293              range.setEnd(EntryPosition.createPosition(entries.get(size - 1)));
+      294              dataEvents.setDatas(entries);
+      295              long memsize = 0L;
+      296              for (CanalEntry.Entry entry : entries) {
+      297                  memsize += entry.getHeader().getEventLength();
+      298              }
+      299              dataEvents.setMemSize(memsize);
+      300              try {
+      301                  dataBlockingQueue.put(dataEvents);
+      302              } catch (InterruptedException e) {
+      303                  logger.error("put message to executor error:", e);
+      304                  throw new CanalException(e);
+      305              }
+      306          }
+      307      }
+      308  
+      309      private void executeOneBatch(Events<CanalEntry.Entry, EntryPosition> dataEvents) throws UserException {
+      310          final long batchId = dataEvents.getId();
+      311          Map<String, CanalSyncChannel> preferChannels = Maps.newHashMap();
+      312          Map<String, CanalSyncChannel> secondaryChannels = Maps.newHashMap();
+      313          EntryPosition startPosition = dataEvents.getPositionRange().getStart();
+      314          EntryPosition endPosition = dataEvents.getPositionRange().getEnd();
+      315          for (CanalSyncChannel channel : idToChannels.values()) {
+      316              String key = CanalUtils.getFullName(channel.getSrcDataBase(), channel.getSrcTable());
+      317              // if last commit position is null, it is the first time to execute batch
+      318              EntryPosition commitPosition = positionMeta.getCommitPosition(channel.getId());
+      319              if (commitPosition != null) {
+      320                  if (commitPosition.compareTo(startPosition) < 0) {
+      321                      preferChannels.put(key, channel);
+      322                  } else if (commitPosition.compareTo(endPosition) < 0) {
+      323                      secondaryChannels.put(key, channel);
+      324                  }
+      325              } else {
+      326                  preferChannels.put(key, channel);
+      327              }
+      328          }
+      329  
+      330          // distribute data to channels
+      331          for (CanalEntry.Entry entry : dataEvents.getDatas()) {
+      332              CanalEntry.EntryType entryType = entry.getEntryType();
+      333              try {
+      334                  if (entryType == CanalEntry.EntryType.ROWDATA) {
+      335                      CanalEntry.RowChange rowChange;
+      336                      try {
+      337                          rowChange = CanalEntry.RowChange.parseFrom(entry.getStoreValue());
+      338                      } catch (InvalidProtocolBufferException e) {
+      339                          throw new CanalException("parse event has an error , data:" + entry.toString(), e);
+      340                      }
+      341                      final CanalEntry.Header header = entry.getHeader();
+      342                      final CanalEntry.EventType eventType = rowChange.getEventType();
+      343                      if (!CanalUtils.isDML(eventType) || rowChange.getIsDdl()) {
+      344                          String sql = rowChange.getSql();
+      345                          processDDL(header, eventType, sql);
+      346                          return;
+      347                      }
+      348                      String schemaTableName = CanalUtils.getFullName(header.getSchemaName(), header.getTableName());
+      349                      if (preferChannels.containsKey(schemaTableName)) {
+      350                          CanalSyncChannel channel = preferChannels.get(schemaTableName);
+      351                          channel.submit(batchId, eventType, rowChange);
+      352                      } else if (secondaryChannels.containsKey(schemaTableName)) {
+      353                          CanalSyncChannel channel = secondaryChannels.get(schemaTableName);
+      354                          EntryPosition position = EntryPosition.createPosition(entry);
+      355                          EntryPosition commitPosition = positionMeta.getCommitPosition(channel.getId());
+      356                          if (position.compareTo(commitPosition) > 0) {
+      357                              channel.submit(batchId, eventType, rowChange);
+      358                          }
+      359                      }
+      360                      // print row
+      361                      if (debug) {
+      362                          CanalUtils.printRow(rowChange, header);
+      363                      }
+      364                  }
+      365              } catch (Exception e) {
+      366                  logger.error("execute event has an error, data: {}, msg: {}", entry.toString(), e);
+      367                  throw new UserException("execute batch failed, batchId: " + batchId + " ,msg: " + e.getMessage());
+      368              }
+      369          }
+      370      }
+      371  
+      372      // currently not support ddl
+      373      private void processDDL(CanalEntry.Header header, CanalEntry.EventType eventType, String sql) {
+      374          String table = header.getSchemaName() + "." + header.getTableName();
+      375          switch (eventType) {
+      376              case CREATE:
+      377                  logger.warn("parse create table event, table: {}, sql: {}", table, sql);
+      378                  return;
+      379              case ALTER:
+      380                  logger.warn("parse alter table event, table: {}, sql: {}", table, sql);
+      381                  return;
+      382              case TRUNCATE:
+      383                  logger.warn("parse truncate table event, table: {}, sql: {}", table, sql);
+      384                  return;
+      385              case ERASE:
+      386              case QUERY:
+      387                  logger.warn("parse event : {}, sql: {} . ignored!", eventType.name(), sql);
+      388                  return;
+      389              case RENAME:
+      390                  logger.warn("parse rename table event, table: {}, sql: {}", table, sql);
+      391                  return;
+      392              case CINDEX:
+      393                  logger.warn("parse create index event, table: {}, sql: {}", table, sql);
+      394                  return;
+      395              case DINDEX:
+      396                  logger.warn("parse delete index event, table: {}, sql: {}", table, sql);
+      397                  return;
+      398              default:
+      399                  logger.warn("parse unknown event: {}, table: {}, sql: {}", eventType.name(), table, sql);
+      400                  break;
+      401          }
+      402      }
+      403  
+      404      private void ack() {
+      405          if (!ackBatches.isEmpty()) {
+      406              logger.info("client ack batches: {}", ackBatches);
+      407              while (!ackBatches.isEmpty()) {
+      408                  // ack the oldest batch
+      409                  long minBatchId = Collections.min(ackBatches);
+      410                  connector.ack(minBatchId);
+      411                  ackBatches.remove(minBatchId);
+      412                  PositionRange<EntryPosition> positionRange = positionMeta.removeBatch(minBatchId);
+      413                  positionMeta.setAckPosition(positionRange.getEnd());
+      414                  positionMeta.setAckTime(System.currentTimeMillis());
+      415              }
+      416          }
+      417      }
+      418  
+      419      private void rollback() {
+      420          holdGetLock();
+      421          try {
+      422              // Wait for the receiver to put the last message into the queue before clearing queue
+      423              try {
+      424                  Thread.sleep(1000L);
+      425              } catch (InterruptedException e) {
+      426                  // ignore
+      427              }
+      428  
+      429              if (!ackBatches.isEmpty()) {
+      430                  connector.rollback();
+      431              }
+      432          } finally {
+      433              releaseGetLock();
+      434          }
+      435          dataBlockingQueue.clear();
+      436          ackBatches.clear();
+      437          positionMeta.clearAllBatch();
+      438      }
+      439  
+      440      public String getPositionInfo() {
+      441          EntryPosition ackPosition = positionMeta.getAckPosition();
+      442          long ackTime = positionMeta.getAckTime();
+      443          StringBuilder sb = new StringBuilder();
+      444          if (ackPosition != null) {
+      445              DateTimeFormatter format = DateTimeFormatter.ofPattern(DATE_FORMAT).withZone(ZoneId.systemDefault());
+      446              long executeTime = ackPosition.getExecuteTime();
+      447              long delayTime = ackTime - executeTime;
+      448              LocalDateTime date = LocalDateTime.ofInstant(Instant.ofEpochMilli(System.currentTimeMillis()),
+      449                      ZoneId.systemDefault());
+      450              sb.append("position:").append(ackPosition)
+      451                      .append(", executeTime:[").append(format.format(date)).append("], ")
+      452                      .append("delay:").append(delayTime).append("ms");
+      453              if (StringUtils.isNotEmpty(ackPosition.getGtid())) {
+      454                  sb.append(", gtid(").append(ackPosition.getGtid())
+      455                          .append(") ");
+      456              }
+      457          } else {
+       ... truncated at 400 lines ...

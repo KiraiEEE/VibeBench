@@ -1,0 +1,374 @@
+row 30   bethington/ghidra-mcp#86
+============================================================================
+CLASS com.xebyte.core.FrontEndProgramProvider   loc=369 methods=11 wmc=75 lcom=0.0 c3=0.1998494485334859
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       42  public class FrontEndProgramProvider implements ProgramProvider {
+       43  
+       44      private final PluginTool tool;
+       45      private final Map<String, Program> openPrograms = new ConcurrentHashMap<>();
+       46      private final Map<String, String> pathToName = new ConcurrentHashMap<>(); // project path -> cache key
+       47      private volatile Program currentProgram;
+       48      private final TaskMonitor monitor;
+       49      private final Object consumer; // DomainObject consumer for release tracking
+       50  
+       51      /**
+       52       * Create a FrontEndProgramProvider for the given tool.
+       53       *
+       54       * @param tool The Ghidra PluginTool (FrontEnd tool)
+       55       * @param consumer The consumer object for DomainObject tracking (typically the plugin instance)
+       56       */
+       57      public FrontEndProgramProvider(PluginTool tool, Object consumer) {
+       58          this.tool = tool;
+       59          this.consumer = consumer;
+       60          this.monitor = new ConsoleTaskMonitor();
+       61      }
+       62  
+       63      @Override
+       64      public Program getCurrentProgram() {
+       65          // Check all running CodeBrowsers for a current program
+       66          for (ProgramManager pm : findAllCodeBrowserProgramManagers()) {
+       67              Program cbProgram = pm.getCurrentProgram();
+       68              if (cbProgram != null) {
+       69                  return cbProgram;
+       70              }
+       71          }
+       72          // Fall back to our internally tracked current program
+       73          return currentProgram;
+       74      }
+       75  
+       76      @Override
+       77      public Program getProgram(String name) {
+       78          if (name == null || name.trim().isEmpty()) {
+       79              return getCurrentProgram();
+       80          }
+       81  
+       82          String searchName = name.trim();
+       83  
+       84          // 1. ALWAYS check CodeBrowser programs first — if the user has a program open
+       85          // in a CodeBrowser, we MUST use that instance so changes are visible immediately.
+       86          // This is critical: using our own cached instance would modify a different object
+       87          // in memory, and the CodeBrowser wouldn't see the changes until a reload.
+       88          List<Program> cbPrograms = collectCodeBrowserPrograms();
+       89  
+       90          // Path-based match against CodeBrowser programs (e.g., "/Vanilla/1.13c/D2Client.dll")
+       91          if (searchName.startsWith("/")) {
+       92              for (Program prog : cbPrograms) {
+       93                  DomainFile df = prog.getDomainFile();
+       94                  String dfPath = (df != null) ? df.getPathname() : "null";
+       95                  if (df != null && df.getPathname().equals(searchName)) {
+       96                      return prog;
+       97                  }
+       98              }
+       99          }
+      100  
+      101          // Name-based match against CodeBrowser programs
+      102          for (Program prog : cbPrograms) {
+      103              if (prog.getName().equalsIgnoreCase(searchName)) {
+      104                  return prog;
+      105              }
+      106          }
+      107          // Partial match on CodeBrowser programs
+      108          for (Program prog : cbPrograms) {
+      109              if (prog.getName().toLowerCase().contains(searchName.toLowerCase())) {
+      110                  return prog;
+      111              }
+      112          }
+      113  
+      114          // 2. Check path-based cache (handles multi-version same-name DLLs not in CodeBrowser)
+      115          if (searchName.startsWith("/")) {
+      116              String cacheKey = pathToName.get(searchName);
+      117              if (cacheKey != null) {
+      118                  Program cached = openPrograms.get(cacheKey);
+      119                  if (cached != null) {
+      120                      return cached;
+      121                  }
+      122              }
+      123          }
+      124  
+      125          // 3. Check our cache (only for non-path lookups to avoid collisions)
+      126          if (!searchName.startsWith("/")) {
+      127              Program cached = openPrograms.get(searchName);
+      128              if (cached != null) {
+      129                  return cached;
+      130              }
+      131              // Case-insensitive cache lookup
+      132              for (Map.Entry<String, Program> entry : openPrograms.entrySet()) {
+      133                  if (entry.getKey().equalsIgnoreCase(searchName)) {
+      134                      return entry.getValue();
+      135                  }
+      136              }
+      137          }
+      138  
+      139          // 4. Try to open from project by name or path
+      140          return openFromProject(searchName);
+      141      }
+      142  
+      143      @Override
+      144      public Program[] getAllOpenPrograms() {
+      145          // Collect programs from ALL CodeBrowser instances (deduped by identity)
+      146          List<Program> allPrograms = collectCodeBrowserPrograms();
+      147  
+      148          // Add our cached programs that aren't already in the list
+      149          // Deduplicate by object identity only — same-named programs from
+      150          // different versions (e.g., /Vanilla/1.00/D2Common.dll vs /Vanilla/1.13d/D2Common.dll)
+      151          // must both appear in the list
+      152          for (Program prog : openPrograms.values()) {
+      153              boolean alreadyListed = false;
+      154              for (Program existing : allPrograms) {
+      155                  if (existing == prog) {
+      156                      alreadyListed = true;
+      157                      break;
+      158                  }
+      159              }
+      160              if (!alreadyListed) {
+      161                  allPrograms.add(prog);
+      162              }
+      163          }
+      164  
+      165          return allPrograms.toArray(new Program[0]);
+      166      }
+      167  
+      168      @Override
+      169      public void setCurrentProgram(Program program) {
+      170          this.currentProgram = program;
+      171  
+      172          // Set current in the CodeBrowser that actually has this program open
+      173          if (program != null) {
+      174              for (ProgramManager pm : findAllCodeBrowserProgramManagers()) {
+      175                  for (Program p : pm.getAllOpenPrograms()) {
+      176                      if (p == program || p.getName().equals(program.getName())) {
+      177                          pm.setCurrentProgram(program);
+      178                          return;
+      179                      }
+      180                  }
+      181              }
+      182          }
+      183      }
+      184  
+      185      /**
+      186       * Collect programs from all running CodeBrowser instances, deduplicating
+      187       * by object identity and name.
+      188       *
+      189       * @return Mutable list of unique programs across all CodeBrowsers
+      190       */
+      191      private List<Program> collectCodeBrowserPrograms() {
+      192          List<Program> allPrograms = new ArrayList<>();
+      193          for (ProgramManager pm : findAllCodeBrowserProgramManagers()) {
+      194              for (Program prog : pm.getAllOpenPrograms()) {
+      195                  // Deduplicate by object identity only — not by name,
+      196                  // since multiple versions of the same DLL are distinct programs
+      197                  boolean alreadyListed = false;
+      198                  for (Program existing : allPrograms) {
+      199                      if (existing == prog) {
+      200                          alreadyListed = true;
+      201                          break;
+      202                      }
+      203                  }
+      204                  if (!alreadyListed) {
+      205                      allPrograms.add(prog);
+      206                  }
+      207              }
+      208          }
+      209          return allPrograms;
+      210      }
+      211  
+      212      @Override
+      213      public Project getProject() {
+      214          return tool.getProject();
+      215      }
+      216  
+      217      /**
+      218       * Open a program from the active project by name or path.
+      219       *
+      220       * @param nameOrPath Program name (e.g., "D2Common.dll") or project path (e.g., "/LoD/1.00/D2Common.dll")
+      221       * @return The opened program, or null if not found
+      222       */
+      223      @Override
+      224      public Program openFromProject(String nameOrPath) {
+      225          Project project = tool.getProject();
+      226          if (project == null) {
+      227              Msg.warn(this, "No active project");
+      228              return null;
+      229          }
+      230  
+      231          ProjectData projectData = project.getProjectData();
+      232          if (projectData == null) {
+      233              return null;
+      234          }
+      235  
+      236          DomainFile domainFile = null;
+      237  
+      238          // Try as absolute path first
+      239          if (nameOrPath.startsWith("/")) {
+      240              domainFile = projectData.getFile(nameOrPath);
+      241          }
+      242  
+      243          // If not found by path, search recursively by name
+      244          if (domainFile == null) {
+      245              domainFile = findFileByName(projectData.getRootFolder(), nameOrPath);
+      246          }
+      247  
+      248          if (domainFile == null) {
+      249              Msg.info(this, "File not found in project: " + nameOrPath);
+      250              return null;
+      251          }
+      252  
+      253          String projectPath = domainFile.getPathname();
+      254          // Use project path as unique cache key (handles multiple versions of same DLL)
+      255          String cacheKey = projectPath;
+      256  
+      257          try {
+      258              // getDomainObject returns the SAME instance if already open in CodeBrowser
+      259              // This is the key to seamless integration — shared domain objects
+      260              Program program = (Program) domainFile.getDomainObject(consumer, false, false, monitor);
+      261  
+      262              // Release previous consumer reference if overwriting a cache entry
+      263              // to prevent reference count leaks on the DomainObject
+      264              Program previousProgram = openPrograms.get(cacheKey);
+      265              if (previousProgram != null && previousProgram != program) {
+      266                  try {
+      267                      previousProgram.release(consumer);
+      268                      Msg.info(this, "Released previous cached program for: " + cacheKey);
+      269                  } catch (Exception ex) {
+      270                      Msg.warn(this, "Error releasing previous program " + cacheKey + ": " + ex.getMessage());
+      271                  }
+      272              }
+      273  
+      274              openPrograms.put(cacheKey, program);
+      275              pathToName.put(projectPath, cacheKey);
+      276              // Also map the input path if different from project path
+      277              if (!nameOrPath.equals(projectPath)) {
+      278                  pathToName.put(nameOrPath, cacheKey);
+      279              }
+      280              if (currentProgram == null) {
+      281                  currentProgram = program;
+      282              }
+      283              Msg.info(this, "Opened program from project: " + program.getName() +
+      284                  " (" + projectPath + ")");
+      285              return program;
+      286          } catch (Exception e) {
+      287              Msg.error(this, "Failed to open program: " + nameOrPath + " — " + e.getMessage());
+      288              // Try read-only as fallback
+      289              try {
+      290                  Program program = (Program) domainFile.getImmutableDomainObject(consumer, DomainFile.DEFAULT_VERSION, monitor);
+      291  
+      292                  // Release previous consumer reference if overwriting
+      293                  Program previousProgram = openPrograms.get(cacheKey);
+      294                  if (previousProgram != null && previousProgram != program) {
+      295                      try {
+      296                          previousProgram.release(consumer);
+      297                      } catch (Exception ex) {
+      298                          Msg.warn(this, "Error releasing previous program " + cacheKey + ": " + ex.getMessage());
+      299                      }
+      300                  }
+      301  
+      302                  openPrograms.put(cacheKey, program);
+      303                  pathToName.put(projectPath, cacheKey);
+      304                  if (!nameOrPath.equals(projectPath)) {
+      305                      pathToName.put(nameOrPath, cacheKey);
+      306                  }
+      307                  if (currentProgram == null) {
+      308                      currentProgram = program;
+      309                  }
+      310                  Msg.info(this, "Opened program read-only: " + program.getName());
+      311                  return program;
+      312              } catch (Exception e2) {
+      313                  Msg.error(this, "Failed to open program even read-only: " + nameOrPath + " — " + e2.getMessage());
+      314                  return null;
+      315              }
+      316          }
+      317      }
+      318  
+      319      /**
+      320       * Search for a file by name recursively in the project folder tree.
+      321       */
+      322      private DomainFile findFileByName(DomainFolder folder, String name) {
+      323          if (folder == null) {
+      324              return null;
+      325          }
+      326  
+      327          // Check files in this folder
+      328          try {
+      329              for (DomainFile file : folder.getFiles()) {
+      330                  if (file.getName().equalsIgnoreCase(name)) {
+      331                      return file;
+      332                  }
+      333              }
+      334  
+      335              // Recurse into subfolders
+      336              for (DomainFolder subfolder : folder.getFolders()) {
+      337                  DomainFile found = findFileByName(subfolder, name);
+      338                  if (found != null) {
+      339                      return found;
+      340                  }
+      341              }
+      342          } catch (Exception e) {
+      343              Msg.warn(this, "Error searching folder " + folder.getPathname() + ": " + e.getMessage());
+      344          }
+      345  
+      346          return null;
+      347      }
+      348  
+      349      /**
+      350       * Find ProgramManagers from ALL running CodeBrowser tool instances.
+      351       * When multiple CodeBrowsers are open (e.g., user double-clicks multiple
+      352       * programs in FrontEnd), each has its own ProgramManager.
+      353       *
+      354       * @return List of ProgramManagers from all running CodeBrowsers (may be empty)
+      355       */
+      356      private List<ProgramManager> findAllCodeBrowserProgramManagers() {
+      357          List<ProgramManager> managers = new ArrayList<>();
+      358  
+      359          Project project = tool.getProject();
+      360          if (project == null) {
+      361              return managers;
+      362          }
+      363  
+      364          try {
+      365              ghidra.framework.model.ToolManager tm = project.getToolManager();
+      366              if (tm == null) {
+      367                  return managers;
+      368              }
+      369  
+      370              for (PluginTool runningTool : tm.getRunningTools()) {
+      371                  ProgramManager pm = runningTool.getService(ProgramManager.class);
+      372                  if (pm != null) {
+      373                      managers.add(pm);
+      374                  }
+      375              }
+      376          } catch (Exception e) {
+      377              // ToolManager may not be available in all contexts
+      378          }
+      379  
+      380          return managers;
+      381      }
+      382  
+      383      /**
+      384       * Release all programs opened by this provider.
+      385       * Called during plugin dispose.
+      386       */
+      387      public void releaseAll() {
+      388          for (Map.Entry<String, Program> entry : openPrograms.entrySet()) {
+      389              try {
+      390                  Program program = entry.getValue();
+      391                  program.release(consumer);
+      392                  Msg.info(this, "Released program: " + entry.getKey());
+      393              } catch (Exception e) {
+      394                  Msg.warn(this, "Error releasing program " + entry.getKey() + ": " + e.getMessage());
+      395              }
+      396          }
+      397          openPrograms.clear();
+      398          pathToName.clear();
+      399          currentProgram = null;
+      400      }
+      401  
+      402      /**
+      403       * Get the underlying PluginTool.
+      404       *
+      405       * @return The PluginTool
+      406       */
+      407      public PluginTool getTool() {
+      408          return tool;
+      409      }
+      410  }

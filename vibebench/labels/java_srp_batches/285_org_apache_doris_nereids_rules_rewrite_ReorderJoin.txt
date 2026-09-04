@@ -1,0 +1,358 @@
+row 285   apache/doris#61356
+============================================================================
+CLASS org.apache.doris.nereids.rules.rewrite.ReorderJoin   loc=353 methods=6 wmc=45 lcom=0.0 c3=0.342955250538364
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       80  @DependsRules({
+       81      MergeFilters.class
+       82  })
+       83  public class ReorderJoin extends OneRewriteRuleFactory {
+       84      @Override
+       85      public Rule build() {
+       86          return logicalFilter(subTree(LogicalJoin.class, LogicalFilter.class))
+       87              .whenNot(filter -> filter.child() instanceof LogicalJoin
+       88                      && ((LogicalJoin<?, ?>) filter.child()).isMarkJoin())
+       89              .thenApply(ctx -> {
+       90                  if (ctx.statementContext.getConnectContext().getSessionVariable().isDisableJoinReorder()
+       91                          || ctx.cascadesContext.isLeadingDisableJoinReorder()
+       92                          || ((LogicalJoin<?, ?>) ctx.root.child()).isLeadingJoin()) {
+       93                      return null;
+       94                  }
+       95  
+       96                  LogicalFilter<Plan> filter = ctx.root;
+       97                  Set<Expression> uniqueExprConjuncts = Sets.newHashSet();
+       98                  Set<Expression> nonUniqueExprConjuncts = Sets.newHashSetWithExpectedSize(filter.getConjuncts().size());
+       99                  for (Expression conjunct : filter.getConjuncts()) {
+      100                      // after reorder and push down the random() down to lower join,
+      101                      // the rewritten sql may have less rows() than the origin sql
+      102                      if (conjunct.containsUniqueFunction()) {
+      103                          uniqueExprConjuncts.add(conjunct);
+      104                      } else {
+      105                          nonUniqueExprConjuncts.add(conjunct);
+      106                      }
+      107                  }
+      108                  if (nonUniqueExprConjuncts.isEmpty()) {
+      109                      return null;
+      110                  }
+      111                  LogicalFilter<Plan> nonUniqueExprFilter = uniqueExprConjuncts.isEmpty()
+      112                          ? filter : filter.withConjunctsAndChild(nonUniqueExprConjuncts, filter.child());
+      113  
+      114                  Map<Plan, DistributeHint> planToHintType = Maps.newHashMap();
+      115                  Plan plan = joinToMultiJoin(nonUniqueExprFilter, planToHintType);
+      116                  Preconditions.checkState(plan instanceof MultiJoin, "join to multi join should return MultiJoin,"
+      117                          + " but return plan is " + plan.getType());
+      118                  MultiJoin multiJoin = (MultiJoin) plan;
+      119                  ctx.statementContext.addJoinFilters(multiJoin.getJoinFilter());
+      120                  ctx.statementContext.setMaxNAryInnerJoin(multiJoin.children().size());
+      121                  Plan after = multiJoinToJoin(multiJoin, planToHintType);
+      122                  if (after != null && !after.equals(nonUniqueExprFilter)) {
+      123                      return PlanUtils.filterOrSelf(uniqueExprConjuncts, after);
+      124                  } else {
+      125                      return null;
+      126                  }
+      127              }).toRule(RuleType.REORDER_JOIN);
+      128      }
+      129  
+      130      /**
+      131       * Recursively convert to
+      132       * {@link LogicalJoin} or {@link LogicalFilter}--{@link LogicalJoin}
+      133       * --> {@link MultiJoin}
+      134       */
+      135      public Plan joinToMultiJoin(Plan plan, Map<Plan, DistributeHint> planToHintType) {
+      136          // subtree can't specify the end of Pattern. so end can be GroupPlan or Filter
+      137          if (nonJoinAndNonFilter(plan)
+      138                  || (plan instanceof LogicalFilter && nonJoinAndNonFilter(plan.child(0)))) {
+      139              return plan;
+      140          }
+      141  
+      142          List<Plan> inputs = Lists.newArrayList();
+      143          List<Expression> joinFilter = Lists.newArrayList();
+      144          List<Expression> notInnerHashJoinConditions = Lists.newArrayList();
+      145          List<Expression> notInnerOtherJoinConditions = Lists.newArrayList();
+      146  
+      147          LogicalJoin<?, ?> join;
+      148          // Implicit rely on {rule: MergeFilters}, so don't exist filter--filter--join.
+      149          if (plan instanceof LogicalFilter) {
+      150              LogicalFilter<?> filter = (LogicalFilter<?>) plan;
+      151              for (Expression conjunct : filter.getConjuncts()) {
+      152                  // (t1 join t2) join t3 where t1.a = t3.x + random()
+      153                  // if reorder, then may have ((t1 join t3) on t1.a = t3.x + random()) join t2,
+      154                  // then the reorder result will less rows than origin.
+      155                  if (conjunct.containsUniqueFunction()) {
+      156                      return plan;
+      157                  }
+      158              }
+      159              joinFilter.addAll(filter.getConjuncts());
+      160              join = (LogicalJoin<?, ?>) filter.child();
+      161          } else {
+      162              join = (LogicalJoin<?, ?>) plan;
+      163          }
+      164  
+      165          if (join.isMarkJoin()) {
+      166              return plan;
+      167          }
+      168  
+      169          if (join.getJoinType().isInnerOrCrossJoin()) {
+      170              joinFilter.addAll(join.getHashJoinConjuncts());
+      171              joinFilter.addAll(join.getOtherJoinConjuncts());
+      172          } else {
+      173              notInnerHashJoinConditions.addAll(join.getHashJoinConjuncts());
+      174              notInnerOtherJoinConditions.addAll(join.getOtherJoinConjuncts());
+      175          }
+      176  
+      177          // recursively convert children.
+      178          planToHintType.put(join.left(), new DistributeHint(DistributeType.NONE));
+      179          Plan left = joinToMultiJoin(join.left(), planToHintType);
+      180          planToHintType.put(join.right(), join.getDistributeHint());
+      181          Plan right = joinToMultiJoin(join.right(), planToHintType);
+      182  
+      183          boolean changeLeft = join.getJoinType().isRightJoin()
+      184                  || join.getJoinType().isFullOuterJoin();
+      185          if (canCombine(left, changeLeft)) {
+      186              MultiJoin leftMultiJoin = (MultiJoin) left;
+      187              inputs.addAll(leftMultiJoin.children());
+      188              joinFilter.addAll(leftMultiJoin.getJoinFilter());
+      189          } else {
+      190              inputs.add(left);
+      191          }
+      192  
+      193          boolean changeRight = join.getJoinType().isLeftJoin()
+      194                  || join.getJoinType().isFullOuterJoin();
+      195          if (canCombine(right, changeRight)) {
+      196              MultiJoin rightMultiJoin = (MultiJoin) right;
+      197              inputs.addAll(rightMultiJoin.children());
+      198              joinFilter.addAll(rightMultiJoin.getJoinFilter());
+      199          } else {
+      200              inputs.add(right);
+      201          }
+      202  
+      203          return new MultiJoin(
+      204                  inputs,
+      205                  joinFilter,
+      206                  join.getJoinType(),
+      207                  notInnerHashJoinConditions,
+      208                  notInnerOtherJoinConditions);
+      209      }
+      210  
+      211      /**
+      212       * Recursively convert to
+      213       * {@link MultiJoin}
+      214       * -->
+      215       * {@link LogicalJoin} or
+      216       * {@link LogicalFilter}--{@link LogicalJoin}
+      217       * <p>
+      218       * When all input is CROSS/Inner Join, all join will be flattened.
+      219       * Otherwise, we will split {join cluster} into multiple {@link MultiJoin}.
+      220       * <p>
+      221       * Here are examples of the {@link MultiJoin}s constructed after this rules has been applied.
+      222       * <p>
+      223       * simple example:
+      224       * <ul>
+      225       * <li>A JOIN B --> MJ(A, B)
+      226       * <li>A JOIN B JOIN C JOIN D --> MJ(A, B, C, D)
+      227       * <li>A LEFT (OUTER/SEMI/ANTI) JOIN B --> MJ([LOJ/LSJ/LAJ]A, B)
+      228       * <li>A LEFT (OUTER/SEMI/ANTI) JOIN B --> MJ([ROJ/RSJ/RAJ]A, B)
+      229       * <li>A FULL JOIN B --> MJ[FOJ](A, B)
+      230       * </ul>
+      231       * </p>
+      232       * <p>
+      233       * complex example:
+      234       * <ul>
+      235       * <li>A LEFT OUTER JOIN (B JOIN C) --> MJ([LOJ]A, MJ(B, C)))
+      236       * <li>(A JOIN B) LEFT JOIN C --> MJ(A, B, C)
+      237       * <li>(A LEFT OUTER JOIN B) JOIN C --> MJ(MJ(A, B), C)
+      238       * <li>A LEFT JOIN (B FULL JOIN C) --> MJ(A, MJ[full](B, C))
+      239       * <li>(A LEFT JOIN B) FULL JOIN (C RIGHT JOIN D) --> MJ[full](MJ(A, B), MJ(C, D))
+      240       * </ul>
+      241       * </p>
+      242       * more complex example:
+      243       * <ul>
+      244       * <li> A JOIN B JOIN C LEFT JOIN D --> MJ([LOJ]A, B, C, D)
+      245       * <li> A JOIN B JOIN C LEFT JOIN (D JOIN F) --> MJ([LOJ]A, B, C, MJ(D, F))
+      246       * <li> A RIGHT JOIN (B JOIN C JOIN D)--> MJ([ROJ]A, B, C, D)
+      247       * <li> A JOIN B RIGHT JOIN (C JOIN D) --> MJ(A, B, MJ([ROJ]C, D))
+      248       * </ul>
+      249       * </p>
+      250       * Graphic presentation:
+      251       * <pre>
+      252       * A JOIN B JOIN C LEFT JOIN D JOIN F
+      253       *      left                  left│
+      254       * A  B  C  D  F   ──►   A  B  C  │ D  F   ──►  MJ(LOJ A,B,C,MJ(DF)
+      255       *
+      256       * A JOIN B RIGHT JOIN C JOIN D JOIN F
+      257       *     right                  │right
+      258       * A  B  C  D  F   ──►   A  B │  C  D  F   ──►  MJ(A,B,MJ(ROJ C,D,F)
+      259       *
+      260       * (A JOIN B JOIN C) FULL JOIN (D JOIN F)
+      261       *       full                    │
+      262       * A  B  C  D  F   ──►   A  B  C │ D  F    ──►  MJ(FOJ MJ(A,B,C) MJ(D,F))
+      263       * </pre>
+      264       */
+      265      public Plan multiJoinToJoin(MultiJoin multiJoin, Map<Plan, DistributeHint> planToHintType) {
+      266          if (multiJoin.arity() == 1) {
+      267              return PlanUtils.filterOrSelf(ImmutableSet.copyOf(multiJoin.getJoinFilter()), multiJoin.child(0));
+      268          }
+      269  
+      270          Builder<Plan> builder = ImmutableList.builder();
+      271          // recursively handle multiJoin children.
+      272          for (Plan child : multiJoin.children()) {
+      273              if (child instanceof MultiJoin) {
+      274                  MultiJoin childMultiJoin = (MultiJoin) child;
+      275                  builder.add(multiJoinToJoin(childMultiJoin, planToHintType));
+      276              } else {
+      277                  builder.add(child);
+      278              }
+      279          }
+      280          MultiJoin multiJoinHandleChildren = multiJoin.withChildren(builder.build());
+      281  
+      282          if (!multiJoinHandleChildren.getJoinType().isInnerOrCrossJoin()) {
+      283              List<Expression> remainingFilter;
+      284  
+      285              Plan left;
+      286              Plan right;
+      287              if (multiJoinHandleChildren.getJoinType().isLeftJoin()) {
+      288                  right = multiJoinHandleChildren.child(multiJoinHandleChildren.arity() - 1);
+      289                  Set<ExprId> rightOutputExprIdSet = right.getOutputExprIdSet();
+      290                  Map<Boolean, List<Expression>> split = multiJoin.getJoinFilter().stream()
+      291                          .collect(Collectors.partitioningBy(expr ->
+      292                                  Utils.isIntersecting(rightOutputExprIdSet, expr.getInputSlotExprIds())
+      293                          ));
+      294                  remainingFilter = split.get(true);
+      295                  List<Expression> pushedFilter = split.get(false);
+      296                  left = multiJoinToJoin(new MultiJoin(
+      297                          multiJoinHandleChildren.children().subList(0, multiJoinHandleChildren.arity() - 1),
+      298                          pushedFilter,
+      299                          JoinType.INNER_JOIN,
+      300                          ExpressionUtils.EMPTY_CONDITION, ExpressionUtils.EMPTY_CONDITION), planToHintType);
+      301              } else if (multiJoinHandleChildren.getJoinType().isRightJoin()) {
+      302                  left = multiJoinHandleChildren.child(0);
+      303                  Set<ExprId> leftOutputExprIdSet = left.getOutputExprIdSet();
+      304                  Map<Boolean, List<Expression>> split = multiJoin.getJoinFilter().stream()
+      305                          .collect(Collectors.partitioningBy(expr ->
+      306                                  Utils.isIntersecting(leftOutputExprIdSet, expr.getInputSlotExprIds())
+      307                          ));
+      308                  remainingFilter = split.get(true);
+      309                  List<Expression> pushedFilter = split.get(false);
+      310                  right = multiJoinToJoin(new MultiJoin(
+      311                          multiJoinHandleChildren.children().subList(1, multiJoinHandleChildren.arity()),
+      312                          pushedFilter,
+      313                          JoinType.INNER_JOIN,
+      314                          ExpressionUtils.EMPTY_CONDITION, ExpressionUtils.EMPTY_CONDITION), planToHintType);
+      315              } else {
+      316                  remainingFilter = multiJoin.getJoinFilter();
+      317                  Preconditions.checkState(multiJoinHandleChildren.arity() == 2);
+      318                  List<Plan> children = multiJoinHandleChildren.children().stream().map(child -> {
+      319                      if (child instanceof MultiJoin) {
+      320                          return multiJoinToJoin((MultiJoin) child, planToHintType);
+      321                      } else {
+      322                          return child;
+      323                      }
+      324                  }).collect(Collectors.toList());
+      325                  left = children.get(0);
+      326                  right = children.get(1);
+      327              }
+      328  
+      329              return PlanUtils.filterOrSelf(ImmutableSet.copyOf(remainingFilter), new LogicalJoin<>(
+      330                      multiJoinHandleChildren.getJoinType(),
+      331                      multiJoinHandleChildren.getNotInnerHashJoinConditions(),
+      332                      multiJoinHandleChildren.getNotInnerOtherJoinConditions(),
+      333                      planToHintType.getOrDefault(right, new DistributeHint(DistributeType.NONE)),
+      334                      Optional.empty(),
+      335                      left, right, null));
+      336          }
+      337  
+      338          // following this multiJoin just contain INNER/CROSS.
+      339          Set<Expression> joinFilter = new LinkedHashSet<>(multiJoinHandleChildren.getJoinFilter());
+      340  
+      341          Plan left = multiJoinHandleChildren.child(0);
+      342          Set<Integer> usedPlansIndex = new LinkedHashSet<>();
+      343          usedPlansIndex.add(0);
+      344  
+      345          while (usedPlansIndex.size() != multiJoinHandleChildren.children().size()) {
+      346              LogicalJoin<? extends Plan, ? extends Plan> join = findInnerJoin(left, multiJoinHandleChildren.children(),
+      347                      joinFilter, usedPlansIndex, planToHintType);
+      348              join.getHashJoinConjuncts().forEach(joinFilter::remove);
+      349              join.getOtherJoinConjuncts().forEach(joinFilter::remove);
+      350  
+      351              left = join;
+      352          }
+      353  
+      354          return PlanUtils.filterOrSelf(joinFilter, left);
+      355      }
+      356  
+      357      /**
+      358       * Returns whether an input can be merged without changing semantics.
+      359       *
+      360       * @param input input into a MultiJoin or (GroupPlan|LogicalFilter)
+      361       * @param changeChildren generate nullable or one side child not exist.
+      362       * @return true if the input can be combined into a parent MultiJoin
+      363       */
+      364      private static boolean canCombine(Plan input, boolean changeChildren) {
+      365          return input instanceof MultiJoin
+      366                  && ((MultiJoin) input).getJoinType().isInnerOrCrossJoin()
+      367                  && !changeChildren;
+      368      }
+      369  
+      370      /**
+      371       * Find hash condition from joinFilter
+      372       * Get InnerJoin from left, right from [candidates].
+      373       *
+      374       * @return InnerJoin or CrossJoin{left, last of [candidates]}
+      375       */
+      376      private LogicalJoin<? extends Plan, ? extends Plan> findInnerJoin(Plan left, List<Plan> candidates,
+      377              Set<Expression> joinFilter, Set<Integer> usedPlansIndex, Map<Plan, DistributeHint> planToHintType) {
+      378          List<Expression> firstOtherJoinConditions = ExpressionUtils.EMPTY_CONDITION;
+      379          int firstCandidate = -1;
+      380          Set<ExprId> leftOutputExprIdSet = left.getOutputExprIdSet();
+      381          for (int i = 0; i < candidates.size(); i++) {
+      382              if (usedPlansIndex.contains(i)) {
+      383                  continue;
+      384              }
+      385  
+      386              Plan candidate = candidates.get(i);
+      387              Set<ExprId> rightOutputExprIdSet = candidate.getOutputExprIdSet();
+      388  
+      389              Set<ExprId> joinOutputExprIdSet = JoinUtils.getJoinOutputExprIdSet(left, candidate);
+      390  
+      391              List<Expression> currentJoinFilter = joinFilter.stream()
+      392                      .filter(expr -> {
+      393                          Set<ExprId> exprInputSlotExprIds = expr.getInputSlotExprIds();
+      394                          return !leftOutputExprIdSet.containsAll(exprInputSlotExprIds)
+      395                                  && !rightOutputExprIdSet.containsAll(exprInputSlotExprIds)
+      396                                  && joinOutputExprIdSet.containsAll(exprInputSlotExprIds);
+      397                      }).collect(Collectors.toList());
+      398  
+      399              Pair<List<Expression>, List<Expression>> pair = JoinUtils.extractExpressionForHashTable(
+      400                      left.getOutput(), candidate.getOutput(), currentJoinFilter);
+      401              List<Expression> hashJoinConditions = pair.first;
+      402              if (!hashJoinConditions.isEmpty()) {
+      403                  usedPlansIndex.add(i);
+      404                  return new LogicalJoin<>(JoinType.INNER_JOIN,
+      405                          hashJoinConditions, pair.second,
+      406                          planToHintType.getOrDefault(candidate, new DistributeHint(DistributeType.NONE)),
+      407                          Optional.empty(),
+      408                          left, candidate, null);
+      409              } else {
+      410                  if (firstCandidate == -1) {
+      411                      firstCandidate = i;
+      412                      firstOtherJoinConditions = pair.second;
+      413                  }
+      414              }
+      415          }
+      416          // All { left -> one in [candidates] } is CrossJoin
+      417          // Generate a CrossJoin
+      418          // NOTICE: we must traverse for head to tail to ensure result is stable.
+      419          usedPlansIndex.add(firstCandidate);
+      420          Plan right = candidates.get(firstCandidate);
+      421          return new LogicalJoin<>(JoinType.CROSS_JOIN,
+      422                  ExpressionUtils.EMPTY_CONDITION,
+      423                  firstOtherJoinConditions,
+      424                  planToHintType.getOrDefault(right, new DistributeHint(DistributeType.NONE)),
+      425                  Optional.empty(),
+      426                  left, right, null);
+      427      }
+      428  
+      429      private boolean nonJoinAndNonFilter(Plan plan) {
+      430          return !(plan instanceof LogicalJoin) && !(plan instanceof LogicalFilter);
+      431      }
+      432  }

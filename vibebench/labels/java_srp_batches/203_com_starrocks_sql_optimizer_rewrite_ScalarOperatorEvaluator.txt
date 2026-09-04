@@ -1,0 +1,399 @@
+row 203   StarRocks/starrocks#70342
+============================================================================
+CLASS com.starrocks.sql.optimizer.rewrite.ScalarOperatorEvaluator   loc=394 methods=9 wmc=82 lcom=0.0 c3=0.2101125758345165
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       60  public enum ScalarOperatorEvaluator {
+       61      INSTANCE;
+       62  
+       63      private static final Logger LOG = LogManager.getLogger(ScalarOperatorEvaluator.class);
+       64      private ImmutableMap<FunctionSignature, FunctionInvoker> functions;
+       65  
+       66      private ScalarOperatorEvaluator() {
+       67          registerFunctions();
+       68      }
+       69  
+       70      private synchronized void registerFunctions() {
+       71          // double checked locking pattern
+       72          // functions only need to init once
+       73          if (functions != null) {
+       74              return;
+       75          }
+       76  
+       77          ImmutableMap.Builder<FunctionSignature, FunctionInvoker> mapBuilder = new ImmutableMap.Builder<>();
+       78  
+       79          Class<?> metaFunctions = MetaFunctions.class;
+       80          Class<?> clazz = ScalarOperatorFunctions.class;
+       81          for (Method method : ListUtils.union(
+       82                  Lists.newArrayList(clazz.getDeclaredMethods()),
+       83                  Lists.newArrayList(metaFunctions.getDeclaredMethods()))) {
+       84              ConstantFunction annotation = method.getAnnotation(ConstantFunction.class);
+       85              registerFunction(mapBuilder, method, annotation);
+       86  
+       87              ConstantFunction.List listAnnotation = method.getAnnotation(ConstantFunction.List.class);
+       88  
+       89              if (listAnnotation != null) {
+       90                  for (ConstantFunction f : listAnnotation.list()) {
+       91                      registerFunction(mapBuilder, method, f);
+       92                  }
+       93              }
+       94          }
+       95          this.functions = mapBuilder.build();
+       96      }
+       97  
+       98      private void registerFunction(ImmutableMap.Builder<FunctionSignature, FunctionInvoker> mapBuilder,
+       99                                    Method method, ConstantFunction annotation) {
+      100          if (annotation != null) {
+      101              String name = annotation.name().toUpperCase();
+      102              Type returnType = ScalarType.createType(annotation.returnType());
+      103              List<Type> argTypes = new ArrayList<>();
+      104              for (PrimitiveType type : annotation.argTypes()) {
+      105                  argTypes.add(ScalarType.createType(type));
+      106              }
+      107  
+      108              FunctionSignature signature = new FunctionSignature(name, argTypes, returnType);
+      109              mapBuilder.put(signature, new FunctionInvoker(method, signature, annotation.isMetaFunction(),
+      110                      annotation.isMonotonic()));
+      111          }
+      112      }
+      113  
+      114      public Function getMetaFunction(FunctionName name, Type[] args) {
+      115          String nameStr = name.getFunction().toUpperCase();
+      116          // NOTE: only support VARCHAR as return type
+      117          FunctionSignature signature = new FunctionSignature(nameStr, Lists.newArrayList(args), Type.VARCHAR);
+      118          FunctionInvoker invoker = functions.get(signature);
+      119          if (invoker == null || !invoker.isMetaFunction) {
+      120              return null;
+      121          }
+      122  
+      123          Function function = new Function(name, Lists.newArrayList(args), Type.VARCHAR, false);
+      124          function.setMetaFunction(true);
+      125          return function;
+      126      }
+      127  
+      128      public ScalarOperator evaluation(CallOperator root) {
+      129          return evaluation(root, false);
+      130      }
+      131  
+      132      /**
+      133       * evaluation a fe built-in function
+      134       *
+      135       * @param root CallOperator root
+      136       * @return ConstantOperator if the CallOperator is effect (All child constant/FE builtin function support/....)
+      137       */
+      138      public ScalarOperator evaluation(CallOperator root, boolean needMonotonic) {
+      139          if (ConnectContext.get() != null
+      140                  && ConnectContext.get().getSessionVariable().isDisableFunctionFoldConstants()) {
+      141              return root;
+      142          }
+      143  
+      144          for (ScalarOperator child : root.getChildren()) {
+      145              if (!OperatorType.CONSTANT.equals(child.getOpType())) {
+      146                  return root;
+      147              }
+      148          }
+      149  
+      150          Function fn = root.getFunction();
+      151          if (fn == null) {
+      152              return root;
+      153          }
+      154  
+      155          // return Null directly iff:
+      156          // 1. Not UDF
+      157          // 2. Not in isNotAlwaysNullResultWithNullParamFunctions
+      158          // 3. Has null parameter
+      159          // 4. Not assert_true
+      160          if (!GlobalStateMgr.getCurrentState()
+      161                  .isNotAlwaysNullResultWithNullParamFunction(fn.getFunctionName().getFunction())
+      162                  && !fn.isUdf()
+      163                  && !FunctionSet.ASSERT_TRUE.equals(fn.getFunctionName().getFunction())) {
+      164              for (ScalarOperator op : root.getChildren()) {
+      165                  if (((ConstantOperator) op).isNull()) {
+      166                      // Should return ConstantOperator.createNull(fn.getReturnType()),
+      167                      // but for keep same with old StarRocks
+      168                      // types in decimalv3-typed function instances are wild types(both precision and scale are -1)
+      169                      // the wild types should never escaped outside of function instance resolution.
+      170                      Type type = fn.getReturnType();
+      171                      if (type.isDecimalV3()) {
+      172                          return ConstantOperator.createNull(root.getType());
+      173                      } else {
+      174                          return ConstantOperator.createNull(fn.getReturnType());
+      175                      }
+      176                  }
+      177              }
+      178          }
+      179  
+      180          List<Type> argTypes = new ArrayList<>(Arrays.asList(fn.getArgs()));
+      181  
+      182          FunctionSignature signature =
+      183                  new FunctionSignature(fn.functionName().toUpperCase(), argTypes, fn.getReturnType());
+      184  
+      185          FunctionInvoker invoker = functions.get(signature);
+      186  
+      187          if (invoker == null) {
+      188              return root;
+      189          }
+      190  
+      191          if (needMonotonic && !isMonotonicFunc(invoker, root)) {
+      192              return root;
+      193          }
+      194  
+      195          try {
+      196              ConstantOperator operator = invoker.invoke(root.getChildren());
+      197              // check return result type, decimal will change return type
+      198              if (!operator.isNull() &&
+      199                      operator.getType().getPrimitiveType() != fn.getReturnType().getPrimitiveType()) {
+      200                  Preconditions.checkState(operator.getType().isDecimalOfAnyVersion());
+      201                  Preconditions.checkState(fn.getReturnType().isDecimalOfAnyVersion());
+      202                  if (operator.getType().isDecimal256()) {
+      203                      Optional<ConstantOperator> res = operator.castTo(fn.getReturnType());
+      204                      if (res.isPresent() && res.get().isConstantNull()) {
+      205                          return root;
+      206                      }
+      207                  }
+      208                  operator.setType(fn.getReturnType());
+      209              }
+      210              return operator;
+      211          } catch (Exception e) {
+      212              if (LOG.isDebugEnabled()) {
+      213                  LOG.debug("failed to invoke", e);
+      214              }
+      215              if (invoker.isMetaFunction) {
+      216                  throw new StarRocksPlannerException(ErrorType.USER_ERROR, ExceptionUtils.getRootCauseMessage(e));
+      217              }
+      218          }
+      219          return root;
+      220      }
+      221  
+      222      public boolean isMonotonicFunction(CallOperator call) {
+      223          if (call instanceof CastOperator) {
+      224              return true;
+      225          }
+      226          FunctionSignature signature;
+      227          if (call.getFunction() != null) {
+      228              Function fn = call.getFunction();
+      229              List<Type> argTypes = Arrays.asList(fn.getArgs());
+      230              signature = new FunctionSignature(fn.functionName().toUpperCase(), argTypes, fn.getReturnType());
+      231          } else {
+      232              List<Type> argTypes = call.getArguments().stream().map(ScalarOperator::getType).collect(Collectors.toList());
+      233              signature = new FunctionSignature(call.getFnName().toUpperCase(), argTypes, call.getType());
+      234          }
+      235  
+      236          FunctionInvoker invoker = functions.get(signature);
+      237  
+      238          return invoker != null && isMonotonicFunc(invoker, call);
+      239      }
+      240  
+      241      public boolean isFEConstantFunction(CallOperator call) {
+      242          FunctionSignature signature;
+      243          if (call.getFunction() != null) {
+      244              Function fn = call.getFunction();
+      245              List<Type> argTypes = Arrays.asList(fn.getArgs());
+      246              signature = new FunctionSignature(fn.functionName().toUpperCase(), argTypes, fn.getReturnType());
+      247          } else {
+      248              List<Type> argTypes = call.getArguments().stream().map(ScalarOperator::getType).collect(Collectors.toList());
+      249              signature = new FunctionSignature(call.getFnName().toUpperCase(), argTypes, call.getType());
+      250          }
+      251  
+      252          FunctionInvoker invoker = functions.get(signature);
+      253          return invoker != null;
+      254      }
+      255  
+      256      private boolean isMonotonicFunc(FunctionInvoker invoker, CallOperator operator) {
+      257          if (!invoker.isMonotonic) {
+      258              return false;
+      259          }
+      260  
+      261          final ImmutableSet<String> SUPPORTED = ImmutableSet.of(
+      262                  FunctionSet.DATE_FORMAT,
+      263                  FunctionSet.STR_TO_DATE,
+      264                  FunctionSet.STR2DATE,
+      265                  FunctionSet.FROM_UNIXTIME,
+      266                  FunctionSet.FROM_UNIXTIME_MS,
+      267                  FunctionSet.TO_DATETIME
+      268          );
+      269  
+      270          if (SUPPORTED.contains(invoker.getSignature().getName().toLowerCase()) && operator.getChildren().size() == 2) {
+      271              String pattern = operator.getChild(1).toString();
+      272              if (pattern.isEmpty()) {
+      273                  return true;
+      274              }
+      275  
+      276              if (SUPPORT_JAVA_STYLE_DATETIME_FORMATTER.contains(pattern.trim())) {
+      277                  return true;
+      278              }
+      279              Optional<String> stripedPattern = stripFormatValue(pattern);
+      280              // "YmdHiSf" or "YmdHisf" ensure the format string value reserve the original date order
+      281              // like date_format('2021-01-01', '%Y-%m-%d') is qualified but date_format('2021-01-01', '%m-%Y-%d') is not
+      282              return stripedPattern.map(e -> "YmdHiSf".startsWith(e) || "YmdHisf".startsWith(e)).orElse(false);
+      283          }
+      284  
+      285          return true;
+      286      }
+      287      private Optional<String> stripFormatValue(String pattern) {
+      288          StringBuilder builder = new StringBuilder();
+      289          boolean unsupportedFormat = false;
+      290          for (char c : pattern.toCharArray()) {
+      291              switch (c) {
+      292                  case 'Y':
+      293                  case 'm':
+      294                  case 'd':
+      295                  case 'H':
+      296                  case 'i':
+      297                  case 'S':
+      298                  case 's':
+      299                  case 'f':
+      300                      builder.append(c);
+      301                      break;
+      302                  case 'a':
+      303                  case 'b':
+      304                  case 'c':
+      305                  case 'D':
+      306                  case 'e':
+      307                  case 'h':
+      308                  case 'I':
+      309                  case 'j':
+      310                  case 'k':
+      311                  case 'l':
+      312                  case 'M':
+      313                  case 'p':
+      314                  case 'r':
+      315                  case 'T':
+      316                  case 'U':
+      317                  case 'u':
+      318                  case 'V':
+      319                  case 'v':
+      320                  case 'W':
+      321                  case 'w':
+      322                  case 'X':
+      323                  case 'x':
+      324                  case 'y':
+      325                      unsupportedFormat = true;
+      326                      break;
+      327                  default:
+      328                      // do nothing
+      329              }
+      330          }
+      331  
+      332          return unsupportedFormat ? Optional.empty() : Optional.of(builder.toString());
+      333      }
+      334  
+      335      private static class FunctionInvoker {
+      336          private final boolean isMetaFunction;
+      337  
+      338          private final boolean isMonotonic;
+      339          private final Method method;
+      340          private final FunctionSignature signature;
+      341  
+      342          public FunctionInvoker(Method method, FunctionSignature signature, boolean isMetaFunction, boolean isMonotonic) {
+      343              this.method = method;
+      344              this.signature = signature;
+      345              this.isMetaFunction = isMetaFunction;
+      346              this.isMonotonic = isMonotonic;
+      347          }
+      348  
+      349          public Method getMethod() {
+      350              return method;
+      351          }
+      352  
+      353          public FunctionSignature getSignature() {
+      354              return signature;
+      355          }
+      356  
+      357          // Function doesn't support array type
+      358          public ConstantOperator invoke(List<ScalarOperator> args) throws IllegalAccessException, InvocationTargetException {
+      359              final List<Object> invokeArgs = createInvokeArgs(args);
+      360              return (ConstantOperator) method.invoke(null, invokeArgs.toArray());
+      361          }
+      362  
+      363          private List<Object> createInvokeArgs(List<ScalarOperator> args) {
+      364              final List<Object> invokeArgs = Lists.newArrayList();
+      365              for (int index = 0; index < method.getParameterTypes().length; index++) {
+      366                  final Class<?> argType = method.getParameterTypes()[index];
+      367  
+      368                  if (argType.isArray()) {
+      369                      Preconditions.checkArgument(method.getParameterTypes().length == index + 1);
+      370                      final List<ConstantOperator> variableArgs = Lists.newArrayList();
+      371                      Set<PrimitiveType> checkSet = Sets.newHashSet();
+      372  
+      373                      for (int variableArgIndex = index; variableArgIndex < args.size(); variableArgIndex++) {
+      374                          ConstantOperator arg = (ConstantOperator) args.get(variableArgIndex);
+      375                          variableArgs.add(arg);
+      376                          checkSet.add(arg.getType().getPrimitiveType());
+      377                      }
+      378  
+      379                      // Array data must keep same kinds
+      380                      if (checkSet.size() > 1) {
+      381                          throw new IllegalArgumentException("Function's args does't match.");
+      382                      }
+      383  
+      384                      ConstantOperator[] argsArray = new ConstantOperator[variableArgs.size()];
+      385                      argsArray = variableArgs.toArray(argsArray);
+      386                      invokeArgs.add(argsArray);
+      387                  } else {
+      388                      invokeArgs.add(args.get(index));
+      389                  }
+      390              }
+      391              return invokeArgs;
+      392          }
+      393  
+      394      }
+      395  
+      396      private static class FunctionSignature {
+      397          private final String name;
+      398          private final List<Type> argTypes;
+      399          private final Type returnType;
+      400  
+      401          public FunctionSignature(String name, List<Type> argTypes, Type returnType) {
+      402              this.name = name;
+      403              this.argTypes = argTypes;
+      404              this.returnType = returnType;
+      405          }
+      406  
+      407          public List<Type> getArgTypes() {
+      408              return argTypes;
+      409          }
+      410  
+      411          public Type getReturnType() {
+      412              return returnType;
+      413          }
+      414  
+      415          public String getName() {
+      416              return name;
+      417          }
+      418  
+      419          @Override
+      420          public String toString() {
+      421              return "FunctionSignature. name: " + name + ", return: " + returnType
+      422                      + ", args: " + Joiner.on(",").join(argTypes);
+      423          }
+      424  
+      425          @Override
+      426          public boolean equals(Object o) {
+      427              if (this == o) {
+      428                  return true;
+      429              }
+      430  
+      431              if (o == null || getClass() != o.getClass()) {
+      432                  return false;
+      433              }
+      434  
+      435              ScalarOperatorEvaluator.FunctionSignature signature = (ScalarOperatorEvaluator.FunctionSignature) o;
+      436  
+      437              List<PrimitiveType> primitiveTypes =
+      438                      argTypes.stream().map(Type::getPrimitiveType).collect(Collectors.toList());
+      439              List<PrimitiveType> sigPrimitiveTypes =
+      440                      signature.argTypes.stream().map(Type::getPrimitiveType).collect(Collectors.toList());
+      441              return Objects.equals(name, signature.name) &&
+      442                      primitiveTypes.equals(sigPrimitiveTypes) &&
+      443                      returnType.matchesType(signature.returnType);
+      444          }
+      445  
+      446          @Override
+      447          public int hashCode() {
+      448              List<PrimitiveType> primitiveTypes =
+      449                      argTypes.stream().map(Type::getPrimitiveType).collect(Collectors.toList());
+      450              return Objects.hash(name, primitiveTypes, returnType.getPrimitiveType());
+      451          }
+      452      }
+      453  }

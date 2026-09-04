@@ -1,0 +1,251 @@
+row 346   StarRocks/starrocks#70757
+============================================================================
+CLASS com.starrocks.qe.scheduler.assignment.RemoteFragmentAssignmentStrategy   loc=246 methods=7 wmc=44 lcom=0.0 c3=0.2878976498911961
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       42  public class RemoteFragmentAssignmentStrategy implements FragmentAssignmentStrategy {
+       43  
+       44      private final ConnectContext connectContext;
+       45      private final WorkerProvider workerProvider;
+       46      private final boolean isGatherOutput;
+       47      private final boolean usePipeline;
+       48      private final boolean enableDopAdaption;
+       49  
+       50      private final Random random;
+       51  
+       52      public RemoteFragmentAssignmentStrategy(ConnectContext connectContext, WorkerProvider workerProvider,
+       53                                              boolean usePipeline, boolean isGatherOutput, Random random) {
+       54          this.connectContext = connectContext;
+       55          this.workerProvider = workerProvider;
+       56          this.usePipeline = usePipeline;
+       57          this.enableDopAdaption = usePipeline && connectContext.getSessionVariable().isEnablePipelineAdaptiveDop();
+       58          this.isGatherOutput = isGatherOutput;
+       59          this.random = random;
+       60      }
+       61  
+       62      @Override
+       63      public void assignFragmentToWorker(ExecutionFragment execFragment) throws StarRocksException {
+       64          final PlanFragment fragment = execFragment.getPlanFragment();
+       65  
+       66          // If left child is MultiCastDataFragment(only support left now), will keep same instance with child.
+       67          boolean isCTEConsumerFragment =
+       68                  !fragment.getChildren().isEmpty() && fragment.getChild(0) instanceof MultiCastPlanFragment;
+       69          if (isCTEConsumerFragment) {
+       70              assignCTEConsumerFragmentToWorker(execFragment);
+       71              return;
+       72          }
+       73  
+       74          if (fragment.isGatherFragment()) {
+       75              assignGatherFragmentToWorker(execFragment);
+       76              return;
+       77          }
+       78  
+       79          assignRemoteFragmentToWorker(execFragment);
+       80      }
+       81  
+       82      private void assignCTEConsumerFragmentToWorker(ExecutionFragment execFragment) {
+       83          ExecutionFragment childFragment = execFragment.getChild(0);
+       84          for (FragmentInstance childInstance : childFragment.getInstances()) {
+       85              execFragment.addInstance(new FragmentInstance(childInstance.getWorker(), execFragment));
+       86          }
+       87      }
+       88  
+       89      private void assignGatherFragmentToWorker(ExecutionFragment execFragment) throws StarRocksException {
+       90          long workerId;
+       91          
+       92          // Check if gather fragment locality optimization is enabled
+       93          boolean enableOptimization = connectContext != null && 
+       94                  connectContext.getSessionVariable() != null &&
+       95                  connectContext.getSessionVariable().isEnableGatherFragmentLocalityOptimization();
+       96          
+       97          if (enableOptimization) {
+       98              // Check if all instances of other ExecutionFragments (except current one) are on the same node
+       99              Long commonWorkerId = findCommonWorkerIdForOtherFragments(execFragment);
+      100              if (commonWorkerId != null) {
+      101                  // If all other fragments' instances are on the same node, choose that node
+      102                  workerId = commonWorkerId;
+      103              } else {
+      104                  // Otherwise, randomly select the next node
+      105                  workerId = workerProvider.selectNextWorker();
+      106              }
+      107          } else {
+      108              // If optimization is disabled, directly randomly select the next node
+      109              workerId = workerProvider.selectNextWorker();
+      110          }
+      111          
+      112          FragmentInstance instance = new FragmentInstance(workerProvider.getWorkerById(workerId), execFragment);
+      113          execFragment.addInstance(instance);
+      114      }
+      115  
+      116      /**
+      117       * Find if all instances of other ExecutionFragments (except current one) are on the same node
+      118       * @param currentFragment the current ExecutionFragment
+      119       * @return the node ID if all other fragments' instances are on the same node; otherwise return null
+      120       */
+      121      private Long findCommonWorkerIdForOtherFragments(ExecutionFragment currentFragment) {
+      122          ExecutionDAG executionDAG = currentFragment.getExecutionDAG();
+      123          List<ExecutionFragment> allFragments = executionDAG.getFragmentsInCreatedOrder();
+      124          
+      125          // Collect worker IDs of all instances from other fragments (except current one)
+      126          Set<Long> allWorkerIds = Sets.newHashSet();
+      127          for (ExecutionFragment fragment : allFragments) {
+      128              if (fragment != currentFragment) {
+      129                  for (FragmentInstance instance : fragment.getInstances()) {
+      130                      allWorkerIds.add(instance.getWorkerId());
+      131                      if (allWorkerIds.size() > 1) {
+      132                          return null;
+      133                      }
+      134                  }
+      135              }
+      136          }
+      137          
+      138          // If all other fragments' instances are on the same node, return that node ID
+      139          if (allWorkerIds.size() == 1) {
+      140              return allWorkerIds.iterator().next();
+      141          }
+      142          
+      143          return null;
+      144      }
+      145  
+      146      private void assignRemoteFragmentToWorker(ExecutionFragment execFragment) {
+      147          final PlanFragment fragment = execFragment.getPlanFragment();
+      148  
+      149          // hostSet contains target backends to whom fragment instances of the current PlanFragment will be
+      150          // delivered. when pipeline parallelization is adopted, the number of instances should be the size
+      151          // of hostSet, that it to say, each backend has exactly one fragment.
+      152          Set<Long> workerIdSet = Sets.newHashSet();
+      153          int maxParallelism = 0;
+      154  
+      155          List<Long> selectedComputedNodes = workerProvider.selectAllComputeNodes();
+      156          if (workerProvider.isPreferComputeNode() && !selectedComputedNodes.isEmpty()
+      157                  && !fragment.isSingleTabletGatherOutputFragment()) {
+      158              workerIdSet = adaptiveChooseNodes(fragment, selectedComputedNodes, Sets.newHashSet(selectedComputedNodes));
+      159              // make olapScan maxParallelism equals prefer compute node number
+      160              maxParallelism = workerIdSet.size() * fragment.getParallelExecNum();
+      161          } else if (fragment.isUnionFragment() && isGatherOutput) {
+      162              // union fragment use all children's host
+      163              // if output fragment isn't gather, all fragment must keep 1 instance
+      164              for (int i = 0; i < execFragment.childrenSize(); i++) {
+      165                  ExecutionFragment childExecFragment = execFragment.getChild(i);
+      166                  childExecFragment.getInstances().stream()
+      167                          .map(FragmentInstance::getWorkerId)
+      168                          .forEach(workerIdSet::add);
+      169              }
+      170              maxParallelism = workerIdSet.size() * fragment.getParallelExecNum();
+      171          } else {
+      172              // there is no leftmost scan; we assign the same hosts as those of our
+      173              // input fragment which has a higher instance_number
+      174              int maxIndex = 0;
+      175              for (int i = 0; i < execFragment.childrenSize(); i++) {
+      176                  int curInputFragmentParallelism = execFragment.getChild(i).getInstances().size();
+      177                  // when dop adaptation enabled, numInstances * pipelineDop is equivalent to numInstances in
+      178                  // non-pipeline engine and pipeline engine(dop adaptation disabled).
+      179                  if (enableDopAdaption) {
+      180                      curInputFragmentParallelism *= fragment.getChild(i).getPipelineDop();
+      181                  }
+      182  
+      183                  if (curInputFragmentParallelism > maxParallelism) {
+      184                      maxParallelism = curInputFragmentParallelism;
+      185                      maxIndex = i;
+      186                  }
+      187              }
+      188  
+      189              ExecutionFragment maxFragment = execFragment.getChild(maxIndex);
+      190              Set<Long> childUsedHost = maxFragment.getInstances().stream()
+      191                      .map(FragmentInstance::getWorkerId)
+      192                      .collect(Collectors.toSet());
+      193              workerIdSet = adaptiveChooseNodes(fragment, workerProvider.getAllAvailableNodes(), childUsedHost);
+      194  
+      195              // The adaptive choose nodes process may change the selected nodes number.
+      196              // When enable pipeline engine but dop is not 0, We have to change the maxParallelism value
+      197              // to ensure it keeps equal with the size of workerIdSet.
+      198              if (usePipeline) {
+      199                  maxParallelism = workerIdSet.size();
+      200              }
+      201          }
+      202  
+      203          if (enableDopAdaption) {
+      204              maxParallelism = workerIdSet.size();
+      205          }
+      206  
+      207          int exchangeInstances = -1;
+      208          if (connectContext != null && connectContext.getSessionVariable() != null) {
+      209              exchangeInstances = connectContext.getSessionVariable().getExchangeInstanceParallel();
+      210          }
+      211          List<Long> workerIds;
+      212          if (exchangeInstances > 0 && maxParallelism > exchangeInstances) {
+      213              // random select some instance
+      214              // get distinct host, when parallel_fragment_exec_instance_num > 1, single host may execute several instances
+      215              maxParallelism = exchangeInstances;
+      216              workerIds = Lists.newArrayList(workerIdSet);
+      217              Collections.shuffle(workerIds, random);
+      218          } else {
+      219              workerIds = Lists.newArrayList(workerIdSet);
+      220          }
+      221  
+      222          for (int i = 0; i < maxParallelism; i++) {
+      223              Long workerId = workerIds.get(i % workerIds.size());
+      224              FragmentInstance instance = new FragmentInstance(workerProvider.getWorkerById(workerId), execFragment);
+      225              execFragment.addInstance(instance);
+      226          }
+      227  
+      228          // When group by cardinality is smaller than number of backend, only some backends always
+      229          // process while other has no data to process.
+      230          // So we shuffle instances to make different backends handle different queries.
+      231          execFragment.shuffleInstances(random);
+      232  
+      233          // TODO: switch to unpartitioned/coord execution if our input fragment
+      234          // is executed that way (could have been downgraded from distributed)
+      235      }
+      236  
+      237      private Set<Long> adaptiveChooseNodes(PlanFragment fragment, List<Long> candidates,
+      238                                            Set<Long> childUsedHosts) {
+      239          List<Long> childHosts = Lists.newArrayList(childUsedHosts);
+      240  
+      241          // sometimes we may reverse the fragment order like SHUFFLE_HASH_BUCKET plan, so we need sort
+      242          // the list to ensure the most left child is at the 0 index position.
+      243          List<PlanFragment> sortedFragments = fragment.getChildren().stream()
+      244                  .sorted(Comparator.comparing(e -> e.getPlanRoot().getId().asInt()))
+      245                  .collect(Collectors.toList());
+      246  
+      247          long maxOutputOfRightChild = sortedFragments.stream().skip(1)
+      248                  .map(e -> e.getPlanRoot().getCardinality()).reduce(Long::max)
+      249                  .orElse(fragment.getChild(0).getPlanRoot().getCardinality());
+      250          long outputOfMostLeftChild = sortedFragments.get(0).getPlanRoot().getCardinality();
+      251  
+      252          long nodeNums = getOptimalNodeNums(outputOfMostLeftChild, maxOutputOfRightChild, fragment.getPipelineDop(),
+      253                  candidates.size());
+      254  
+      255          SessionVariableConstants.ChooseInstancesMode mode = connectContext.getSessionVariable()
+      256                  .getChooseExecuteInstancesMode();
+      257          if (mode.enableIncreaseInstance() && nodeNums > childUsedHosts.size()) {
+      258              for (Long id : candidates) {
+      259                  if (!childUsedHosts.contains(id)) {
+      260                      childHosts.add(id);
+      261                      workerProvider.selectWorkerUnchecked(id);
+      262                      if (childHosts.size() == nodeNums) {
+      263                          break;
+      264                      }
+      265                  }
+      266              }
+      267              return Sets.newHashSet(childHosts);
+      268          } else if (mode.enableDecreaseInstance() && nodeNums < childUsedHosts.size()
+      269                  && candidates.size() >= Config.adaptive_choose_instances_threshold) {
+      270              Collections.shuffle(childHosts, random);
+      271              return childHosts.stream().limit(nodeNums).collect(Collectors.toSet());
+      272          } else {
+      273              return Sets.newHashSet(childHosts);
+      274          }
+      275      }
+      276  
+      277      public static long getOptimalNodeNums(long outputOfMostLeftChild, long maxOutputOfRightChild, int dop, int candidateSize) {
+      278          long baseNodeNums = (long) Math.ceil((double) maxOutputOfRightChild / TINY_SCALE_ROWS_LIMIT / dop);
+      279          double base = Math.max(Math.E, baseNodeNums);
+      280  
+      281          long amplifyFactor = Math.round(Math.max(1,
+      282                  Math.log(outputOfMostLeftChild / TINY_SCALE_ROWS_LIMIT / dop) / Math.log(base)));
+      283  
+      284          return Math.min(amplifyFactor * baseNodeNums, candidateSize);
+      285      }
+      286  
+      287  }

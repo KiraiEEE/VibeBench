@@ -1,0 +1,406 @@
+row 27   dadoonet/fscrawler#2172
+============================================================================
+CLASS fr.pilato.elasticsearch.crawler.fs.client.ElasticsearchClient   loc=968 methods=45 wmc=153 lcom=0.0 c3=0.0980240973608772
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       68  public class ElasticsearchClient implements IElasticsearchClient {
+       69  
+       70      private static final Logger logger = LogManager.getLogger();
+       71      private final FsSettings settings;
+       72      private static final String USER_AGENT = "FSCrawler-Rest-Client-" + Version.getVersion();
+       73  
+       74      // TODO this should be configurable
+       75      public static final int CHECK_NODES_EVERY = 10;
+       76  
+       77      private Client client = null;
+       78      private FsCrawlerBulkProcessor<ElasticsearchOperation, ElasticsearchBulkRequest, ElasticsearchBulkResponse> bulkProcessor = null;
+       79      private final List<String> hosts;
+       80      private final List<String> initialHosts;
+       81  
+       82      private String version = null;
+       83      private String license = null;
+       84      private int majorVersion;
+       85      private int minorVersion;
+       86      private int currentNode = -1;
+       87      private int currentRun = -1;
+       88      private String authorizationHeader = null;
+       89      private boolean semanticSearch;
+       90      private boolean vectorSearch = false;
+       91      private boolean serverless;
+       92  
+       93      public ElasticsearchClient(FsSettings settings) {
+       94          this.settings = settings;
+       95          this.hosts = new ArrayList<>(settings.getElasticsearch().getNodes().size());
+       96          this.initialHosts = new ArrayList<>(settings.getElasticsearch().getNodes().size());
+       97          settings.getElasticsearch().getNodes().forEach(node -> {
+       98              hosts.add(node.decodedUrl());
+       99              initialHosts.add(node.decodedUrl());
+      100          });
+      101          if (hosts.size() == 1) {
+      102              // We have only one node, so we won't have to select a specific one but the only one.
+      103              currentNode = 0;
+      104          }
+      105          semanticSearch = settings.getElasticsearch().isSemanticSearch();
+      106      }
+      107  
+      108      @Override
+      109      public void start() throws ElasticsearchClientException {
+      110          if (client != null) {
+      111              // The client has already been initialized. Let's skip this again
+      112              return;
+      113          }
+      114  
+      115          // Create the client
+      116          ClientConfig config = new ClientConfig();
+      117          // We need to suppress this, so we can do DELETE with body
+      118          config.property(ClientProperties.SUPPRESS_HTTP_COMPLIANCE_VALIDATION, true);
+      119  
+      120          ClientBuilder clientBuilder = ClientBuilder.newBuilder()
+      121                  .hostnameVerifier(new NullHostNameVerifier())
+      122                  .withConfig(config);
+      123  
+      124          SSLContext sslContext = null;
+      125          if (settings.getElasticsearch().isSslVerification()) {
+      126              String caCertificatePath = settings.getElasticsearch().getCaCertificate();
+      127              if (caCertificatePath != null) {
+      128                  File certFile = new File(caCertificatePath);
+      129                  sslContext = sslContextFromHttpCaCrt(certFile);
+      130                  logger.debug("Using provided CA Certificate from [{}]", caCertificatePath);
+      131                  clientBuilder.sslContext(sslContext);
+      132              }
+      133          } else {
+      134              // Trusting all certificates. For test purposes only.
+      135              try {
+      136                  sslContext = SSLContext.getInstance("SSL");
+      137                  sslContext.init(null, trustAllCerts, new SecureRandom());
+      138                  clientBuilder.sslContext(sslContext);
+      139              } catch (KeyManagementException | NoSuchAlgorithmException e) {
+      140                  logger.warn("Failed to get SSL Context", e);
+      141                  throw new RuntimeException(e);
+      142              }
+      143          }
+      144  
+      145          // If we have an Api Key let's use it. Otherwise, we will use basic auth
+      146          if (!FsCrawlerUtil.isNullOrEmpty(settings.getElasticsearch().getApiKey())) {
+      147              authorizationHeader = "ApiKey " + settings.getElasticsearch().getApiKey();
+      148          } else {
+      149              HttpAuthenticationFeature feature = HttpAuthenticationFeature.basic(
+      150                      settings.getElasticsearch().getUsername(),
+      151                      settings.getElasticsearch().getPassword());
+      152              clientBuilder.register(feature);
+      153          }
+      154          if (sslContext != null) {
+      155              clientBuilder.sslContext(sslContext);
+      156          }
+      157          client = clientBuilder.build();
+      158          if (logger.isTraceEnabled()) {
+      159              client
+      160  //                    .property(LoggingFeature.LOGGING_FEATURE_LOGGER_NAME_CLIENT, ElasticsearchClient.class.getName())
+      161                      .property(LoggingFeature.LOGGING_FEATURE_LOGGER_LEVEL_CLIENT, Level.FINEST.getName())
+      162                      .property(LoggingFeature.LOGGING_FEATURE_VERBOSITY_CLIENT, LoggingFeature.Verbosity.PAYLOAD_ANY)
+      163                      .property(LoggingFeature.LOGGING_FEATURE_MAX_ENTITY_SIZE_CLIENT, 8000);
+      164          }
+      165  
+      166          try {
+      167              String esVersion = getVersion();
+      168              logger.debug("Elasticsearch Client connected to a node running version {}", esVersion);
+      169              if (!settings.getElasticsearch().isSslVerification()) {
+      170                  logger.warn("We are not doing SSL verification. It's not recommended for production.");
+      171              }
+      172          } catch (Exception e) {
+      173              logger.warn("Failed to create elasticsearch client on {}. Message: {}.",
+      174                      settings.getElasticsearch().toString(),
+      175                      e.getMessage());
+      176              throw e;
+      177          }
+      178  
+      179          if (settings.getElasticsearch().getPipeline() != null) {
+      180              // Check that the pipeline exists
+      181              if (!isExistingPipeline(settings.getElasticsearch().getPipeline())) {
+      182                  throw new RuntimeException("You defined pipeline:" + settings.getElasticsearch().getPipeline() +
+      183                          ", but it does not exist.");
+      184              }
+      185          }
+      186  
+      187          if (semanticSearch) {
+      188              // Check the version we are running or if it's using serverless
+      189              if ((majorVersion >= 8 && minorVersion >= 17) || serverless || (majorVersion >= 9)) {
+      190                  logger.debug("Semantic search is enabled and we are running on a version of Elasticsearch {} " +
+      191                          "which is 8.17 or higher. We will try to use the semantic search features.", version);
+      192                  license = getLicense();
+      193                  if (!"enterprise".equals(license) && !"trial".equals(license)) {
+      194                      logger.warn("Semantic search is enabled but we are running Elasticsearch with a {} " +
+      195                              "license although we need either an enterprise or trial license." +
+      196                              "We will not be able to use the semantic search features ATM. We might switch later to " +
+      197                              "a vector embeddings generation.", license);
+      198                      semanticSearch = false;
+      199                      vectorSearch = true;
+      200                  } else {
+      201                      logger.debug("Semantic search is enabled");
+      202                  }
+      203              } else {
+      204                  logger.warn("Semantic search is enabled but we are running on a version of Elasticsearch {} " +
+      205                          "which is lower than 8.17. We will not be able to use the semantic search features.", version);
+      206                  semanticSearch = false;
+      207              }
+      208          }
+      209  
+      210          // Create the BulkProcessor instance
+      211          bulkProcessor = new FsCrawlerBulkProcessor.Builder<>(
+      212                  new ElasticsearchEngine(this),
+      213                  new FsCrawlerRetryBulkProcessorListener<>("es_rejected_execution_exception"),
+      214                  ElasticsearchBulkRequest::new)
+      215                  .setBulkActions(settings.getElasticsearch().getBulkSize())
+      216                  .setFlushInterval(settings.getElasticsearch().getFlushInterval())
+      217                  .setByteSize(settings.getElasticsearch().getByteSize())
+      218                  .build();
+      219      }
+      220  
+      221      private static SSLContext sslContextFromHttpCaCrt(File file) {
+      222          try(InputStream in = new FileInputStream(file)) {
+      223              CertificateFactory cf = CertificateFactory.getInstance("X.509");
+      224              Certificate certificate = cf.generateCertificate(in);
+      225  
+      226              final KeyStore keyStore = KeyStore.getInstance(KeyStore.getDefaultType());
+      227              keyStore.load(null, null);
+      228              keyStore.setCertificateEntry("elasticsearch-ca", certificate);
+      229  
+      230              TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+      231              tmf.init(keyStore);
+      232  
+      233              SSLContext sslContext = SSLContext.getInstance("TLS");
+      234              sslContext.init(null, tmf.getTrustManagers(), null);
+      235              return sslContext;
+      236          } catch (CertificateException | NoSuchAlgorithmException | KeyManagementException | KeyStoreException | IOException e) {
+      237              throw new RuntimeException(e);
+      238          }
+      239      }
+      240  
+      241      public List<String> getAvailableNodes() {
+      242          return hosts;
+      243      }
+      244  
+      245      @Override
+      246      public String getVersion() throws ElasticsearchClientException {
+      247          if (version != null) {
+      248              return version;
+      249          }
+      250          logger.debug("get version");
+      251          String response = httpGet(null);
+      252          // We parse the response
+      253          DocumentContext document = parseJsonAsDocumentContext(response);
+      254          // Cache the version and the major version
+      255          version = document.read("$.version.number");
+      256          majorVersion = extractMajorVersion(version);
+      257          minorVersion = extractMinorVersion(version);
+      258          serverless = false;
+      259  
+      260          try {
+      261              if ("serverless".equals(document.read("$.version.build_flavor"))) {
+      262                  logger.debug("We are running on Elastic serverless cloud so we can not consider version number.");
+      263                  serverless = true;
+      264                  version = "serverless";
+      265                  majorVersion = 99;
+      266                  minorVersion = 999;
+      267              }
+      268          } catch (PathNotFoundException e) {
+      269              // We are not running an official Elasticsearch version
+      270              logger.info("FSCrawler only supports Elasticsearch official distribution. " +
+      271                      "You are running another custom distribution. We will not be able to use some features like " +
+      272                      "semantic search.");
+      273          }
+      274          logger.debug("get version returns {} and {} as the major version number", version, majorVersion);
+      275          return version;
+      276      }
+      277  
+      278      @Override
+      279      public String getLicense() throws ElasticsearchClientException {
+      280          if (license != null) {
+      281              return license;
+      282          }
+      283  
+      284          // License endpoint might not be ready in IT so we retry with exponential wait time up to 1 minute
+      285          int retries = 0;
+      286          int maxRetries = 5;
+      287          int waitTime = 1000;
+      288          while (retries < maxRetries) {
+      289              try {
+      290                  return getLicenseInternal();
+      291              } catch (NotFoundException e) {
+      292                  logger.warn("License endpoint is not ready yet. Retrying in {}ms", waitTime);
+      293                  try {
+      294                      Thread.sleep(waitTime);
+      295                  } catch (InterruptedException ex) {
+      296                      Thread.currentThread().interrupt();
+      297                  }
+      298                  waitTime *= 2;
+      299                  retries++;
+      300              }
+      301          }
+      302  
+      303          throw new ElasticsearchClientException("License endpoint is not ready after " + maxRetries + " retries");
+      304      }
+      305  
+      306      private String getLicenseInternal() throws ElasticsearchClientException {
+      307          logger.debug("get license");
+      308          String response = httpGet("_license");
+      309  
+      310          // We parse the response
+      311          DocumentContext document = parseJsonAsDocumentContext(response);
+      312          // Cache the license level
+      313          license = document.read("$.license.type");
+      314  
+      315          logger.debug("get license returns {}", license);
+      316          return license;
+      317      }
+      318  
+      319      @Override
+      320      public int getMajorVersion() {
+      321          return majorVersion;
+      322      }
+      323  
+      324      @Override
+      325      public void pushComponentTemplate(String name, String json) throws ElasticsearchClientException {
+      326          logger.debug("push component template [{}]", name);
+      327          String url = "_component_template/" + name;
+      328          logger.trace("component template: [{}]", json);
+      329          try {
+      330              httpPut(url, json);
+      331          } catch (WebApplicationException e) {
+      332              throw new ElasticsearchClientException("Error while creating component template " + name, e);
+      333          }
+      334      }
+      335  
+      336      @Override
+      337      public void pushIndexTemplate(String name, String json) throws ElasticsearchClientException {
+      338          logger.debug("push index template [{}]", name);
+      339          String url = "_index_template/" + name;
+      340          logger.trace("index template: [{}]", json);
+      341          try {
+      342              httpPut(url, json);
+      343          } catch (WebApplicationException e) {
+      344              throw new ElasticsearchClientException("Error while creating index template " + name, e);
+      345          }
+      346      }
+      347  
+      348      /**
+      349       * Check if an index exists
+      350       * @param index index name
+      351       * @return true if the index exists, false otherwise
+      352       */
+      353      @Override
+      354      public boolean isExistingIndex(String index) throws ElasticsearchClientException {
+      355          logger.debug("is existing index [{}]", index);
+      356          try {
+      357              httpGet(index);
+      358              logger.debug("Index [{}] was found", index);
+      359              return true;
+      360          } catch (NotFoundException e) {
+      361              logger.debug("Index [{}] was not found", index);
+      362              return false;
+      363          }
+      364      }
+      365  
+      366      /**
+      367       * Check if a pipeline exists
+      368       * @param pipelineName pipeline name
+      369       * @return true if the pipeline exists, false otherwise
+      370       */
+      371      @Override
+      372      public boolean isExistingPipeline(String pipelineName) throws ElasticsearchClientException {
+      373          logger.debug("is existing pipeline [{}]", pipelineName);
+      374          try {
+      375              httpGet("_ingest/pipeline/" + pipelineName);
+      376              logger.debug("Pipeline [{}] was found", pipelineName);
+      377              return true;
+      378          } catch (NotFoundException e) {
+      379              logger.debug("Pipeline [{}] was not found", pipelineName);
+      380              return false;
+      381          }
+      382      }
+      383  
+      384      /**
+      385       * Refresh an index (only used in tests)
+      386       * @param index index name
+      387       * @throws ElasticsearchClientException In case of error
+      388       */
+      389      @Override
+      390      public void refresh(String index) throws ElasticsearchClientException {
+      391          if (serverless) {
+      392              logger.debug("Skipping refresh on serverless");
+      393              return;
+      394          }
+      395  
+      396          logger.debug("refresh index [{}]", index);
+      397          String url = index + "/_refresh";
+      398          if (index == null) {
+      399              url = "_refresh";
+      400          }
+      401          String response = httpPost(url, null);
+      402          DocumentContext document = parseJsonAsDocumentContext(response);
+      403          int shardsFailed = document.read("$._shards.failed");
+      404          if (shardsFailed > 0) {
+      405              throw new ElasticsearchClientException("Unable to refresh index " + index + " : " + response);
+      406          }
+      407      }
+      408  
+      409      /**
+      410       * Wait for an index to become at least yellow (all primaries assigned), up to 10 seconds
+      411       * @param index index name
+      412       */
+      413      @Override
+      414      public void waitForHealthyIndex(String index) throws ElasticsearchClientException {
+      415          try {
+      416              Await.awaitBusy(() -> {
+      417                  String health = catIndicesHealth(index);
+      418                  return "green".equals(health) || "yellow".equals(health);
+      419              });
+      420          } catch (InterruptedException e) {
+      421              Thread.currentThread().interrupt();
+      422              throw new ElasticsearchClientException("Await interrupted while waiting for healthy index [" +
+      423                      index + "]", e);
+      424          }
+      425      }
+      426  
+      427      private String catIndicesHealth(String index) {
+      428          try {
+      429              String response = httpGet("_cat/indices/" + index,
+      430                      new AbstractMap.SimpleImmutableEntry<>("h", "health"));
+      431              DocumentContext document = parseJsonAsDocumentContext(response);
+      432              String health = document.read("$[0].health");
+      433              logger.trace("index [{}] health: [{}]", index, health);
+      434              return health;
+      435          } catch (WebApplicationException e) {
+      436              if (e.getResponse().getStatus() == Response.Status.NOT_FOUND.getStatusCode()) {
+      437                  logger.debug("Index [{}] not found yet", index);
+      438                  return null;
+      439              }
+      440              throw e;
+      441          } catch (ElasticsearchClientException e) {
+      442              throw new RuntimeException(e);
+      443          }
+      444      }
+      445  
+      446      private static final TrustManager[] trustAllCerts = new TrustManager[] { new X509TrustManager() {
+      447          @Override public void checkClientTrusted(X509Certificate[] chain, String authType) {}
+      448          @Override public void checkServerTrusted(X509Certificate[] chain, String authType) {}
+      449          @Override public X509Certificate[] getAcceptedIssuers() { return null; }
+      450      }};
+      451  
+      452      public static class NullHostNameVerifier implements HostnameVerifier {
+      453          @Override public boolean verify(String urlHostName, SSLSession session) {
+      454              if (!urlHostName.equalsIgnoreCase(session.getPeerHost())) {
+      455                  logger.warn("URL host [{}] is different to SSLSession host [{}].", urlHostName, session.getPeerHost());
+      456              }
+      457              return true;
+      458          }
+      459      }
+      460  
+      461      @Override
+      462      public void index(String index, String id, Doc doc, String pipeline) {
+      463          String json = serialize(doc);
+      464          indexRawJson(index, id, json, pipeline);
+      465      }
+      466  
+      467      @Override
+       ... truncated at 400 lines ...

@@ -1,0 +1,191 @@
+row 383   apache/solr#3913
+============================================================================
+CLASS org.apache.solr.update.UpdateLog.RecentUpdates   loc=186 methods=8 wmc=39 lcom=0.0 c3=0.1535102069410341
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+     1768    public class RecentUpdates implements Closeable {
+     1769      final Deque<TransactionLog> logList; // newest first
+     1770      List<List<Update>> updateList;
+     1771      HashMap<Long, Update> updates;
+     1772      public List<Update> deleteByQueryList;
+     1773      public List<DeleteUpdate> deleteList;
+     1774      Set<Long> bufferUpdates = new HashSet<>();
+     1775  
+     1776      public RecentUpdates(Deque<TransactionLog> logList) {
+     1777        this.logList = logList;
+     1778        boolean success = false;
+     1779        try {
+     1780          update();
+     1781          success = true;
+     1782        } finally {
+     1783          // defensive: if some unknown exception is thrown,
+     1784          // make sure we close so that the tlogs are decref'd
+     1785          if (!success) {
+     1786            close();
+     1787          }
+     1788        }
+     1789      }
+     1790  
+     1791      public List<Long> getVersions(int n) {
+     1792        return getVersions(n, Long.MAX_VALUE);
+     1793      }
+     1794  
+     1795      public Set<Long> getBufferUpdates() {
+     1796        return Collections.unmodifiableSet(bufferUpdates);
+     1797      }
+     1798  
+     1799      public List<Long> getVersions(int n, long maxVersion) {
+     1800        List<Long> ret = new ArrayList<>(n);
+     1801        LongSet set = new LongHashSet(n);
+     1802        final int nInput = n;
+     1803  
+     1804        for (List<Update> singleList : updateList) {
+     1805          for (Update ptr : singleList) {
+     1806            if (Math.abs(ptr.version) > Math.abs(maxVersion)) continue;
+     1807            if (!set.add(ptr.version)) {
+     1808              if (debug) {
+     1809                log.debug(
+     1810                    "getVersions(n={}, maxVersion={}) not returning duplicate version = {}",
+     1811                    nInput,
+     1812                    maxVersion,
+     1813                    ptr.version);
+     1814              }
+     1815              continue;
+     1816            }
+     1817            ret.add(ptr.version);
+     1818            if (--n <= 0) return ret;
+     1819          }
+     1820        }
+     1821  
+     1822        return ret;
+     1823      }
+     1824  
+     1825      public Object lookup(long version) {
+     1826        Update update = updates.get(version);
+     1827        if (update == null) return null;
+     1828  
+     1829        return update.log.lookup(update.pointer);
+     1830      }
+     1831  
+     1832      /** Returns the list of deleteByQueries that happened after the given version */
+     1833      public List<Object> getDeleteByQuery(long afterVersion, LongSet updateVersions) {
+     1834        List<Object> result = new ArrayList<>(deleteByQueryList.size());
+     1835        for (Update update : deleteByQueryList) {
+     1836          if (Math.abs(update.version) > afterVersion) {
+     1837            if (updateVersions.add(update.version)) {
+     1838              Object dbq = update.log.lookup(update.pointer);
+     1839              result.add(dbq);
+     1840            } else {
+     1841              if (debug) {
+     1842                log.debug(
+     1843                    "UpdateLog.RecentUpdates.getDeleteByQuery(afterVersion={}) not returning duplicate version = {}",
+     1844                    afterVersion,
+     1845                    update.version);
+     1846              }
+     1847            }
+     1848          }
+     1849        }
+     1850        return result;
+     1851      }
+     1852  
+     1853      private void update() {
+     1854        int numUpdates = 0;
+     1855        updateList = new ArrayList<>(logList.size());
+     1856        deleteByQueryList = new ArrayList<>();
+     1857        deleteList = new ArrayList<>();
+     1858        updates = CollectionUtil.newHashMap(numRecordsToKeep);
+     1859  
+     1860        for (TransactionLog oldLog : logList) {
+     1861          List<Update> updatesForLog = new ArrayList<>();
+     1862  
+     1863          TransactionLog.ReverseReader reader = null;
+     1864          try {
+     1865            reader = oldLog.getReverseReader();
+     1866  
+     1867            while (numUpdates < numRecordsToKeep) {
+     1868              Object o = null;
+     1869              try {
+     1870                o = reader.next();
+     1871                if (o == null) break;
+     1872  
+     1873                // should currently be a List<Oper,Ver,Doc/Id>
+     1874                List<?> entry = (List<?>) o;
+     1875  
+     1876                // TODO: refactor this out so we get common error handling
+     1877                int opAndFlags = (Integer) entry.get(UpdateLog.FLAGS_IDX);
+     1878                int oper = opAndFlags & UpdateLog.OPERATION_MASK;
+     1879                long version = (Long) entry.get(UpdateLog.VERSION_IDX);
+     1880  
+     1881                if (oldLog.isBuffer) bufferUpdates.add(version);
+     1882  
+     1883                switch (oper) {
+     1884                  case UpdateLog.ADD:
+     1885                  case UpdateLog.UPDATE_INPLACE:
+     1886                  case UpdateLog.DELETE:
+     1887                  case UpdateLog.DELETE_BY_QUERY:
+     1888                    Update update = new Update();
+     1889                    update.log = oldLog;
+     1890                    update.pointer = reader.position();
+     1891                    update.version = version;
+     1892  
+     1893                    if (oper == UpdateLog.UPDATE_INPLACE) {
+     1894                      if (entry.size() == 5) {
+     1895                        update.previousVersion = (Long) entry.get(UpdateLog.PREV_VERSION_IDX);
+     1896                      }
+     1897                    }
+     1898                    updatesForLog.add(update);
+     1899                    updates.put(version, update);
+     1900  
+     1901                    if (oper == UpdateLog.DELETE_BY_QUERY) {
+     1902                      deleteByQueryList.add(update);
+     1903                    } else if (oper == UpdateLog.DELETE) {
+     1904                      deleteList.add(new DeleteUpdate(version, (byte[]) entry.get(2)));
+     1905                    }
+     1906  
+     1907                    break;
+     1908  
+     1909                  case UpdateLog.COMMIT:
+     1910                    break;
+     1911                  default:
+     1912                    throw new SolrException(
+     1913                        SolrException.ErrorCode.SERVER_ERROR, "Unknown Operation! " + oper);
+     1914                }
+     1915              } catch (ClassCastException cl) {
+     1916                log.warn("Unexpected log entry or corrupt log.  Entry={}", o, cl);
+     1917                // would be caused by a corrupt transaction log
+     1918              } catch (Exception ex) {
+     1919                log.warn("Exception reverse reading log", ex);
+     1920                break;
+     1921              }
+     1922  
+     1923              numUpdates++;
+     1924            }
+     1925  
+     1926          } catch (IOException | AssertionError e) {
+     1927            // catch AssertionError to handle certain test failures correctly failure to read a log
+     1928            // record isn't fatal
+     1929            log.error("Exception reading versions from log", e);
+     1930          } finally {
+     1931            if (reader != null) reader.close();
+     1932          }
+     1933  
+     1934          updateList.add(updatesForLog);
+     1935        }
+     1936      }
+     1937  
+     1938      @Override
+     1939      public void close() {
+     1940        for (TransactionLog log : logList) {
+     1941          log.decref();
+     1942        }
+     1943      }
+     1944  
+     1945      public long getMaxRecentVersion() {
+     1946        long maxRecentVersion = 0L;
+     1947        if (updates != null) {
+     1948          for (Long key : updates.keySet())
+     1949            maxRecentVersion = Math.max(maxRecentVersion, Math.abs(key.longValue()));
+     1950        }
+     1951        return maxRecentVersion;
+     1952      }
+     1953    }
