@@ -1,0 +1,598 @@
+row 20   line/armeria#6605
+============================================================================
+CONTRACT com.linecorp.armeria.server.HttpService   members=1.0 implementers=103.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       33  @FunctionalInterface
+       34  public interface HttpService extends Service<HttpRequest, HttpResponse> {
+       35  
+       36      @Override
+       37      @CheckReturnValue
+       38      HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception;
+       39  
+       40      /**
+       41       * Creates a new {@link Service} that decorates this {@link HttpService} with the specified
+       42       * {@code decorator}.
+       43       */
+       44      default <R extends Service<R_I, R_O>, R_I extends Request, R_O extends Response>
+       45      R decorate(Function<? super HttpService, R> decorator) {
+       46          final R newService = decorator.apply(this);
+       47  
+       48          if (newService == null) {
+       49              throw new NullPointerException("decorator.apply() returned null: " + decorator);
+       50          }
+       51  
+       52          return newService;
+       53      }
+       54  
+       55      /**
+       56       * Creates a new {@link HttpService} that decorates this {@link HttpService} with the specified
+       57       * {@link DecoratingHttpServiceFunction}.
+       58       */
+       59      default HttpService decorate(DecoratingHttpServiceFunction function) {
+       60          return new FunctionalDecoratingHttpService(this, function);
+       61      }
+       62  
+       63      /**
+       64       * Determines an {@link ExchangeType} for this {@link HttpService} from the given {@link RoutingContext}.
+       65       * By default, {@link ExchangeType#BIDI_STREAMING} is set.
+       66       *
+       67       * <p>Note that an {@link HttpRequest} will be aggregated before serving the {@link HttpService} if
+       68       * {@link ExchangeType#UNARY} or {@link ExchangeType#RESPONSE_STREAMING} is set.
+       69       */
+       70      @UnstableApi
+       71      default ExchangeType exchangeType(RoutingContext routingContext) {
+       72          return ExchangeType.BIDI_STREAMING;
+       73      }
+       74  
+       75      /**
+       76       * Returns the {@link ServiceOptions} of this {@link HttpService}.
+       77       */
+       78      @UnstableApi
+       79      default ServiceOptions options() {
+       80          return ServiceOptions.of();
+       81      }
+       82  }
+
+---------- IMPLEMENTER com.linecorp.armeria.server.athenz.AthenzService  stubs=0/1 ----------
+      113  @UnstableApi
+      114  public final class AthenzService extends SimpleDecoratingHttpService {
+      115  
+      116      /**
+      117       * Returns a new {@link AthenzServiceBuilder} with the specified {@link ZtsBaseClient}.
+      118       */
+      119      public static AthenzServiceBuilder builder(ZtsBaseClient ztsBaseClient) {
+      120          requireNonNull(ztsBaseClient, "ztsBaseClient");
+      121          return new AthenzServiceBuilder(ztsBaseClient);
+      122      }
+      123  
+      124      private final AthenzAuthorizer authorizer;
+      125      private final AthenzResourceProvider athenzResourceProvider;
+      126      private final String athenzAction;
+      127      private final List<AthenzTokenHeader> tokenHeaders;
+      128      private final MeterIdPrefix meterIdPrefix;
+      129      private final String resourceTagValue;
+      130  
+      131      @Nullable
+      132      private Timer allowedTimer;
+      133      @Nullable
+      134      private Timer deniedTimer;
+      135  
+      136      AthenzService(HttpService delegate, AthenzAuthorizer authorizer,
+      137                    AthenzResourceProvider athenzResourceProvider, String athenzAction,
+      138                    List<AthenzTokenHeader> tokenHeaders, MeterIdPrefix meterIdPrefix,
+      139                    String resourceTagValue) {
+      140          super(delegate);
+      141  
+      142          this.authorizer = authorizer;
+      143          this.athenzResourceProvider = athenzResourceProvider;
+      144          this.athenzAction = athenzAction;
+      145          this.tokenHeaders = tokenHeaders;
+      146          this.meterIdPrefix = meterIdPrefix;
+      147          this.resourceTagValue = resourceTagValue;
+      148      }
+      149  
+      150      AthenzService(HttpService delegate, AthenzAuthorizer authorizer, String athenzResource,
+      151                    String athenzAction, List<AthenzTokenHeader> tokenHeaders,
+      152                    MeterIdPrefix meterIdPrefix) {
+      153          this(delegate, authorizer, (ctx, req) -> UnmodifiableFuture.completedFuture(athenzResource),
+      154               athenzAction, tokenHeaders, meterIdPrefix, athenzResource);
+      155      }
+      156  
+      157      @Override
+      158      public void serviceAdded(ServiceConfig cfg) throws Exception {
+      159          super.serviceAdded(cfg);
+      160          final MeterRegistry meterRegistry = cfg.server().meterRegistry();
+      161          final String name = meterIdPrefix.name("token.authorization");
+      162          allowedTimer = MoreMeters.newTimer(meterRegistry, name,
+      163                                             meterIdPrefix.tags("result", "allowed",
+      164                                                                "resource", resourceTagValue,
+      165                                                                "action", athenzAction));
+      166          deniedTimer = MoreMeters.newTimer(meterRegistry, name,
+      167                                            meterIdPrefix.tags("result", "denied",
+      168                                                               "resource", resourceTagValue,
+      169                                                               "action", athenzAction));
+      170      }
+      171  
+      172      @Override
+      173      public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
+      174          final long startNanos = System.nanoTime();
+      175  
+      176          final String token = extractToken(req.headers());
+      177          if (token == null) {
+      178              assert deniedTimer != null;
+      179              deniedTimer.record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+      180              return HttpResponse.of(HttpStatus.UNAUTHORIZED, MediaType.PLAIN_TEXT, "Missing token");
+      181          }
+      182  
+      183          try {
+      184              final CompletableFuture<String> resourceFuture = athenzResourceProvider.provide(ctx, req);
+      185              final CompletableFuture<HttpResponse> future = resourceFuture
+      186                      .thenApplyAsync(
+      187                              athenzResource -> {
+      188                                  if (Strings.isNullOrEmpty(athenzResource)) {
+      189                                      throw new IllegalArgumentException("Resource is null or empty");
+      190                                  }
+      191                                  final AccessCheckStatus status = authorizer.authorize(token, athenzResource,
+      192                                                                                        athenzAction);
+      193                                  final long elapsedNanos = System.nanoTime() - startNanos;
+      194                                  if (status == AccessCheckStatus.ALLOW) {
+      195                                      assert allowedTimer != null;
+      196                                      allowedTimer.record(elapsedNanos, TimeUnit.NANOSECONDS);
+      197                                      try {
+      198                                          return unwrap().serve(ctx, req);
+      199                                      } catch (Exception e) {
+      200                                          return Exceptions.throwUnsafely(e);
+      201                                      }
+      202                                  } else {
+      203                                      assert deniedTimer != null;
+      204                                      deniedTimer.record(elapsedNanos, TimeUnit.NANOSECONDS);
+      205                                      return HttpResponse.of(HttpStatus.UNAUTHORIZED, MediaType.PLAIN_TEXT,
+      206                                                             status.toString());
+      207                                  }
+      208                              },
+      209                              ctx.blockingTaskExecutor())
+      210                      .exceptionally(cause -> {
+      211                          assert deniedTimer != null;
+      212                          deniedTimer.record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+      213                          return createErrorResponse(cause);
+      214                      });
+      215              return HttpResponse.of(future);
+      216          } catch (Exception e) {
+      217              assert deniedTimer != null;
+      218              deniedTimer.record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+      219              return createErrorResponse(e);
+      220          }
+      221      }
+      222  
+      223      @Nullable
+      224      private String extractToken(RequestHeaders headers) {
+      225          for (AthenzTokenHeader tokenHeader : tokenHeaders) {
+      226              final String token = headers.get(tokenHeader.headerName(), "");
+      227              if (token.isEmpty()) {
+      228                  continue;
+      229              }
+      230              return token;
+      231          }
+      232          return null;
+      233      }
+      234  
+      235      private static HttpResponse createErrorResponse(Throwable cause) {
+      236          final Throwable peeled = Exceptions.peel(cause);
+      237          if (peeled instanceof IllegalArgumentException) {
+      238              return HttpResponse.of(HttpStatus.BAD_REQUEST, MediaType.PLAIN_TEXT,
+      239                                     "Resource could not be resolved: " + cause.getMessage());
+      240          }
+      241  
+      242          return Exceptions.throwUnsafely(peeled);
+      243      }
+      244  }
+
+---------- IMPLEMENTER com.linecorp.armeria.thrift.PooledResponseBufferBenchmark.PooledDecoratingService  stubs=0/1 ----------
+       64      private static final class PooledDecoratingService extends SimpleDecoratingHttpService {
+       65  
+       66          private PooledDecoratingService(HttpService delegate) {
+       67              super(delegate);
+       68          }
+       69  
+       70          @Override
+       71          public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
+       72              final HttpResponse res = unwrap().serve(ctx, req);
+       73              final HttpResponseWriter decorated = HttpResponse.streaming();
+       74              res.subscribe(new Subscriber<HttpObject>() {
+       75                  @Override
+       76                  public void onSubscribe(Subscription s) {
+       77                      s.request(Long.MAX_VALUE);
+       78                  }
+       79  
+       80                  @Override
+       81                  public void onNext(HttpObject httpObject) {
+       82                      decorated.write(httpObject);
+       83                  }
+       84  
+       85                  @Override
+       86                  public void onError(Throwable t) {
+       87                      decorated.close(t);
+       88                  }
+       89  
+       90                  @Override
+       91                  public void onComplete() {
+       92                      decorated.close();
+       93                  }
+       94              }, SubscriptionOption.WITH_POOLED_OBJECTS);
+       95              return decorated;
+       96          }
+       97      }
+
+---------- IMPLEMENTER com.linecorp.armeria.thrift.PooledResponseBufferBenchmark.UnpooledDecoratingService  stubs=0/1 ----------
+       99      private static final class UnpooledDecoratingService extends SimpleDecoratingHttpService {
+      100  
+      101          private UnpooledDecoratingService(HttpService delegate) {
+      102              super(delegate);
+      103          }
+      104  
+      105          @Override
+      106          public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
+      107              final HttpResponse res = unwrap().serve(ctx, req);
+      108              final HttpResponseWriter decorated = HttpResponse.streaming();
+      109              res.subscribe(new Subscriber<HttpObject>() {
+      110                  @Override
+      111                  public void onSubscribe(Subscription s) {
+      112                      s.request(Long.MAX_VALUE);
+      113                  }
+      114  
+      115                  @Override
+      116                  public void onNext(HttpObject httpObject) {
+      117                      decorated.write(httpObject);
+      118                  }
+      119  
+      120                  @Override
+      121                  public void onError(Throwable t) {
+      122                      decorated.close(t);
+      123                  }
+      124  
+      125                  @Override
+      126                  public void onComplete() {
+      127                      decorated.close();
+      128                  }
+      129              });
+      130              return decorated;
+      131          }
+      132      }
+
+---------- IMPLEMENTER com.linecorp.armeria.internal.server.annotation.DefaultAnnotatedService  stubs=0/1 ----------
+       86  final class DefaultAnnotatedService implements AnnotatedService {
+       87      private static final Logger logger = LoggerFactory.getLogger(DefaultAnnotatedService.class);
+       88  
+       89      private static final MethodHandles.Lookup lookup = MethodHandles.lookup();
+       90  
+       91      private static final CompletableFuture<AggregatedResult>
+       92              NO_AGGREGATION_FUTURE = UnmodifiableFuture.completedFuture(AggregatedResult.EMPTY);
+       93  
+       94      private final Object object;
+       95      private final Class<?> serviceClass;
+       96      private final Method method;
+       97      private final int overloadId;
+       98      private final MethodHandle methodHandle;
+       99      @Nullable
+      100      private final MethodHandle callKotlinSuspendingMethod;
+      101      private final boolean isKotlinSuspendingMethod;
+      102      private final List<AnnotatedValueResolver> resolvers;
+      103  
+      104      private final AggregationStrategy aggregationStrategy;
+      105      @Nullable
+      106      private final ExceptionHandlerFunction exceptionHandler;
+      107      private final ResponseConverterFunction responseConverter;
+      108      private final Type actualReturnType;
+      109  
+      110      private final Route route;
+      111      private final HttpStatus defaultStatus;
+      112      private final HttpHeaders defaultHttpHeaders;
+      113      private final HttpHeaders defaultHttpTrailers;
+      114  
+      115      private final ResponseType responseType;
+      116      private final boolean useBlockingTaskExecutor;
+      117      @Nullable
+      118      private final String name;
+      119  
+      120      private final ServiceOptions options;
+      121      private final List<BeanFieldInfo> paramBeanFieldInfos;
+      122      private final BeanFieldInfo retBeanFieldInfo;
+      123  
+      124      DefaultAnnotatedService(Object object, Method method,
+      125                              int overloadId, List<AnnotatedValueResolver> resolvers,
+      126                              List<ExceptionHandlerFunction> exceptionHandlers,
+      127                              List<ResponseConverterFunction> responseConverters,
+      128                              Route route,
+      129                              HttpStatus defaultStatus,
+      130                              HttpHeaders defaultHttpHeaders,
+      131                              HttpHeaders defaultHttpTrailers,
+      132                              boolean useBlockingTaskExecutor) {
+      133          this.object = requireNonNull(object, "object");
+      134          this.method = requireNonNull(method, "method");
+      135          checkArgument(overloadId >= 0, "overloadId: %s (expected: >= 0)", overloadId);
+      136          this.overloadId = overloadId;
+      137          serviceClass = ClassUtil.getUserClass(object.getClass());
+      138  
+      139          checkArgument(!method.isVarArgs(), "%s#%s declared to take a variable number of arguments",
+      140                        method.getDeclaringClass().getSimpleName(), method.getName());
+      141          isKotlinSuspendingMethod = KotlinUtil.isSuspendingFunction(method);
+      142          this.resolvers = requireNonNull(resolvers, "resolvers");
+      143  
+      144          requireNonNull(exceptionHandlers, "exceptionHandlers");
+      145          if (exceptionHandlers.isEmpty()) {
+      146              exceptionHandler = null;
+      147          } else {
+      148              exceptionHandler = new CompositeExceptionHandlerFunction(object.getClass().getSimpleName(),
+      149                                                                       method.getName(), exceptionHandlers);
+      150          }
+      151  
+      152          actualReturnType = getActualReturnType(method);
+      153          responseConverter = newResponseConverter(
+      154                  actualReturnType, requireNonNull(responseConverters, "responseConverters"));
+      155          aggregationStrategy = AggregationStrategy.from(resolvers);
+      156          this.route = requireNonNull(route, "route");
+      157  
+      158          this.defaultStatus = requireNonNull(defaultStatus, "defaultStatus");
+      159          this.defaultHttpHeaders = requireNonNull(defaultHttpHeaders, "defaultHttpHeaders");
+      160          this.defaultHttpTrailers = requireNonNull(defaultHttpTrailers, "defaultHttpTrailers");
+      161          this.useBlockingTaskExecutor = useBlockingTaskExecutor;
+      162          final Class<?> returnType = method.getReturnType();
+      163          if (HttpResponse.class.isAssignableFrom(returnType)) {
+      164              responseType = ResponseType.HTTP_RESPONSE;
+      165          } else if (CompletionStage.class.isAssignableFrom(returnType)) {
+      166              responseType = ResponseType.COMPLETION_STAGE;
+      167          } else if (isKotlinSuspendingMethod) {
+      168              responseType = ResponseType.KOTLIN_COROUTINES;
+      169          } else if (ScalaUtil.isScalaFuture(returnType)) {
+      170              responseType = ResponseType.SCALA_FUTURE;
+      171          } else {
+      172              responseType = ResponseType.OTHER_OBJECTS;
+      173          }
+      174          callKotlinSuspendingMethod = KotlinUtil.getCallKotlinSuspendingMethod();
+      175  
+      176          final ServiceName serviceName = getFirstAnnotation(object, method, ServiceName.class);
+      177          if (serviceName != null) {
+      178              name = serviceName.value();
+      179          } else {
+      180              name = null;
+      181          }
+      182  
+      183          this.method.setAccessible(true);
+      184          // following must be called only after method.setAccessible(true)
+      185          methodHandle = asMethodHandle(method, object);
+      186  
+      187          final ServiceOption serviceOption = getFirstAnnotation(object, method, ServiceOption.class);
+      188          if (serviceOption != null) {
+      189              options = buildServiceOptions(serviceOption);
+      190          } else {
+      191              options = ServiceOptions.of();
+      192          }
+      193  
+      194          paramBeanFieldInfos = resolvers.stream().map(AnnotatedValueResolver::beanFieldInfo)
+      195                                         .collect(ImmutableList.toImmutableList());
+      196          retBeanFieldInfo = new AnnotatedBeanFieldInfo(method, returnType, method.getName());
+      197      }
+      198  
+      199      @Nullable
+      200      private static <T extends Annotation> T getFirstAnnotation(Object object, Method method,
+      201                                                                 Class<T> annotationClass) {
+      202          @Nullable
+      203          T annotation = AnnotationUtil.findFirst(method, annotationClass);
+      204          if (annotation == null) {
+      205              annotation = AnnotationUtil.findFirst(object.getClass(), annotationClass);
+      206          }
+      207          return annotation;
+      208      }
+      209  
+      210      private static Type getActualReturnType(Method method) {
+      211          final Class<?> returnType;
+      212          final Type genericReturnType;
+      213  
+      214          if (KotlinUtil.isKFunction(method)) {
+      215              returnType = KotlinUtil.kFunctionReturnType(method);
+      216              if (KotlinUtil.isReturnTypeNothing(method)) {
+      217                  genericReturnType = KotlinUtil.kFunctionReturnType(method);
+      218              } else {
+      219                  genericReturnType = KotlinUtil.kFunctionGenericReturnType(method);
+      220              }
+      221          } else {
+      222              returnType = method.getReturnType();
+      223              genericReturnType = method.getGenericReturnType();
+      224          }
+      225  
+      226          if (HttpResult.class.isAssignableFrom(returnType) ||
+      227              ResponseEntity.class.isAssignableFrom(returnType)) {
+      228              final ParameterizedType type = (ParameterizedType) genericReturnType;
+      229              warnIfHttpResponseArgumentExists(type, type, returnType);
+      230              return type.getActualTypeArguments()[0];
+      231          } else {
+      232              return genericReturnType;
+      233          }
+      234      }
+      235  
+      236      private static void warnIfHttpResponseArgumentExists(Type returnType,
+      237                                                           ParameterizedType type,
+      238                                                           Class<?> originalReturnType) {
+      239          for (final Type arg : type.getActualTypeArguments()) {
+      240              if (arg instanceof ParameterizedType) {
+      241                  warnIfHttpResponseArgumentExists(returnType, (ParameterizedType) arg, originalReturnType);
+      242              } else if (arg instanceof Class) {
+      243                  final Class<?> clazz = (Class<?>) arg;
+      244                  if (HttpResponse.class.isAssignableFrom(clazz) ||
+      245                      AggregatedHttpResponse.class.isAssignableFrom(clazz)) {
+
+---------- IMPLEMENTER com.linecorp.armeria.internal.server.annotation.DefaultAnnotatedService.ExceptionHandlingHttpService  stubs=0/1 ----------
+      625      private static final class ExceptionHandlingHttpService extends SimpleDecoratingHttpService {
+      626  
+      627          private final ExceptionHandlerFunction exceptionHandler;
+      628  
+      629          ExceptionHandlingHttpService(HttpService service, ExceptionHandlerFunction exceptionHandler) {
+      630              super(service);
+      631              this.exceptionHandler = exceptionHandler;
+      632          }
+      633  
+      634          @Override
+      635          public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) {
+      636              try {
+      637                  final HttpResponse response = unwrap().serve(ctx, req);
+      638                  return response.recover(cause -> {
+      639                      try (SafeCloseable ignored = ctx.push()) {
+      640                          return exceptionHandler.handleException(ctx, req, cause);
+      641                      }
+      642                  });
+      643              } catch (Exception ex) {
+      644                  return exceptionHandler.handleException(ctx, req, ex);
+      645              }
+      646          }
+      647      }
+
+---------- IMPLEMENTER com.linecorp.armeria.internal.server.RouteDecoratingService  stubs=0/1 ----------
+       79  public final class RouteDecoratingService implements HttpService {
+       80  
+       81      private static final AttributeKey<Queue<HttpService>> DECORATOR_KEY =
+       82              AttributeKey.valueOf(RouteDecoratingService.class, "SERVICE_CHAIN");
+       83  
+       84      public static Function<? super HttpService, HttpService> newDecorator(
+       85              Router<RouteDecoratingService> router, List<RouteDecoratingService> routeDecoratingServices) {
+       86          return delegate -> new InitialDispatcherService(delegate, router, routeDecoratingServices);
+       87      }
+       88  
+       89      private final Route route;
+       90      private final HttpService decorator;
+       91  
+       92      @Nullable
+       93      private VirtualHost defaultVirtualHost;
+       94  
+       95      public RouteDecoratingService(Route route, String contextPath,
+       96                                    Function<? super HttpService, ? extends HttpService> decoratorFunction) {
+       97          this.route = requireNonNull(route, "route").withPrefix(contextPath);
+       98          decorator = requireNonNull(decoratorFunction, "decoratorFunction").apply(this);
+       99      }
+      100  
+      101      private RouteDecoratingService(Route route, HttpService decorator) {
+      102          this.route = requireNonNull(route, "route");
+      103          this.decorator = requireNonNull(decorator, "decorator");
+      104      }
+      105  
+      106      /**
+      107       * Adds the specified {@code prefix} to this {@code decorator}.
+      108       */
+      109      public RouteDecoratingService withRoutePrefix(String prefix) {
+      110          return new RouteDecoratingService(route.withPrefix(prefix), decorator);
+      111      }
+      112  
+      113      @Override
+      114      public void serviceAdded(ServiceConfig cfg) throws Exception {
+      115          final VirtualHost defaultVirtualHost = cfg.server().config().defaultVirtualHost();
+      116          if (this.defaultVirtualHost == defaultVirtualHost) {
+      117              // This condition is necessary because:
+      118              // - The same decorator can be added multiple times.
+      119              // - Avoid infinite loop. The delegate of `decorator` is this.
+      120              return;
+      121          }
+      122          this.defaultVirtualHost = defaultVirtualHost;
+      123          decorator.serviceAdded(cfg);
+      124      }
+      125  
+      126      @Override
+      127      public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
+      128          final Queue<HttpService> delegates = ctx.attr(DECORATOR_KEY);
+      129          assert delegates != null;
+      130          final HttpService delegate = delegates.poll();
+      131          assert delegate != null;
+      132          return delegate.serve(ctx, req);
+      133      }
+      134  
+      135      public Route route() {
+      136          return route;
+      137      }
+      138  
+      139      private HttpService decorator() {
+      140          return decorator;
+      141      }
+      142  
+      143      @Nullable
+      144      public <T extends HttpService> T as(ServiceRequestContext ctx, Class<T> serviceClass) {
+      145          final Queue<HttpService> delegates = ctx.attr(DECORATOR_KEY);
+      146          if (delegates == null) {
+      147              return null;
+      148          }
+      149  
+      150          for (HttpService delegate : delegates) {
+      151              final T service = delegate.as(serviceClass);
+      152              if (service != null) {
+      153                  return service;
+      154              }
+      155          }
+      156          return null;
+      157      }
+      158  
+      159      @Override
+      160      public String toString() {
+      161          return MoreObjects.toStringHelper(this)
+      162                            .add("route", route)
+      163                            .toString();
+      164      }
+      165  
+      166      public static final class InitialDispatcherService extends SimpleDecoratingHttpService {
+      167  
+      168          private final Router<RouteDecoratingService> router;
+      169          private final List<RouteDecoratingService> routeDecoratingServices;
+      170  
+      171          InitialDispatcherService(HttpService delegate, Router<RouteDecoratingService> router,
+      172                                   List<RouteDecoratingService> routeDecoratingServices) {
+      173              super(delegate);
+      174              this.router = router;
+      175              this.routeDecoratingServices = routeDecoratingServices;
+      176          }
+      177  
+      178          @Override
+      179          public void serviceAdded(ServiceConfig cfg) throws Exception {
+      180              super.serviceAdded(cfg);
+      181              for (RouteDecoratingService routeDecoratingService : routeDecoratingServices) {
+      182                  routeDecoratingService.serviceAdded(cfg);
+      183              }
+      184          }
+      185  
+      186          @Override
+      187          public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
+      188              final Queue<HttpService> serviceChain = new ArrayDeque<>(4);
+      189              router.findAll(ctx.routingContext()).forEach(routed -> {
+      190                  if (routed.isPresent()) {
+      191                      serviceChain.add(routed.value().decorator());
+      192                  }
+      193              });
+      194  
+      195              if (serviceChain.isEmpty()) {
+      196                  return unwrap().serve(ctx, req);
+      197              }
+      198              serviceChain.add((HttpService) unwrap());
+      199              final HttpService service = serviceChain.poll();
+      200              ctx.setAttr(DECORATOR_KEY, serviceChain);
+      201              assert service != null;
+      202              return service.serve(ctx, req);
+      203          }
+      204  
+      205          @Nullable
+      206          public <T extends HttpService> T findService(ServiceRequestContext ctx,
+      207                                                       Class<? extends T> serviceClass) {
+      208              for (Routed<RouteDecoratingService> routed : router.findAll(ctx.routingContext())) {
+      209                  if (routed.isPresent()) {
+      210                      final T service = routed.value().decorator().as(serviceClass);
+      211                      if (service != null) {
+      212                          return service;
+      213                      }
+      214                  }
+      215              }
+      216              return unwrap().as(serviceClass);
+      217          }
+      218  
+      219          @Override
+      220          public String toString() {
+      221              return MoreObjects.toStringHelper(this)
+      222                                .add("router", router)
+      223                                .add("delegate", unwrap()).toString();
+      224          }
+      225      }
+      226  }

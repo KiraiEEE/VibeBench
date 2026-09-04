@@ -1,0 +1,272 @@
+row 66   linkedin/venice#2557
+============================================================================
+CONTRACT com.linkedin.davinci.kafka.consumer.StoreIngestionService   members=19.0 implementers=1.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       20  public interface StoreIngestionService {
+       21    /**
+       22     * Starts consuming messages from Kafka Partition corresponding to Venice Partition.
+       23     *
+       24     * @param veniceStore    Venice Store for the partition.
+       25     * @param partitionId    Venice partition's id.
+       26     * @param pubSubPosition
+       27     */
+       28    void startConsumption(VeniceStoreVersionConfig veniceStore, int partitionId, Optional<PubSubPosition> pubSubPosition);
+       29  
+       30    /**
+       31     * Stops consuming messages from Kafka Partition corresponding to Venice Partition.
+       32     * @param veniceStore Venice Store for the partition.
+       33     * @param partitionId Venice partition's id.
+       34     */
+       35    CompletableFuture<Void> stopConsumption(VeniceStoreVersionConfig veniceStore, int partitionId);
+       36  
+       37    /**
+       38     * Stops consuming messages from Kafka Partition corresponding to Venice Partition and wait up to
+       39     * (sleepSeconds * numRetires) to make sure partition consumption is stopped.
+       40     */
+       41    void stopConsumptionAndWait(
+       42        VeniceStoreVersionConfig veniceStore,
+       43        int partitionId,
+       44        int sleepSeconds,
+       45        int numRetries,
+       46        boolean whetherToResetOffset);
+       47  
+       48    /**
+       49     * Kill all of running consumptions of given store.
+       50     *
+       51     * @param topicName Venice topic (store and version number) for the corresponding consumer task that needs to be killed.
+       52     */
+       53    boolean killConsumptionTask(String topicName);
+       54  
+       55    void promoteToLeader(
+       56        VeniceStoreVersionConfig veniceStoreVersionConfig,
+       57        int partitionId,
+       58        LeaderFollowerPartitionStateModel.LeaderSessionIdChecker checker);
+       59  
+       60    void demoteToStandby(
+       61        VeniceStoreVersionConfig veniceStoreVersionConfig,
+       62        int partitionId,
+       63        LeaderFollowerPartitionStateModel.LeaderSessionIdChecker checker);
+       64  
+       65    /**
+       66     * Adds Notifier to get Notifications for get various status of the consumption
+       67     * tasks like start, completed, progress and error states.
+       68     *
+       69     * Multiple Notifiers can be added for the same consumption tasks and all of them will
+       70     * be notified in order.
+       71     *
+       72     * @param notifier
+       73     */
+       74    void addIngestionNotifier(VeniceNotifier notifier);
+       75  
+       76    void replaceAndAddTestNotifier(VeniceNotifier notifier);
+       77  
+       78    /**
+       79     * Check whether there is a running consumption task for given store.
+       80     */
+       81    boolean containsRunningConsumption(VeniceStoreVersionConfig veniceStore);
+       82  
+       83    /**
+       84     * Check whether there is a running consumption task for given store version topic.
+       85     */
+       86    boolean containsRunningConsumption(String topic);
+       87  
+       88    /**
+       89     * Check whether the specified partition is still being consumed
+       90     */
+       91    boolean isPartitionConsuming(String topic, int partitionId);
+       92  
+       93    /**
+       94     * Get topic names that are currently maintained by the ingestion service with corresponding version status not in an
+       95     * online state. Topics with invalid store or version number are also included in the returned list.
+       96     * @return a {@link Set} of topic names.
+       97     */
+       98    Set<String> getIngestingTopicsWithVersionStatusNotOnline();
+       99  
+      100    void recordIngestionFailure(String storeName);
+      101  
+      102    /**
+      103     * Records an ingestion failure with version-level OTel metrics including the failure reason dimension.
+      104     */
+      105    void recordIngestionFailure(String storeName, int version, VeniceIngestionFailureReason reason);
+      106  
+      107    /**
+      108     * Get AggVersionedStorageIngestionStats
+      109     * @return an instance of {@link AggVersionedIngestionStats}
+      110     */
+      111    AggVersionedIngestionStats getAggVersionedIngestionStats();
+      112  
+      113    StoreIngestionTask getStoreIngestionTask(String topic);
+      114  
+      115    VeniceConfigLoader getVeniceConfigLoader();
+      116  
+      117    VeniceWriterFactory getVeniceWriterFactory();
+      118  
+      119    Optional<PubSubPosition> getPubSubPosition(
+      120        VeniceStoreVersionConfig veniceStore,
+      121        int partitionId,
+      122        Map<Integer, Long> timestampMap,
+      123        Map<Integer, PubSubPosition> pubSubPosition);
+      124  }
+
+---------- IMPLEMENTER com.linkedin.davinci.kafka.consumer.KafkaStoreIngestionService  stubs=0/19 ----------
+      145  public class KafkaStoreIngestionService extends AbstractVeniceService implements StoreIngestionService {
+      146    private static final String GROUP_ID_FORMAT = "%s_%s";
+      147  
+      148    private static final Logger LOGGER = LogManager.getLogger(KafkaStoreIngestionService.class);
+      149    // Extra logger dedicated for ingestion info for slow partition.
+      150    private static final Logger INGESTION_DEBUGGER_LOGGER = LogManager.getLogger(TopicPartitionIngestionInfo.class);
+      151  
+      152    private final StorageService storageService;
+      153  
+      154    private final VeniceConfigLoader veniceConfigLoader;
+      155  
+      156    private final Queue<VeniceNotifier> leaderFollowerNotifiers = new ConcurrentLinkedQueue<>();
+      157  
+      158    private final StorageMetadataService storageMetadataService;
+      159  
+      160    private final ReadOnlyStoreRepository metadataRepo;
+      161    private final AggHostLevelIngestionStats hostLevelIngestionStats;
+      162    private final AggVersionedIngestionStats versionedIngestionStats;
+      163  
+      164    /**
+      165     * Store buffer service to persist data into local bdb for all the stores.
+      166     */
+      167    private final AbstractStoreBufferService storeBufferService;
+      168  
+      169    private final AggKafkaConsumerService aggKafkaConsumerService;
+      170  
+      171    /**
+      172     * A repository mapping each Version Topic to it corresponding Ingestion task responsible
+      173     * for consuming messages and making changes to the local store accordingly.
+      174     */
+      175    private final NavigableMap<String, StoreIngestionTask> topicNameToIngestionTaskMap;
+      176  
+      177    private final Optional<SchemaReader> kafkaMessageEnvelopeSchemaReader;
+      178  
+      179    private final MetaStoreWriter metaStoreWriter;
+      180  
+      181    private final StoreIngestionTaskFactory ingestionTaskFactory;
+      182  
+      183    private final boolean isDaVinciClient;
+      184  
+      185    private final TopicManagerRepository topicManagerRepository;
+      186  
+      187    private ExecutorService participantStoreConsumerExecutorService;
+      188  
+      189    private ExecutorService ingestionExecutorService;
+      190  
+      191    private final ParticipantStoreConsumptionTask participantStoreConsumptionTask;
+      192  
+      193    // TODO: This could be a composite storage engine which keeps secondary storage engines updated in lockstep with a
+      194    // primary
+      195    // source. This could be a view of the data, or in our case a cache, or both potentially.
+      196    private final Optional<ObjectCacheBackend> cacheBackend;
+      197    private final Map<String, InternalDaVinciRecordTransformerConfig> storeNameToInternalRecordTransformerConfig =
+      198        new VeniceConcurrentHashMap<>();
+      199    private AggVersionedDaVinciRecordTransformerStats recordTransformerStats = null;
+      200  
+      201    private final PubSubProducerAdapterFactory producerAdapterFactory;
+      202  
+      203    private final InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer;
+      204  
+      205    private final StorageEngineBackedCompressorFactory compressorFactory;
+      206  
+      207    private final ResourceAutoClosableLockManager<String> topicLockManager;
+      208  
+      209    private final PubSubTopicRepository pubSubTopicRepository = new PubSubTopicRepository();
+      210    private final PubSubContext pubSubContext;
+      211    private final AsyncStoreChangeNotifier asyncStoreChangeNotifier;
+      212    private final KafkaValueSerializer kafkaValueSerializer;
+      213    private final IngestionThrottler ingestionThrottler;
+      214    private final ExecutorService aaWCWorkLoadProcessingThreadPool;
+      215    private final AdaptiveThrottlerSignalService adaptiveThrottlerSignalService;
+      216  
+      217    private final VeniceServerConfig serverConfig;
+      218  
+      219    private final Lazy<ZKHelixAdmin> zkHelixAdmin;
+      220  
+      221    private final ExecutorService aaWCIngestionStorageLookupThreadPool;
+      222  
+      223    private final ScheduledExecutorService idleStoreIngestionTaskKillerExecutor;
+      224  
+      225    private final VeniceWriterFactory veniceWriterFactory;
+      226    private final MetricsRepository metricsRepository;
+      227  
+      228    private final HeartbeatMonitoringService heartbeatMonitoringService;
+      229  
+      230    public KafkaStoreIngestionService(
+      231        StorageService storageService,
+      232        VeniceConfigLoader veniceConfigLoader,
+      233        StorageMetadataService storageMetadataService,
+      234        ClusterInfoProvider clusterInfoProvider,
+      235        ReadOnlyStoreRepository metadataRepo,
+      236        ReadOnlySchemaRepository schemaRepo,
+      237        ReadOnlyLiveClusterConfigRepository liveClusterConfigRepository,
+      238        MetricsRepository metricsRepository,
+      239        Optional<SchemaReader> kafkaMessageEnvelopeSchemaReader,
+      240        Optional<ClientConfig> clientConfig,
+      241        InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer,
+      242        Optional<HelixReadOnlyZKSharedSchemaRepository> zkSharedSchemaRepository,
+      243        ICProvider icProvider,
+      244        StorageEngineBackedCompressorFactory compressorFactory,
+      245        Optional<ObjectCacheBackend> cacheBackend,
+      246        boolean isDaVinciClient,
+      247        RemoteIngestionRepairService remoteIngestionRepairService,
+      248        PubSubClientsFactory pubSubClientsFactory,
+      249        Optional<SSLFactory> sslFactory,
+      250        HeartbeatMonitoringService heartbeatMonitoringService,
+      251        Lazy<ZKHelixAdmin> zkHelixAdmin,
+      252        AdaptiveThrottlerSignalService adaptiveThrottlerSignalService,
+      253        Optional<D2Client> d2Client) {
+      254      this.storageService = storageService;
+      255      this.cacheBackend = cacheBackend;
+      256      this.metricsRepository = metricsRepository;
+      257      this.storageMetadataService = storageMetadataService;
+      258      this.metadataRepo = metadataRepo;
+      259      this.topicNameToIngestionTaskMap = new ConcurrentSkipListMap<>();
+      260      this.veniceConfigLoader = veniceConfigLoader;
+      261      this.isDaVinciClient = isDaVinciClient;
+      262      this.partitionStateSerializer = partitionStateSerializer;
+      263      this.compressorFactory = compressorFactory;
+      264      this.zkHelixAdmin = zkHelixAdmin;
+      265      this.heartbeatMonitoringService = heartbeatMonitoringService;
+      266      // Each topic that has any partition ingested by this class has its own lock.
+      267      this.topicLockManager = new ResourceAutoClosableLockManager<>(ReentrantLock::new);
+      268      this.serverConfig = veniceConfigLoader.getVeniceServerConfig();
+      269      Properties veniceWriterProperties =
+      270          veniceConfigLoader.getVeniceClusterConfig().getClusterProperties().toProperties();
+      271  
+      272      veniceWriterProperties.put(PubSubConstants.PUBSUB_PRODUCER_USE_HIGH_THROUGHPUT_DEFAULTS, "true");
+      273      producerAdapterFactory = pubSubClientsFactory.getProducerAdapterFactory();
+      274      this.veniceWriterFactory = new VeniceWriterFactory(
+      275          veniceWriterProperties,
+      276          producerAdapterFactory,
+      277          metricsRepository,
+      278          serverConfig.getPubSubPositionTypeRegistry());
+      279      this.adaptiveThrottlerSignalService = adaptiveThrottlerSignalService;
+      280      this.ingestionThrottler = new IngestionThrottler(
+      281          isDaVinciClient,
+      282          serverConfig,
+      283          () -> Collections.unmodifiableMap(topicNameToIngestionTaskMap),
+      284          adaptiveThrottlerSignalService);
+      285  
+      286      final Map<String, EventThrottler> kafkaUrlToRecordsThrottler;
+      287      if (liveClusterConfigRepository != null) {
+      288        Set<String> regionNames = serverConfig.getRegionNames();
+      289        kafkaUrlToRecordsThrottler = new HashMap<>(regionNames.size());
+      290        regionNames.forEach(region -> {
+      291          kafkaUrlToRecordsThrottler.put(
+      292              region,
+      293              new EventThrottler(
+      294                  () -> (long) liveClusterConfigRepository.getConfigs()
+      295                      .getServerKafkaFetchQuotaRecordsPerSecondForRegion(region),
+      296                  serverConfig.getKafkaFetchQuotaTimeWindow(),
+      297                  "kafka_consumption_records_count_" + region,
+      298                  true, // Check quota before recording since we buffer throttled records and don't send them to disk or
+      299                        // kafka
+      300                  EventThrottler.REJECT_STRATEGY) // We want exceptions to be thrown when quota is exceeded
+      301          );
+      302        });
+      303      } else {
+      304        kafkaUrlToRecordsThrottler = Collections.emptyMap();

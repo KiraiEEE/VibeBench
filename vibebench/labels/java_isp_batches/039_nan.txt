@@ -1,0 +1,370 @@
+row 39   graphql-java/graphql-java#4218
+============================================================================
+CONTRACT graphql.execution.incremental.DeferredExecutionSupport   members=4.0 implementers=2.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       46  @Internal
+       47  public interface DeferredExecutionSupport {
+       48  
+       49      boolean isDeferredField(MergedField mergedField);
+       50  
+       51      int deferredFieldsCount();
+       52  
+       53      List<String> getNonDeferredFieldNames(List<String> allFieldNames);
+       54  
+       55      Set<IncrementalCall<? extends IncrementalPayload>> createCalls();
+       56  
+       57      DeferredExecutionSupport NOOP = new DeferredExecutionSupport.NoOp();
+       58  
+       59      /**
+       60       * An implementation that actually executes the deferred fields.
+       61       */
+       62      class DeferredExecutionSupportImpl implements DeferredExecutionSupport {
+       63          private final ImmutableListMultimap<DeferredExecution, MergedField> deferredExecutionToFields;
+       64          private final ImmutableSet<MergedField> deferredFields;
+       65          private final ImmutableList<String> nonDeferredFieldNames;
+       66          private final ExecutionStrategyParameters parameters;
+       67          private final ExecutionContext executionContext;
+       68          private final BiFunction<ExecutionContext, ExecutionStrategyParameters, CompletableFuture<FieldValueInfo>> resolveFieldWithInfoFn;
+       69          private final BiFunction<ExecutionContext, ExecutionStrategyParameters, Supplier<ExecutionStepInfo>> executionStepInfoFn;
+       70          private final Map<String, Supplier<CompletableFuture<DeferredFragmentCall.FieldWithExecutionResult>>> dfCache = new HashMap<>();
+       71  
+       72          public DeferredExecutionSupportImpl(
+       73                  MergedSelectionSet mergedSelectionSet,
+       74                  ExecutionStrategyParameters parameters,
+       75                  ExecutionContext executionContext,
+       76                  BiFunction<ExecutionContext, ExecutionStrategyParameters, CompletableFuture<FieldValueInfo>> resolveFieldWithInfoFn,
+       77                  BiFunction<ExecutionContext, ExecutionStrategyParameters, Supplier<ExecutionStepInfo>> executionStepInfoFn
+       78          ) {
+       79              this.executionContext = executionContext;
+       80              this.resolveFieldWithInfoFn = resolveFieldWithInfoFn;
+       81              this.executionStepInfoFn = executionStepInfoFn;
+       82              ImmutableListMultimap.Builder<DeferredExecution, MergedField> deferredExecutionToFieldsBuilder = ImmutableListMultimap.builder();
+       83              ImmutableSet.Builder<MergedField> deferredFieldsBuilder = ImmutableSet.builder();
+       84              ImmutableList.Builder<String> nonDeferredFieldNamesBuilder = ImmutableList.builder();
+       85  
+       86              mergedSelectionSet.getSubFields().values().forEach(mergedField -> {
+       87                  if (mergedField.getFieldsCount() > mergedField.getDeferredExecutions().size()) {
+       88                      nonDeferredFieldNamesBuilder.add(mergedField.getSingleField().getResultKey());
+       89                      return;
+       90                  }
+       91                  mergedField.getDeferredExecutions().forEach(de -> {
+       92                      deferredExecutionToFieldsBuilder.put(de, mergedField);
+       93                      deferredFieldsBuilder.add(mergedField);
+       94                  });
+       95              });
+       96  
+       97              this.deferredExecutionToFields = deferredExecutionToFieldsBuilder.build();
+       98              this.deferredFields = deferredFieldsBuilder.build();
+       99              this.parameters = parameters;
+      100              this.nonDeferredFieldNames = nonDeferredFieldNamesBuilder.build();
+      101          }
+      102  
+      103          @Override
+      104          public boolean isDeferredField(MergedField mergedField) {
+      105              return deferredFields.contains(mergedField);
+      106          }
+      107  
+      108          @Override
+      109          public int deferredFieldsCount() {
+      110              return deferredFields.size();
+      111          }
+      112  
+      113          @Override
+      114          public List<String> getNonDeferredFieldNames(List<String> allFieldNames) {
+      115              return this.nonDeferredFieldNames;
+      116          }
+      117  
+      118          @Override
+      119          public Set<IncrementalCall<? extends IncrementalPayload>> createCalls() {
+      120              ImmutableSet<DeferredExecution> deferredExecutions = deferredExecutionToFields.keySet();
+      121              Set<IncrementalCall<? extends IncrementalPayload>> set = Sets.newHashSetWithExpectedSize(deferredExecutions.size());
+      122  
+      123              for (DeferredExecution deferredExecution : deferredExecutions) {
+      124                  set.add(this.createDeferredFragmentCall(deferredExecution));
+      125              }
+      126              return set;
+      127          }
+      128  
+      129          private DeferredFragmentCall createDeferredFragmentCall(DeferredExecution deferredExecution) {
+      130              int level = parameters.getPath().getLevel() + 1;
+      131              List<MergedField> mergedFields = deferredExecutionToFields.get(deferredExecution);
+      132              AlternativeCallContext alternativeCallContext = new AlternativeCallContext(level, mergedFields.size());
+      133  
+      134              List<Supplier<CompletableFuture<DeferredFragmentCall.FieldWithExecutionResult>>> calls = FpKit.arrayListSizedTo(mergedFields);
+      135              for (MergedField currentField : mergedFields) {
+      136                  calls.add(this.createResultSupplier(currentField, alternativeCallContext));
+      137              }
+      138  
+      139              return new DeferredFragmentCall(
+      140                      deferredExecution.getLabel(),
+      141                      this.parameters.getPath(),
+      142                      calls,
+      143                      alternativeCallContext
+      144              );
+      145          }
+      146  
+      147          private Supplier<CompletableFuture<DeferredFragmentCall.FieldWithExecutionResult>> createResultSupplier(
+      148                  MergedField currentField,
+      149                  AlternativeCallContext alternativeCallContext
+      150          ) {
+      151              Map<String, MergedField> fields = new LinkedHashMap<>();
+      152              fields.put(currentField.getResultKey(), currentField);
+      153  
+      154              ExecutionStrategyParameters executionStrategyParameters = parameters.transform(builder ->
+      155                      {
+      156                          MergedSelectionSet mergedSelectionSet = MergedSelectionSet.newMergedSelectionSet().subFields(fields).build();
+      157                          ResultPath path = parameters.getPath().segment(currentField.getResultKey());
+      158                          builder.deferredCallContext(alternativeCallContext)
+      159                                  .field(currentField)
+      160                                  .fields(mergedSelectionSet)
+      161                                  .path(path)
+      162                                  .parent(null); // this is a break in the parent -> child chain - it's a new start effectively
+      163                      }
+      164              );
+      165  
+      166              // todo: handle cached computations
+      167              return dfCache.computeIfAbsent(
+      168                      currentField.getResultKey(),
+      169                      // The same field can be associated with multiple defer executions, so
+      170                      // we memoize the field resolution to avoid multiple calls to the same data fetcher
+      171                      key -> FpKit.interThreadMemoize(resolveDeferredFieldValue(currentField, executionContext, executionStrategyParameters)
+      172                      )
+      173              );
+      174          }
+      175  
+      176          @NonNull
+      177          private Supplier<CompletableFuture<DeferredFragmentCall.FieldWithExecutionResult>> resolveDeferredFieldValue(MergedField currentField, ExecutionContext executionContext, ExecutionStrategyParameters executionStrategyParameters) {
+      178              return () -> {
+      179  
+      180                  Instrumentation instrumentation = executionContext.getInstrumentation();
+      181                  Supplier<ExecutionStepInfo> executionStepInfo = executionStepInfoFn.apply(executionContext, executionStrategyParameters);
+      182                  InstrumentationFieldParameters fieldParameters = new InstrumentationFieldParameters(executionContext, executionStepInfo);
+      183                  InstrumentationContext<Object> deferredFieldCtx = nonNullCtx(instrumentation.beginDeferredField(fieldParameters, executionContext.getInstrumentationState()));
+      184  
+      185                  CompletableFuture<FieldValueInfo> fieldValueResult = resolveFieldWithInfoFn.apply(this.executionContext, executionStrategyParameters);
+      186                  executionContext.getDataLoaderDispatcherStrategy().deferFieldFetched(executionStrategyParameters);
+      187  
+      188  
+      189                  deferredFieldCtx.onDispatched();
+      190  
+      191                  fieldValueResult.whenComplete((fieldValueInfo, throwable) -> {
+      192                      this.executionContext.getDataLoaderDispatcherStrategy().deferredOnFieldValue(currentField.getResultKey(), fieldValueInfo, throwable, executionStrategyParameters);
+      193                      deferredFieldCtx.onCompleted(fieldValueInfo, throwable);
+      194                  });
+      195  
+      196  
+      197                  CompletableFuture<ExecutionResult> executionResultCF = fieldValueResult
+      198                          .thenCompose(fvi -> fvi
+      199                                  .getFieldValueFuture()
+      200                                  .thenApply(fv -> ExecutionResultImpl.newExecutionResult().data(fv).build())
+      201                          );
+      202  
+      203                  return executionResultCF
+      204                          .thenApply(executionResult ->
+      205                                  new DeferredFragmentCall.FieldWithExecutionResult(currentField.getResultKey(), executionResult)
+      206                          );
+      207              };
+      208          }
+      209      }
+      210  
+      211      /**
+      212       * A no-op implementation that should be used when incremental support is not enabled for the current execution.
+      213       */
+      214      class NoOp implements DeferredExecutionSupport {
+      215  
+      216          @Override
+      217          public boolean isDeferredField(MergedField mergedField) {
+      218              return false;
+      219          }
+      220  
+      221          @Override
+      222          public int deferredFieldsCount() {
+      223              return 0;
+      224          }
+      225  
+      226          @Override
+      227          public List<String> getNonDeferredFieldNames(List<String> allFieldNames) {
+      228              return allFieldNames;
+      229          }
+      230  
+      231          @Override
+      232          public Set<IncrementalCall<? extends IncrementalPayload>> createCalls() {
+      233              return Collections.emptySet();
+      234          }
+      235      }
+      236  }
+
+---------- IMPLEMENTER graphql.execution.incremental.DeferredExecutionSupport.DeferredExecutionSupportImpl  stubs=0/4 ----------
+       62      class DeferredExecutionSupportImpl implements DeferredExecutionSupport {
+       63          private final ImmutableListMultimap<DeferredExecution, MergedField> deferredExecutionToFields;
+       64          private final ImmutableSet<MergedField> deferredFields;
+       65          private final ImmutableList<String> nonDeferredFieldNames;
+       66          private final ExecutionStrategyParameters parameters;
+       67          private final ExecutionContext executionContext;
+       68          private final BiFunction<ExecutionContext, ExecutionStrategyParameters, CompletableFuture<FieldValueInfo>> resolveFieldWithInfoFn;
+       69          private final BiFunction<ExecutionContext, ExecutionStrategyParameters, Supplier<ExecutionStepInfo>> executionStepInfoFn;
+       70          private final Map<String, Supplier<CompletableFuture<DeferredFragmentCall.FieldWithExecutionResult>>> dfCache = new HashMap<>();
+       71  
+       72          public DeferredExecutionSupportImpl(
+       73                  MergedSelectionSet mergedSelectionSet,
+       74                  ExecutionStrategyParameters parameters,
+       75                  ExecutionContext executionContext,
+       76                  BiFunction<ExecutionContext, ExecutionStrategyParameters, CompletableFuture<FieldValueInfo>> resolveFieldWithInfoFn,
+       77                  BiFunction<ExecutionContext, ExecutionStrategyParameters, Supplier<ExecutionStepInfo>> executionStepInfoFn
+       78          ) {
+       79              this.executionContext = executionContext;
+       80              this.resolveFieldWithInfoFn = resolveFieldWithInfoFn;
+       81              this.executionStepInfoFn = executionStepInfoFn;
+       82              ImmutableListMultimap.Builder<DeferredExecution, MergedField> deferredExecutionToFieldsBuilder = ImmutableListMultimap.builder();
+       83              ImmutableSet.Builder<MergedField> deferredFieldsBuilder = ImmutableSet.builder();
+       84              ImmutableList.Builder<String> nonDeferredFieldNamesBuilder = ImmutableList.builder();
+       85  
+       86              mergedSelectionSet.getSubFields().values().forEach(mergedField -> {
+       87                  if (mergedField.getFieldsCount() > mergedField.getDeferredExecutions().size()) {
+       88                      nonDeferredFieldNamesBuilder.add(mergedField.getSingleField().getResultKey());
+       89                      return;
+       90                  }
+       91                  mergedField.getDeferredExecutions().forEach(de -> {
+       92                      deferredExecutionToFieldsBuilder.put(de, mergedField);
+       93                      deferredFieldsBuilder.add(mergedField);
+       94                  });
+       95              });
+       96  
+       97              this.deferredExecutionToFields = deferredExecutionToFieldsBuilder.build();
+       98              this.deferredFields = deferredFieldsBuilder.build();
+       99              this.parameters = parameters;
+      100              this.nonDeferredFieldNames = nonDeferredFieldNamesBuilder.build();
+      101          }
+      102  
+      103          @Override
+      104          public boolean isDeferredField(MergedField mergedField) {
+      105              return deferredFields.contains(mergedField);
+      106          }
+      107  
+      108          @Override
+      109          public int deferredFieldsCount() {
+      110              return deferredFields.size();
+      111          }
+      112  
+      113          @Override
+      114          public List<String> getNonDeferredFieldNames(List<String> allFieldNames) {
+      115              return this.nonDeferredFieldNames;
+      116          }
+      117  
+      118          @Override
+      119          public Set<IncrementalCall<? extends IncrementalPayload>> createCalls() {
+      120              ImmutableSet<DeferredExecution> deferredExecutions = deferredExecutionToFields.keySet();
+      121              Set<IncrementalCall<? extends IncrementalPayload>> set = Sets.newHashSetWithExpectedSize(deferredExecutions.size());
+      122  
+      123              for (DeferredExecution deferredExecution : deferredExecutions) {
+      124                  set.add(this.createDeferredFragmentCall(deferredExecution));
+      125              }
+      126              return set;
+      127          }
+      128  
+      129          private DeferredFragmentCall createDeferredFragmentCall(DeferredExecution deferredExecution) {
+      130              int level = parameters.getPath().getLevel() + 1;
+      131              List<MergedField> mergedFields = deferredExecutionToFields.get(deferredExecution);
+      132              AlternativeCallContext alternativeCallContext = new AlternativeCallContext(level, mergedFields.size());
+      133  
+      134              List<Supplier<CompletableFuture<DeferredFragmentCall.FieldWithExecutionResult>>> calls = FpKit.arrayListSizedTo(mergedFields);
+      135              for (MergedField currentField : mergedFields) {
+      136                  calls.add(this.createResultSupplier(currentField, alternativeCallContext));
+      137              }
+      138  
+      139              return new DeferredFragmentCall(
+      140                      deferredExecution.getLabel(),
+      141                      this.parameters.getPath(),
+      142                      calls,
+      143                      alternativeCallContext
+      144              );
+      145          }
+      146  
+      147          private Supplier<CompletableFuture<DeferredFragmentCall.FieldWithExecutionResult>> createResultSupplier(
+      148                  MergedField currentField,
+      149                  AlternativeCallContext alternativeCallContext
+      150          ) {
+      151              Map<String, MergedField> fields = new LinkedHashMap<>();
+      152              fields.put(currentField.getResultKey(), currentField);
+      153  
+      154              ExecutionStrategyParameters executionStrategyParameters = parameters.transform(builder ->
+      155                      {
+      156                          MergedSelectionSet mergedSelectionSet = MergedSelectionSet.newMergedSelectionSet().subFields(fields).build();
+      157                          ResultPath path = parameters.getPath().segment(currentField.getResultKey());
+      158                          builder.deferredCallContext(alternativeCallContext)
+      159                                  .field(currentField)
+      160                                  .fields(mergedSelectionSet)
+      161                                  .path(path)
+      162                                  .parent(null); // this is a break in the parent -> child chain - it's a new start effectively
+      163                      }
+      164              );
+      165  
+      166              // todo: handle cached computations
+      167              return dfCache.computeIfAbsent(
+      168                      currentField.getResultKey(),
+      169                      // The same field can be associated with multiple defer executions, so
+      170                      // we memoize the field resolution to avoid multiple calls to the same data fetcher
+      171                      key -> FpKit.interThreadMemoize(resolveDeferredFieldValue(currentField, executionContext, executionStrategyParameters)
+      172                      )
+      173              );
+      174          }
+      175  
+      176          @NonNull
+      177          private Supplier<CompletableFuture<DeferredFragmentCall.FieldWithExecutionResult>> resolveDeferredFieldValue(MergedField currentField, ExecutionContext executionContext, ExecutionStrategyParameters executionStrategyParameters) {
+      178              return () -> {
+      179  
+      180                  Instrumentation instrumentation = executionContext.getInstrumentation();
+      181                  Supplier<ExecutionStepInfo> executionStepInfo = executionStepInfoFn.apply(executionContext, executionStrategyParameters);
+      182                  InstrumentationFieldParameters fieldParameters = new InstrumentationFieldParameters(executionContext, executionStepInfo);
+      183                  InstrumentationContext<Object> deferredFieldCtx = nonNullCtx(instrumentation.beginDeferredField(fieldParameters, executionContext.getInstrumentationState()));
+      184  
+      185                  CompletableFuture<FieldValueInfo> fieldValueResult = resolveFieldWithInfoFn.apply(this.executionContext, executionStrategyParameters);
+      186                  executionContext.getDataLoaderDispatcherStrategy().deferFieldFetched(executionStrategyParameters);
+      187  
+      188  
+      189                  deferredFieldCtx.onDispatched();
+      190  
+      191                  fieldValueResult.whenComplete((fieldValueInfo, throwable) -> {
+      192                      this.executionContext.getDataLoaderDispatcherStrategy().deferredOnFieldValue(currentField.getResultKey(), fieldValueInfo, throwable, executionStrategyParameters);
+      193                      deferredFieldCtx.onCompleted(fieldValueInfo, throwable);
+      194                  });
+      195  
+      196  
+      197                  CompletableFuture<ExecutionResult> executionResultCF = fieldValueResult
+      198                          .thenCompose(fvi -> fvi
+      199                                  .getFieldValueFuture()
+      200                                  .thenApply(fv -> ExecutionResultImpl.newExecutionResult().data(fv).build())
+      201                          );
+      202  
+      203                  return executionResultCF
+      204                          .thenApply(executionResult ->
+      205                                  new DeferredFragmentCall.FieldWithExecutionResult(currentField.getResultKey(), executionResult)
+      206                          );
+      207              };
+      208          }
+      209      }
+
+---------- IMPLEMENTER graphql.execution.incremental.DeferredExecutionSupport.NoOp  stubs=0/4 ----------
+      214      class NoOp implements DeferredExecutionSupport {
+      215  
+      216          @Override
+      217          public boolean isDeferredField(MergedField mergedField) {
+      218              return false;
+      219          }
+      220  
+      221          @Override
+      222          public int deferredFieldsCount() {
+      223              return 0;
+      224          }
+      225  
+      226          @Override
+      227          public List<String> getNonDeferredFieldNames(List<String> allFieldNames) {
+      228              return allFieldNames;
+      229          }
+      230  
+      231          @Override
+      232          public Set<IncrementalCall<? extends IncrementalPayload>> createCalls() {
+      233              return Collections.emptySet();
+      234          }
+      235      }
