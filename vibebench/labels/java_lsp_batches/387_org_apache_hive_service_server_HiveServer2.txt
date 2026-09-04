@@ -1,0 +1,249 @@
+row 387   mr3project/hive-mr3#78
+============================================================================
+OVERRIDE  org.apache.hive.service.server.HiveServer2.init(HiveConf)
+BASE      org.apache.hive.service.CompositeService.init(HiveConf)
+QUESTION: can an instance of the SUBCLASS be used anywhere the BASE
+          is expected, without breaking the caller?
+
+---------------- BASE METHOD ----------------
+       56    @Override
+       57    public synchronized void init(HiveConf hiveConf) {
+       58      for (Service service : serviceList) {
+       59        service.init(hiveConf);
+       60      }
+       61      super.init(hiveConf);
+       62    }
+
+---------------- OVERRIDE ----------------
+      276    @Override
+      277    public synchronized void init(HiveConf hiveConf) {
+      278      //Initialize metrics first, as some metrics are for initialization stuff.
+      279      try {
+      280        if (hiveConf.getBoolVar(ConfVars.HIVE_SERVER2_METRICS_ENABLED)) {
+      281          MetricsFactory.init(hiveConf);
+      282        }
+      283      } catch (Throwable t) {
+      284        LOG.warn("Could not initiate the HiveServer2 Metrics system.  Metrics may not be reported.", t);
+      285      }
+      286      setUpZooKeeperAuth(hiveConf);
+      287      // Do not allow sessions - leader election or initialization will allow them for an active HS2.
+      288      cliService = new CLIService(this, false);
+      289      addService(cliService);
+      290      final HiveServer2 hiveServer2 = this;
+      291      boolean isHttpTransportMode = isHttpTransportMode(hiveConf);
+      292      boolean isAllTransportMode = isAllTransportMode(hiveConf);
+      293      if (isHttpTransportMode || isAllTransportMode) {
+      294        thriftCLIService = new ThriftHttpCLIService(cliService);
+      295        addService(thriftCLIService);
+      296      }
+      297      if (!isHttpTransportMode || isAllTransportMode)  {
+      298        thriftCLIService = new ThriftBinaryCLIService(cliService);
+      299        addService(thriftCLIService); //thriftCliService instance is used for zookeeper purposes
+      300      }
+      301  
+      302      super.init(hiveConf);
+      303      this.serviceContext = new ServiceContext(() -> thriftCLIService.getServerIPAddress().getCanonicalHostName(),
+      304          () -> thriftCLIService.getPortNumber());
+      305      serviceContext.setClusterIdInConf(hiveConf);
+      306  
+      307      // Set host name in conf
+      308      try {
+      309        hiveConf.set(HiveConf.ConfVars.HIVE_SERVER2_THRIFT_BIND_HOST.varname, getServerHost());
+      310      } catch (Throwable t) {
+      311        throw new Error("Unable to initialize HiveServer2", t);
+      312      }
+      313      if (HiveConf.getBoolVar(hiveConf, ConfVars.LLAP_HS2_ENABLE_COORDINATOR)) {
+      314        // See method comment.
+      315        try {
+      316          LlapCoordinator.initializeInstance(hiveConf);
+      317        } catch (IOException e) {
+      318          throw new RuntimeException(e);
+      319        }
+      320      }
+      321      // Trigger the creation of LLAP registry client, if in use. Clients may be using a different
+      322      // cluster than the default one, but at least for the default case we'd have it covered.
+      323      String llapHosts = HiveConf.getVar(hiveConf, HiveConf.ConfVars.LLAP_DAEMON_SERVICE_HOSTS);
+      324      if (llapHosts != null && !llapHosts.isEmpty()) {
+      325        LlapRegistryService.getClient(hiveConf);
+      326      }
+      327  
+      328      // Initialize metadata provider class and trimmer
+      329      CalcitePlanner.warmup();
+      330  
+      331      // Create views registry
+      332      HiveMaterializedViewsRegistry.get().init();
+      333  
+      334      StatsSources.initialize(hiveConf);
+      335  
+      336      if (hiveConf.getBoolVar(ConfVars.HIVE_SCHEDULED_QUERIES_EXECUTOR_ENABLED)) {
+      337        scheduledQueryService = ScheduledQueryExecutionService.startScheduledQueryExecutorService(hiveConf);
+      338      }
+      339  
+      340      if (hiveConf.getBoolVar(ConfVars.HIVE_QUERY_HISTORY_ENABLED)) {
+      341        queryHistoryService = QueryHistoryService.newInstance(hiveConf, serviceContext);
+      342        queryHistoryService.start();
+      343      }
+      344  
+      345      // Setup cache if enabled.
+      346      if (hiveConf.getBoolVar(HiveConf.ConfVars.HIVE_QUERY_RESULTS_CACHE_ENABLED)) {
+      347        try {
+      348          QueryResultsCache.initialize(hiveConf);
+      349        } catch (Exception err) {
+      350          throw new RuntimeException("Error initializing the query results cache", err);
+      351        }
+      352      }
+      353  
+      354      // setup metastore client cache
+      355      if (hiveConf.getBoolVar(ConfVars.MSC_CACHE_ENABLED)) {
+      356        HiveMetaStoreClientWithLocalCache.init(hiveConf);
+      357      }
+      358  
+      359      try {
+      360        NotificationEventPoll.initialize(hiveConf);
+      361      } catch (Exception err) {
+      362        throw new RuntimeException("Error initializing notification event poll", err);
+      363      }
+      364  
+      365      wmQueue = hiveConf.get(ConfVars.HIVE_SERVER2_TEZ_INTERACTIVE_QUEUE.varname, "").trim();
+      366      this.zooKeeperAclProvider = getACLProvider(hiveConf);
+      367  
+      368      this.serviceDiscovery = hiveConf.getBoolVar(ConfVars.HIVE_SERVER2_SUPPORT_DYNAMIC_SERVICE_DISCOVERY);
+      369      this.activePassiveHA = hiveConf.getBoolVar(ConfVars.HIVE_SERVER2_ACTIVE_PASSIVE_HA_ENABLE);
+      370  
+      371      try {
+      372        if (serviceDiscovery) {
+      373          serviceUri = getServerInstanceURI();
+      374          addConfsToPublish(hiveConf, confsToPublish, serviceUri);
+      375          if (activePassiveHA) {
+      376            hiveConf.set(INSTANCE_URI_CONFIG, serviceUri);
+      377            leaderLatchListener = new HS2LeaderLatchListener(this, SessionState.get());
+      378            leaderActionsExecutorService = Executors.newSingleThreadExecutor(new ThreadFactoryBuilder().setDaemon(true)
+      379              .setNameFormat("Leader Actions Handler Thread").build());
+      380            hs2HARegistry = HS2ActivePassiveHARegistry.create(hiveConf, false);
+      381  
+      382            if (hiveConf.getVar(ConfVars.HIVE_EXECUTION_ENGINE).equals("tez")) {
+      383              watcherThreadExecutor = Executors.newSingleThreadExecutor();
+      384            }
+      385          }
+      386        }
+      387      } catch (Exception e) {
+      388        throw new ServiceException(e);
+      389      }
+      390  
+      391      try {
+      392        logCompactionParameters(hiveConf);
+      393        maybeStartCompactorThreads(hiveConf);
+      394      } catch (Exception e) {
+      395        throw new RuntimeException(e);
+      396      }
+      397  
+      398      // Setup web UI
+      399      final int webUIPort;
+      400      final String webHost;
+      401      try {
+      402        webUIPort = hiveConf.getIntVar(ConfVars.HIVE_SERVER2_WEBUI_PORT);
+      403        webHost = IPStackUtils.adaptWildcardAddress(
+      404            hiveConf.getVar(ConfVars.HIVE_SERVER2_WEBUI_BIND_HOST));
+      405        // We disable web UI in tests unless the test is explicitly setting a
+      406        // unique web ui port so that we don't mess up ptests.
+      407        boolean uiDisabledInTest = hiveConf.getBoolVar(ConfVars.HIVE_IN_TEST) &&
+      408            (webUIPort == Integer.valueOf(ConfVars.HIVE_SERVER2_WEBUI_PORT.getDefaultValue()));
+      409        if (uiDisabledInTest) {
+      410          LOG.info("Web UI is disabled in test mode since webui port was not specified");
+      411        } else {
+      412          if (webUIPort <= 0) {
+      413            LOG.info("Web UI is disabled since port is set to " + webUIPort);
+      414          } else {
+      415            LOG.info("Starting Web UI on port "+ webUIPort);
+      416            if (JspFactory.getDefaultFactory() == null) {
+      417              // Set the default JspFactory to avoid NPE while opening the home page
+      418              JspFactory.setDefaultFactory(new org.apache.jasper.runtime.JspFactoryImpl());
+      419            }
+      420            HttpServer.Builder builder = createHttpServerBuilder(webHost, webUIPort, "hiveserver2", "/", 
+      421                hiveConf, cliService, pamAuthenticator);
+      422            if (serviceDiscovery && activePassiveHA) {
+      423              addHAContextAttributes(builder, hiveConf);
+      424              builder.addServlet("leader", HS2LeadershipManager.class);
+      425              builder.addServlet("peers", HS2Peers.class);
+      426            }
+      427            builder.addServlet("llap", LlapServlet.class);
+      428            builder.addServlet("jdbcjar", JdbcJarDownloadServlet.class);
+      429            builder.setContextRootRewriteTarget(HS2_WEBUI_ROOT_URI);
+      430  
+      431            String webUIAuthMethodConfig = hiveConf.getVar(ConfVars.HIVE_SERVER2_WEBUI_AUTH_METHOD);
+      432            WebUIAuthMethod webUIAuthMethod = getWebUIAuthMethod(webUIAuthMethodConfig);
+      433            if (WebUIAuthMethod.LDAP == webUIAuthMethod) {
+      434              ldapAuthService = new LdapAuthService(hiveConf, passwdAuthenticationProvider);
+      435              builder.addGlobalFilter("ldap", "/*", new LDAPAuthenticationFilter(ldapAuthService));
+      436            }
+      437            webServer = builder.build();
+      438            webServer.addServlet("query_page", "/query_page.html", QueryProfileServlet.class);
+      439            webServer.addServlet("api", "/api/*", QueriesRESTfulAPIServlet.class);
+      440            if (ldapAuthService != null) {
+      441              webServer.addServlet("login", "/login", new ServletHolder(new LoginServlet(ldapAuthService)));
+      442            }
+      443            initHAHealthChecker(webServer, hiveConf);
+      444          }
+      445        }
+      446      } catch (IOException e) {
+      447        throw new ServiceException(e);
+      448      }
+      449  
+      450      long otelExporterFrequency =
+      451          hiveConf.getTimeVar(ConfVars.HIVE_OTEL_METRICS_FREQUENCY_SECONDS, TimeUnit.MILLISECONDS);
+      452      if (otelExporterFrequency > 0) {
+      453        try {
+      454          otelExporter = new OTELExporter(OTELUtils.getOpenTelemetry(hiveConf), cliService.getSessionManager(),
+      455              otelExporterFrequency, getServerHost());
+      456  
+      457          otelExporter.setName("OTEL Exporter");
+      458          otelExporter.setDaemon(true);
+      459          otelExporter.start();
+      460  
+      461          LOG.info("Started OTEL exporter with frequency {}", otelExporterFrequency);
+      462        } catch (Exception e) {
+      463          throw new RuntimeException(e);
+      464        }
+      465      }
+      466  
+      467      if (serviceDiscovery && activePassiveHA) {
+      468        try {
+      469          // Cf. Bug fixed in HIVE-29138 which calls setUpZooKeeperAuth() in the beginning of init()
+      470          zooKeeperClient = hiveConf.getZKConfig().startZookeeperClient(zooKeeperAclProvider, false);
+      471        } catch (Exception e) {
+      472          LOG.error("Error in creating ZooKeeper Client", e);
+      473          throw new ServiceException(e);
+      474        }
+      475      }
+      476  
+      477      // Limits.COUNTERS_MAX should be the same in both HiveServer2 and DAGAppMaster
+      478      TezConfiguration tezConf = new TezConfiguration(hiveConf);
+      479      Limits.setConfiguration(tezConf);
+      480  
+      481      if (hiveConf.getVar(ConfVars.HIVE_EXECUTION_ENGINE).equals("tez")) {
+      482        // must call before server.start() because server.start() may start LeaderWatcher which can then be
+      483        // triggered even before server.start() returns
+      484        try {
+      485          MR3SessionManagerImpl.getInstance().setup(hiveConf, zooKeeperClient);
+      486        } catch (Exception e) {
+      487          LOG.error("Error in setting up MR3SessionManager", e);
+      488          throw new ServiceException(e);
+      489        }
+      490        //   1. serviceDiscovery == true && activePassiveHA == true: multiple HS2 instances, leader exists
+      491        //      - use service discovery and share ApplicationID
+      492        //      - ApplicationConnectionWatcher has been created
+      493        //      - LeaderWatcher is created when isLeader() is called
+      494        //   2. serviceDiscovery == true && activePassiveHA == false: multiple HS2 instances, no leader exists
+      495        //      - only for using service discovery (without sharing ApplicationID)
+      496        //      - ApplicationConnectionWatcher is not created
+      497        ///     - isLeader() is never called
+      498        //   3. serviceDiscovery == false: no ZooKeeper
+      499        //      - same as in case 2
+      500      }
+      501  
+      502      // Add a shutdown hook for catching SIGTERM & SIGINT
+      503      long timeout = HiveConf.getTimeVar(getHiveConf(),
+      504          HiveConf.ConfVars.HIVE_SERVER2_GRACEFUL_STOP_TIMEOUT, TimeUnit.SECONDS);
+      505      // Extra time for releasing the resources if timeout sets to 0
+      506      ShutdownHookManager.addGracefulShutDownHook(() -> graceful_stop(),  timeout == 0 ? 30 : timeout);
+      507    }
