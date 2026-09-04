@@ -275,17 +275,30 @@ def check_degenerate_pairs(pr: pd.DataFrame) -> None:
         import json as _json
         base = Path(C.EXTRACT_DIR_JAVA)
         bad = 0
+        verified = 0
         for pid in empty.pr_id.astype(str):
             f = base / pid / "_touched.json"
             if not f.exists():
                 continue
             try:
-                if not _json.loads(f.read_text()):
-                    bad += 1
+                if _json.loads(f.read_text()):
+                    continue                      # non-empty: nothing to check
             except Exception:
-                pass
+                bad += 1
+                continue
+            # EMPTY. Legitimate only if GitHub itself answered for this PR.
+            # `_verified.json` is written by fix_file_lists.py when the API
+            # returned a COMPLETE file list containing no Java. Without that
+            # marker an empty list is indistinguishable from the failed diff
+            # that silently lost 2,948 PRs, so it stays a FAIL.
+            if (base / pid / "_verified.json").exists():
+                verified += 1
+            else:
+                bad += 1
+        ok(f"{verified:,} PRs have an empty file list VERIFIED against GitHub "
+           f"(a finding: the PR really touches no Java)")
         (ok if bad == 0 else fail)(
-            f"no PR is dropped on an EMPTY cached file list ({bad} found) -- "
+            f"no PR is dropped on an UNVERIFIED empty file list ({bad} found) -- "
             f"an empty raw diff is a resolution failure, never an answer")
     else:
         ok("no PR carries the no_touched_files status")

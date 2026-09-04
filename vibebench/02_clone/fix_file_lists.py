@@ -58,6 +58,22 @@ BATCH = 50
 _lock = threading.Lock()
 
 
+def _mark_verified(d: Path, res) -> None:
+    """Record that GitHub itself answered for this PR.
+
+    Written beside `_touched.json`. Its presence is what lets the verifier
+    accept an empty file list as a FINDING ("no Java in this PR") rather than a
+    FAILURE ("we could not work out what this PR changed").
+    """
+    try:
+        safeio.write_json(d / "_verified.json",
+                          {"source": "github_api",
+                           "changed_files": res.changed_files,
+                           "complete": bool(res.complete)})
+    except Exception:                                  # noqa: BLE001
+        pass
+
+
 def _targets(pr: pd.DataFrame) -> pd.DataFrame:
     """The PRs to fix, tagged by why."""
     rows = []
@@ -131,11 +147,22 @@ def main() -> None:
                         except Exception:              # noqa: BLE001
                             old = []
                     if sorted(old) == sorted(keep):
+                        # STILL RECORD THE VERIFICATION even when the list did
+                        # not change. An EMPTY list means two very different
+                        # things -- "GitHub confirms this PR touches no Java"
+                        # and "our diff failed and produced nothing" -- and the
+                        # second is the bug that lost 2,948 PRs. Without a
+                        # marker the two are indistinguishable on disk, and the
+                        # verifier has to treat every empty list as suspect.
+                        if a.apply:
+                            cache.parent.mkdir(parents=True, exist_ok=True)
+                            _mark_verified(cache.parent, res)
                         st["same"] += 1
                         continue
                     if a.apply:
                         cache.parent.mkdir(parents=True, exist_ok=True)
                         safeio.write_json(cache, keep)
+                        _mark_verified(cache.parent, res)
                     st["written"] += 1
                     deltas.append((row.why, row.full_name, row.pr_number,
                                    len(old), len(keep)))

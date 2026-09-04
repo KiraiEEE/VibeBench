@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+from collections import OrderedDict
 
 _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parents[1]))
@@ -132,13 +133,28 @@ def main() -> None:
     out = Path(a.out_dir) if a.out_dir else (C.LABELS_DIR / f"java_{a.principle}_batches")
     out.mkdir(parents=True, exist_ok=True)
 
-    cache: dict[tuple, tuple] = {}
+    # BOUNDED cache. This used to be an unbounded dict and it held the FULL
+    # SOURCE TREE plus the parsed index for EVERY PR in the sample: measured
+    # 2026-09-04 at 10.8 GB resident on a 400-row OCP sample, which drove the
+    # machine to 0.6 GB free and 7,388 hard faults/s -- thrashing, and unusable
+    # for anything else.
+    #
+    # A tiny cache loses almost nothing: rows are emitted in sample order and
+    # consecutive rows very often share a PR, so the hit rate that matters is
+    # the immediate one. Keeping the last few trees captures that while bounding
+    # residency to a few hundred MB.
+    CACHE_MAX = 4
+    cache: "OrderedDict[tuple, tuple]" = OrderedDict()
     for i, r in df.iterrows():
         key = (r.full_name, int(r.pr_number))
-        if key not in cache:
+        if key in cache:
+            cache.move_to_end(key)
+        else:
             tr = tree_for(*key)
             ix = D.build_index(analyze_tree(tr)) if tr else None
             cache[key] = (tr, ix)
+            while len(cache) > CACHE_MAX:
+                cache.popitem(last=False)
         tree, ix = cache[key]
         if tree is None or ix is None:
             (out / f"{i:03d}_UNAVAILABLE.txt").write_text(
