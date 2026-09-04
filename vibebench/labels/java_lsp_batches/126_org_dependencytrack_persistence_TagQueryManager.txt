@@ -1,0 +1,182 @@
+row 126   DependencyTrack/dependency-track#5736
+============================================================================
+OVERRIDE  org.dependencytrack.persistence.TagQueryManager.deleteTags(Collection<String>)
+BASE      org.dependencytrack.persistence.QueryManager.deleteTags(Collection<String>)
+QUESTION: can an instance of the SUBCLASS be used anywhere the BASE
+          is expected, without breaking the caller?
+
+---------------- BASE METHOD ----------------
+     1404      public void deleteTags(final Collection<String> tagNames) {
+     1405          getTagQueryManager().deleteTags(tagNames);
+     1406      }
+
+---------------- OVERRIDE ----------------
+      288      @Override
+      289      public void deleteTags(final Collection<String> tagNames) {
+      290          runInTransaction(() -> {
+      291              final Map.Entry<String, Map<String, Object>> projectAclConditionAndParams = getProjectAclSqlCondition();
+      292              final String projectAclCondition = projectAclConditionAndParams.getKey();
+      293              final Map<String, Object> projectAclConditionParams = projectAclConditionAndParams.getValue();
+      294  
+      295              final var tagNameFilters = new ArrayList<String>(tagNames.size());
+      296              final var params = new HashMap<>(projectAclConditionParams);
+      297  
+      298              int paramIndex = 0;
+      299              for (final String tagName : tagNames) {
+      300                  final var paramName = "tagName" + (++paramIndex);
+      301                  tagNameFilters.add("\"NAME\" = :" + paramName);
+      302                  params.put(paramName, tagName);
+      303              }
+      304  
+      305              final Query<?> candidateQuery = pm.newQuery(Query.SQL, /* language=SQL */ """
+      306                      SELECT "ID"
+      307                           , "NAME"
+      308                           , (SELECT COUNT(*)
+      309                                FROM "PROJECTS_TAGS"
+      310                               INNER JOIN "PROJECT"
+      311                                  ON "PROJECT"."ID" = "PROJECTS_TAGS"."PROJECT_ID"
+      312                               WHERE "PROJECTS_TAGS"."TAG_ID" = "TAG"."ID") AS "projectCount"
+      313                           , (SELECT COUNT(*)
+      314                                FROM "PROJECTS_TAGS"
+      315                               INNER JOIN "PROJECT"
+      316                                  ON "PROJECT"."ID" = "PROJECTS_TAGS"."PROJECT_ID"
+      317                               WHERE "PROJECTS_TAGS"."TAG_ID" = "TAG"."ID"
+      318                                 AND %s) AS "accessibleProjectCount"
+      319                           , (SELECT COUNT(*)
+      320                                FROM "PROJECT"
+      321                               WHERE "COLLECTION_TAG" = "TAG"."ID") AS "collectionProjectCount"
+      322                           , (SELECT COUNT(*)
+      323                                FROM "PROJECT"
+      324                               WHERE "COLLECTION_TAG" = "TAG"."ID"
+      325                                 AND %s) AS "accessibleCollectionProjectCount"
+      326                           , (SELECT COUNT(*)
+      327                                FROM "POLICY_TAGS"
+      328                               INNER JOIN "POLICY"
+      329                                  ON "POLICY"."ID" = "POLICY_TAGS"."POLICY_ID"
+      330                               WHERE "POLICY_TAGS"."TAG_ID" = "TAG"."ID") AS "policyCount"
+      331                           , (SELECT COUNT(*)
+      332                                FROM "NOTIFICATIONRULE_TAGS"
+      333                               INNER JOIN "NOTIFICATIONRULE"
+      334                                  ON "NOTIFICATIONRULE"."ID" = "NOTIFICATIONRULE_TAGS"."NOTIFICATIONRULE_ID"
+      335                               WHERE "NOTIFICATIONRULE_TAGS"."TAG_ID" = "TAG"."ID") AS "notificationRuleCount"
+      336                        FROM "TAG"
+      337                       WHERE %s
+      338                      """.formatted(projectAclCondition, projectAclCondition, String.join(" OR ", tagNameFilters)));
+      339              candidateQuery.setNamedParameters(params);
+      340              final List<TagDeletionCandidateRow> candidateRows =
+      341                      executeAndCloseResultList(candidateQuery, TagDeletionCandidateRow.class);
+      342  
+      343              final var errorByTagName = new HashMap<String, String>();
+      344  
+      345              if (tagNames.size() > candidateRows.size()) {
+      346                  final Set<String> candidateRowNames = candidateRows.stream()
+      347                          .map(TagDeletionCandidateRow::name)
+      348                          .collect(Collectors.toSet());
+      349                  for (final String tagName : tagNames) {
+      350                      if (!candidateRowNames.contains(tagName)) {
+      351                          errorByTagName.put(tagName, "Tag does not exist");
+      352                      }
+      353                  }
+      354  
+      355                  throw TagOperationFailedException.forDeletion(errorByTagName);
+      356              }
+      357  
+      358              boolean hasPortfolioManagementPermission = false;
+      359              boolean hasPolicyManagementPermission = false;
+      360              boolean hasSystemConfigurationPermission = false;
+      361              if (principal == null) {
+      362                  hasPortfolioManagementPermission = true;
+      363                  hasPolicyManagementPermission = true;
+      364                  hasSystemConfigurationPermission = true;
+      365              } else {
+      366                  if (principal instanceof final ApiKey apiKey) {
+      367                      hasPortfolioManagementPermission = hasPermission(apiKey, Permissions.Constants.PORTFOLIO_MANAGEMENT);
+      368                      hasPolicyManagementPermission = hasPermission(apiKey, Permissions.Constants.POLICY_MANAGEMENT);
+      369                      hasSystemConfigurationPermission = hasPermission(apiKey, Permissions.Constants.SYSTEM_CONFIGURATION);
+      370                  } else if (principal instanceof final UserPrincipal user) {
+      371                      hasPortfolioManagementPermission = hasPermission(user, Permissions.Constants.PORTFOLIO_MANAGEMENT, /* includeTeams */ true);
+      372                      hasPolicyManagementPermission = hasPermission(user, Permissions.Constants.POLICY_MANAGEMENT, /* includeTeams */ true);
+      373                      hasSystemConfigurationPermission = hasPermission(user, Permissions.Constants.SYSTEM_CONFIGURATION, /* includeTeams */ true);
+      374                  }
+      375              }
+      376  
+      377              for (final TagDeletionCandidateRow row : candidateRows) {
+      378                  if (row.projectCount() > 0 && !hasPortfolioManagementPermission) {
+      379                      errorByTagName.put(row.name(), """
+      380                              The tag is assigned to %d project(s), but the authenticated principal \
+      381                              is missing the %s permission.""".formatted(row.projectCount(), Permissions.PORTFOLIO_MANAGEMENT));
+      382                      continue;
+      383                  }
+      384  
+      385                  final long inaccessibleProjectAssignmentCount =
+      386                          row.projectCount() - row.accessibleProjectCount();
+      387                  if (inaccessibleProjectAssignmentCount > 0) {
+      388                      errorByTagName.put(row.name(), """
+      389                              The tag is assigned to %d project(s) that are not accessible \
+      390                              by the authenticated principal.""".formatted(inaccessibleProjectAssignmentCount));
+      391                      continue;
+      392                  }
+      393  
+      394                  if (row.collectionProjectCount() > 0 && !hasPortfolioManagementPermission) {
+      395                      errorByTagName.put(row.name(), """
+      396                              The tag is used by %d collection project(s), but the authenticated principal \
+      397                              is missing the %s permission.""".formatted(row.collectionProjectCount(), Permissions.PORTFOLIO_MANAGEMENT));
+      398                      continue;
+      399                  }
+      400  
+      401                  final long inaccessibleCollectionProjectAssignmentCount =
+      402                          row.collectionProjectCount() - row.accessibleCollectionProjectCount();
+      403                  if (inaccessibleCollectionProjectAssignmentCount > 0) {
+      404                      errorByTagName.put(row.name(), """
+      405                              The tag is used by %d collection project(s) that are not accessible \
+      406                              by the authenticated principal.""".formatted(inaccessibleCollectionProjectAssignmentCount));
+      407                      continue;
+      408                  }
+      409  
+      410                  if (row.policyCount() > 0 && !hasPolicyManagementPermission) {
+      411                      errorByTagName.put(row.name(), """
+      412                              The tag is assigned to %d policies, but the authenticated principal \
+      413                              is missing the %s permission.""".formatted(row.policyCount(), Permissions.POLICY_MANAGEMENT));
+      414                  }
+      415  
+      416                  if (row.notificationRuleCount() > 0 && !hasSystemConfigurationPermission) {
+      417                      errorByTagName.put(row.name(), """
+      418                              The tag is assigned to %d notification rules, but the authenticated principal \
+      419                              is missing the %s permission.""".formatted(row.notificationRuleCount(), Permissions.SYSTEM_CONFIGURATION));
+      420                  }
+      421              }
+      422  
+      423              if (!errorByTagName.isEmpty()) {
+      424                  throw TagOperationFailedException.forDeletion(errorByTagName);
+      425              }
+      426  
+      427              // TODO: In v5 this should be solved using a FK constraint with ON DELETE SET NULL.
+      428              final List<Long> candidateIdsWithCollectionProjects = candidateRows.stream()
+      429                      .filter(row -> row.accessibleCollectionProjectCount() > 0)
+      430                      .map(TagDeletionCandidateRow::id)
+      431                      .toList();
+      432              if (!candidateIdsWithCollectionProjects.isEmpty()) {
+      433                  final Query<?> unassignCollectionProjectQuery = pm.newQuery(Query.JDOQL, """
+      434                          UPDATE org.dependencytrack.model.Project
+      435                             SET collectionTag = null
+      436                           WHERE :tagIds.contains(collectionTag.id)
+      437                          """);
+      438                  try {
+      439                      unassignCollectionProjectQuery.execute(candidateIdsWithCollectionProjects);
+      440                  } finally {
+      441                      unassignCollectionProjectQuery.closeAll();
+      442                  }
+      443              }
+      444  
+      445              final Query<Tag> deletionQuery = pm.newQuery(Tag.class);
+      446              deletionQuery.setFilter(":ids.contains(id)");
+      447              try {
+      448                  deletionQuery.deletePersistentAll(
+      449                          candidateRows.stream()
+      450                                  .map(TagDeletionCandidateRow::id)
+      451                                  .toList());
+      452              } finally {
+      453                  deletionQuery.closeAll();
+      454              }
+      455          });
+      456      }
