@@ -208,10 +208,17 @@ def check_label_samples() -> None:
 
 def check_batches() -> None:
     head("G. BATCHES: the judge must NOT be able to see the verdict")
+    # ONLY the shapes the extractor itself would emit. The first version matched
+    # a bare "verdict" and fired on a plagiarism-case class in the judged SOURCE
+    # (getVerdict()), which is the code under review, not a leak. A check that
+    # cries wolf gets ignored, so it must match the leak and nothing else: our
+    # own column names, or an explicit true/false assignment to a flag field.
     leak_re = re.compile(
-        r"\b(srp_risk|ocp_risk|isp_risk|lsp_risk|dip_risk|verdict|"
-        r"smell\s*=\s*(true|false)|violation\s*=\s*(true|false)|"
-        r"flagged\s*=\s*(true|false))\b", re.I)
+        r"(srp_risk|ocp_risk|isp_risk|lsp_risk|dip_risk)\s*[=:]|"
+        r"\bsmell\s*=\s*(true|false)\b|"
+        r"\bviolation\s*=\s*(true|false)\b|"
+        r"\bflagged\s*=\s*(true|false)\b|"
+        r"DETECTOR (SAYS|VERDICT)", re.I)
     for name in list(ENT) + ["dip"]:
         d = C.LABELS_DIR / f"java_{name}_batches"
         if not d.exists():
