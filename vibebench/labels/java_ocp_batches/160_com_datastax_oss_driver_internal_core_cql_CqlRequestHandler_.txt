@@ -1,0 +1,167 @@
+row 160   scylladb/java-driver#828
+============================================================================
+CHAIN in com.datastax.oss.driver.internal.core.cql.CqlRequestHandler.NodeResponseCallback.processErrorResponse(Error)   kind=instanceof subject='prepareError' branches=3 closed_set=False
+cases: QueryValidationException;FunctionFailureException;ProtocolError
+QUESTION: is the set of variants OPEN (a new one is expected, and
+          would force editing this chain) or CLOSED by nature?
+SHOWING THE WHOLE ENCLOSING METHOD -- a branch count alone cannot answer this.
+>>> marks the dispatch chain itself.
+
+      817      private void processErrorResponse(Error errorMessage) {
+      818        if (errorMessage.code == ProtocolConstants.ErrorCode.UNPREPARED) {
+      819          ByteBuffer idToReprepare = ByteBuffer.wrap(((Unprepared) errorMessage).id);
+      820          LOG.trace(
+      821              "[{}] Statement {} is not prepared on {}, repreparing",
+      822              logPrefix,
+      823              Bytes.toHexString(idToReprepare),
+      824              node);
+      825          RepreparePayload repreparePayload = session.getRepreparePayloads().get(idToReprepare);
+      826          if (repreparePayload == null) {
+      827            throw new IllegalStateException(
+      828                String.format(
+      829                    "Tried to execute unprepared query %s but we don't have the data to reprepare it",
+      830                    Bytes.toHexString(idToReprepare)));
+      831          }
+      832          Prepare reprepareMessage = repreparePayload.toMessage();
+      833          ThrottledAdminRequestHandler<ByteBuffer> reprepareHandler =
+      834              ThrottledAdminRequestHandler.prepare(
+      835                  channel,
+      836                  true,
+      837                  reprepareMessage,
+      838                  repreparePayload.customPayload,
+      839                  Conversions.resolveRequestTimeout(statement, executionProfile),
+      840                  throttler,
+      841                  sessionMetricUpdater,
+      842                  logPrefix);
+      843          reprepareHandler
+      844              .start()
+      845              .handle(
+      846                  (repreparedId, exception) -> {
+      847                    if (exception != null) {
+      848                      // If the error is not recoverable, surface it to the client instead of retrying
+      849                      if (exception instanceof UnexpectedResponseException) {
+      850                        Message prepareErrorMessage =
+      851                            ((UnexpectedResponseException) exception).message;
+      852                        if (prepareErrorMessage instanceof Error) {
+      853                          CoordinatorException prepareError =
+      854                              Conversions.toThrowable(node, (Error) prepareErrorMessage, context);
+>>>   855                          if (prepareError instanceof QueryValidationException
+      856                              || prepareError instanceof FunctionFailureException
+      857                              || prepareError instanceof ProtocolError) {
+      858                            LOG.trace("[{}] Unrecoverable error on reprepare, rethrowing", logPrefix);
+      859                            trackNodeError(node, prepareError, NANOTIME_NOT_MEASURED_YET);
+      860                            setFinalError(statement, prepareError, node, execution);
+      861                            return null;
+      862                          }
+      863                        }
+      864                      } else if (exception instanceof RequestThrottlingException) {
+      865                        trackNodeError(node, exception, NANOTIME_NOT_MEASURED_YET);
+      866                        setFinalError(statement, exception, node, execution);
+      867                        return null;
+      868                      }
+      869                      recordError(node, exception);
+      870                      trackNodeError(node, exception, NANOTIME_NOT_MEASURED_YET);
+      871                      LOG.trace("[{}] Reprepare failed, trying next node", logPrefix);
+      872                      sendRequest(statement, null, queryPlan, execution, retryCount, false);
+      873                    } else {
+      874                      if (!repreparedId.equals(idToReprepare)) {
+      875                        IllegalStateException illegalStateException =
+      876                            new IllegalStateException(
+      877                                String.format(
+      878                                    "ID mismatch while trying to reprepare (expected %s, got %s). "
+      879                                        + "This prepared statement won't work anymore. "
+      880                                        + "This usually happens when you run a 'USE...' query after "
+      881                                        + "the statement was prepared.",
+      882                                    Bytes.toHexString(idToReprepare),
+      883                                    Bytes.toHexString(repreparedId)));
+      884                        trackNodeError(node, illegalStateException, NANOTIME_NOT_MEASURED_YET);
+      885                        setFinalError(statement, illegalStateException, node, execution);
+      886                      }
+      887                      LOG.trace("[{}] Reprepare sucessful, retrying", logPrefix);
+      888                      sendRequest(statement, node, queryPlan, execution, retryCount, false);
+      889                    }
+      890                    return null;
+      891                  });
+      892          return;
+      893        }
+      894        CoordinatorException error = Conversions.toThrowable(node, errorMessage, context);
+      895        NodeMetricUpdater metricUpdater = ((DefaultNode) node).getMetricUpdater();
+      896        if (error instanceof BootstrappingException) {
+      897          LOG.trace("[{}] {} is bootstrapping, trying next node", logPrefix, node);
+      898          recordError(node, error);
+      899          trackNodeError(node, error, NANOTIME_NOT_MEASURED_YET);
+      900          sendRequest(statement, null, queryPlan, execution, retryCount, false);
+      901        } else if (error instanceof QueryValidationException
+      902            || error instanceof FunctionFailureException
+      903            || error instanceof ProtocolError) {
+      904          LOG.trace("[{}] Unrecoverable error, rethrowing", logPrefix);
+      905          metricUpdater.incrementCounter(DefaultNodeMetric.OTHER_ERRORS, executionProfile.getName());
+      906          trackNodeError(node, error, NANOTIME_NOT_MEASURED_YET);
+      907          setFinalError(statement, error, node, execution);
+      908        } else {
+      909          RetryPolicy retryPolicy = Conversions.resolveRetryPolicy(context, executionProfile);
+      910          RetryVerdict verdict;
+      911          if (error instanceof ReadTimeoutException) {
+      912            ReadTimeoutException readTimeout = (ReadTimeoutException) error;
+      913            verdict =
+      914                retryPolicy.onReadTimeoutVerdict(
+      915                    statement,
+      916                    readTimeout.getConsistencyLevel(),
+      917                    readTimeout.getBlockFor(),
+      918                    readTimeout.getReceived(),
+      919                    readTimeout.wasDataPresent(),
+      920                    retryCount);
+      921            updateErrorMetrics(
+      922                metricUpdater,
+      923                verdict,
+      924                DefaultNodeMetric.READ_TIMEOUTS,
+      925                DefaultNodeMetric.RETRIES_ON_READ_TIMEOUT,
+      926                DefaultNodeMetric.IGNORES_ON_READ_TIMEOUT);
+      927          } else if (error instanceof WriteTimeoutException) {
+      928            WriteTimeoutException writeTimeout = (WriteTimeoutException) error;
+      929            verdict =
+      930                Conversions.resolveIdempotence(statement, executionProfile)
+      931                    ? retryPolicy.onWriteTimeoutVerdict(
+      932                        statement,
+      933                        writeTimeout.getConsistencyLevel(),
+      934                        writeTimeout.getWriteType(),
+      935                        writeTimeout.getBlockFor(),
+      936                        writeTimeout.getReceived(),
+      937                        retryCount)
+      938                    : RetryVerdict.RETHROW;
+      939            updateErrorMetrics(
+      940                metricUpdater,
+      941                verdict,
+      942                DefaultNodeMetric.WRITE_TIMEOUTS,
+      943                DefaultNodeMetric.RETRIES_ON_WRITE_TIMEOUT,
+      944                DefaultNodeMetric.IGNORES_ON_WRITE_TIMEOUT);
+      945          } else if (error instanceof UnavailableException) {
+      946            UnavailableException unavailable = (UnavailableException) error;
+      947            verdict =
+      948                retryPolicy.onUnavailableVerdict(
+      949                    statement,
+      950                    unavailable.getConsistencyLevel(),
+      951                    unavailable.getRequired(),
+      952                    unavailable.getAlive(),
+      953                    retryCount);
+      954            updateErrorMetrics(
+      955                metricUpdater,
+      956                verdict,
+      957                DefaultNodeMetric.UNAVAILABLES,
+      958                DefaultNodeMetric.RETRIES_ON_UNAVAILABLE,
+      959                DefaultNodeMetric.IGNORES_ON_UNAVAILABLE);
+      960          } else {
+      961            verdict =
+      962                Conversions.resolveIdempotence(statement, executionProfile)
+      963                    ? retryPolicy.onErrorResponseVerdict(statement, error, retryCount)
+      964                    : RetryVerdict.RETHROW;
+      965            updateErrorMetrics(
+      966                metricUpdater,
+      967                verdict,
+      968                DefaultNodeMetric.OTHER_ERRORS,
+      969                DefaultNodeMetric.RETRIES_ON_OTHER_ERROR,
+      970                DefaultNodeMetric.IGNORES_ON_OTHER_ERROR);
+      971          }
+      972          processRetryVerdict(verdict, error);
+      973        }
+      974      }

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -134,6 +135,9 @@ def find_method(ix, type_id: str, sig: str):
     return t, None
 
 
+MAX_TREE_FILES = int(os.environ.get("VB_MAX_TREE_FILES", 14000))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--principle", required=True, choices=["srp", "ocp", "lsp", "isp", "dip"])
@@ -185,6 +189,14 @@ def main() -> None:
             cache.move_to_end(key)
         else:
             tr = tree_for(*key)
+            # SIZE CAP. A mega-repo tree cannot be parsed inside the extraction
+            # budget, and attempting it stalls every row behind it. Skipping is
+            # honest: the row is marked UNJUDGEABLE and the audit counts it,
+            # rather than the queue silently halting.
+            if tr and len(tr) > MAX_TREE_FILES:
+                print(f"  row {i}: {key[0]} tree has {len(tr):,} files "
+                      f"(> {MAX_TREE_FILES:,}), skipping", flush=True)
+                tr = None
             ix = D.build_index(analyze_tree(tr)) if tr else None
             cache[key] = (tr, ix)
             while len(cache) > CACHE_MAX:
@@ -287,14 +299,47 @@ def main() -> None:
             bmods = D.dip_modules(D.build_index(analyze_tree(btree))) if btree else {}
             bcycles = {frozenset(c) for c in dipgraph.find_cycles(bmods)} if bmods else set()
             acycles = list(dipgraph.find_cycles(mods))
-            new_c = [c for c in acycles if frozenset(c) not in bcycles]
-            old_c = [c for c in acycles if frozenset(c) in bcycles]
-            for c in new_c:
-                body.append("NEW CYCLE: " + " -> ".join(sorted(c)))
-            for c in old_c[:5]:
-                body.append("pre-existing cycle (NOT this PR): " + " -> ".join(sorted(c)))
-            if len(old_c) > 5:
-                body.append(f"... and {len(old_c) - 5} more pre-existing cycles")
+            # SHOW THE SAME UNIT THE DETECTOR USES: cyclic PAIRS, not SCCs.
+            # (fixed 2026-09-05) This block compared strongly-connected
+            # components by exact set identity, so a pre-existing tangle that
+            # absorbed one class printed as a brand new cycle -- 32 of the
+            # first 60 batches announced a NEW CYCLE while the PR's cycle count
+            # had not risen, and one announced one while the count FELL from 13
+            # to 12. The judge was therefore answering a different question
+            # from the one the detector asks. dip/graph.py::cyclic_pairs
+            # already documents why the pair is the stable unit: shrinking an
+            # SCC produces no new pair, and growing one produces pairs only for
+            # the module that joined. run_java.py charges a pair only when one
+            # of its ends is a module this PR touched, so this does the same.
+            bpairs = dipgraph.cyclic_pairs(dipgraph.find_cycles(bmods)) if bmods else set()
+            apairs = dipgraph.cyclic_pairs(acycles)
+            # "touched" = the module's FILE TEXT differs between the two
+            # trees. ModuleInfo carries no hash, so an attribute-based guess
+            # would silently degrade to "modules the after-tree has and the
+            # before-tree does not" and miss every MODIFIED file -- which is
+            # most of them. ix.modules carries `file`, and both trees are
+            # {path: source} dicts, so the exact comparison is available.
+            _btree = btree or {}
+            touched_mods = {m["name"] for m in ix.modules
+                            if tree.get(m["file"]) != _btree.get(m["file"])}
+            charged = sorted(q for q in (apairs - bpairs)
+                             if q[0] in touched_mods or q[1] in touched_mods)
+            uncharged = sorted(q for q in (apairs - bpairs)
+                               if q[0] not in touched_mods and q[1] not in touched_mods)
+            if charged:
+                body.append(f"NEWLY CYCLIC PAIRS involving a module this PR "
+                            f"changed ({len(charged)}):")
+                for u, v in charged[:20]:
+                    body.append(f"    {u}  <->  {v}")
+                if len(charged) > 20:
+                    body.append(f"    ... and {len(charged) - 20} more")
+            else:
+                body.append("NO newly cyclic pair involves a module this PR "
+                            "changed.")
+            if uncharged:
+                body.append(f"({len(uncharged)} other pairs became cyclic, but "
+                            f"in modules this PR did not change.)")
+            body.append(f"pre-existing cyclic pairs (NOT this PR): {len(bpairs)}")
             bedges = {(mn, t) for mn, mi in bmods.items() for t in mi.imports}
             body.append("\nNEW IMPORT EDGES (absent from the before-tree; "
                         "target marked abstract or CONCRETE):")

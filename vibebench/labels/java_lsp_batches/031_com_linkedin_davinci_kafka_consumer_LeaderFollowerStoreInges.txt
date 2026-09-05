@@ -1,0 +1,96 @@
+row 31   linkedin/venice#2585
+============================================================================
+OVERRIDE  com.linkedin.davinci.kafka.consumer.LeaderFollowerStoreIngestionTask.waitForAllMessageToBeProcessedFromTopicPartition(PubSubTopicPartition,PartitionConsumptionState)
+BASE      com.linkedin.davinci.kafka.consumer.StoreIngestionTask.waitForAllMessageToBeProcessedFromTopicPartition(PubSubTopicPartition,PartitionConsumptionState)
+QUESTION: can an instance of the SUBCLASS be used anywhere the BASE
+          is expected, without breaking the caller?
+
+---------------- BASE METHOD ----------------
+     5004    protected void waitForAllMessageToBeProcessedFromTopicPartition(
+     5005        PubSubTopicPartition topicPartition,
+     5006        PartitionConsumptionState partitionConsumptionState) throws InterruptedException {
+     5007      storeBufferService.drainBufferedRecordsFromTopicPartition(topicPartition);
+     5008    }
+
+---------------- OVERRIDE ----------------
+     3109    @Override
+     3110    protected void waitForAllMessageToBeProcessedFromTopicPartition(
+     3111        PubSubTopicPartition topicPartition,
+     3112        PartitionConsumptionState partitionConsumptionState) throws InterruptedException {
+     3113      super.waitForAllMessageToBeProcessedFromTopicPartition(topicPartition, partitionConsumptionState);
+     3114  
+     3115      /**
+     3116       * In case of L/F model in Leader we first produce to local kafka then queue to drainer from kafka callback thread.
+     3117       * The above waiting is not sufficient enough since it only waits for whatever was queue prior to calling the
+     3118       * above api. This alone would not guarantee that all messages from that topic partition
+     3119       * has been processed completely. Additionally we need to wait for the last leader producer future to complete.
+     3120       *
+     3121       * Practically the above is not needed for Leader at all if we are waiting for the future below. But waiting does not
+     3122       * cause any harm and also keep this function simple. Otherwise we might have to check if this is the Leader for the partition.
+     3123       *
+     3124       * The code should only be effective in L/F model Leader instances as lastFuture should be null in all other scenarios.
+     3125       */
+     3126      if (partitionConsumptionState != null) {
+     3127        /**
+     3128         * The following logic will make sure all the records queued in the buffer queue will be processed completely.
+     3129         */
+     3130        try {
+     3131          CompletableFuture<Void> lastQueuedRecordPersistedFuture =
+     3132              partitionConsumptionState.getLastQueuedRecordPersistedFuture();
+     3133          if (lastQueuedRecordPersistedFuture != null) {
+     3134            lastQueuedRecordPersistedFuture.get(WAITING_TIME_FOR_LAST_RECORD_TO_BE_PROCESSED, MILLISECONDS);
+     3135          }
+     3136        } catch (InterruptedException e) {
+     3137          LOGGER.warn(
+     3138              "Got interrupted while waiting for the last queued record to be persisted from: {} for replica: {}"
+     3139                  + "Will throw the interrupt exception.",
+     3140              topicPartition,
+     3141              partitionConsumptionState.getReplicaId(),
+     3142              e);
+     3143          throw e;
+     3144        } catch (Exception e) {
+     3145          LOGGER.error(
+     3146              "Got exception while waiting for the last queued record to be persisted from: {} for replica: {}. Will swallow.",
+     3147              topicPartition,
+     3148              partitionConsumptionState.getReplicaId(),
+     3149              e);
+     3150        }
+     3151        Future<Void> lastFuture = null;
+     3152        try {
+     3153          lastFuture = partitionConsumptionState.getLastLeaderPersistFuture();
+     3154          if (lastFuture != null) {
+     3155            long synchronizeStartTimeInNS = System.nanoTime();
+     3156            lastFuture.get(WAITING_TIME_FOR_LAST_RECORD_TO_BE_PROCESSED, MILLISECONDS);
+     3157            double syncLatency = LatencyUtils.getElapsedTimeFromNSToMS(synchronizeStartTimeInNS);
+     3158            hostLevelIngestionStats.recordLeaderProducerSynchronizeLatency(syncLatency);
+     3159            versionedIngestionStats.recordProducerSynchronizeTime(storeName, versionNumber, syncLatency);
+     3160          }
+     3161        } catch (InterruptedException e) {
+     3162          LOGGER.warn(
+     3163              "Got interrupted while waiting for the last leader producer future of record from: {} for replica: {}. "
+     3164                  + "No data loss. Will throw the interrupt exception.",
+     3165              topicPartition,
+     3166              partitionConsumptionState.getReplicaId(),
+     3167              e);
+     3168          versionedDIVStats.recordBenignLeaderProducerFailure(storeName, versionNumber);
+     3169          throw e;
+     3170        } catch (TimeoutException e) {
+     3171          LOGGER.error(
+     3172              "Timeout while waiting for the last leader producer future of record from topic-partition: {} for replica: {}. No data loss. Will swallow.",
+     3173              topicPartition,
+     3174              partitionConsumptionState.getReplicaId(),
+     3175              e);
+     3176          lastFuture.cancel(true);
+     3177          partitionConsumptionState.setLastLeaderPersistFuture(null);
+     3178          versionedDIVStats.recordBenignLeaderProducerFailure(storeName, versionNumber);
+     3179        } catch (Exception e) {
+     3180          LOGGER.error(
+     3181              "Got exception while waiting for the latest producer future to be completed. Will swallow. Topic-partition: {} Replica: {}",
+     3182              topicPartition,
+     3183              e);
+     3184          partitionConsumptionState.setLastLeaderPersistFuture(null);
+     3185          // No need to fail the push job; just record the failure.
+     3186          versionedDIVStats.recordBenignLeaderProducerFailure(storeName, versionNumber);
+     3187        }
+     3188      }
+     3189    }

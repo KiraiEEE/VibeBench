@@ -1,0 +1,171 @@
+row 7   rsocket/rsocket-java#1130
+============================================================================
+CONTRACT io.rsocket.keepalive.KeepAliveFramesAcceptor   members=1.0 implementers=3.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+        6  public interface KeepAliveFramesAcceptor extends Disposable {
+        7  
+        8    void receive(ByteBuf keepAliveFrame);
+        9  }
+
+---------- IMPLEMENTER io.rsocket.keepalive.KeepAliveSupport  stubs=0/1 ----------
+       33  public abstract class KeepAliveSupport implements KeepAliveFramesAcceptor {
+       34  
+       35    final ByteBufAllocator allocator;
+       36    final Scheduler scheduler;
+       37    final Duration keepAliveInterval;
+       38    final Duration keepAliveTimeout;
+       39    final long keepAliveTimeoutMillis;
+       40  
+       41    volatile int state;
+       42    static final AtomicIntegerFieldUpdater<KeepAliveSupport> STATE =
+       43        AtomicIntegerFieldUpdater.newUpdater(KeepAliveSupport.class, "state");
+       44  
+       45    static final int STOPPED_STATE = 0;
+       46    static final int STARTING_STATE = 1;
+       47    static final int STARTED_STATE = 2;
+       48    static final int DISPOSED_STATE = -1;
+       49  
+       50    volatile Consumer<KeepAlive> onTimeout;
+       51    volatile Consumer<ByteBuf> onFrameSent;
+       52  
+       53    Disposable ticksDisposable;
+       54  
+       55    volatile ResumeStateHolder resumeStateHolder;
+       56    volatile long lastReceivedMillis;
+       57  
+       58    private KeepAliveSupport(
+       59        ByteBufAllocator allocator, int keepAliveInterval, int keepAliveTimeout) {
+       60      this.allocator = allocator;
+       61      this.scheduler = Schedulers.parallel();
+       62      this.keepAliveInterval = Duration.ofMillis(keepAliveInterval);
+       63      this.keepAliveTimeout = Duration.ofMillis(keepAliveTimeout);
+       64      this.keepAliveTimeoutMillis = keepAliveTimeout;
+       65    }
+       66  
+       67    public KeepAliveSupport start() {
+       68      if (this.state == STOPPED_STATE && STATE.compareAndSet(this, STOPPED_STATE, STARTING_STATE)) {
+       69        this.lastReceivedMillis = scheduler.now(TimeUnit.MILLISECONDS);
+       70  
+       71        final Disposable disposable =
+       72            Flux.interval(keepAliveInterval, scheduler).subscribe(v -> onIntervalTick());
+       73        this.ticksDisposable = disposable;
+       74  
+       75        if (this.state != STARTING_STATE
+       76            || !STATE.compareAndSet(this, STARTING_STATE, STARTED_STATE)) {
+       77          disposable.dispose();
+       78        }
+       79      }
+       80      return this;
+       81    }
+       82  
+       83    public void stop() {
+       84      terminate(STOPPED_STATE);
+       85    }
+       86  
+       87    @Override
+       88    public void receive(ByteBuf keepAliveFrame) {
+       89      this.lastReceivedMillis = scheduler.now(TimeUnit.MILLISECONDS);
+       90      if (resumeStateHolder != null) {
+       91        final long remoteLastReceivedPos = KeepAliveFrameCodec.lastPosition(keepAliveFrame);
+       92        resumeStateHolder.onImpliedPosition(remoteLastReceivedPos);
+       93      }
+       94      if (KeepAliveFrameCodec.respondFlag(keepAliveFrame)) {
+       95        long localLastReceivedPos = localLastReceivedPosition();
+       96        send(
+       97            KeepAliveFrameCodec.encode(
+       98                allocator,
+       99                false,
+      100                localLastReceivedPos,
+      101                KeepAliveFrameCodec.data(keepAliveFrame).retain()));
+      102      }
+      103    }
+      104  
+      105    public KeepAliveSupport resumeState(ResumeStateHolder resumeStateHolder) {
+      106      this.resumeStateHolder = resumeStateHolder;
+      107      return this;
+      108    }
+      109  
+      110    public KeepAliveSupport onSendKeepAliveFrame(Consumer<ByteBuf> onFrameSent) {
+      111      this.onFrameSent = onFrameSent;
+      112      return this;
+      113    }
+      114  
+      115    public KeepAliveSupport onTimeout(Consumer<KeepAlive> onTimeout) {
+      116      this.onTimeout = onTimeout;
+      117      return this;
+      118    }
+      119  
+      120    @Override
+      121    public void dispose() {
+      122      terminate(DISPOSED_STATE);
+      123    }
+      124  
+      125    @Override
+      126    public boolean isDisposed() {
+      127      return ticksDisposable.isDisposed();
+      128    }
+      129  
+      130    abstract void onIntervalTick();
+      131  
+      132    void send(ByteBuf frame) {
+      133      if (onFrameSent != null) {
+      134        onFrameSent.accept(frame);
+      135      }
+      136    }
+      137  
+      138    void tryTimeout() {
+      139      long now = scheduler.now(TimeUnit.MILLISECONDS);
+      140      if (now - lastReceivedMillis >= keepAliveTimeoutMillis) {
+      141        if (onTimeout != null) {
+      142          onTimeout.accept(new KeepAlive(keepAliveInterval, keepAliveTimeout));
+      143        }
+      144        stop();
+      145      }
+      146    }
+      147  
+      148    void terminate(int terminationState) {
+      149      for (; ; ) {
+      150        final int state = this.state;
+      151  
+      152        if (state == STOPPED_STATE || state == DISPOSED_STATE) {
+      153          return;
+      154        }
+      155  
+      156        final Disposable disposable = this.ticksDisposable;
+      157        if (STATE.compareAndSet(this, state, terminationState)) {
+      158          disposable.dispose();
+      159          return;
+      160        }
+      161      }
+      162    }
+      163  
+      164    long localLastReceivedPosition() {
+      165      return resumeStateHolder != null ? resumeStateHolder.impliedPosition() : 0;
+      166    }
+      167  
+      168    public static final class ClientKeepAliveSupport extends KeepAliveSupport {
+      169  
+      170      public ClientKeepAliveSupport(
+      171          ByteBufAllocator allocator, int keepAliveInterval, int keepAliveTimeout) {
+      172        super(allocator, keepAliveInterval, keepAliveTimeout);
+      173      }
+      174  
+      175      @Override
+      176      void onIntervalTick() {
+      177        tryTimeout();
+      178        send(
+      179            KeepAliveFrameCodec.encode(
+      180                allocator, true, localLastReceivedPosition(), Unpooled.EMPTY_BUFFER));
+      181      }
+      182    }
+      183  
+      184    public static final class ServerKeepAliveSupport extends KeepAliveSupport {
+      185  
+      186      public ServerKeepAliveSupport(
+      187          ByteBufAllocator allocator, int keepAliveInterval, int keepAliveTimeout) {
+      188        super(allocator, keepAliveInterval, keepAliveTimeout);
+      189      }
+      190  
+      191      @Override
+      192      void onIntervalTick() {

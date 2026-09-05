@@ -37,7 +37,15 @@ import gitsnap  # noqa: E402  -- NO_WINDOW  # noqa: E402
 SIDECAR_DIR = Path(__file__).resolve().parent / "java_sidecar"
 SIDECAR_JAR = SIDECAR_DIR / "target" / "java-sidecar-1.0-jar-with-dependencies.jar"
 FACTS_CACHE = C.CORPUS_DIR / "java_facts_cache"
-TIMEOUT_S = getattr(C, "JAVA_SIDECAR_TIMEOUT_S", 900)
+# The analysis pass needs a generous ceiling: a monorepo tree legitimately
+# takes many minutes and losing it loses a corpus row. LABEL EXTRACTION is
+# different -- it renders judging material for a SAMPLE, and one
+# 40-minute tree stalls the whole queue (opentelemetry-java-instrumentation
+# held the DIP extraction for 24 minutes on 2026-09-05 with 57 rows still
+# to go, and DIP parses TWO trees per row). The env override lets the
+# extractor cap it without changing what the analysis pass does.
+TIMEOUT_S = int(os.environ.get("VB_SIDECAR_TIMEOUT_S",
+                               getattr(C, "JAVA_SIDECAR_TIMEOUT_S", 900)))
 HEAP = getattr(C, "JAVA_SIDECAR_HEAP", "3g")
 
 # JVM flags, all three measured on this machine rather than guessed.

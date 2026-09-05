@@ -1,0 +1,1289 @@
+row 6   besu-eth/besu#10120
+============================================================================
+CONTRACT org.hyperledger.besu.ethereum.eth.transactions.layered.AbstractTransactionsLayer   members=17.0 implementers=6.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       70  public abstract class AbstractTransactionsLayer implements TransactionsLayer {
+       71    private static final Logger LOG = LoggerFactory.getLogger(AbstractTransactionsLayer.class);
+       72    private static final NavigableMap<Long, PendingTransaction> EMPTY_SENDER_TXS = new TreeMap<>();
+       73    private static final int[] UNLIMITED_PROMOTIONS_PER_TYPE =
+       74        new int[TransactionType.values().length];
+       75  
+       76    static {
+       77      Arrays.fill(UNLIMITED_PROMOTIONS_PER_TYPE, Integer.MAX_VALUE);
+       78    }
+       79  
+       80    protected final TransactionPoolConfiguration poolConfig;
+       81    protected final TransactionsLayer nextLayer;
+       82    protected final BiFunction<PendingTransaction, PendingTransaction, Boolean>
+       83        transactionReplacementTester;
+       84    protected final TransactionPoolMetrics metrics;
+       85    protected final Map<Hash, PendingTransaction> pendingTransactions = new HashMap<>();
+       86    protected final Map<Address, NavigableMap<Long, PendingTransaction>> txsBySender =
+       87        new HashMap<>();
+       88    private final Subscribers<PendingTransactionAddedListener> onAddedListeners =
+       89        Subscribers.create();
+       90    private final Subscribers<PendingTransactionDroppedListener> onDroppedListeners =
+       91        Subscribers.create();
+       92    private OptionalLong nextLayerOnAddedListenerId = OptionalLong.empty();
+       93    private OptionalLong nextLayerOnDroppedListenerId = OptionalLong.empty();
+       94    protected long spaceUsed = 0;
+       95    protected final int[] txCountByType = new int[TransactionType.values().length];
+       96    private final BlobCache blobCache;
+       97    private final EthScheduler ethScheduler;
+       98  
+       99    protected AbstractTransactionsLayer(
+      100        final TransactionPoolConfiguration poolConfig,
+      101        final EthScheduler ethScheduler,
+      102        final TransactionsLayer nextLayer,
+      103        final BiFunction<PendingTransaction, PendingTransaction, Boolean>
+      104            transactionReplacementTester,
+      105        final TransactionPoolMetrics metrics,
+      106        final BlobCache blobCache) {
+      107      this.poolConfig = poolConfig;
+      108      this.ethScheduler = ethScheduler;
+      109      this.nextLayer = nextLayer;
+      110      this.transactionReplacementTester = transactionReplacementTester;
+      111      this.metrics = metrics;
+      112      metrics.initSpaceUsed(this::getLayerSpaceUsed, name());
+      113      metrics.initTransactionCount(pendingTransactions::size, name());
+      114      metrics.initUniqueSenderCount(txsBySender::size, name());
+      115      Arrays.stream(TransactionType.values())
+      116          .forEach(
+      117              type ->
+      118                  metrics.initTransactionCountByType(
+      119                      () -> txCountByType[type.ordinal()], name(), type));
+      120      this.blobCache = blobCache;
+      121    }
+      122  
+      123    protected abstract boolean gapsAllowed();
+      124  
+      125    @Override
+      126    public void reset() {
+      127      pendingTransactions.clear();
+      128      txsBySender.clear();
+      129      spaceUsed = 0;
+      130      Arrays.fill(txCountByType, 0);
+      131      nextLayer.reset();
+      132    }
+      133  
+      134    @Override
+      135    public Optional<PendingTransaction> getByHash(final Hash transactionHash) {
+      136      final var currLayerTx = pendingTransactions.get(transactionHash);
+      137      if (currLayerTx == null) {
+      138        return nextLayer.getByHash(transactionHash);
+      139      }
+      140      return Optional.of(currLayerTx);
+      141    }
+      142  
+      143    @Override
+      144    public boolean contains(final Transaction transaction) {
+      145      return pendingTransactions.containsKey(transaction.getHash())
+      146          || nextLayer.contains(transaction);
+      147    }
+      148  
+      149    /**
+      150     * Return the full content of this layer, organized as a list of sender pending txs. For each
+      151     * sender the collection pending txs is ordered by nonce asc.
+      152     *
+      153     * @return a list of sender pending txs
+      154     */
+      155    @VisibleForTesting
+      156    abstract List<List<PendingTransaction>> getBySender();
+      157  
+      158    @Override
+      159    public List<PendingTransaction> getAll() {
+      160      final List<PendingTransaction> allNextLayers = nextLayer.getAll();
+      161      final List<PendingTransaction> allTxs =
+      162          new ArrayList<>(pendingTransactions.size() + allNextLayers.size());
+      163      allTxs.addAll(pendingTransactions.values());
+      164      allTxs.addAll(allNextLayers);
+      165      return allTxs;
+      166    }
+      167  
+      168    @Override
+      169    public Map<Address, List<PendingTransaction>> getAllBySender() {
+      170      final Map<Address, List<PendingTransaction>> allNextLayers = nextLayer.getAllBySender();
+      171      final Map<Address, List<PendingTransaction>> allBySender =
+      172          HashMap.newHashMap(allNextLayers.size() + txsBySender.size());
+      173      allBySender.putAll(allNextLayers);
+      174  
+      175      txsBySender.forEach(
+      176          (sender, pendingTxs) ->
+      177              allBySender.merge(
+      178                  sender,
+      179                  new ArrayList<>(pendingTxs.values()),
+      180                  (prevList, newList) -> {
+      181                    newList.addAll(prevList);
+      182                    return newList;
+      183                  }));
+      184      return allBySender;
+      185    }
+      186  
+      187    @Override
+      188    public long getCumulativeUsedSpace() {
+      189      return getLayerSpaceUsed() + nextLayer.getCumulativeUsedSpace();
+      190    }
+      191  
+      192    protected long getLayerSpaceUsed() {
+      193      return spaceUsed;
+      194    }
+      195  
+      196    protected abstract TransactionAddedResult canAdd(
+      197        final PendingTransaction pendingTransaction, final int gap);
+      198  
+      199    @Override
+      200    public TransactionAddedResult add(
+      201        final PendingTransaction pendingTransaction, final int gap, final AddReason addReason) {
+      202  
+      203      // is replacing an existing one?
+      204      TransactionAddedResult addStatus = maybeReplaceTransaction(pendingTransaction);
+      205      if (addStatus == null) {
+      206        addStatus = canAdd(pendingTransaction, gap);
+      207      }
+      208  
+      209      if (addStatus.equals(TRY_NEXT_LAYER)) {
+      210        return addToNextLayer(pendingTransaction, gap, addReason);
+      211      }
+      212  
+      213      if (addStatus.isSuccess()) {
+      214        final var addedPendingTransaction =
+      215            addReason.makeCopy() ? pendingTransaction.detachedCopy() : pendingTransaction;
+      216        processAdded(addedPendingTransaction, addReason);
+      217        addStatus.maybeReplacedTransaction().ifPresent(this::replaced);
+      218  
+      219        nextLayer.notifyAdded(addedPendingTransaction);
+      220  
+      221        if (!maybeFull()) {
+      222          // if there is space try to see if the added tx filled some gaps
+      223          tryFillGap(addStatus, addedPendingTransaction, getRemainingPromotionsPerType());
+      224        }
+      225  
+      226        if (addReason.sendNotification()) {
+      227          logAdded(addedPendingTransaction, gap, addReason, name());
+      228          ethScheduler.scheduleServiceTask(() -> notifyTransactionAdded(addedPendingTransaction));
+      229        }
+      230  
+      231      } else {
+      232        final var rejectReason = addStatus.maybeInvalidReason().orElseThrow();
+      233        metrics.incrementRejected(pendingTransaction, rejectReason, name());
+      234        LOG.atTrace()
+      235            .setMessage("Transaction {} rejected reason {}")
+      236            .addArgument(pendingTransaction::toTraceLog)
+      237            .addArgument(rejectReason)
+      238            .log();
+      239      }
+      240  
+      241      return addStatus;
+      242    }
+      243  
+      244    private boolean maybeFull() {
+      245      final long cacheFreeSpace = cacheFreeSpace();
+      246      final int overflowTxsCount = pendingTransactions.size() - maxTransactionsNumber();
+      247      if (cacheFreeSpace < 0 || overflowTxsCount > 0) {
+      248        LOG.atDebug()
+      249            .setMessage("Layer full: {}")
+      250            .addArgument(
+      251                () ->
+      252                    cacheFreeSpace < 0
+      253                        ? "need to free " + (-cacheFreeSpace) + " space"
+      254                        : "need to evict " + overflowTxsCount + " transaction(s)")
+      255            .log();
+      256  
+      257        evict(-cacheFreeSpace, overflowTxsCount);
+      258        return true;
+      259      }
+      260      return false;
+      261    }
+      262  
+      263    private void tryFillGap(
+      264        final TransactionAddedResult addStatus,
+      265        final PendingTransaction pendingTransaction,
+      266        final int[] remainingPromotionsPerType) {
+      267      // it makes sense to fill gaps only if the add is not a replacement and this layer does not
+      268      // allow gaps
+      269      if (!addStatus.isReplacement() && !gapsAllowed()) {
+      270        final PendingTransaction promotedTx =
+      271            nextLayer.promoteFor(
+      272                pendingTransaction.getSender(),
+      273                pendingTransaction.getNonce(),
+      274                remainingPromotionsPerType);
+      275        if (promotedTx != null) {
+      276          processAdded(promotedTx, AddReason.PROMOTED);
+      277          if (!maybeFull()) {
+      278            tryFillGap(ADDED, promotedTx, remainingPromotionsPerType);
+      279          }
+      280        }
+      281      }
+      282    }
+      283  
+      284    @Override
+      285    public void notifyAdded(final PendingTransaction pendingTransaction) {
+      286      final Address sender = pendingTransaction.getSender();
+      287      final var senderTxs = txsBySender.get(sender);
+      288      if (senderTxs != null) {
+      289        if (senderTxs.firstKey() < pendingTransaction.getNonce()) {
+      290          // in the case the world state has been updated but the confirmed txs have not yet been
+      291          // processed
+      292          confirmed(sender, pendingTransaction.getNonce());
+      293        } else if (senderTxs.firstKey() == pendingTransaction.getNonce()) {
+      294          // it is a cross layer replacement, namely added to a previous layer
+      295          final PendingTransaction replacedTx = senderTxs.pollFirstEntry().getValue();
+      296          processRemove(senderTxs, replacedTx.getTransaction(), CROSS_LAYER_REPLACED);
+      297  
+      298          if (senderTxs.isEmpty()) {
+      299            txsBySender.remove(sender);
+      300          }
+      301        } else {
+      302          internalNotifyAdded(senderTxs, pendingTransaction);
+      303        }
+      304      }
+      305      nextLayer.notifyAdded(pendingTransaction);
+      306    }
+      307  
+      308    protected abstract void internalNotifyAdded(
+      309        final NavigableMap<Long, PendingTransaction> senderTxs,
+      310        final PendingTransaction pendingTransaction);
+      311  
+      312    @Override
+      313    public PendingTransaction promoteFor(
+      314        final Address sender, final long nonce, final int[] remainingPromotionsPerType) {
+      315      final var senderTxs = txsBySender.get(sender);
+      316      if (senderTxs != null) {
+      317        long expectedNonce = nonce + 1;
+      318        if (senderTxs.firstKey() == expectedNonce) {
+      319          final var candidateTx = senderTxs.firstEntry().getValue();
+      320          final var txType = candidateTx.getTransaction().getType();
+      321  
+      322          if (remainingPromotionsPerType[txType.ordinal()] > 0) {
+      323            senderTxs.pollFirstEntry();
+      324            processRemove(
+      325                senderTxs,
+      326                candidateTx.getTransaction(),
+      327                LayeredRemovalReason.LayerMoveReason.PROMOTED);
+      328            metrics.incrementRemoved(candidateTx, "promoted", name());
+      329  
+      330            if (senderTxs.isEmpty()) {
+      331              txsBySender.remove(sender);
+      332            }
+      333            --remainingPromotionsPerType[txType.ordinal()];
+      334            return candidateTx;
+      335          }
+      336          return null;
+      337        }
+      338      }
+      339      return nextLayer.promoteFor(sender, nonce, remainingPromotionsPerType);
+      340    }
+      341  
+      342    private TransactionAddedResult addToNextLayer(
+      343        final PendingTransaction pendingTransaction, final int distance, final AddReason addReason) {
+      344      return addToNextLayer(
+      345          txsBySender.getOrDefault(pendingTransaction.getSender(), EMPTY_SENDER_TXS),
+      346          pendingTransaction,
+      347          distance,
+      348          addReason);
+      349    }
+      350  
+      351    protected TransactionAddedResult addToNextLayer(
+      352        final NavigableMap<Long, PendingTransaction> senderTxs,
+      353        final PendingTransaction pendingTransaction,
+      354        final int distance,
+      355        final AddReason addReason) {
+      356      final int nextLayerDistance;
+      357      if (senderTxs.isEmpty()) {
+      358        nextLayerDistance = distance;
+      359      } else {
+      360        nextLayerDistance = (int) (pendingTransaction.getNonce() - (senderTxs.lastKey() + 1));
+      361      }
+      362      return nextLayer.add(pendingTransaction, nextLayerDistance, addReason);
+      363    }
+      364  
+      365    private void processAdded(final PendingTransaction addedTx, final AddReason addReason) {
+      366      pendingTransactions.put(addedTx.getHash(), addedTx);
+      367      final var senderTxs = txsBySender.computeIfAbsent(addedTx.getSender(), s -> new TreeMap<>());
+      368      senderTxs.put(addedTx.getNonce(), addedTx);
+      369      increaseCounters(addedTx);
+      370      metrics.incrementAdded(addedTx, addReason, name());
+      371      internalAdd(senderTxs, addedTx);
+      372      LOG.atTrace()
+      373          .setMessage("[{}] added pending transactions {}, reason: {}")
+      374          .addArgument(name())
+      375          .addArgument(addedTx::toTraceLog)
+      376          .addArgument(addReason)
+      377          .log();
+      378    }
+      379  
+      380    protected abstract void internalAdd(
+      381        final NavigableMap<Long, PendingTransaction> senderTxs, final PendingTransaction addedTx);
+      382  
+      383    protected abstract int maxTransactionsNumber();
+      384  
+      385    private void evict(final long spaceToFree, final int txsToEvict) {
+      386      final var evictableTx = getEvictable();
+      387      if (evictableTx != null) {
+      388        final var lessReadySender = evictableTx.getSender();
+      389        final var lessReadySenderTxs = txsBySender.get(lessReadySender);
+      390  
+      391        long evictedSize = 0;
+      392        int evictedCount = 0;
+      393        PendingTransaction lastTx;
+      394        // lastTx must never be null, because the sender have at least the lessReadyTx
+      395        while ((evictedSize < spaceToFree || txsToEvict > evictedCount)
+      396            && !lessReadySenderTxs.isEmpty()) {
+      397          lastTx = lessReadySenderTxs.pollLastEntry().getValue();
+      398          processEvict(lessReadySenderTxs, lastTx, EVICTED);
+      399          ++evictedCount;
+      400          evictedSize += lastTx.memorySize();
+      401          // evicted can always be added to the next layer
+      402          addToNextLayer(lessReadySenderTxs, lastTx, 0, MOVE);
+      403        }
+      404  
+      405        if (lessReadySenderTxs.isEmpty()) {
+      406          txsBySender.remove(lessReadySender);
+      407        }
+      408  
+      409        final long newSpaceToFree = spaceToFree - evictedSize;
+      410        final int newTxsToEvict = txsToEvict - evictedCount;
+      411  
+      412        if ((newSpaceToFree > 0 || newTxsToEvict > 0) && !txsBySender.isEmpty()) {
+      413          // try next less valuable sender
+      414          evict(newSpaceToFree, newTxsToEvict);
+      415        }
+      416      }
+      417    }
+      418  
+      419    protected void replaced(final PendingTransaction replacedTx) {
+      420      pendingTransactions.remove(replacedTx.getHash());
+      421      decreaseCounters(replacedTx);
+      422      metrics.incrementRemoved(replacedTx, REPLACED.label(), name());
+      423      internalReplaced(replacedTx);
+      424      notifyTransactionDropped(replacedTx, REPLACED);
+      425    }
+      426  
+      427    protected abstract void internalReplaced(final PendingTransaction replacedTx);
+      428  
+      429    private TransactionAddedResult maybeReplaceTransaction(final PendingTransaction incomingTx) {
+      430  
+      431      final var existingTxs = txsBySender.get(incomingTx.getSender());
+      432  
+      433      if (existingTxs != null) {
+      434        final var existingReadyTx = existingTxs.get(incomingTx.getNonce());
+      435        if (existingReadyTx != null) {
+      436  
+      437          if (existingReadyTx.getHash().equals(incomingTx.getHash())) {
+      438            return ALREADY_KNOWN;
+      439          }
+      440  
+      441          if (!transactionReplacementTester.apply(existingReadyTx, incomingTx)) {
+      442            return REJECTED_UNDERPRICED_REPLACEMENT;
+      443          }
+      444          return TransactionAddedResult.createForReplacement(existingReadyTx);
+      445        }
+      446      }
+      447      return null;
+      448    }
+      449  
+      450    protected PendingTransaction processRemove(
+      451        final NavigableMap<Long, PendingTransaction> senderTxs,
+      452        final Transaction transaction,
+      453        final LayeredRemovalReason removalReason) {
+      454      final PendingTransaction removedTx = pendingTransactions.remove(transaction.getHash());
+      455  
+      456      if (removedTx != null) {
+      457        decreaseCounters(removedTx);
+      458        metrics.incrementRemoved(removedTx, removalReason.label(), name());
+      459        internalRemove(senderTxs, removedTx, removalReason);
+      460        if (removalReason.removedFrom().equals(POOL)) {
+      461          logRemoved(removedTx, removalReason, name());
+      462          notifyTransactionDropped(removedTx, removalReason);
+      463        } else {
+      464          logMoved(removedTx, removalReason, name());
+      465        }
+      466      }
+      467      return removedTx;
+      468    }
+      469  
+       ... truncated at 400 lines ...
+
+---------- IMPLEMENTER org.hyperledger.besu.ethereum.eth.transactions.layered.AbstractPrioritizedTransactions  stubs=0/10 ----------
+       47  public abstract class AbstractPrioritizedTransactions extends AbstractSequentialTransactionsLayer {
+       48    protected final TreeSet<PendingTransaction> orderByFee;
+       49    private final MiningConfiguration miningConfiguration;
+       50  
+       51    public AbstractPrioritizedTransactions(
+       52        final TransactionPoolConfiguration poolConfig,
+       53        final EthScheduler ethScheduler,
+       54        final TransactionsLayer prioritizedTransactions,
+       55        final TransactionPoolMetrics metrics,
+       56        final BiFunction<PendingTransaction, PendingTransaction, Boolean>
+       57            transactionReplacementTester,
+       58        final BlobCache blobCache,
+       59        final MiningConfiguration miningConfiguration) {
+       60      super(
+       61          poolConfig,
+       62          ethScheduler,
+       63          prioritizedTransactions,
+       64          transactionReplacementTester,
+       65          metrics,
+       66          blobCache);
+       67      this.orderByFee = new TreeSet<>(this::compareByFee);
+       68      this.miningConfiguration = miningConfiguration;
+       69      getAndLogMinPriorityFeePerGas();
+       70      getAndLogMinTransactionGasPrice();
+       71    }
+       72  
+       73    @Override
+       74    public void reset() {
+       75      super.reset();
+       76      orderByFee.clear();
+       77    }
+       78  
+       79    @Override
+       80    public String name() {
+       81      return "prioritized";
+       82    }
+       83  
+       84    @Override
+       85    protected TransactionAddedResult canAdd(
+       86        final PendingTransaction pendingTransaction, final int gap) {
+       87      final var senderTxs = txsBySender.get(pendingTransaction.getSender());
+       88  
+       89      if (hasExpectedNonce(senderTxs, pendingTransaction, gap) && hasPriority(pendingTransaction)) {
+       90  
+       91        return TransactionAddedResult.ADDED;
+       92      }
+       93  
+       94      return TransactionAddedResult.TRY_NEXT_LAYER;
+       95    }
+       96  
+       97    @Override
+       98    protected void internalAdd(
+       99        final NavigableMap<Long, PendingTransaction> senderTxs, final PendingTransaction addedTx) {
+      100      orderByFee.add(addedTx);
+      101    }
+      102  
+      103    @Override
+      104    protected void internalReplaced(final PendingTransaction replacedTx) {
+      105      orderByFee.remove(replacedTx);
+      106    }
+      107  
+      108    private boolean hasPriority(final PendingTransaction pendingTransaction) {
+      109      // check if there is space for that tx type
+      110      final var txType = pendingTransaction.getTransaction().getType();
+      111      if (txCountByType[txType.ordinal()]
+      112          >= poolConfig
+      113              .getMaxPrioritizedTransactionsByType()
+      114              .getOrDefault(txType, Integer.MAX_VALUE)) {
+      115        return false;
+      116      }
+      117  
+      118      // if it does not pass the promotion filter, then has not priority
+      119      if (!promotionFilter(pendingTransaction)) {
+      120        return false;
+      121      }
+      122  
+      123      // if there is space add it, otherwise check if it has more value than the last one
+      124      if (orderByFee.size() < poolConfig.getMaxPrioritizedTransactions()) {
+      125        return true;
+      126      }
+      127      return compareByFee(pendingTransaction, orderByFee.first()) > 0;
+      128    }
+      129  
+      130    @Override
+      131    protected int maxTransactionsNumber() {
+      132      return poolConfig.getMaxPrioritizedTransactions();
+      133    }
+      134  
+      135    @Override
+      136    protected PendingTransaction getEvictable() {
+      137      return orderByFee.first();
+      138    }
+      139  
+      140    protected abstract int compareByFee(final PendingTransaction pt1, final PendingTransaction pt2);
+      141  
+      142    @Override
+      143    protected void internalRemove(
+      144        final NavigableMap<Long, PendingTransaction> senderTxs,
+      145        final PendingTransaction removedTx,
+      146        final LayeredRemovalReason removalReason) {
+      147      orderByFee.remove(removedTx);
+      148    }
+      149  
+      150    @Override
+      151    protected void internalPenalize(final PendingTransaction penalizedTx) {
+      152      orderByFee.remove(penalizedTx);
+      153      penalizedTx.decrementScore();
+      154      orderByFee.add(penalizedTx);
+      155    }
+      156  
+      157    @Override
+      158    public List<PendingTransaction> promote(
+      159        final Predicate<PendingTransaction> promotionFilter,
+      160        final long freeSpace,
+      161        final int freeSlots,
+      162        final int[] remainingPromotionsPerType) {
+      163      return List.of();
+      164    }
+      165  
+      166    /**
+      167     * Here the max number of txs of a specific type that can be promoted, is defined by the
+      168     * configuration, so we return the difference between the configured max and the current count of
+      169     * txs for each type
+      170     *
+      171     * @return an array containing the max amount of txs that can be promoted for each type
+      172     */
+      173    @Override
+      174    protected int[] getRemainingPromotionsPerType() {
+      175      final var allTypes = TransactionType.values();
+      176      final var remainingPromotionsPerType = new int[allTypes.length];
+      177      for (int i = 0; i < allTypes.length; i++) {
+      178        remainingPromotionsPerType[i] =
+      179            poolConfig
+      180                    .getMaxPrioritizedTransactionsByType()
+      181                    .getOrDefault(allTypes[i], Integer.MAX_VALUE)
+      182                - txCountByType[i];
+      183      }
+      184      return remainingPromotionsPerType;
+      185    }
+      186  
+      187    /**
+      188     * Return the full content of this layer, organized as a list of sender pending txs. For each
+      189     * sender the collection pending txs is ordered by nonce asc.
+      190     *
+      191     * <p>Returned sender list order detail: first the sender of the most profitable tx.
+      192     *
+      193     * @return a list of sender pending txs
+      194     */
+      195    @Override
+      196    public List<List<PendingTransaction>> getBySender() {
+      197      final var sendersToAdd = new HashSet<>(txsBySender.keySet());
+      198      return orderByFee.descendingSet().stream()
+      199          .map(PendingTransaction::getSender)
+      200          .filter(sendersToAdd::remove)
+      201          .map(sender -> List.copyOf(txsBySender.get(sender).values()))
+      202          .toList();
+      203    }
+      204  
+      205    /**
+      206     * Returns pending txs by sender and ordered by score desc. In case a sender has pending txs with
+
+---------- IMPLEMENTER org.hyperledger.besu.ethereum.eth.transactions.layered.AbstractSequentialTransactionsLayer  stubs=2/5 ----------
+       36  public abstract class AbstractSequentialTransactionsLayer extends AbstractTransactionsLayer {
+       37  
+       38    public AbstractSequentialTransactionsLayer(
+       39        final TransactionPoolConfiguration poolConfig,
+       40        final EthScheduler ethScheduler,
+       41        final TransactionsLayer nextLayer,
+       42        final BiFunction<PendingTransaction, PendingTransaction, Boolean>
+       43            transactionReplacementTester,
+       44        final TransactionPoolMetrics metrics,
+       45        final BlobCache blobCache) {
+       46      super(poolConfig, ethScheduler, nextLayer, transactionReplacementTester, metrics, blobCache);
+       47    }
+       48  
+       49    @Override
+       50    public void remove(final PendingTransaction invalidatedTx, final PoolRemovalReason reason) {
+       51      nextLayer.remove(invalidatedTx, reason);
+       52  
+       53      final var senderTxs = txsBySender.get(invalidatedTx.getSender());
+       54      final long invalidNonce = invalidatedTx.getNonce();
+       55      if (senderTxs != null && Long.compareUnsigned(invalidNonce, senderTxs.lastKey()) <= 0) {
+       56        // on sequential layers we need to push to next layer all the txs following the invalid one,
+       57        // even if it belongs to a previous layer
+       58  
+       59        if (senderTxs.remove(invalidNonce) != null) {
+       60          // invalid tx removed in this layer
+       61          processRemove(senderTxs, invalidatedTx.getTransaction(), reason);
+       62        }
+       63  
+       64        // push following to next layer
+       65        pushDown(senderTxs, invalidNonce, 1);
+       66  
+       67        if (senderTxs.isEmpty()) {
+       68          txsBySender.remove(invalidatedTx.getSender());
+       69        }
+       70      }
+       71    }
+       72  
+       73    private void pushDown(
+       74        final NavigableMap<Long, PendingTransaction> senderTxs,
+       75        final long afterNonce,
+       76        final int gap) {
+       77      senderTxs.tailMap(afterNonce, false).values().stream().toList().stream()
+       78          .peek(
+       79              txToRemove -> {
+       80                senderTxs.remove(txToRemove.getNonce());
+       81                processRemove(senderTxs, txToRemove.getTransaction(), FOLLOW_INVALIDATED);
+       82              })
+       83          .forEach(followingTx -> nextLayer.add(followingTx, gap, MOVE));
+       84    }
+       85  
+       86    @Override
+       87    protected boolean gapsAllowed() {
+       88      return false;
+       89    }
+       90  
+       91    @Override
+       92    protected void internalConfirmed(
+       93        final NavigableMap<Long, PendingTransaction> senderTxs,
+       94        final Address sender,
+       95        final long maxConfirmedNonce,
+       96        final PendingTransaction highestNonceRemovedTx) {
+       97      // no -op
+       98    }
+       99  
+      100    @Override
+      101    protected void internalEvict(
+      102        final NavigableMap<Long, PendingTransaction> senderTxs, final PendingTransaction evictedTx) {
+      103      internalRemove(senderTxs, evictedTx, EVICTED);
+      104    }
+      105  
+      106    @Override
+      107    public OptionalLong getNextNonceFor(final Address sender) {
+      108      final OptionalLong nextLayerRes = nextLayer.getNextNonceFor(sender);
+      109      if (nextLayerRes.isEmpty()) {
+      110        final var senderTxs = txsBySender.get(sender);
+      111        if (senderTxs != null) {
+      112          return OptionalLong.of(senderTxs.lastKey() + 1);
+      113        }
+      114      }
+      115      return nextLayerRes;
+      116    }
+      117  
+      118    @Override
+      119    public OptionalLong getCurrentNonceFor(final Address sender) {
+      120      final var senderTxs = txsBySender.get(sender);
+      121      if (senderTxs != null) {
+      122        return OptionalLong.of(senderTxs.firstKey());
+      123      }
+      124      return nextLayer.getCurrentNonceFor(sender);
+      125    }
+      126  
+      127    @Override
+      128    public PendingTransactions.Status getStatus() {
+      129      final PendingTransactions.Status nextLayerStatus = nextLayer.getStatus();
+      130      return new PendingTransactions.Status(
+      131          nextLayerStatus.pendingCount() + pendingTransactions.size(), nextLayerStatus.queuedCount());
+      132    }
+      133  
+      134    @Override
+      135    protected void internalNotifyAdded(
+      136        final NavigableMap<Long, PendingTransaction> senderTxs,
+      137        final PendingTransaction pendingTransaction) {
+      138      // no-op
+      139    }
+      140  
+      141    protected boolean hasExpectedNonce(
+      142        final NavigableMap<Long, PendingTransaction> senderTxs,
+      143        final PendingTransaction pendingTransaction,
+      144        final long gap) {
+      145      if (senderTxs == null) {
+      146        return gap == 0;
+      147      }
+      148  
+      149      // true if prepend or append
+      150      return (senderTxs.lastKey() + 1) == pendingTransaction.getNonce()
+      151          || (senderTxs.firstKey() - 1) == pendingTransaction.getNonce();
+      152    }
+      153  
+      154    @Override
+      155    protected void internalConsistencyCheck(
+      156        final Map<Address, NavigableMap<Long, PendingTransaction>> prevLayerTxsBySender) {
+      157      txsBySender.values().stream()
+      158          .filter(senderTxs -> senderTxs.size() > 1)
+      159          .map(NavigableMap::entrySet)
+      160          .map(Set::iterator)
+      161          .forEach(
+      162              itNonce -> {
+      163                PendingTransaction firstTx = itNonce.next().getValue();
+      164  
+      165                prevLayerTxsBySender.computeIfPresent(
+      166                    firstTx.getSender(),
+      167                    (sender, txsByNonce) -> {
+      168                      assert txsByNonce.lastKey() + 1 == firstTx.getNonce()
+      169                          : "first nonce is not sequential with previous layer last nonce";
+      170                      return txsByNonce;
+      171                    });
+      172  
+      173                long prevNonce = firstTx.getNonce();
+      174  
+      175                while (itNonce.hasNext()) {
+      176                  final long currNonce = itNonce.next().getKey();
+      177                  assert prevNonce + 1 == currNonce : "non sequential nonce";
+      178                  prevNonce = currNonce;
+      179                }
+      180              });
+      181    }
+      182  }
+
+---------- IMPLEMENTER org.hyperledger.besu.ethereum.eth.transactions.layered.BaseFeePrioritizedTransactions  stubs=0/3 ----------
+       39  public class BaseFeePrioritizedTransactions extends AbstractPrioritizedTransactions {
+       40  
+       41    private static final Logger LOG = LoggerFactory.getLogger(BaseFeePrioritizedTransactions.class);
+       42    private final SenderBalanceChecker senderBalanceChecker;
+       43    private Optional<Wei> nextBlockBaseFee;
+       44  
+       45    public BaseFeePrioritizedTransactions(
+       46        final TransactionPoolConfiguration poolConfig,
+       47        final Supplier<BlockHeader> chainHeadHeaderSupplier,
+       48        final EthScheduler ethScheduler,
+       49        final TransactionsLayer nextLayer,
+       50        final TransactionPoolMetrics metrics,
+       51        final BiFunction<PendingTransaction, PendingTransaction, Boolean>
+       52            transactionReplacementTester,
+       53        final FeeMarket feeMarket,
+       54        final BlobCache blobCache,
+       55        final MiningConfiguration miningConfiguration,
+       56        final SenderBalanceChecker senderBalanceChecker) {
+       57      super(
+       58          poolConfig,
+       59          ethScheduler,
+       60          nextLayer,
+       61          metrics,
+       62          transactionReplacementTester,
+       63          blobCache,
+       64          miningConfiguration);
+       65      this.nextBlockBaseFee =
+       66          Optional.of(calculateNextBlockBaseFee(feeMarket, chainHeadHeaderSupplier.get()));
+       67      this.senderBalanceChecker = senderBalanceChecker;
+       68    }
+       69  
+       70    @Override
+       71    protected int compareByFee(final PendingTransaction pt1, final PendingTransaction pt2) {
+       72      return Comparator.comparing(PendingTransaction::getScore)
+       73          .thenComparing(PendingTransaction::hasPriority)
+       74          .thenComparing(
+       75              (PendingTransaction pendingTransaction) ->
+       76                  pendingTransaction.getTransaction().getEffectivePriorityFeePerGas(nextBlockBaseFee))
+       77          .thenComparing(
+       78              (PendingTransaction pendingTransaction) ->
+       79                  pendingTransaction.getTransaction().getMaxGasPrice())
+       80          .thenComparing(Comparator.comparing(PendingTransaction::getNonce).reversed())
+       81          .thenComparing(PendingTransaction::getSequence)
+       82          .compare(pt1, pt2);
+       83    }
+       84  
+       85    /**
+       86     * On base fee markets when a new block is added we can calculate the base fee for the next block
+       87     * and use it to keep only pending transactions willing to pay at least that fee in the
+       88     * prioritized layer, since only these transactions are executable, while all the other can be
+       89     * demoted to the next layer.
+       90     *
+       91     * @param blockHeader the header of the added block
+       92     * @param feeMarket the fee market
+       93     */
+       94    @Override
+       95    protected void internalBlockAdded(final BlockHeader blockHeader, final FeeMarket feeMarket) {
+       96      final Wei newNextBlockBaseFee = calculateNextBlockBaseFee(feeMarket, blockHeader);
+       97  
+       98      LOG.atTrace()
+       99          .setMessage("Updating base fee from {} to {}")
+      100          .addArgument(nextBlockBaseFee.get()::toHumanReadableString)
+      101          .addArgument(newNextBlockBaseFee::toHumanReadableString)
+      102          .log();
+      103  
+      104      nextBlockBaseFee = Optional.of(newNextBlockBaseFee);
+      105      orderByFee.clear();
+      106      senderBalanceChecker.clear();
+      107  
+      108      final var itTxsBySender = txsBySender.entrySet().iterator();
+      109      while (itTxsBySender.hasNext()) {
+      110        final var senderTxs = itTxsBySender.next().getValue();
+      111  
+      112        Optional<Long> maybeFirstDemotedNonce = Optional.empty();
+      113  
+      114        for (final var e : senderTxs.entrySet()) {
+      115          final PendingTransaction tx = e.getValue();
+      116          // it must pass the promotion filter to be prioritized
+      117          if (promotionFilter(tx)) {
+      118            orderByFee.add(tx);
+      119          } else {
+      120            // otherwise sender txs starting from this nonce need to be demoted to next layer,
+      121            // and we can go to next sender
+      122            maybeFirstDemotedNonce = Optional.of(e.getKey());
+      123            break;
+      124          }
+      125        }
+      126  
+      127        maybeFirstDemotedNonce.ifPresent(
+      128            nonce -> {
+      129              // demote all txs after the first demoted to the next layer, because none of them is
+      130              // executable now, and we can avoid sorting them until they are candidate for execution
+      131              // again
+      132              final var demoteTxs = senderTxs.tailMap(nonce, true);
+      133              while (!demoteTxs.isEmpty()) {
+      134                final PendingTransaction demoteTx = demoteTxs.pollLastEntry().getValue();
+      135                LOG.atTrace()
+      136                    .setMessage(
+      137                        "Demoting tx {} since it does not respect anymore the requisites to stay in this layer."
+      138                            + " Next block base fee {}")
+      139                    .addArgument(demoteTx::toTraceLog)
+      140                    .addArgument(newNextBlockBaseFee::toHumanReadableString)
+      141                    .log();
+      142                processEvict(senderTxs, demoteTx, DEMOTED);
+      143                addToNextLayer(senderTxs, demoteTx, 0, MOVE);
+      144              }
+      145            });
+      146  
+      147        if (senderTxs.isEmpty()) {
+      148          itTxsBySender.remove();
+      149        }
+      150      }
+      151    }
+      152  
+      153    private Wei calculateNextBlockBaseFee(final FeeMarket feeMarket, final BlockHeader blockHeader) {
+      154      if (feeMarket.implementsBaseFee()) {
+      155        final var baseFeeMarket = (BaseFeeMarket) feeMarket;
+      156        return baseFeeMarket.computeBaseFee(
+      157            blockHeader.getNumber() + 1,
+      158            blockHeader.getBaseFee().orElse(Wei.ZERO),
+      159            blockHeader.getGasUsed(),
+      160            baseFeeMarket.targetGasUsed(blockHeader));
+      161      }
+      162      return Wei.ZERO;
+      163    }
+      164  
+      165    @Override
+      166    protected boolean promotionFilter(final PendingTransaction pendingTransaction) {
+      167      // check if the tx is willing to pay at least the base fee
+      168      if (nextBlockBaseFee
+      169          .map(pendingTransaction.getTransaction().getMaxGasPrice()::lessThan)
+      170          .orElse(true)) {
+      171        return false;
+      172      }
+      173  
+      174      // priority txs are promoted even if they pay less
+      175      if (!pendingTransaction.hasPriority()) {
+      176        // check if effective gas price is higher than the min gas price
+      177        if (pendingTransaction
+      178            .getTransaction()
+      179            .getEffectiveGasPrice(nextBlockBaseFee)
+      180            .lessThan(getAndLogMinTransactionGasPrice())) {
+      181          return false;
+      182        }
+      183  
+      184        // check if enough priority fee is paid
+      185        final var minPriorityFeePerGas = getAndLogMinPriorityFeePerGas();
+      186        if (!minPriorityFeePerGas.equals(Wei.ZERO)) {
+      187          final Wei priorityFeePerGas =
+      188              pendingTransaction.getTransaction().getEffectivePriorityFeePerGas(nextBlockBaseFee);
+      189          if (priorityFeePerGas.lessThan(minPriorityFeePerGas)) {
+      190            return false;
+      191          }
+      192        }
+      193      }
+      194  
+      195      // check is the sender has enough balance
+      196      return senderBalanceChecker.hasEnoughBalanceFor(pendingTransaction);
+      197    }
+      198  
+
+---------- IMPLEMENTER org.hyperledger.besu.ethereum.eth.transactions.layered.GasPricePrioritizedTransactions  stubs=1/3 ----------
+       36  public class GasPricePrioritizedTransactions extends AbstractPrioritizedTransactions {
+       37    private final SenderBalanceChecker senderBalanceChecker;
+       38  
+       39    public GasPricePrioritizedTransactions(
+       40        final TransactionPoolConfiguration poolConfig,
+       41        final EthScheduler ethScheduler,
+       42        final TransactionsLayer nextLayer,
+       43        final TransactionPoolMetrics metrics,
+       44        final BiFunction<PendingTransaction, PendingTransaction, Boolean>
+       45            transactionReplacementTester,
+       46        final BlobCache blobCache,
+       47        final MiningConfiguration miningConfiguration,
+       48        final SenderBalanceChecker senderBalanceChecker) {
+       49      super(
+       50          poolConfig,
+       51          ethScheduler,
+       52          nextLayer,
+       53          metrics,
+       54          transactionReplacementTester,
+       55          blobCache,
+       56          miningConfiguration);
+       57      this.senderBalanceChecker = senderBalanceChecker;
+       58    }
+       59  
+       60    @Override
+       61    protected int compareByFee(final PendingTransaction pt1, final PendingTransaction pt2) {
+       62      return comparing(PendingTransaction::getScore)
+       63          .thenComparing(PendingTransaction::hasPriority)
+       64          .thenComparing(PendingTransaction::getGasPrice)
+       65          .thenComparing(PendingTransaction::getSequence)
+       66          .compare(pt1, pt2);
+       67    }
+       68  
+       69    @Override
+       70    protected void internalBlockAdded(final BlockHeader blockHeader, final FeeMarket feeMarket) {
+       71      // no-op
+       72    }
+       73  
+       74    @Override
+       75    protected boolean promotionFilter(final PendingTransaction pendingTransaction) {
+       76  
+       77      if (!senderBalanceChecker.hasEnoughBalanceFor(pendingTransaction)) {
+       78        return false;
+       79      }
+       80  
+       81      return pendingTransaction.hasPriority()
+       82          || pendingTransaction
+       83              .getTransaction()
+       84              .getGasPrice()
+       85              .map(getAndLogMinTransactionGasPrice()::lessOrEqualThan)
+       86              .orElse(false);
+       87    }
+       88  
+       89    @Override
+       90    protected String internalLogStats() {
+       91      if (orderByFee.isEmpty()) {
+       92        return "GasPrice Prioritized: Empty";
+       93      }
+       94  
+       95      final PendingTransaction highest = orderByFee.last();
+       96      final PendingTransaction lowest = orderByFee.first();
+       97  
+       98      return "GasPrice Prioritized: "
+       99          + "count: "
+      100          + pendingTransactions.size()
+      101          + ", space used: "
+      102          + spaceUsed
+      103          + ", unique senders: "
+      104          + txsBySender.size()
+      105          + ", highest priority tx: [score: "
+      106          + highest.getScore()
+      107          + ", gas price: "
+      108          + highest.getTransaction().getGasPrice().get().toHumanReadableString()
+      109          + ", hash: "
+      110          + highest.getHash()
+      111          + "], lowest priority tx: [score: "
+      112          + lowest.getScore()
+      113          + ", gas price: "
+      114          + lowest.getTransaction().getGasPrice().get().toHumanReadableString()
+      115          + ", hash: "
+      116          + lowest.getHash()
+      117          + "]";
+      118    }
+      119  }
+
+---------- IMPLEMENTER org.hyperledger.besu.ethereum.eth.transactions.layered.ReadyTransactions  stubs=1/13 ----------
+       41  public class ReadyTransactions extends AbstractSequentialTransactionsLayer {
+       42  
+       43    private final NavigableSet<PendingTransaction> orderByMaxFee =
+       44        new TreeSet<>(
+       45            Comparator.comparing(PendingTransaction::getScore)
+       46                .thenComparing(PendingTransaction::hasPriority)
+       47                .thenComparing((PendingTransaction pt) -> pt.getTransaction().getMaxGasPrice())
+       48                .thenComparing(PendingTransaction::getSequence));
+       49  
+       50    public ReadyTransactions(
+       51        final TransactionPoolConfiguration poolConfig,
+       52        final EthScheduler ethScheduler,
+       53        final TransactionsLayer nextLayer,
+       54        final TransactionPoolMetrics metrics,
+       55        final BiFunction<PendingTransaction, PendingTransaction, Boolean>
+       56            transactionReplacementTester,
+       57        final BlobCache blobCache) {
+       58      super(poolConfig, ethScheduler, nextLayer, transactionReplacementTester, metrics, blobCache);
+       59    }
+       60  
+       61    @Override
+       62    public String name() {
+       63      return "ready";
+       64    }
+       65  
+       66    @Override
+       67    public void reset() {
+       68      super.reset();
+       69      orderByMaxFee.clear();
+       70    }
+       71  
+       72    @Override
+       73    protected long cacheFreeSpace() {
+       74      return poolConfig.getPendingTransactionsLayerMaxCapacityBytes() - getLayerSpaceUsed();
+       75    }
+       76  
+       77    @Override
+       78    protected TransactionAddedResult canAdd(
+       79        final PendingTransaction pendingTransaction, final int gap) {
+       80      final var senderTxs = txsBySender.get(pendingTransaction.getSender());
+       81  
+       82      if (hasExpectedNonce(senderTxs, pendingTransaction, gap)) {
+       83        return TransactionAddedResult.ADDED;
+       84      }
+       85  
+       86      return TransactionAddedResult.TRY_NEXT_LAYER;
+       87    }
+       88  
+       89    @Override
+       90    protected void internalAdd(
+       91        final NavigableMap<Long, PendingTransaction> senderTxs,
+       92        final PendingTransaction pendingTransaction) {
+       93      if (senderTxs.firstKey() == pendingTransaction.getNonce()) {
+       94        // replace previous if exists
+       95        if (senderTxs.size() > 1) {
+       96          final PendingTransaction secondTx = senderTxs.get(pendingTransaction.getNonce() + 1);
+       97          orderByMaxFee.remove(secondTx);
+       98        }
+       99        orderByMaxFee.add(pendingTransaction);
+      100      }
+      101    }
+      102  
+      103    @Override
+      104    protected int maxTransactionsNumber() {
+      105      return Integer.MAX_VALUE;
+      106    }
+      107  
+      108    @Override
+      109    protected void internalRemove(
+      110        final NavigableMap<Long, PendingTransaction> senderTxs,
+      111        final PendingTransaction removedTx,
+      112        final LayeredRemovalReason removalReason) {
+      113      orderByMaxFee.remove(removedTx);
+      114      if (!senderTxs.isEmpty()) {
+      115        orderByMaxFee.add(senderTxs.firstEntry().getValue());
+      116      }
+      117    }
+      118  
+      119    @Override
+      120    protected void internalPenalize(final PendingTransaction penalizedTx) {
+      121      final var senderTxs = txsBySender.get(penalizedTx.getSender());
+      122      if (senderTxs.firstKey() == penalizedTx.getNonce()) {
+      123        // since we only sort the first tx of sender, we only need to re-sort in this case
+      124        orderByMaxFee.remove(penalizedTx);
+      125        penalizedTx.decrementScore();
+      126        orderByMaxFee.add(penalizedTx);
+      127      } else {
+      128        // otherwise we just decrement the score
+      129        penalizedTx.decrementScore();
+      130      }
+      131    }
+      132  
+      133    @Override
+      134    protected void internalReplaced(final PendingTransaction replacedTx) {
+      135      orderByMaxFee.remove(replacedTx);
+      136    }
+      137  
+      138    @Override
+      139    protected void internalBlockAdded(final BlockHeader blockHeader, final FeeMarket feeMarket) {
+      140      // no-op
+      141    }
+      142  
+      143    @Override
+      144    protected PendingTransaction getEvictable() {
+      145      return orderByMaxFee.first();
+      146    }
+      147  
+      148    @Override
+      149    protected boolean promotionFilter(final PendingTransaction pendingTransaction) {
+      150      return true;
+      151    }
+      152  
+      153    /**
+      154     * Return the full content of this layer, organized as a list of sender pending txs. For each
+      155     * sender the collection pending txs is ordered by nonce asc.
+      156     *
+      157     * <p>Returned sender list order detail: first the sender of the tx with the highest max gas
+      158     * price.
+      159     *
+      160     * @return a list of sender pending txs
+      161     */
+      162    @Override
+      163    public List<List<PendingTransaction>> getBySender() {
+      164      return orderByMaxFee.descendingSet().stream()
+      165          .map(PendingTransaction::getSender)
+      166          .map(sender -> List.copyOf(txsBySender.get(sender).values()))
+      167          .toList();
+      168    }
+      169  
+      170    @Override
+      171    public List<PendingTransaction> promote(
+      172        final Predicate<PendingTransaction> promotionFilter,
+      173        final long freeSpace,
+      174        final int freeSlots,
+      175        final int[] remainingPromotionsPerType) {
+      176      long accumulatedSpace = 0;
+      177      final List<PendingTransaction> promotedTxs = new ArrayList<>();
+      178  
+      179      // first find all txs that can be promoted
+      180      search:
+      181      for (final var senderFirstTx : orderByMaxFee.descendingSet()) {
+      182        final var senderTxs = txsBySender.get(senderFirstTx.getSender());
+      183        for (final var candidateTx : senderTxs.values()) {
+      184          final var txType = candidateTx.getTransaction().getType();
+      185          if (promotionFilter.test(candidateTx) && remainingPromotionsPerType[txType.ordinal()] > 0) {
+      186            accumulatedSpace += candidateTx.memorySize();
+      187            if (promotedTxs.size() < freeSlots && accumulatedSpace <= freeSpace) {
+      188              promotedTxs.add(candidateTx);
+      189              --remainingPromotionsPerType[txType.ordinal()];
+      190            } else {
+      191              // no room for more txs the search is over exit the loops
+      192              break search;
+      193            }
+      194          } else {
+      195            // skip remaining txs for this sender to avoid gaps
+      196            break;
+      197          }
+      198        }
+      199      }
+      200  
+
+---------- IMPLEMENTER org.hyperledger.besu.ethereum.eth.transactions.layered.SparseTransactions  stubs=2/17 ----------
+       52  public class SparseTransactions extends AbstractTransactionsLayer {
+       53    private static final String SENDER_MIXED_PRIORITY_ERROR =
+       54        "Sender %s cannot simultaneously have and not have priority."
+       55            + " Probably you need to set --tx-pool-no-local-priority=true and/or configure"
+       56            + " the list of priority senders with --tx-pool-priority-senders";
+       57  
+       58    /**
+       59     * Order sparse tx by priority flag and sequence asc, so that we pick for eviction txs that have
+       60     * no priority and with the lowest sequence number (oldest) first.
+       61     */
+       62    private final NavigableSet<PendingTransaction> sparseEvictionOrder =
+       63        new TreeSet<>(
+       64            Comparator.comparing(PendingTransaction::hasPriority)
+       65                .thenComparing(PendingTransaction::getSequence));
+       66  
+       67    private final Map<Address, Integer> gapBySender = new HashMap<>();
+       68    private final List<SendersByPriority> orderByGap;
+       69  
+       70    public SparseTransactions(
+       71        final TransactionPoolConfiguration poolConfig,
+       72        final EthScheduler ethScheduler,
+       73        final TransactionsLayer nextLayer,
+       74        final TransactionPoolMetrics metrics,
+       75        final BiFunction<PendingTransaction, PendingTransaction, Boolean>
+       76            transactionReplacementTester,
+       77        final BlobCache blobCache) {
+       78      super(poolConfig, ethScheduler, nextLayer, transactionReplacementTester, metrics, blobCache);
+       79      orderByGap = new ArrayList<>(poolConfig.getMaxFutureBySender());
+       80      IntStream.range(0, poolConfig.getMaxFutureBySender())
+       81          .forEach(i -> orderByGap.add(new SendersByPriority()));
+       82    }
+       83  
+       84    @Override
+       85    public String name() {
+       86      return "sparse";
+       87    }
+       88  
+       89    @Override
+       90    protected long cacheFreeSpace() {
+       91      return poolConfig.getPendingTransactionsLayerMaxCapacityBytes() - getLayerSpaceUsed();
+       92    }
+       93  
+       94    @Override
+       95    protected boolean gapsAllowed() {
+       96      return true;
+       97    }
+       98  
+       99    @Override
+      100    public void reset() {
+      101      super.reset();
+      102      sparseEvictionOrder.clear();
+      103      gapBySender.clear();
+      104      orderByGap.forEach(SendersByPriority::clear);
+      105    }
+      106  
+      107    @Override
+      108    protected TransactionAddedResult canAdd(
+      109        final PendingTransaction pendingTransaction, final int gap) {
+      110      gapBySender.compute(
+      111          pendingTransaction.getSender(),
+      112          (sender, currGap) -> {
+      113            if (currGap == null) {
+      114              orderByGap.get(gap).add(pendingTransaction);
+      115              return gap;
+      116            }
+      117            if (Long.compareUnsigned(
+      118                    pendingTransaction.getNonce(), txsBySender.get(sender).firstKey())
+      119                < 0) {
+      120              orderByGap.get(currGap).remove(sender);
+      121              orderByGap.get(gap).add(pendingTransaction);
+      122              return gap;
+      123            }
+      124            return currGap;
+      125          });
+      126  
+      127      return TransactionAddedResult.ADDED;
+      128    }
+      129  
+      130    @Override
+      131    protected void internalAdd(
+      132        final NavigableMap<Long, PendingTransaction> senderTxs, final PendingTransaction addedTx) {
+      133      sparseEvictionOrder.add(addedTx);
+      134    }
+      135  
+      136    @Override
+      137    protected int maxTransactionsNumber() {
+      138      return Integer.MAX_VALUE;
+      139    }
+      140  
+      141    @Override
+      142    protected void internalReplaced(final PendingTransaction replacedTx) {
+      143      sparseEvictionOrder.remove(replacedTx);
+      144    }
+      145  
+      146    @Override
+      147    protected void internalBlockAdded(final BlockHeader blockHeader, final FeeMarket feeMarket) {}
+      148  
+      149    /**
+      150     * We only want to promote transactions that have gap == 0, so there will be no gap in the prev
+      151     * layers. A promoted transaction is removed from this layer, and the gap data is updated for its
+      152     * sender.
+      153     *
+      154     * @param promotionFilter the prev layer's promotion filter
+      155     * @param freeSpace max amount of memory promoted txs can occupy
+      156     * @param freeSlots max number of promoted txs
+      157     * @return a list of transactions promoted to the prev layer
+      158     */
+      159    @Override
+      160    public List<PendingTransaction> promote(
+      161        final Predicate<PendingTransaction> promotionFilter,
+      162        final long freeSpace,
+      163        final int freeSlots,
+      164        final int[] remainingPromotionsPerType) {
+      165      long accumulatedSpace = 0;
+      166      final List<PendingTransaction> promotedTxs = new ArrayList<>();
+      167  
+      168      final var zeroGapSenders = orderByGap.get(0);
+      169  
+      170      search:
+      171      for (final var sender : zeroGapSenders) {
+      172        final var senderSeqTxs = getSequentialSubset(txsBySender.get(sender));
+      173  
+      174        for (final var candidateTx : senderSeqTxs.values()) {
+      175          final var txType = candidateTx.getTransaction().getType();
+      176          if (promotionFilter.test(candidateTx) && remainingPromotionsPerType[txType.ordinal()] > 0) {
+      177            accumulatedSpace += candidateTx.memorySize();
+      178            if (promotedTxs.size() < freeSlots && accumulatedSpace <= freeSpace) {
+      179              promotedTxs.add(candidateTx);
+      180              --remainingPromotionsPerType[txType.ordinal()];
+      181            } else {
+      182              // no room for more txs the search is over exit the loops
+      183              break search;
+      184            }
+      185          } else {
+      186            // skip remaining txs for this sender
+      187            break;
+      188          }
+      189        }
+      190      }
+      191  
+      192      // remove promoted txs from this layer
+      193      promotedTxs.forEach(
+      194          promotedTx -> {
+      195            final var sender = promotedTx.getSender();
+      196            final var senderTxs = txsBySender.get(sender);
+      197            senderTxs.remove(promotedTx.getNonce());
+      198            processRemove(senderTxs, promotedTx.getTransaction(), PROMOTED);
+      199            if (senderTxs.isEmpty()) {
+      200              txsBySender.remove(sender);
+      201              orderByGap.get(0).remove(sender);
+      202              gapBySender.remove(sender);
+      203            } else {
+      204              final long firstNonce = senderTxs.firstKey();
+      205              final int newGap = (int) (firstNonce - (promotedTx.getNonce() + 1));
+      206              if (newGap != 0) {
+      207                updateGap(sender, 0, newGap);
+      208              }
+      209            }
+      210          });
+      211  

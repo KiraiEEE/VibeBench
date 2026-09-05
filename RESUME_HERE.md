@@ -53,32 +53,75 @@ round 2 is a **test-retest** measurement. **Commitment: the old labels are not
 consulted until all 1,000 rows are judged and locked**, then agreement is
 computed and reported whatever it says.
 
-## Where the work stopped
+## Where the work stopped (PAUSED 2026-09-05, nothing running)
 
 ```
-A  SAMPLE        DONE     200 x 5, seed 777, verified
-B  EXTRACT       PAUSED   dip 107/200, lsp 3/200, ocp/isp/srp 0/200
-C  AUDIT GATE    pending  must be 0 FAIL before any judging
-D  JUDGE         pending  1,000 rows, ~30 s/row, notes mandatory
-E  SCORE         pending
+A  SAMPLE        DONE     200 x 5, seed 777, verified balanced
+B  EXTRACT       dip 200 DONE | lsp 200 DONE | ocp 200 DONE | isp 34/200 | srp 0/200
+C  AUDIT GATE    PASSED for dip, lsp, ocp (0 FAIL each)
+D  JUDGE         dip 200/200 DONE | lsp 59/200 | ocp 0 | isp 0 | srp 0
+E  SCORE         DIP scored, see below
 F  REPORT+VERIFY pending
 ```
 
-Nothing is running. All python/java/bash processes were stopped at the pause.
+**259 of 1,000 rows judged.** Every judged row carries a written reason in
+`notes`; the recorder refuses a label without one.
+
+### DIP is finished and scored
+
+```
+n=200  TP=89  FP=11  FN=0   precision 0.890  recall 1.000
+per agent : Claude_Code 0.778 | Copilot 0.943 | OpenAI_Codex 1.000  (all R=1.000)
+per outcome: merged 0.907 | open 0.769 | rejected 0.909
+```
+
+Precision is comparable across agents and outcomes, so the DIP agent ranking and
+the merged-vs-rejected contrast are both licensed rather than detector artefacts.
+Round 1 reported 0.862 on material that was measuring the wrong thing.
+
+### Known, accepted gap
+
+`java_ocp_batches/180_UNAVAILABLE.txt` -- javifalces/HFTFramework#10, the tree
+could not be fetched. OCP will be judged on 199 of 200 rows. This is a genuine
+fetch failure, NOT the file-size cap.
 
 ## Resume with exactly this
 
 ```bash
-# B: finish extraction. DIP is slowest, it parses BOTH the before and after
-#    trees per row.
+# finish extraction (isp then srp); --only-missing is already wired in
 bash vibebench/extract_round2.sh <scratchdir>
 
-# C: the gate. DO NOT JUDGE if this is not 0 FAIL.
-python vibebench/07_verify/audit_label_batches.py
+# gate, per principle or all
+python vibebench/07_verify/audit_label_batches.py --principle isp
+
+# then continue judging LSP from row 59, then OCP, ISP, SRP.
+# Labels are ONLY written through record_labels.py:
+#   python -c "import sys; sys.path.insert(0,'vibebench/labels'); import record_labels as R;
+#              R.record('lsp', {59:(False,'reason...')})"
+# Progress: python vibebench/labels/record_labels.py --status
 ```
 
-Note: `extract_round2.sh` does not pass `--only-missing`. Add it to reuse DIP's
-107, or accept a re-extract. Either is correct; re-extracting is just slower.
+Compact batch viewers used while judging live in the scratchpad
+(`lspview.py`); the DIP one was an inline grep over
+`NEWLY CYCLIC PAIRS` / `NO newly` plus the `NEW IMPORT EDGES` block.
+
+## Judging rules being applied consistently (keep these)
+
+**DIP** -- a ONE-WAY concrete import is not a violation; a CLOSED CYCLE or an
+abstraction importing a concrete IS. Pre-existing cycles never count.
+
+**LSP** -- not a violation when: the override calls `super` first and adds
+behaviour; the base already DECLARES the exception the override throws (java
+-dataloader `ValueCachingNotSupported`); both methods are PRIVATE, so there is
+no polymorphic override at all (deeplearning4j); both are `@Nullable`, so
+returning null is inside the contract (maven); the override reports a STRONGER
+guarantee (questdb `isThreadSafe` false -> true); it is a protected template
+hook only the base calls (micronaut `buildAnnotation`).
+IS a violation when: the base does real work and the override is a bare
+`throw new UnsupportedOperationException` (refused bequest); the override
+narrows what inputs are accepted (Cronvoy rejects non-DIRECT proxies); the
+override returns null where the base guarantees a value (StarRocks REST catalog,
+nd4j `compress`).
 
 ## Guards added 2026-09-05 (these are what make round 2 trustworthy)
 

@@ -1,0 +1,171 @@
+row 185   StarRocks/starrocks#70342
+============================================================================
+CHAIN in com.starrocks.sql.analyzer.QueryAnalyzer.Visitor.resolveTableRef(Relation,Scope,Set<TableName>)   kind=instanceof subject='relation' branches=4 closed_set=False
+cases: JoinRelation;PivotRelation;FileTableFunctionRelation;TableRelation
+QUESTION: is the set of variants OPEN (a new one is expected, and
+          would force editing this chain) or CLOSED by nature?
+SHOWING THE WHOLE ENCLOSING METHOD -- a branch count alone cannot answer this.
+>>> marks the dispatch chain itself.
+
+      495          private Relation resolveTableRef(Relation relation, Scope scope, Set<TableName> aliasSet) {
+>>>   496              if (relation instanceof JoinRelation) {
+      497                  JoinRelation join = (JoinRelation) relation;
+      498                  join.setLeft(resolveTableRef(join.getLeft(), scope, aliasSet));
+      499                  Relation rightRelation = resolveTableRef(join.getRight(), scope, aliasSet);
+      500                  join.setRight(rightRelation);
+      501                  if (rightRelation instanceof TableFunctionRelation) {
+      502                      join.setLateral(true);
+      503                  }
+      504                  return join;
+      505              } else if (relation instanceof PivotRelation) {
+      506                  PivotRelation pivotRelation = (PivotRelation) relation;
+      507                  pivotRelation.setQuery(resolveTableRef(pivotRelation.getQuery(), scope, aliasSet));
+      508                  return pivotRelation;
+      509              } else if (relation instanceof FileTableFunctionRelation) {
+      510                  FileTableFunctionRelation tableFunctionRelation = (FileTableFunctionRelation) relation;
+      511                  // If files() was pre-resolved in an unlock phase, reuse it to avoid RPC under lock
+      512                  if (tableFunctionRelation.getTable() instanceof TableFunctionTable) {
+      513                      TableFunctionTable preResolved = (TableFunctionTable) tableFunctionRelation.getTable();
+      514                      Consumer<TableFunctionTable> pushDown = tableFunctionRelation.getPushDownSchemaFunc();
+      515                      if (pushDown != null && !preResolved.isListFilesOnly()) {
+      516                          pushDown.accept(preResolved);
+      517                          tableFunctionRelation.setTable(preResolved);
+      518                      }
+      519                      if (preResolved.isListFilesOnly()) {
+      520                          return convertFileTableFunctionRelation(preResolved);
+      521                      }
+      522                      return relation;
+      523                  }
+      524  
+      525                  Table table = resolveTableFunctionTable(
+      526                          tableFunctionRelation.getProperties(), tableFunctionRelation.getPushDownSchemaFunc());
+      527                  TableFunctionTable tableFunctionTable = (TableFunctionTable) table;
+      528                  if (tableFunctionTable.isListFilesOnly()) {
+      529                      return convertFileTableFunctionRelation(tableFunctionTable);
+      530                  } else {
+      531                      tableFunctionRelation.setTable(table);
+      532                      return relation;
+      533                  }
+      534              } else if (relation instanceof TableRelation) {
+      535                  TableRelation tableRelation = (TableRelation) relation;
+      536                  TableName tableName = tableRelation.getName();
+      537                  if (tableName != null && Strings.isNullOrEmpty(tableName.getDb())) {
+      538                      Optional<CTERelation> withQuery = scope.getCteQueries(tableName.getTbl());
+      539                      if (withQuery.isPresent()) {
+      540                          CTERelation withRelation = withQuery.get();
+      541                          withRelation.addTableRef();
+      542                          RelationFields withRelationFields = withQuery.get().getRelationFields();
+      543                          ImmutableList.Builder<Field> outputFields = ImmutableList.builder();
+      544  
+      545                          for (int fieldIdx = 0; fieldIdx < withRelationFields.getAllFields().size(); ++fieldIdx) {
+      546                              Field originField = withRelationFields.getAllFields().get(fieldIdx);
+      547                              outputFields.add(new Field(
+      548                                      originField.getName(), originField.getType(), tableRelation.getResolveTableName(),
+      549                                      originField.getOriginExpression()));
+      550                          }
+      551  
+      552                          // The CTERelation stored in the Scope is not used directly here, but a new Relation is copied.
+      553                          // It is because we hope to obtain a new RelationId to distinguish multiple cte reuses.
+      554                          // Because the reused cte should not be considered the same relation.
+      555                          // eg: with w as (select * from t0) select v1,sum(v2) from w group by v1 " +
+      556                          //                "having v1 in (select v3 from w where v2 = 2)
+      557                          // cte used in outer query and sub-query can't use same relation-id and field
+      558                          CTERelation newCteRelation = new CTERelation(withRelation.getCteMouldId(), tableName.getTbl(),
+      559                                  withRelation.getColumnOutputNames(),
+      560                                  withRelation.getCteQueryStatement());
+      561                          newCteRelation.setAlias(tableRelation.getAlias());
+      562                          newCteRelation.setResolvedInFromClause(true);
+      563                          newCteRelation.setScope(
+      564                                  new Scope(RelationId.of(newCteRelation), new RelationFields(outputFields.build())));
+      565                          return newCteRelation;
+      566                      }
+      567                  }
+      568  
+      569                  TableName resolveTableName = relation.getResolveTableName();
+      570                  resolveTableName.normalization(session);
+      571                  if (aliasSet.contains(resolveTableName)) {
+      572                      ErrorReport.reportSemanticException(ErrorCode.ERR_NONUNIQ_TABLE,
+      573                              relation.getResolveTableName().getTbl());
+      574                  } else {
+      575                      aliasSet.add(new TableName(resolveTableName.getCatalog(),
+      576                              resolveTableName.getDb(),
+      577                              resolveTableName.getTbl()));
+      578                  }
+      579  
+      580                  Table table = resolveTable(tableRelation);
+      581                  Relation r;
+      582                  if (table instanceof View) {
+      583                      View view = (View) table;
+      584                      QueryStatement queryStatement = view.getQueryStatement();
+      585                      ViewRelation viewRelation = new ViewRelation(tableName, view, queryStatement);
+      586  
+      587                      // If tableRelation is an object that needs to be rewritten by policy,
+      588                      // then when it is changed to ViewRelation, both the view and the table
+      589                      // after the view is parsed also need to inherit this rewriting logic.
+      590                      if (tableRelation.isNeedRewrittenByPolicy()) {
+      591                          viewRelation.setNeedRewrittenByPolicy(true);
+      592  
+      593                          new AstTraverser<Void, Void>() {
+      594                              @Override
+      595                              public Void visitRelation(Relation relation, Void context) {
+      596                                  relation.setNeedRewrittenByPolicy(true);
+      597                                  return null;
+      598                              }
+      599                          }.visit(queryStatement);
+      600                      }
+      601                      viewRelation.setAlias(tableRelation.getAlias());
+      602  
+      603                      r = viewRelation;
+      604                  } else if (table instanceof ConnectorView) {
+      605                      ConnectorView connectorView = (ConnectorView) table;
+      606                      QueryStatement queryStatement = connectorView.getQueryStatement();
+      607                      View view = new View(connectorView.getId(), connectorView.getName(), connectorView.getFullSchema(),
+      608                              connectorView.getType());
+      609                      view.setInlineViewDefWithSqlMode(connectorView.getInlineViewDef(), 0);
+      610                      ViewRelation viewRelation = new ViewRelation(tableName, view, queryStatement);
+      611                      viewRelation.setAlias(tableRelation.getAlias());
+      612  
+      613                      r = viewRelation;
+      614                  } else {
+      615                      if (tableRelation.getQueryPeriodString() != null && !table.isTemporal()) {
+      616                          throw unsupportedException("Unsupported table type for temporal clauses, table type: " +
+      617                                  table.getType());
+      618                      }
+      619  
+      620                      if (table.isSupported()) {
+      621                          tableRelation.setTable(table);
+      622                          r = tableRelation;
+      623                      } else {
+      624                          throw unsupportedException("Unsupported scan table type: " + table.getType());
+      625                      }
+      626                  }
+      627  
+      628                  if (!r.isNeedRewrittenByPolicy()) {
+      629                      return r;
+      630                  }
+      631                  assert tableName != null;
+      632                  QueryStatement policyRewriteQuery = SecurityPolicyRewriteRule.buildView(session, r, tableName);
+      633                  if (policyRewriteQuery == null) {
+      634                      return r;
+      635                  } else {
+      636                      r.setNeedRewrittenByPolicy(false);
+      637                      SubqueryRelation subqueryRelation = new SubqueryRelation(policyRewriteQuery);
+      638  
+      639                      // If an alias exists, rewrite the alias into subquery to ensure
+      640                      // that the original expression can be resolved correctly.
+      641                      // `select v1 from tbl t` is rewritten as `select t.v1 from (select tbl.v1 from tbl) t`
+      642                      subqueryRelation.setAlias(resolveTableName);
+      643                      return subqueryRelation;
+      644                  }
+      645              } else {
+      646                  if (relation.getResolveTableName() != null) {
+      647                      if (aliasSet.contains(relation.getResolveTableName())) {
+      648                          ErrorReport.reportSemanticException(ErrorCode.ERR_NONUNIQ_TABLE,
+      649                                  relation.getResolveTableName().getTbl());
+      650                      } else {
+      651                          aliasSet.add(relation.getResolveTableName());
+      652                      }
+      653                  }
+      654                  return relation;
+      655              }
+      656          }

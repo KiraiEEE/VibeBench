@@ -20,7 +20,7 @@ for p in dip lsp ocp isp srp; do
   echo "EXTRACT $p  ($(date '+%H:%M:%S'))"
   echo "=============================================="
   python vibebench/labels/extract_java_label_batches.py \
-      --principle "$p" --file "java_${p}_labeling_sample.csv" \
+      --principle "$p" --file "java_${p}_labeling_sample.csv" --only-missing \
       > "$S/ex_${p}_r2.log" 2>&1
   rc=$?
   n=$(ls "vibebench/labels/java_${p}_batches" 2>/dev/null | wc -l)

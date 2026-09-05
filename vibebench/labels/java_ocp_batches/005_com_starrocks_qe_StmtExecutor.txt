@@ -1,0 +1,382 @@
+row 5   StarRocks/starrocks#68506
+============================================================================
+CHAIN in com.starrocks.qe.StmtExecutor.execute()   kind=instanceof subject='e' branches=2 closed_set=False
+cases: TimeoutException;NoAliveBackendException
+QUESTION: is the set of variants OPEN (a new one is expected, and
+          would force editing this chain) or CLOSED by nature?
+SHOWING THE WHOLE ENCLOSING METHOD -- a branch count alone cannot answer this.
+>>> marks the dispatch chain itself.
+
+      765      public void execute() throws Exception {
+      766          long beginTimeInNanoSecond = TimeUtils.getStartTime();
+      767          context.setStmtId(STMT_ID_GENERATOR.incrementAndGet());
+      768          context.setIsForward(false);
+      769          context.setIsLeaderTransferred(false);
+      770          context.setCurrentThreadId(Thread.currentThread().getId());
+      771  
+      772          SessionVariable sessionVariableBackup = context.getSessionVariable();
+      773          // set true to change session variable
+      774          boolean skipRestore = false;
+      775          // set execution id.
+      776          // For statements other than `cache select`, try to use query id as execution id when execute first time.
+      777          UUID uuid = context.getQueryId();
+      778          if (!sessionVariableBackup.isEnableCacheSelect()) {
+      779              context.setExecutionId(UUIDUtil.toTUniqueId(uuid));
+      780          }
+      781  
+      782          // if use http protocol, use httpResultSender to send result to netty channel
+      783          if (context instanceof HttpConnectContext) {
+      784              httpResultSender = new HttpResultSender((HttpConnectContext) context);
+      785          }
+      786  
+      787          final boolean shouldMarkIdleCheck = shouldMarkIdleCheck(parsedStmt);
+      788          final Long originWarehouseId = context.getCurrentWarehouseIdAllowNull();
+      789          if (shouldMarkIdleCheck && originWarehouseId != null) {
+      790              WarehouseIdleChecker.increaseRunningSQL(originWarehouseId);
+      791          }
+      792  
+      793          RecursiveCTEExecutor cteExecutor = null;
+      794          try {
+      795              context.getState().setIsQuery(context.isQueryStmt(parsedStmt));
+      796              if (parsedStmt.isExistQueryScopeHint()) {
+      797                  processQueryScopeHint();
+      798              }
+      799  
+      800              // set warehouse for auditLog
+      801              context.getAuditEventBuilder()
+      802                      .setWarehouse(context.getCurrentWarehouseName())
+      803                      .setCNGroup(context.getCurrentComputeResourceName());
+      804              LOG.debug("set warehouse {} for stmt: {}", context.getCurrentWarehouseName(), parsedStmt);
+      805              if (parsedStmt.isExplain()) {
+      806                  // reset the explain level to avoid the previous explain level affect the current query.
+      807                  context.setExplainLevel(parsedStmt.getExplainLevel());
+      808              } else {
+      809                  context.setExplainLevel(null);
+      810              }
+      811  
+      812              if (RecursiveCTEAstCheck.hasRecursiveCte(parsedStmt, context)) {
+      813                  redirectStatus = RedirectStatus.FORWARD_WITH_SYNC;
+      814                  if (isForwardToLeader()) {
+      815                      context.setIsForward(true);
+      816                      forwardToLeader();
+      817                      return;
+      818                  }
+      819                  cteExecutor = new RecursiveCTEExecutor(context);
+      820                  parsedStmt = cteExecutor.splitOuterStmt(parsedStmt);
+      821                  if (parsedStmt.isExplain()) {
+      822                      // Every time set no send flag and clean all data in buffer
+      823                      context.getMysqlChannel().reset();
+      824                      String explainString = cteExecutor.explainCTE(parsedStmt);
+      825                      handleExplainStmt(explainString);
+      826                      return;
+      827                  } else {
+      828                      cteExecutor.prepareRecursiveCTE();
+      829                  }
+      830              }
+      831  
+      832              redirectStatus = RedirectStatus.getRedirectStatus(parsedStmt);
+      833              // for explain query, we can trace even if optimizer fails and execPlan is null
+      834              // for refresh materialized view, use handleDdlStmt instead.
+      835              if (parsedStmt.isExplainTrace() && !(parsedStmt instanceof RefreshMaterializedViewStatement)) {
+      836                  if (isForwardToLeader()) {
+      837                      context.setIsForward(true);
+      838                      forwardToLeader();
+      839                      return;
+      840                  }
+      841  
+      842                  ExecPlan execPlan = null;
+      843                  try {
+      844                      execPlan = generateExecPlan();
+      845                  } catch (Exception e) {
+      846                      LOG.warn("Generate exec plan failed for explain stmt: {}",
+      847                              parsedStmt.getOrigStmt().originStmt, e);
+      848                  }
+      849                  handleExplainExecPlan(execPlan);
+      850                  return;
+      851              }
+      852  
+      853              // execPlan is the output of planner
+      854              ExecPlan execPlan = generateExecPlan();
+      855  
+      856              // no need to execute http query dump request in BE
+      857              if (context.isHTTPQueryDump) {
+      858                  return;
+      859              }
+      860  
+      861              // For follower: verify sql in BlackList before forward to leader
+      862              // For leader: if this is a proxy sql, no need to verify sql in BlackList because every fe has its own blacklist
+      863              if ((parsedStmt instanceof QueryStatement || parsedStmt instanceof InsertStmt
+      864                      || parsedStmt instanceof CreateTableAsSelectStmt)
+      865                      && Config.enable_sql_blacklist && !parsedStmt.isExplain() && !isProxy) {
+      866                  OriginStatement origStmt = parsedStmt.getOrigStmt();
+      867                  if (context.isStatisticsConnection() || context.isStatisticsJob()) {
+      868                      // For statistics connection or job, we trust it and skip sql blacklist check
+      869                      LOG.debug("skip sql blacklist check for statistics connection or job. stmt: {}",
+      870                              origStmt.originStmt);
+      871                  } else if (origStmt != null) {
+      872                      String originSql = origStmt.originStmt.trim()
+      873                              .toLowerCase().replaceAll(" +", " ");
+      874                      // If this sql is in blacklist, show message.
+      875                      GlobalStateMgr.getCurrentState().getSqlBlackList().verifying(originSql);
+      876                      if (Config.enable_sql_digest || context.getSessionVariable().isEnableSQLDigest()) {
+      877                          String digest = ConnectProcessor.computeStatementDigest(parsedStmt);
+      878                          if (!digest.isEmpty()) {
+      879                              GlobalStateMgr.getCurrentState().getSqlDigestBlackList().verifying(digest);
+      880                          }
+      881                      }
+      882                  }
+      883              }
+      884  
+      885              if (isForwardToLeader()) {
+      886                  context.setIsForward(true);
+      887                  forwardToLeader();
+      888                  return;
+      889              } else {
+      890                  LOG.debug("no need to transfer to Leader. stmt: {}", context.getStmtId());
+      891              }
+      892  
+      893              if (parsedStmt instanceof QueryStatement) {
+      894                  final boolean isStatisticsJob = AnalyzerUtils.isStatisticsJob(context, parsedStmt);
+      895                  context.setStatisticsJob(isStatisticsJob);
+      896  
+      897                  // Record planner costs in audit log
+      898                  Preconditions.checkNotNull(execPlan, "query must has a plan");
+      899  
+      900                  int retryTime = Config.max_query_retry_time;
+      901                  ExecuteExceptionHandler.RetryContext retryContext =
+      902                          new ExecuteExceptionHandler.RetryContext(0, execPlan, context, parsedStmt);
+      903                  for (int i = 0; i < retryTime; i++) {
+      904                      boolean needRetry = false;
+      905                      retryContext.setRetryTime(i);
+      906                      try {
+      907                          //reset query id for each retry
+      908                          if (i > 0) {
+      909                              uuid = UUIDUtil.genUUID();
+      910                              LOG.info("transfer QueryId: {} to {}", DebugUtil.printId(context.getQueryId()),
+      911                                      DebugUtil.printId(uuid));
+      912                              context.setExecutionId(UUIDUtil.toTUniqueId(uuid));
+      913                          }
+      914  
+      915                          handleQueryStmt(retryContext.getExecPlan());
+      916                          break;
+      917                      } catch (Exception e) {
+      918                          // For Arrow Flight SQL, FE doesn't know whether the client has already pull data from BE.
+      919                          // So FE cannot decide whether it is able to retry.
+      920                          if (i == retryTime - 1 || context.isArrowFlightSql()) {
+      921                              throw e;
+      922                          }
+      923                          ExecuteExceptionHandler.handle(e, retryContext);
+      924                          if (!context.getMysqlChannel().isSend()) {
+      925                              String originStmt;
+      926                              if (parsedStmt.getOrigStmt() != null) {
+      927                                  originStmt = parsedStmt.getOrigStmt().originStmt;
+      928                              } else {
+      929                                  originStmt = this.originStmt.originStmt;
+      930                              }
+      931                              needRetry = true;
+      932                              LOG.warn("retry {} times. stmt: {}", (i + 1), originStmt);
+      933                          } else {
+      934                              throw e;
+      935                          }
+      936                      } finally {
+      937                          boolean isAsync = false;
+      938                          try {
+      939                              if (needRetry) {
+      940                                  // If the runtime profile is enabled, then we need to clean up the profile record related
+      941                                  // to this failed execution.
+      942                                  String queryId = DebugUtil.printId(context.getExecutionId());
+      943                                  ProfileManager.getInstance().removeProfile(queryId);
+      944                                  // reset compute resource
+      945                                  context.ensureCurrentComputeResourceAvailable();
+      946                              } else {
+      947                                  // Release all resources after the query finish as soon as possible, as query profile is
+      948                                  // asynchronous which can be delayed a long time.
+      949                                  if (coord != null) {
+      950                                      coord.onReleaseSlots();
+      951                                  }
+      952  
+      953                                  if (context.isProfileEnabled()) {
+      954                                      isAsync = tryProcessProfileAsync(execPlan, i);
+      955                                      if (parsedStmt.isExplainAnalyze()) {
+      956                                          if (coord != null && coord.isShortCircuit()) {
+      957                                              throw new StarRocksException(
+      958                                                      "short circuit point query doesn't suppot explain analyze stmt, " +
+      959                                                              "you can set it off by using  set enable_short_circuit=false");
+      960                                          }
+      961                                          handleExplainStmt(ExplainAnalyzer.analyze(
+      962                                                  ProfilingExecPlan.buildFrom(execPlan), profile, null,
+      963                                                  context.getSessionVariable().getColorExplainOutput()));
+      964                                      }
+      965                                  }
+      966                              }
+      967  
+      968                              if (context.getState().isError()) {
+      969                                  RuntimeProfile plannerProfile = new RuntimeProfile("Planner");
+      970                                  Tracers.toRuntimeProfile(plannerProfile);
+      971                                  LOG.warn("Query {} failed. Planner profile : {}",
+      972                                          context.getQueryId().toString(), plannerProfile);
+      973                              }
+      974                          } finally {
+      975                              if (isAsync) {
+      976                                  QeProcessorImpl.INSTANCE.monitorQuery(context.getExecutionId(),
+      977                                          System.currentTimeMillis() +
+      978                                                  context.getSessionVariable().getProfileTimeout() * 1000L);
+      979                              } else {
+      980                                  QeProcessorImpl.INSTANCE.unregisterQuery(context.getExecutionId());
+      981                              }
+      982                          }
+      983                      }
+      984                  }
+      985              } else if (parsedStmt instanceof SetStmt) {
+      986                  // set statement will ignore hint.
+      987                  handleSetStmt();
+      988                  skipRestore = context.getState().getStateType().equals(MysqlStateType.OK);
+      989              } else if (parsedStmt instanceof RefreshConnectionsStmt) {
+      990                  handleRefreshConnectionsStmt();
+      991              } else if (parsedStmt instanceof UseDbStmt) {
+      992                  handleUseDbStmt();
+      993              } else if (parsedStmt instanceof SetWarehouseStmt) {
+      994                  handleSetWarehouseStmt();
+      995                  skipRestore = context.getState().getStateType().equals(MysqlStateType.OK);
+      996              } else if (parsedStmt instanceof UseCatalogStmt) {
+      997                  handleUseCatalogStmt();
+      998              } else if (parsedStmt instanceof SetCatalogStmt) {
+      999                  handleSetCatalogStmt();
+     1000              } else if (parsedStmt instanceof CreateTableAsSelectStmt) {
+     1001                  handleCreateTableAsSelectStmt(beginTimeInNanoSecond);
+     1002              } else if (parsedStmt instanceof DmlStmt) {
+     1003                  handleDMLStmtWithProfile(execPlan, (DmlStmt) parsedStmt);
+     1004              } else if (parsedStmt instanceof DdlStmt) {
+     1005                  handleDdlStmt();
+     1006              } else if (parsedStmt instanceof ShowStmt) {
+     1007                  handleShow();
+     1008              } else if (parsedStmt instanceof KillStmt) {
+     1009                  handleKill();
+     1010              } else if (parsedStmt instanceof ExportStmt) {
+     1011                  handleExportStmt(context.getQueryId());
+     1012              } else if (parsedStmt instanceof UnsupportedStmt) {
+     1013                  handleUnsupportedStmt();
+     1014              } else if (parsedStmt instanceof AnalyzeStmt) {
+     1015                  handleAnalyzeStmt();
+     1016              } else if (parsedStmt instanceof AnalyzeProfileStmt) {
+     1017                  handleAnalyzeProfileStmt();
+     1018              } else if (parsedStmt instanceof DropHistogramStmt) {
+     1019                  handleDropHistogramStmt();
+     1020              } else if (parsedStmt instanceof DropStatsStmt) {
+     1021                  handleDropStatsStmt();
+     1022              } else if (parsedStmt instanceof KillAnalyzeStmt) {
+     1023                  handleKillAnalyzeStmt();
+     1024              } else if (parsedStmt instanceof AddSqlBlackListStmt) {
+     1025                  handleAddSqlBlackListStmt();
+     1026              } else if (parsedStmt instanceof DelSqlBlackListStmt) {
+     1027                  handleDelSqlBlackListStmt();
+     1028              } else if (parsedStmt instanceof AddSqlDigestBlackListStmt) {
+     1029                  handleAddSqlDigestBlackListStmt();
+     1030              } else if (parsedStmt instanceof DelSqlDigestBlackListStmt) {
+     1031                  handleDelSqlDigestBlackListStmt();
+     1032              } else if (parsedStmt instanceof ExecuteAsStmt) {
+     1033                  handleExecAsStmt();
+     1034              } else if (parsedStmt instanceof ExecuteScriptStmt) {
+     1035                  handleExecScriptStmt();
+     1036              } else if (parsedStmt instanceof SetRoleStmt) {
+     1037                  handleSetRole();
+     1038              } else if (parsedStmt instanceof SetDefaultRoleStmt) {
+     1039                  handleSetDefaultRole();
+     1040              } else if (parsedStmt instanceof UpdateFailPointStatusStatement) {
+     1041                  handleUpdateFailPointStatusStmt();
+     1042              } else if (parsedStmt instanceof PrepareStmt) {
+     1043                  handlePrepareStmt(execPlan);
+     1044              } else if (parsedStmt instanceof DeallocateStmt) {
+     1045                  handleDeallocateStmt();
+     1046              } else if (parsedStmt instanceof AddBackendBlackListStmt) {
+     1047                  handleAddBackendBlackListStmt();
+     1048              } else if (parsedStmt instanceof DelBackendBlackListStmt) {
+     1049                  handleDelBackendBlackListStmt();
+     1050              } else if (parsedStmt instanceof AddComputeNodeBlackListStmt) {
+     1051                  handleAddComputeNodeBlackListStmt();
+     1052              } else if (parsedStmt instanceof DelComputeNodeBlackListStmt) {
+     1053                  handleDelComputeNodeBlackListStmt();
+     1054              } else if (parsedStmt instanceof PlanAdvisorStmt) {
+     1055                  handlePlanAdvisorStmt();
+     1056              } else if (parsedStmt instanceof TranslateStmt) {
+     1057                  handleTranslateStmt();
+     1058              } else if (parsedStmt instanceof BeginStmt) {
+     1059                  TransactionStmtExecutor.beginStmt(context, (BeginStmt) parsedStmt);
+     1060              } else if (parsedStmt instanceof CommitStmt) {
+     1061                  TransactionStmtExecutor.commitStmt(context, (CommitStmt) parsedStmt);
+     1062              } else if (parsedStmt instanceof RollbackStmt) {
+     1063                  TransactionStmtExecutor.rollbackStmt(context, (RollbackStmt) parsedStmt);
+     1064              } else {
+     1065                  context.getState().setError("Do not support this query.");
+     1066              }
+     1067          } catch (IOException e) {
+     1068              LOG.warn("execute IOException ", e);
+     1069              // the exception happens when interact with client
+     1070              // this exception shows the connection is gone
+     1071              context.getState().setError(e.getMessage());
+     1072          } catch (LargeInPredicateException e) {
+     1073              // Re-throw LargeInPredicateException to trigger a full retry from parser stage
+     1074              // The query will be re-parsed and re-executed with enable_large_in_predicate=false
+     1075              // to use the traditional expression-based approach instead of raw constant optimization
+     1076              String sql = originStmt != null ? originStmt.originStmt : "";
+     1077              String truncatedSql = sql.length() > 200 ? sql.substring(0, 200) + "..." : sql;
+     1078              LOG.error("LargeInPredicate optimization failed, sql: {}, error: {}. Will retry with" +
+     1079                      " enable_large_in_predicate=false.", truncatedSql, e.getMessage());
+     1080              throw e;
+     1081          } catch (StarRocksException e) {
+     1082              String sql = originStmt != null ? originStmt.originStmt : "";
+     1083              // analysis exception only print message, not print the stack
+     1084              LOG.info("execute Exception, sql: {}, error: {}", SqlCredentialRedactor.redact(sql), e.getMessage());
+     1085              context.getState().setError(e.getMessage());
+>>>  1086              if (parsedStmt instanceof KillStmt) {
+     1087                  // ignore kill stmt execute err(not monitor it)
+     1088                  context.getState().setErrType(QueryState.ErrType.IGNORE_ERR);
+     1089              } else if (e instanceof TimeoutException) {
+     1090                  context.getState().setErrType(QueryState.ErrType.EXEC_TIME_OUT);
+     1091              } else if (e instanceof NoAliveBackendException) {
+     1092                  context.getState().setErrType(QueryState.ErrType.INTERNAL_ERR);
+     1093              } else {
+     1094                  // TODO: some StarRocksException doesn't belong to analysis error
+     1095                  // we should set such error type to internal error
+     1096                  context.getState().setErrType(QueryState.ErrType.ANALYSIS_ERR);
+     1097              }
+     1098          } catch (Throwable e) {
+     1099              String sql = originStmt != null ? originStmt.originStmt : "";
+     1100              LOG.warn("execute Exception, sql: {}, " + SqlCredentialRedactor.redact(sql), e);
+     1101              context.getState().setError(e.getMessage());
+     1102              context.getState().setErrType(QueryState.ErrType.INTERNAL_ERR);
+     1103          } finally {
+     1104              GlobalStateMgr.getCurrentState().getMetadataMgr().removeQueryMetadata();
+     1105              if (context.getState().isError() && coord != null) {
+     1106                  coord.cancel(PPlanFragmentCancelReason.INTERNAL_ERROR, context.getState().getErrorMessage());
+     1107              }
+     1108  
+     1109              if (parsedStmt != null && parsedStmt.isExistQueryScopeHint()) {
+     1110                  clearQueryScopeHintContext();
+     1111              }
+     1112  
+     1113              // restore session variable in connect context
+     1114              if (!skipRestore) {
+     1115                  context.setSessionVariable(sessionVariableBackup);
+     1116              }
+     1117  
+     1118              if (shouldMarkIdleCheck && originWarehouseId != null) {
+     1119                  WarehouseIdleChecker.decreaseRunningSQL(originWarehouseId,
+     1120                          originStmt == null ? "" : originStmt.originStmt);
+     1121              }
+     1122  
+     1123              recordExecStatsIntoContext();
+     1124  
+     1125              if (GracefulExitFlag.isGracefulExit() && context.isLeaderTransferred() && !isInternalStmt) {
+     1126                  LOG.info("leader is transferred during executing, forward to new leader");
+     1127                  isForwardToLeaderOpt = Optional.of(true);
+     1128                  forwardToLeader();
+     1129              }
+     1130  
+     1131              // process post-action after query is finished
+     1132              context.onQueryFinished();
+     1133              if (cteExecutor != null) {
+     1134                  cteExecutor.finalizeRecursiveCTE();
+     1135              }
+     1136          }
+     1137      }

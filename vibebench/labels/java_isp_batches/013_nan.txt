@@ -1,0 +1,665 @@
+row 13   debezium/debezium#7130
+============================================================================
+CONTRACT io.debezium.connector.oracle.logminer.processor.CacheProvider   members=5.0 implementers=6.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       13  public interface CacheProvider<T extends Transaction> extends AutoCloseable {
+       14  
+       15      /**
+       16       * The name for the transaction cache
+       17       */
+       18      String TRANSACTIONS_CACHE_NAME = "transactions";
+       19  
+       20      /**
+       21       * The name for the recently processed transactions cache
+       22       */
+       23      String PROCESSED_TRANSACTIONS_CACHE_NAME = "processed-transactions";
+       24  
+       25      /**
+       26       * The name for the schema changes cache
+       27       */
+       28      String SCHEMA_CHANGES_CACHE_NAME = "schema-changes";
+       29  
+       30      /**
+       31       * The name for the LogMiner events cache
+       32       */
+       33      String EVENTS_CACHE_NAME = "events";
+       34  
+       35      /**
+       36       * Displays cache statistics
+       37       */
+       38      void displayCacheStatistics();
+       39  
+       40      /**
+       41       * Get the transaction cache
+       42       *
+       43       * <ul>
+       44       *     <li>Key - The unique transaction id</li>
+       45       *     <li>Value - The transaction instance</li>
+       46       * </ul>
+       47       *
+       48       * @return the transaction cache, never {@code null}
+       49       */
+       50      LogMinerCache<String, T> getTransactionCache();
+       51  
+       52      /**
+       53       * Get the LogMiner events cache
+       54       *
+       55       * <ul>
+       56       *     <li>Key - The event id, in the format of {@code transactionId-eventSequence}</li>
+       57       *     <li>Value - The raw LogMinerEvent object instance</li>
+       58       * </ul>
+       59       *
+       60       * @return the evnts cache, never {@code null}
+       61       */
+       62      LogMinerCache<String, LogMinerEvent> getEventCache();
+       63  
+       64      /**
+       65       * Get the Schema Changes cache
+       66       *
+       67       * <ul>
+       68       *     <li>Key - The system change number of the schema change</li>
+       69       *     <li>Value - The table the schema change is related to</li>
+       70       * </ul>
+       71       *
+       72       * @return the schema changes cache, never {@code null}
+       73       */
+       74      LogMinerCache<String, String> getSchemaChangesCache();
+       75  
+       76      /**
+       77       * Get the processed transactions cache
+       78       *
+       79       * <ul>
+       80       *     <li>Key - The unique transaction id</li>
+       81       *     <li>Value - The transaction's commit or rollback system change number</li>
+       82       * </ul>
+       83       *
+       84       * @return the processed transactions cache, never {@code null}
+       85       */
+       86      LogMinerCache<String, String> getProcessedTransactionsCache();
+       87  }
+
+---------- IMPLEMENTER io.debezium.connector.oracle.logminer.processor.AbstractLogMinerEventProcessor  stubs=0/1 ----------
+       86  public abstract class AbstractLogMinerEventProcessor<T extends Transaction> implements LogMinerEventProcessor, CacheProvider<T> {
+       87  
+       88      private static final Logger LOGGER = LoggerFactory.getLogger(AbstractLogMinerEventProcessor.class);
+       89      private static final Logger ABANDONED_DETAILS_LOGGER = LoggerFactory.getLogger(AbstractLogMinerEventProcessor.class.getName() + ".AbandonedDetails");
+       90      private static final String NO_SEQUENCE_TRX_ID_SUFFIX = "ffffffff";
+       91      private static final String XML_WRITE_PREAMBLE = "XML_REDO := ";
+       92      private static final String XML_WRITE_PREAMBLE_NULL = XML_WRITE_PREAMBLE + "NULL";
+       93  
+       94      private final OracleConnection jdbcConnection;
+       95      private final ChangeEventSourceContext context;
+       96      private final OracleConnectorConfig connectorConfig;
+       97      private final OracleDatabaseSchema schema;
+       98      private final OraclePartition partition;
+       99      private final OracleOffsetContext offsetContext;
+      100      private final EventDispatcher<OraclePartition, TableId> dispatcher;
+      101      private final LogMinerStreamingChangeEventSourceMetrics metrics;
+      102      private final LogMinerDmlParser dmlParser;
+      103      private final LogMinerColumnResolverDmlParser reconstructColumnDmlParser;
+      104      private final SelectLobParser selectLobParser;
+      105      private final ExtendedStringParser extendedStringParser;
+      106      private final XmlBeginParser xmlBeginParser;
+      107      private final Tables.TableFilter tableFilter;
+      108  
+      109      protected final Counters counters;
+      110      protected final String sqlQuery;
+      111  
+      112      private Scn currentOffsetScn = Scn.NULL;
+      113      private Map<Integer, Scn> currentOffsetCommitScns = new HashMap<>();
+      114      private Instant lastProcessedScnChangeTime = null;
+      115      private Scn lastProcessedScn = Scn.NULL;
+      116      private boolean sequenceUnavailable = false;
+      117  
+      118      private final Set<String> abandonedTransactionsCache = new HashSet<>();
+      119      private final InMemoryPendingTransactionsCache inMemoryPendingTransactionsCache = new InMemoryPendingTransactionsCache();
+      120  
+      121      protected AbstractLogMinerEventProcessor(ChangeEventSourceContext context,
+      122                                               OracleConnectorConfig connectorConfig,
+      123                                               OracleDatabaseSchema schema,
+      124                                               OraclePartition partition,
+      125                                               OracleOffsetContext offsetContext,
+      126                                               EventDispatcher<OraclePartition, TableId> dispatcher,
+      127                                               LogMinerStreamingChangeEventSourceMetrics metrics,
+      128                                               OracleConnection jdbcConnection) {
+      129          this.context = context;
+      130          this.connectorConfig = connectorConfig;
+      131          this.schema = schema;
+      132          this.partition = partition;
+      133          this.offsetContext = offsetContext;
+      134          this.dispatcher = dispatcher;
+      135          this.metrics = metrics;
+      136          this.tableFilter = connectorConfig.getTableFilters().dataCollectionFilter();
+      137          this.counters = new Counters();
+      138          this.dmlParser = new LogMinerDmlParser(connectorConfig);
+      139          this.reconstructColumnDmlParser = new LogMinerColumnResolverDmlParser(connectorConfig);
+      140          this.selectLobParser = new SelectLobParser();
+      141          this.extendedStringParser = new ExtendedStringParser();
+      142          this.xmlBeginParser = new XmlBeginParser();
+      143          this.sqlQuery = LogMinerQueryBuilder.build(connectorConfig);
+      144          this.jdbcConnection = jdbcConnection;
+      145      }
+      146  
+      147      protected void reCreateInMemoryCache() {
+      148          getTransactionCache().keys(trStream -> {
+      149              trStream.forEach(tr -> {
+      150                  getEventCache().keys(eventStream -> {
+      151                      int count = (int) eventStream.filter(e -> e.startsWith(tr + "-")).count();
+      152                      LOGGER.info("Re-creating in memory cache of event count for transaction '" + tr + "'. No of events found: " + count);
+      153                      inMemoryPendingTransactionsCache.initKey(tr, count);
+      154                  });
+      155              });
+      156          });
+      157      }
+      158  
+      159      protected Set<String> getAbandonedTransactionsCache() {
+      160          return abandonedTransactionsCache;
+      161      }
+      162  
+      163      protected OracleConnectorConfig getConfig() {
+      164          return connectorConfig;
+      165      }
+      166  
+      167      protected OracleDatabaseSchema getSchema() {
+      168          return schema;
+      169      }
+      170  
+      171      /**
+      172       * Check whether a transaction has been recently processed through either a commit or rollback.
+      173       *
+      174       * @param transactionId the unique transaction id
+      175       * @return true if the transaction has been recently processed, false otherwise
+      176       */
+      177      protected boolean isRecentlyProcessed(String transactionId) {
+      178          return getProcessedTransactionsCache().containsKey(transactionId);
+      179      }
+      180  
+      181      /**
+      182       * Checks whether the LogMinerEvent row for a schema change can be emitted.
+      183       *
+      184       * @param row the result set row
+      185       * @return true if the schema change has been seen, false otherwise.
+      186       */
+      187      protected boolean hasSchemaChangeBeenSeen(LogMinerEventRow row) {
+      188          return getSchemaChangesCache().containsKey(row.getScn().toString());
+      189      }
+      190  
+      191      /**
+      192       * Return the last processed system change number handled by the processor.
+      193       *
+      194       * @return the last processed system change number, never {@code null}.
+      195       */
+      196      protected Scn getLastProcessedScn() {
+      197          return lastProcessedScn;
+      198      }
+      199  
+      200      /**
+      201       * Return the last processed system change number's change time.
+      202       *
+      203       * @return the last processed system change number change time, may be {@code null}
+      204       */
+      205      protected Instant getLastProcessedScnChangeTime() {
+      206          return lastProcessedScnChangeTime;
+      207      }
+      208  
+      209      /**
+      210       * Creates a new transaction based on the supplied {@code START} event.
+      211       *
+      212       * @param row the event row, must not be {@code null}
+      213       * @return the implementation-specific {@link Transaction} instance
+      214       */
+      215      protected abstract T createTransaction(LogMinerEventRow row);
+      216  
+      217      /**
+      218       * Removes a specific transaction event by database row identifier.
+      219       *
+      220       * @param row the event row that contains the row identifier, must not be {@code null}
+      221       */
+      222      protected void removeEventWithRowId(LogMinerEventRow row) {
+      223          final T transaction = getTransactionCache().get(row.getTransactionId());
+      224          if (transaction != null) {
+      225              if (removeTransactionEventWithRowId(transaction, row)) {
+      226                  return;
+      227              }
+      228              Loggings.logWarningAndTraceRecord(LOGGER, row,
+      229                      "Cannot undo change on table '{}' since event with row-id {} was not found.",
+      230                      row.getTableId(), row.getRowId());
+      231          }
+      232          else if (isTransactionIdWithNoSequence(row.getTransactionId())) {
+      233              // This means that Oracle LogMiner found an event that should be undone but its corresponding
+      234              // undo entry was read in a prior mining session and the transaction's sequence could not be
+      235              // resolved.
+      236              final String prefix = getTransactionIdPrefix(row.getTransactionId());
+      237              LOGGER.debug("Undo change refers to a transaction that has no explicit sequence, '{}'", row.getTransactionId());
+      238              LOGGER.debug("Checking all transactions with prefix '{}'", prefix);
+      239  
+      240              if (getTransactionCache().streamAndReturn(
+      241                      stream -> stream.filter(entry -> entry.getKey().startsWith(prefix))
+      242                              .map(LogMinerCache.Entry::getValue)
+      243                              .anyMatch(t -> removeTransactionEventWithRowId(t, row)))) {
+      244                  return;
+      245              }
+
+---------- IMPLEMENTER io.debezium.connector.oracle.logminer.processor.ehcache.EhcacheLogMinerEventProcessor  stubs=0/4 ----------
+       53  public class EhcacheLogMinerEventProcessor extends AbstractLogMinerEventProcessor<EhcacheTransaction> {
+       54  
+       55      private static final Logger LOGGER = LoggerFactory.getLogger(EhcacheLogMinerEventProcessor.class);
+       56  
+       57      private final CacheManager cacheManager;
+       58      private final LogMinerCache<String, EhcacheTransaction> transactionsCache;
+       59      private final LogMinerCache<String, LogMinerEvent> eventCache;
+       60      private final LogMinerCache<String, String> processedTransactionsCache;
+       61      private final LogMinerCache<String, String> schemaChangesCache;
+       62  
+       63      @SuppressWarnings({ "rawtypes", "unchecked" })
+       64      public EhcacheLogMinerEventProcessor(ChangeEventSourceContext context,
+       65                                           OracleConnectorConfig connectorConfig,
+       66                                           OracleConnection jdbcConnection,
+       67                                           EventDispatcher<OraclePartition, TableId> dispatcher,
+       68                                           OraclePartition partition,
+       69                                           OracleOffsetContext offsetContext,
+       70                                           OracleDatabaseSchema schema,
+       71                                           LogMinerStreamingChangeEventSourceMetrics metrics) {
+       72          super(context, connectorConfig, schema, partition, offsetContext, dispatcher, metrics, jdbcConnection);
+       73          LOGGER.info("Using Ehcache buffer");
+       74  
+       75          this.cacheManager = createCacheManager(connectorConfig);
+       76          this.transactionsCache = new EhcacheLogMinerCache(cacheManager.getCache(TRANSACTIONS_CACHE_NAME, String.class, EhcacheTransaction.class));
+       77          this.processedTransactionsCache = new EhcacheLogMinerCache(cacheManager.getCache(PROCESSED_TRANSACTIONS_CACHE_NAME, String.class, String.class));
+       78          this.schemaChangesCache = new EhcacheLogMinerCache(cacheManager.getCache(SCHEMA_CHANGES_CACHE_NAME, String.class, String.class));
+       79          this.eventCache = new EhcacheLogMinerCache(cacheManager.getCache(EVENTS_CACHE_NAME, String.class, LogMinerEvent.class));
+       80      }
+       81  
+       82      @Override
+       83      protected EhcacheTransaction createTransaction(LogMinerEventRow row) {
+       84          return new EhcacheTransaction(row.getTransactionId(), row.getScn(), row.getChangeTime(), row.getUserName(), row.getThread());
+       85      }
+       86  
+       87      @Override
+       88      public LogMinerCache<String, EhcacheTransaction> getTransactionCache() {
+       89          return transactionsCache;
+       90      }
+       91  
+       92      @Override
+       93      public LogMinerCache<String, LogMinerEvent> getEventCache() {
+       94          return eventCache;
+       95      }
+       96  
+       97      @Override
+       98      public LogMinerCache<String, String> getSchemaChangesCache() {
+       99          return schemaChangesCache;
+      100      }
+      101  
+      102      @Override
+      103      public LogMinerCache<String, String> getProcessedTransactionsCache() {
+      104          return processedTransactionsCache;
+      105      }
+      106  
+      107      @Override
+      108      public void close() throws Exception {
+      109          if (cacheManager != null) {
+      110              cacheManager.close();
+      111          }
+      112      }
+      113  
+      114      private CacheManager createCacheManager(OracleConnectorConfig connectorConfig) {
+      115          try {
+      116              final Configuration ehcacheConfig = connectorConfig.getLogMiningEhcacheConfiguration();
+      117  
+      118              // Create the full XML configuration based on configuration template
+      119              final DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+      120  
+      121              // Required for propagating namespace info
+      122              factory.setNamespaceAware(true);
+      123  
+      124              final DocumentBuilder builder = factory.newDocumentBuilder();
+      125  
+      126              final String xmlData = getConfigurationWithSubstitutions(ehcacheConfig);
+      127              LOGGER.debug("Using Ehcache XML configuration:\n{}", xmlData);
+      128  
+      129              final Document xmlDocument = builder.parse(new InputSource(new StringReader(xmlData)));
+      130  
+      131              final CacheManager cacheManager = CacheManagerBuilder.newCacheManager(new XmlConfiguration(xmlDocument));
+      132              cacheManager.init();
+      133  
+      134              return cacheManager;
+      135          }
+      136          catch (Exception e) {
+      137              throw new DebeziumException("Failed to create Ehcache cache manager", e);
+      138          }
+      139      }
+      140  
+      141      private String getConfigurationWithSubstitutions(Configuration configuration) {
+      142          return readConfigurationTemplate()
+      143                  .replace("${log.mining.buffer.ehcache.global.config}",
+      144                          configuration.getString(LOG_MINING_BUFFER_EHCACHE_GLOBAL_CONFIG, ""))
+      145                  .replace("${log.mining.buffer.ehcache.transactions.config}",
+      146                          configuration.getString(LOG_MINING_BUFFER_EHCACHE_TRANSACTIONS_CONFIG, ""))
+      147                  .replace("${log.mining.buffer.ehcache.processedtransactions.config}",
+      148                          configuration.getString(LOG_MINING_BUFFER_EHCACHE_PROCESSED_TRANSACTIONS_CONFIG, ""))
+      149                  .replace("${log.mining.buffer.ehcache.schemachanges.config}",
+      150                          configuration.getString(LOG_MINING_BUFFER_EHCACHE_SCHEMA_CHANGES_CONFIG, ""))
+      151                  .replace("${log.mining.buffer.ehcache.events.config}",
+      152                          configuration.getString(LOG_MINING_BUFFER_EHCACHE_EVENTS_CONFIG, ""));
+      153      }
+      154  
+      155      private String readConfigurationTemplate() {
+      156          try (InputStream inputStream = getClass().getClassLoader().getResourceAsStream("ehcache/configuration-template.xml")) {
+      157              BufferedReader reader = null;
+      158              try {
+      159                  reader = new BufferedReader(new InputStreamReader(inputStream));
+      160                  return reader.lines().collect(Collectors.joining(System.lineSeparator()));
+      161              }
+      162              finally {
+      163                  if (reader != null) {
+      164                      reader.close();
+      165                  }
+      166              }
+      167          }
+      168          catch (Exception e) {
+      169              throw new DebeziumException("Failed to read Ehcache configuration template", e);
+      170          }
+      171      }
+      172  }
+
+---------- IMPLEMENTER io.debezium.connector.oracle.logminer.processor.infinispan.EmbeddedInfinispanLogMinerEventProcessor  stubs=0/4 ----------
+       51  public class EmbeddedInfinispanLogMinerEventProcessor extends AbstractInfinispanLogMinerEventProcessor {
+       52  
+       53      private static final Logger LOGGER = LoggerFactory.getLogger(EmbeddedInfinispanLogMinerEventProcessor.class);
+       54  
+       55      private final EmbeddedCacheManager cacheManager;
+       56      private final boolean dropBufferOnStop;
+       57  
+       58      private final LogMinerCache<String, InfinispanTransaction> transactionCache;
+       59      private final LogMinerCache<String, LogMinerEvent> eventCache;
+       60      private final LogMinerCache<String, String> processedTransactionsCache;
+       61      private final LogMinerCache<String, String> schemaChangesCache;
+       62  
+       63      public EmbeddedInfinispanLogMinerEventProcessor(ChangeEventSourceContext context,
+       64                                                      OracleConnectorConfig connectorConfig,
+       65                                                      OracleConnection jdbcConnection,
+       66                                                      EventDispatcher<OraclePartition, TableId> dispatcher,
+       67                                                      OraclePartition partition,
+       68                                                      OracleOffsetContext offsetContext,
+       69                                                      OracleDatabaseSchema schema,
+       70                                                      LogMinerStreamingChangeEventSourceMetrics metrics) {
+       71          super(context, connectorConfig, jdbcConnection, dispatcher, partition, offsetContext, schema, metrics);
+       72  
+       73          LOGGER.info("Using Infinispan in embedded mode.");
+       74          this.cacheManager = new DefaultCacheManager(
+       75                  parseAndGetGlobalConfiguration(connectorConfig));
+       76          this.dropBufferOnStop = connectorConfig.isLogMiningBufferDropOnStop();
+       77  
+       78          this.transactionCache = createCache(TRANSACTIONS_CACHE_NAME, connectorConfig, LOG_MINING_BUFFER_INFINISPAN_CACHE_TRANSACTIONS);
+       79          this.processedTransactionsCache = createCache(PROCESSED_TRANSACTIONS_CACHE_NAME, connectorConfig, LOG_MINING_BUFFER_INFINISPAN_CACHE_PROCESSED_TRANSACTIONS);
+       80          this.schemaChangesCache = createCache(SCHEMA_CHANGES_CACHE_NAME, connectorConfig, LOG_MINING_BUFFER_INFINISPAN_CACHE_SCHEMA_CHANGES);
+       81          this.eventCache = createCache(EVENTS_CACHE_NAME, connectorConfig, LOG_MINING_BUFFER_INFINISPAN_CACHE_EVENTS);
+       82  
+       83          reCreateInMemoryCache();
+       84          displayCacheStatistics();
+       85      }
+       86  
+       87      @Override
+       88      public void close() throws Exception {
+       89          if (dropBufferOnStop) {
+       90              LOGGER.info("Clearing infinispan caches");
+       91              transactionCache.clear();
+       92              eventCache.clear();
+       93              schemaChangesCache.clear();
+       94              processedTransactionsCache.clear();
+       95  
+       96              // this block should only be used by tests, should we wrap this in case admin rights aren't given?
+       97              cacheManager.administration().removeCache(CacheProvider.TRANSACTIONS_CACHE_NAME);
+       98              cacheManager.administration().removeCache(CacheProvider.PROCESSED_TRANSACTIONS_CACHE_NAME);
+       99              cacheManager.administration().removeCache(CacheProvider.SCHEMA_CHANGES_CACHE_NAME);
+      100              cacheManager.administration().removeCache(CacheProvider.EVENTS_CACHE_NAME);
+      101          }
+      102          LOGGER.info("Shutting down infinispan embedded caches");
+      103          cacheManager.close();
+      104      }
+      105  
+      106      @Override
+      107      public LogMinerCache<String, InfinispanTransaction> getTransactionCache() {
+      108          return transactionCache;
+      109      }
+      110  
+      111      @Override
+      112      public LogMinerCache<String, LogMinerEvent> getEventCache() {
+      113          return eventCache;
+      114      }
+      115  
+      116      @Override
+      117      public LogMinerCache<String, String> getSchemaChangesCache() {
+      118          return schemaChangesCache;
+      119      }
+      120  
+      121      @Override
+      122      public LogMinerCache<String, String> getProcessedTransactionsCache() {
+      123          return processedTransactionsCache;
+      124      }
+      125  
+      126      private <K, V> LogMinerCache<K, V> createCache(String cacheName, OracleConnectorConfig connectorConfig, Field field) {
+      127          Objects.requireNonNull(cacheName);
+      128  
+      129          final String cacheConfiguration = connectorConfig.getConfig().getString(field);
+      130          Objects.requireNonNull(cacheConfiguration);
+      131  
+      132          // define the cache, parsing the supplied XML configuration
+      133          cacheManager.defineConfiguration(cacheName, parseAndGetConfiguration(cacheName, cacheConfiguration));
+      134          return new InfinispanLogMinerCache<>(cacheManager.getCache(cacheName));
+      135      }
+      136  
+      137      private Configuration parseAndGetConfiguration(String cacheName, String configuration) {
+      138          // We should only be parsing a single cache configuration; however since we have no control over the
+      139          // contents of the provided XML, we validate there is at least 1 and only 1 valid configuration that
+      140          // is provided, and we use the configuration as is.
+      141          //
+      142          // The purpose of these checks is to allow the user to supply a cache configuration with any valid
+      143          // Infinispan name, and we automatically map that configuration to the cache names used by Debezium.
+      144          // So for example, a user could supply a cache config named "processed_transactions" and we would
+      145          // allow that being mapped to our internal cache name of "processed-transactions". Using iterators
+      146          // avoids a NullPointerException in the event the user supplies a name that doesn't match to our
+      147          // internal names exactly.
+      148          final ConfigurationBuilderHolder builderHolder = new ParserRegistry().parse(configuration);
+      149          final Map<String, ConfigurationBuilder> builders = builderHolder.getNamedConfigurationBuilders();
+      150          if (builders.size() > 1) {
+      151              throw new DebeziumException("Infinispan cache configuration for '" + cacheName +
+      152                      "' contains multiple cache configurations and should only contain one.");
+      153          }
+      154          else if (builders.isEmpty()) {
+      155              throw new DebeziumException("Infinispan cache configuration for '" + cacheName +
+      156                      "' contained no valid cache configuration. Please check your connector configuration");
+      157          }
+      158          else {
+      159              return builders.values().iterator().next().build();
+      160          }
+      161      }
+      162  
+      163      private GlobalConfiguration parseAndGetGlobalConfiguration(OracleConnectorConfig connectorConfig) {
+      164          final String globalCacheConfiguration = connectorConfig.getLogMiningInifispanGlobalConfiguration();
+      165          if (globalCacheConfiguration == null) {
+      166              // if no configuration provided, use the default
+      167              return new GlobalConfigurationBuilder().build();
+      168          }
+      169          final ConfigurationBuilderHolder builderHolder = new ParserRegistry().parse(globalCacheConfiguration);
+      170          return builderHolder.getGlobalConfigurationBuilder().build();
+      171      }
+      172  }
+
+---------- IMPLEMENTER io.debezium.connector.oracle.logminer.processor.infinispan.RemoteInfinispanLogMinerEventProcessor  stubs=0/4 ----------
+       52  public class RemoteInfinispanLogMinerEventProcessor extends AbstractInfinispanLogMinerEventProcessor {
+       53  
+       54      private static final Logger LOGGER = LoggerFactory.getLogger(RemoteInfinispanLogMinerEventProcessor.class);
+       55  
+       56      private static final String HOTROD_CLIENT_LOOKUP_PREFIX = "log.mining.buffer.infinispan.client.";
+       57      private static final String HOTROD_CLIENT_PREFIX = "infinispan.client.";
+       58  
+       59      public static final String HOTROD_SERVER_LIST = HOTROD_CLIENT_LOOKUP_PREFIX + "hotrod.server_list";
+       60  
+       61      private final RemoteCacheManager cacheManager;
+       62      private final boolean dropBufferOnStop;
+       63  
+       64      private final LogMinerCache<String, InfinispanTransaction> transactionCache;
+       65      private final LogMinerCache<String, LogMinerEvent> eventCache;
+       66      private final LogMinerCache<String, String> processedTransactionsCache;
+       67      private final LogMinerCache<String, String> schemaChangesCache;
+       68  
+       69      public RemoteInfinispanLogMinerEventProcessor(ChangeEventSourceContext context,
+       70                                                    OracleConnectorConfig connectorConfig,
+       71                                                    OracleConnection jdbcConnection,
+       72                                                    EventDispatcher<OraclePartition, TableId> dispatcher,
+       73                                                    OraclePartition partition,
+       74                                                    OracleOffsetContext offsetContext,
+       75                                                    OracleDatabaseSchema schema,
+       76                                                    LogMinerStreamingChangeEventSourceMetrics metrics) {
+       77          super(context, connectorConfig, jdbcConnection, dispatcher, partition, offsetContext, schema, metrics);
+       78  
+       79          Configuration config = new ConfigurationBuilder()
+       80                  .withProperties(getHotrodClientProperties(connectorConfig))
+       81                  // todo: why must these be defined manually rather than automated like embedded mode?
+       82                  .addContextInitializer(TransactionMarshallerImpl.class.getName())
+       83                  .addContextInitializer(LogMinerEventMarshallerImpl.class.getName())
+       84                  .build();
+       85  
+       86          LOGGER.info("Using Infinispan in Hotrod client mode");
+       87          this.cacheManager = new RemoteCacheManager(config, true);
+       88          this.dropBufferOnStop = connectorConfig.isLogMiningBufferDropOnStop();
+       89  
+       90          this.transactionCache = createCache(TRANSACTIONS_CACHE_NAME, connectorConfig, LOG_MINING_BUFFER_INFINISPAN_CACHE_TRANSACTIONS);
+       91          this.processedTransactionsCache = createCache(PROCESSED_TRANSACTIONS_CACHE_NAME, connectorConfig, LOG_MINING_BUFFER_INFINISPAN_CACHE_PROCESSED_TRANSACTIONS);
+       92          this.schemaChangesCache = createCache(SCHEMA_CHANGES_CACHE_NAME, connectorConfig, LOG_MINING_BUFFER_INFINISPAN_CACHE_SCHEMA_CHANGES);
+       93          this.eventCache = createCache(EVENTS_CACHE_NAME, connectorConfig, LOG_MINING_BUFFER_INFINISPAN_CACHE_EVENTS);
+       94  
+       95          reCreateInMemoryCache();
+       96          displayCacheStatistics();
+       97      }
+       98  
+       99      @Override
+      100      public void close() throws Exception {
+      101          if (dropBufferOnStop) {
+      102              LOGGER.info("Clearing infinispan caches");
+      103              transactionCache.clear();
+      104              eventCache.clear();
+      105              schemaChangesCache.clear();
+      106              processedTransactionsCache.clear();
+      107  
+      108              // this block should only be used by tests, should we wrap this in case admin rights aren't given?
+      109              cacheManager.administration().removeCache(CacheProvider.TRANSACTIONS_CACHE_NAME);
+      110              cacheManager.administration().removeCache(CacheProvider.PROCESSED_TRANSACTIONS_CACHE_NAME);
+      111              cacheManager.administration().removeCache(CacheProvider.SCHEMA_CHANGES_CACHE_NAME);
+      112              cacheManager.administration().removeCache(CacheProvider.EVENTS_CACHE_NAME);
+      113          }
+      114          LOGGER.info("Shutting down infinispan remote caches");
+      115          cacheManager.close();
+      116      }
+      117  
+      118      @Override
+      119      public LogMinerCache<String, InfinispanTransaction> getTransactionCache() {
+      120          return transactionCache;
+      121      }
+      122  
+      123      @Override
+      124      public LogMinerCache<String, LogMinerEvent> getEventCache() {
+      125          return eventCache;
+      126      }
+      127  
+      128      @Override
+      129      public LogMinerCache<String, String> getSchemaChangesCache() {
+      130          return schemaChangesCache;
+      131      }
+      132  
+      133      @Override
+      134      public LogMinerCache<String, String> getProcessedTransactionsCache() {
+      135          return processedTransactionsCache;
+      136      }
+      137  
+      138      private Properties getHotrodClientProperties(OracleConnectorConfig connectorConfig) {
+      139          final Map<String, String> clientSettings = connectorConfig.getConfig()
+      140                  .subset(HOTROD_CLIENT_LOOKUP_PREFIX, true)
+      141                  .asMap();
+      142  
+      143          final Properties properties = new Properties();
+      144          for (Map.Entry<String, String> entry : clientSettings.entrySet()) {
+      145              properties.put(HOTROD_CLIENT_PREFIX + entry.getKey(), entry.getValue());
+      146              if (entry.getKey().toLowerCase().endsWith(ConfigurationProperties.AUTH_USERNAME.toLowerCase())) {
+      147                  // If an authentication username is supplied, enforce authentication required
+      148                  properties.put(ConfigurationProperties.USE_AUTH, "true");
+      149              }
+      150          }
+      151          return properties;
+      152      }
+      153  
+      154      private <C, V> LogMinerCache<C, V> createCache(String cacheName, OracleConnectorConfig connectorConfig, Field field) {
+      155          Objects.requireNonNull(cacheName);
+      156  
+      157          RemoteCache<C, V> cache = cacheManager.getCache(cacheName);
+      158          if (cache != null) {
+      159              // cache is already defined, simply return it
+      160              LOGGER.info("Remote cache '{}' already defined.", cacheName);
+      161              return new InfinispanLogMinerCache<>(cache);
+      162          }
+      163  
+      164          final String cacheConfiguration = connectorConfig.getConfig().getString(field);
+      165          Objects.requireNonNull(cacheConfiguration);
+      166  
+      167          cache = cacheManager.administration().createCache(cacheName, new XMLStringConfiguration(cacheConfiguration));
+      168          if (cache == null) {
+      169              throw new DebeziumException("Failed to create remote Infinispan cache: " + cacheName);
+      170          }
+      171  
+      172          LOGGER.info("Created remote infinispan cache: {}", cacheName);
+      173          return new InfinispanLogMinerCache<>(cache);
+      174      }
+      175  }
+
+---------- IMPLEMENTER io.debezium.connector.oracle.logminer.processor.memory.MemoryLogMinerEventProcessor  stubs=0/4 ----------
+       29  public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor<MemoryTransaction> {
+       30  
+       31      private final LogMinerCache<String, MemoryTransaction> transactionCache = new MemoryBasedLogMinerCache<>();
+       32      private final LogMinerCache<String, LogMinerEvent> eventCache = new MemoryBasedLogMinerCache<>();
+       33      private final LogMinerCache<String, String> schemaCache = new MemoryBasedLogMinerCache<>();
+       34      private final LogMinerCache<String, String> processedTransactionsCache = new MemoryBasedLogMinerCache<>();
+       35  
+       36      public MemoryLogMinerEventProcessor(ChangeEventSourceContext context,
+       37                                          OracleConnectorConfig connectorConfig,
+       38                                          OracleConnection jdbcConnection,
+       39                                          EventDispatcher<OraclePartition, TableId> dispatcher,
+       40                                          OraclePartition partition,
+       41                                          OracleOffsetContext offsetContext,
+       42                                          OracleDatabaseSchema schema,
+       43                                          LogMinerStreamingChangeEventSourceMetrics metrics) {
+       44          super(context, connectorConfig, schema, partition, offsetContext, dispatcher, metrics, jdbcConnection);
+       45      }
+       46  
+       47      @Override
+       48      protected MemoryTransaction createTransaction(LogMinerEventRow row) {
+       49          return new MemoryTransaction(row.getTransactionId(), row.getScn(), row.getChangeTime(), row.getUserName(), row.getThread());
+       50      }
+       51  
+       52      @Override
+       53      public LogMinerCache<String, MemoryTransaction> getTransactionCache() {
+       54          return transactionCache;
+       55      }
+       56  
+       57      @Override
+       58      public LogMinerCache<String, LogMinerEvent> getEventCache() {
+       59  
+       60          return eventCache;
+       61      }
+       62  
+       63      @Override
+       64      public LogMinerCache<String, String> getSchemaChangesCache() {
+       65          return schemaCache;
+       66      }
+       67  
+       68      @Override
+       69      public LogMinerCache<String, String> getProcessedTransactionsCache() {
+       70          return processedTransactionsCache;
+       71      }
+       72  
+       73      @Override
+       74      public void close() throws Exception {
+       75      }
+       76  
+       77  }

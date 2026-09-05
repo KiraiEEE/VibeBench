@@ -1,0 +1,184 @@
+row 164   mr3project/hive-mr3#78
+============================================================================
+OVERRIDE  org.apache.hadoop.hive.ql.io.CombineHiveInputFormat.getSplits(JobConf,int)
+BASE      org.apache.hadoop.hive.ql.io.HiveInputFormat.getSplits(JobConf,int)
+QUESTION: can an instance of the SUBCLASS be used anywhere the BASE
+          is expected, without breaking the caller?
+
+---------------- BASE METHOD ----------------
+      794    @Override
+      795    public InputSplit[] getSplits(JobConf job, int numSplits) throws IOException {
+      796      PerfLogger perfLogger = SessionState.getPerfLogger();
+      797      perfLogger.perfLogBegin(CLASS_NAME, PerfLogger.GET_SPLITS);
+      798      init(job);
+      799      Path[] dirs = getInputPaths(job);
+      800      JobConf newjob = new JobConf(job);
+      801      List<InputSplit> result = new ArrayList<InputSplit>();
+      802  
+      803      List<Path> currentDirs = new ArrayList<Path>();
+      804      Class<? extends InputFormat> currentInputFormatClass = null;
+      805      TableDesc currentTable = null;
+      806      TableScanOperator currentTableScan = null;
+      807  
+      808      boolean pushDownProjection = false;
+      809      //Buffers to hold filter pushdown information
+      810      StringBuilder readColumnsBuffer = new StringBuilder(newjob.
+      811        get(ColumnProjectionUtils.READ_COLUMN_IDS_CONF_STR, ""));;
+      812      StringBuilder readColumnNamesBuffer = new StringBuilder(newjob.
+      813        get(ColumnProjectionUtils.READ_COLUMN_NAMES_CONF_STR, ""));
+      814      boolean fetchVirtualColumns = newjob.getBoolean(ColumnProjectionUtils.FETCH_VIRTUAL_COLUMNS_CONF_STR, false);
+      815      // for each dir, get the InputFormat, and do getSplits.
+      816      for (Path dir : dirs) {
+      817        PartitionDesc part = getPartitionDescFromPath(pathToPartitionInfo, dir);
+      818        Class<? extends InputFormat> inputFormatClass = part.getInputFileFormatClass();
+      819        TableDesc table = part.getTableDesc();
+      820        TableScanOperator tableScan = null;
+      821  
+      822        List<String> aliases = mrwork.getPathToAliases().get(dir);
+      823  
+      824        // Make filter pushdown information available to getSplits.
+      825        if ((aliases != null) && (aliases.size() == 1)) {
+      826          Operator op = mrwork.getAliasToWork().get(aliases.get(0));
+      827          if ((op != null) && (op instanceof TableScanOperator)) {
+      828            tableScan = (TableScanOperator) op;
+      829            //Reset buffers to store filter push down columns
+      830            readColumnsBuffer.setLength(0);
+      831            readColumnNamesBuffer.setLength(0);
+      832            // push down projections.
+      833            ColumnProjectionUtils.appendReadColumns(
+      834                    readColumnsBuffer, readColumnNamesBuffer,
+      835              tableScan.getNeededColumnIDs(), tableScan.getNeededColumns());
+      836            fetchVirtualColumns = tableScan.getConf().hasVirtualCols();
+      837            pushDownProjection = true;
+      838            // push down filters and as of information
+      839            pushFiltersAndAsOf(newjob, tableScan, this.mrwork);
+      840            addGroupingDetails(newjob, tableScan);
+      841          }
+      842        } else {
+      843          if (LOG.isDebugEnabled()) {
+      844            LOG.debug("aliases: {} pathToAliases: {} dir: {}", aliases, mrwork.getPathToAliases(), dir);
+      845          }
+      846        }
+      847  
+      848        if (!currentDirs.isEmpty() &&
+      849            inputFormatClass.equals(currentInputFormatClass) &&
+      850            table.equals(currentTable) &&
+      851            tableScan == currentTableScan) {
+      852          currentDirs.add(dir);
+      853          continue;
+      854        }
+      855  
+      856        if (!currentDirs.isEmpty()) {
+      857          LOG.info("Generating splits as currentDirs is not empty. currentDirs: {}", currentDirs);
+      858  
+      859          // set columns to read in conf
+      860          if (pushDownProjection) {
+      861            pushProjection(newjob, readColumnsBuffer, readColumnNamesBuffer, fetchVirtualColumns);
+      862          }
+      863  
+      864          addSplitsForGroup(currentDirs, currentTableScan, newjob,
+      865              getInputFormatFromCache(currentInputFormatClass, job),
+      866              currentInputFormatClass, currentDirs.size()*(numSplits / dirs.length),
+      867              currentTable, result);
+      868        }
+      869  
+      870        currentDirs.clear();
+      871        currentDirs.add(dir);
+      872        currentTableScan = tableScan;
+      873        currentTable = table;
+      874        currentInputFormatClass = inputFormatClass;
+      875      }
+      876  
+      877      // set columns to read in conf
+      878      if (pushDownProjection) {
+      879        pushProjection(newjob, readColumnsBuffer, readColumnNamesBuffer, fetchVirtualColumns);
+      880      }
+      881  
+      882      if (dirs.length != 0) { // TODO: should this be currentDirs?
+      883        LOG.info("Generating splits for dirs: {}", dirs);
+      884        addSplitsForGroup(currentDirs, currentTableScan, newjob,
+      885            getInputFormatFromCache(currentInputFormatClass, job),
+      886            currentInputFormatClass, currentDirs.size()*(numSplits / dirs.length),
+      887            currentTable, result);
+      888      }
+      889  
+      890      Utilities.clearWorkMapForConf(job);
+      891      LOG.info("number of splits " + result.size());
+      892      perfLogger.perfLogEnd(CLASS_NAME, PerfLogger.GET_SPLITS);
+      893      return result.toArray(new HiveInputSplit[result.size()]);
+      894    }
+
+---------------- OVERRIDE ----------------
+      487    @Override
+      488    public InputSplit[] getSplits(JobConf job, int numSplits) throws IOException {
+      489      PerfLogger perfLogger = SessionState.getPerfLogger();
+      490      perfLogger.perfLogBegin(CLASS_NAME, PerfLogger.GET_SPLITS);
+      491      init(job);
+      492  
+      493      List<InputSplit> result = new ArrayList<>();
+      494  
+      495      Path[] paths = getInputPaths(job);
+      496  
+      497      List<Path> nonCombinablePaths = new ArrayList<>(paths.length / 2);
+      498      List<Path> combinablePaths = new ArrayList<>(paths.length / 2);
+      499  
+      500      int numThreads = Math.min(MAX_CHECK_NONCOMBINABLE_THREAD_NUM,
+      501          (int) Math.ceil((double) paths.length / DEFAULT_NUM_PATH_PER_THREAD));
+      502  
+      503      try {
+      504        Set<Integer> nonCombinablePathIndices = getNonCombinablePathIndices(job, paths, numThreads);
+      505        for (int i = 0; i < paths.length; i++) {
+      506          if (nonCombinablePathIndices.contains(i)) {
+      507            nonCombinablePaths.add(paths[i]);
+      508          } else {
+      509            combinablePaths.add(paths[i]);
+      510          }
+      511        }
+      512      } catch (Exception e) {
+      513        LOG.error("Error checking non-combinable path", e);
+      514        perfLogger.perfLogEnd(CLASS_NAME, PerfLogger.GET_SPLITS);
+      515        throw new IOException(e);
+      516      }
+      517  
+      518      // Store the previous value for the path specification
+      519      String oldPaths = job.get(org.apache.hadoop.mapreduce.lib.input.FileInputFormat.INPUT_DIR);
+      520      LOG.debug("The received input paths are: [{}] against the property {}", oldPaths,
+      521          org.apache.hadoop.mapreduce.lib.input.FileInputFormat.INPUT_DIR);
+      522  
+      523      // Process the normal splits
+      524      if (!nonCombinablePaths.isEmpty()) {
+      525        FileInputFormat.setInputPaths(job, nonCombinablePaths.toArray(new Path[0]));
+      526        InputSplit[] splits = super.getSplits(job, numSplits);
+      527        result.addAll(Arrays.asList(splits));
+      528      }
+      529  
+      530      // Process the combine splits
+      531      if (!combinablePaths.isEmpty()) {
+      532        FileInputFormat.setInputPaths(job, combinablePaths.toArray(new Path[0]));
+      533        Map<Path, PartitionDesc> pathToPartitionInfo = this.pathToPartitionInfo != null ?
+      534            this.pathToPartitionInfo : Utilities.getMapWork(job).getPathToPartitionInfo();
+      535        InputSplit[] splits = getCombineSplits(job, numSplits, pathToPartitionInfo);
+      536        result.addAll(Arrays.asList(splits));
+      537      }
+      538  
+      539      // Restore the old path information back
+      540      // This is just to prevent incompatibilities with previous versions Hive
+      541      // if some application depends on the original value being set.
+      542      if (oldPaths != null) {
+      543        job.set(org.apache.hadoop.mapreduce.lib.input.FileInputFormat.INPUT_DIR, oldPaths);
+      544      }
+      545  
+      546      // clear work from ThreadLocal after splits generated in case of thread is reused in pool.
+      547      Utilities.clearWorkMapForConf(job);
+      548  
+      549      if (result.isEmpty() && paths.length > 0 && job.getBoolean(Utilities.ENSURE_OPERATORS_EXECUTED, false)) {
+      550        // If there are no inputs; the Execution engine skips the operator tree.
+      551        // To prevent it from happening; an opaque  ZeroRows input is added here - when needed.
+      552        result.add(
+      553            new HiveInputSplit(new NullRowsInputFormat.DummyInputSplit(paths[0]), ZeroRowsInputFormat.class.getName()));
+      554      }
+      555  
+      556      LOG.info("Number of all splits " + result.size());
+      557      perfLogger.perfLogEnd(CLASS_NAME, PerfLogger.GET_SPLITS);
+      558      return result.toArray(new InputSplit[0]);
+      559    }
