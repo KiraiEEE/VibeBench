@@ -1,0 +1,358 @@
+row 135   misirio/dbsandboxer#2
+============================================================================
+CONTRACT io.misir.dbsandboxer.core.api.SandboxDatabaseProvider   members=2.0 implementers=2.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       12  public interface SandboxDatabaseProvider {
+       13  
+       14      /**
+       15       * Prepares the sandbox environment.
+       16       *
+       17       * <p>This method should be called once before tests begin to set up the database that will be
+       18       * used as the source for creating test database copies. Implementations should make this method
+       19       * idempotent - multiple calls should not recreate the template if it already exists.
+       20       *
+       21       * @throws SandboxException if the sandbox preparation fails
+       22       */
+       23      void prepareSandbox() throws SandboxException;
+       24  
+       25      /**
+       26       * Rebuilds the sandbox.
+       27       *
+       28       * <p>This method should be called before each test to ensure a clean database state.
+       29       *
+       30       * @throws SandboxException if the sandbox rebuild fails
+       31       */
+       32      void rebuildSandbox() throws SandboxException;
+       33  
+       34      /**
+       35       * Cleans up any resources created by the sandbox after the test suite finishes.
+       36       *
+       37       * <p>The default implementation is a no-op so providers that do not need explicit cleanup can
+       38       * simply inherit it.
+       39       */
+       40      default void cleanupSandbox() throws SandboxException {
+       41          // no-op by default
+       42      }
+       43  }
+
+---------- IMPLEMENTER io.misir.dbsandboxer.core.providers.postgres.PostgresSandboxDatabaseProvider  stubs=0/2 ----------
+       24  public final class PostgresSandboxDatabaseProvider implements SandboxDatabaseProvider {
+       25  
+       26      private static final Logger log =
+       27              LoggerFactory.getLogger(PostgresSandboxDatabaseProvider.class);
+       28  
+       29      private static final AtomicBoolean TEMPLATE_READY = new AtomicBoolean(false);
+       30      private static final Pattern SAFE_DB_NAME = Pattern.compile("^[a-zA-Z_][a-zA-Z0-9_]*$");
+       31      private static final int MIN_PORT = 1;
+       32      private static final int MAX_PORT = 65535;
+       33  
+       34      private final String host;
+       35      private final int port;
+       36      private final String adminDatabase;
+       37      private final String adminUser;
+       38      private final String adminPassword;
+       39  
+       40      private final String primaryDatabaseName;
+       41      private final String templateName;
+       42  
+       43      /**
+       44       * Creates a new PostgreSQL sandbox database provider.
+       45       *
+       46       * @param host the database host
+       47       * @param port the database port (1-65535)
+       48       * @param adminDatabaseName the admin/maintenance database name (usually "postgres")
+       49       * @param adminUser the admin user with CREATE DATABASE privileges
+       50       * @param adminPassword the admin user's password
+       51       * @param primaryDatabaseName the name of the primary database to sandbox
+       52       * @param templateDatabaseName the name of the template database to create
+       53       * @throws IllegalArgumentException if port is out of range or database names are invalid
+       54       * @throws NullPointerException if any required parameter is null
+       55       */
+       56      public PostgresSandboxDatabaseProvider(
+       57              String host,
+       58              int port,
+       59              String adminDatabaseName,
+       60              String adminUser,
+       61              String adminPassword,
+       62              String primaryDatabaseName,
+       63              String templateDatabaseName) {
+       64          this.host = Objects.requireNonNull(host, "host cannot be null");
+       65  
+       66          if (port < MIN_PORT || port > MAX_PORT) {
+       67              throw new IllegalArgumentException(
+       68                      "Port must be between " + MIN_PORT + " and " + MAX_PORT + ", got: " + port);
+       69          }
+       70          this.port = port;
+       71  
+       72          this.adminDatabase = validateDatabaseName(adminDatabaseName, "adminDatabaseName");
+       73          this.adminUser = Objects.requireNonNull(adminUser, "adminUser cannot be null");
+       74          this.adminPassword = Objects.requireNonNull(adminPassword, "adminPassword cannot be null");
+       75          this.primaryDatabaseName = validateDatabaseName(primaryDatabaseName, "primaryDatabaseName");
+       76          this.templateName = validateDatabaseName(templateDatabaseName, "templateDatabaseName");
+       77      }
+       78  
+       79      private static String validateDatabaseName(String name, String paramName) {
+       80          Objects.requireNonNull(name, paramName + " cannot be null");
+       81          if (!SAFE_DB_NAME.matcher(name).matches()) {
+       82              throw new IllegalArgumentException(
+       83                      paramName
+       84                              + " contains invalid characters. "
+       85                              + "Only alphanumeric characters and underscores are allowed: "
+       86                              + name);
+       87          }
+       88          return name;
+       89      }
+       90  
+       91      @Override
+       92      public void prepareSandbox() {
+       93          if (TEMPLATE_READY.get()) {
+       94              return;
+       95          }
+       96          synchronized (TEMPLATE_READY) {
+       97              if (TEMPLATE_READY.get()) {
+       98                  return;
+       99              }
+      100              if (!templateExists()) {
+      101                  createTemplate();
+      102              }
+      103              TEMPLATE_READY.set(true);
+      104          }
+      105      }
+      106  
+      107      /**
+      108       * Drops the application database and recreates it from the template.
+      109       *
+      110       * <p>Very fast (milliseconds) because PostgreSQL copies the physical files instead of replaying
+      111       * migrations.
+      112       */
+      113      @Override
+      114      public void rebuildSandbox() {
+      115          try (Connection admin = DriverManager.getConnection(adminUrl(), adminUser, adminPassword);
+      116                  Statement s = admin.createStatement()) {
+      117  
+      118              terminateConnections(s, primaryDatabaseName);
+      119              s.execute("DROP DATABASE IF EXISTS " + primaryDatabaseName + ';');
+      120              s.execute("CREATE DATABASE " + primaryDatabaseName + " TEMPLATE " + templateName + ';');
+      121  
+      122          } catch (SQLException e) {
+      123              throw new SandboxException(e);
+      124          }
+      125      }
+      126  
+      127      @Override
+      128      public void cleanupSandbox() {
+      129          synchronized (TEMPLATE_READY) {
+      130              TEMPLATE_READY.set(false);
+      131          }
+      132          if (!templateExists()) {
+      133              return;
+      134          }
+      135          try (Connection admin = DriverManager.getConnection(adminUrl(), adminUser, adminPassword);
+      136                  Statement s = admin.createStatement()) {
+      137  
+      138              terminateConnections(s, templateName);
+      139              s.execute("ALTER DATABASE " + templateName + " IS_TEMPLATE false;");
+      140              s.execute("DROP DATABASE IF EXISTS " + templateName + ';');
+      141  
+      142          } catch (SQLException e) {
+      143              throw new SandboxException(e);
+      144          }
+      145      }
+      146  
+      147      private boolean templateExists() {
+      148          final String sql = "SELECT 1 FROM pg_database WHERE datname = ? AND datistemplate";
+      149          try (Connection admin = DriverManager.getConnection(adminUrl(), adminUser, adminPassword);
+      150                  PreparedStatement ps = admin.prepareStatement(sql)) {
+      151  
+      152              ps.setString(1, templateName);
+      153              return ps.executeQuery().next();
+      154  
+      155          } catch (SQLException e) {
+      156              throw new SandboxException(e);
+      157          }
+      158      }
+      159  
+      160      private void createTemplate() {
+      161          log.info("Building template database “{}”…", templateName);
+      162          try (Connection admin = DriverManager.getConnection(adminUrl(), adminUser, adminPassword);
+      163                  Statement s = admin.createStatement()) {
+      164  
+      165              terminateConnections(s, primaryDatabaseName);
+      166  
+      167              s.execute("ALTER DATABASE " + primaryDatabaseName + " IS_TEMPLATE true;");
+      168              s.execute("CREATE DATABASE " + templateName + " TEMPLATE " + primaryDatabaseName + ';');
+      169              s.execute("ALTER DATABASE " + primaryDatabaseName + " IS_TEMPLATE false;");
+      170              s.execute("ALTER DATABASE " + templateName + " IS_TEMPLATE true;");
+      171  
+      172          } catch (SQLException e) {
+      173              throw new IllegalStateException(e);
+      174          }
+      175          log.info("Template “{}” ready.", templateName);
+      176      }
+      177  
+      178      /** JDBC URL for the admin database. */
+      179      private String adminUrl() {
+      180          return "jdbc:postgresql://" + host + ':' + port + '/' + adminDatabase;
+      181      }
+      182  
+      183      /**
+
+---------- IMPLEMENTER io.misir.dbsandboxer.core.providers.sqlite.SqliteSandboxDatabaseProvider  stubs=0/2 ----------
+       21  public final class SqliteSandboxDatabaseProvider implements SandboxDatabaseProvider {
+       22  
+       23      private static final Logger log =
+       24              LoggerFactory.getLogger(SqliteSandboxDatabaseProvider.class);
+       25  
+       26      private static final AtomicBoolean TEMPLATE_READY = new AtomicBoolean(false);
+       27  
+       28      private final Path databaseFile;
+       29      private final Path templateFile;
+       30  
+       31      /**
+       32       * Creates a new SQLite sandbox database provider.
+       33       *
+       34       * @param databaseFile the primary database file that tests will connect to
+       35       * @param templateFile the template database file that will be copied before each test
+       36       */
+       37      public SqliteSandboxDatabaseProvider(Path databaseFile, Path templateFile) {
+       38          Path normalizedDatabase =
+       39                  Objects.requireNonNull(databaseFile, "databaseFile cannot be null")
+       40                          .toAbsolutePath()
+       41                          .normalize();
+       42          Path normalizedTemplate =
+       43                  Objects.requireNonNull(templateFile, "templateFile cannot be null")
+       44                          .toAbsolutePath()
+       45                          .normalize();
+       46          if (normalizedDatabase.equals(normalizedTemplate)) {
+       47              throw new IllegalArgumentException(
+       48                      "databaseFile and templateFile must be different files");
+       49          }
+       50          this.databaseFile = normalizedDatabase;
+       51          this.templateFile = normalizedTemplate;
+       52      }
+       53  
+       54      /**
+       55       * Creates a new SQLite sandbox database provider.
+       56       *
+       57       * @param databaseFile the primary database file path
+       58       * @param templateFile the template database file path
+       59       */
+       60      public SqliteSandboxDatabaseProvider(String databaseFile, String templateFile) {
+       61          this(Path.of(databaseFile), Path.of(templateFile));
+       62      }
+       63  
+       64      @Override
+       65      public void prepareSandbox() {
+       66          if (TEMPLATE_READY.get() && Files.exists(templateFile)) {
+       67              return;
+       68          }
+       69          synchronized (TEMPLATE_READY) {
+       70              if (TEMPLATE_READY.get() && Files.exists(templateFile)) {
+       71                  return;
+       72              }
+       73              if (!Files.exists(templateFile)) {
+       74                  createTemplate();
+       75              }
+       76              TEMPLATE_READY.set(true);
+       77          }
+       78      }
+       79  
+       80      @Override
+       81      public void rebuildSandbox() {
+       82          if (!Files.exists(templateFile)) {
+       83              throw new SandboxException(
+       84                      "SQLite template database does not exist. Call prepareSandbox() first.");
+       85          }
+       86          try {
+       87              ensureParentDirectory(databaseFile);
+       88              deleteDatabaseArtifacts(databaseFile);
+       89              copyDatabaseArtifacts(templateFile, databaseFile);
+       90          } catch (IOException e) {
+       91              throw new SandboxException("Failed to rebuild SQLite sandbox database", e);
+       92          }
+       93      }
+       94  
+       95      @Override
+       96      public void cleanupSandbox() {
+       97          synchronized (TEMPLATE_READY) {
+       98              TEMPLATE_READY.set(false);
+       99          }
+      100          try {
+      101              deleteDatabaseArtifacts(templateFile);
+      102          } catch (IOException e) {
+      103              throw new SandboxException("Failed to clean up SQLite sandbox database", e);
+      104          }
+      105      }
+      106  
+      107      private void createTemplate() {
+      108          if (!Files.exists(databaseFile)) {
+      109              throw new SandboxException(
+      110                      "Primary SQLite database does not exist: " + databaseFile.toAbsolutePath());
+      111          }
+      112          log.info("Building SQLite template database “{}”…", templateFile);
+      113          try {
+      114              ensureParentDirectory(templateFile);
+      115              deleteDatabaseArtifacts(templateFile);
+      116              copyDatabaseArtifacts(databaseFile, templateFile);
+      117          } catch (IOException e) {
+      118              throw new SandboxException("Failed to create SQLite template database", e);
+      119          }
+      120          log.info("SQLite template ready at “{}”.", templateFile);
+      121      }
+      122  
+      123      private static void ensureParentDirectory(Path file) throws IOException {
+      124          Path parent = file.getParent();
+      125          if (parent != null) {
+      126              Files.createDirectories(parent);
+      127          }
+      128      }
+      129  
+      130      private static void deleteDatabaseArtifacts(Path base) throws IOException {
+      131          deleteIfExists(base);
+      132          deleteIfExists(companionFile(base, "-wal"));
+      133          deleteIfExists(companionFile(base, "-shm"));
+      134          deleteIfExists(companionFile(base, "-journal"));
+      135      }
+      136  
+      137      private static void deleteIfExists(Path file) throws IOException {
+      138          if (file != null && Files.exists(file)) {
+      139              Files.delete(file);
+      140          }
+      141      }
+      142  
+      143      private static void copyDatabaseArtifacts(Path source, Path target) throws IOException {
+      144          if (!Files.exists(source)) {
+      145              throw new IOException("SQLite source database not found: " + source);
+      146          }
+      147          ensureParentDirectory(target);
+      148          Files.copy(
+      149                  source,
+      150                  target,
+      151                  StandardCopyOption.REPLACE_EXISTING,
+      152                  StandardCopyOption.COPY_ATTRIBUTES);
+      153          copyCompanion(source, target, "-wal");
+      154          copyCompanion(source, target, "-shm");
+      155          copyCompanion(source, target, "-journal");
+      156      }
+      157  
+      158      private static void copyCompanion(Path source, Path target, String suffix) throws IOException {
+      159          Path companionSource = companionFile(source, suffix);
+      160          if (companionSource != null && Files.exists(companionSource)) {
+      161              Path companionTarget = companionFile(target, suffix);
+      162              ensureParentDirectory(companionTarget);
+      163              Files.copy(
+      164                      companionSource,
+      165                      companionTarget,
+      166                      StandardCopyOption.REPLACE_EXISTING,
+      167                      StandardCopyOption.COPY_ATTRIBUTES);
+      168          }
+      169      }
+      170  
+      171      private static Path companionFile(Path base, String suffix) {
+      172          if (base == null) {
+      173              return null;
+      174          }
+      175          return Path.of(base.toString() + suffix);
+      176      }
+      177  }

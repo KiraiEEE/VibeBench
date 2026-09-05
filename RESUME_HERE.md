@@ -53,19 +53,22 @@ round 2 is a **test-retest** measurement. **Commitment: the old labels are not
 consulted until all 1,000 rows are judged and locked**, then agreement is
 computed and reported whatever it says.
 
-## Where the work stopped (PAUSED 2026-09-05, nothing running)
+## Where the work stopped (PAUSED 2026-09-05 evening, nothing running)
 
 ```
 A  SAMPLE        DONE     200 x 5, seed 777, verified balanced
-B  EXTRACT       dip 200 DONE | lsp 200 DONE | ocp 200 DONE | isp 34/200 | srp 0/200
+B  EXTRACT       dip 200 DONE | lsp 200 DONE | ocp 200 DONE | isp 161/200 | srp 0/200
 C  AUDIT GATE    PASSED for dip, lsp, ocp (0 FAIL each)
-D  JUDGE         dip 200/200 DONE | lsp 59/200 | ocp 0 | isp 0 | srp 0
+D  JUDGE         dip 200/200 DONE | lsp 115/200 | ocp 0 | isp 0 | srp 0
 E  SCORE         DIP scored, see below
 F  REPORT+VERIFY pending
 ```
 
-**259 of 1,000 rows judged.** Every judged row carries a written reason in
+**315 of 1,000 rows judged.** Every judged row carries a written reason in
 `notes`; the recorder refuses a label without one.
+
+Next action on resume: `bash vibebench/extract_round2.sh <scratchdir>` finishes
+ISP then SRP, and judging continues at **LSP row 115**.
 
 ### DIP is finished and scored
 

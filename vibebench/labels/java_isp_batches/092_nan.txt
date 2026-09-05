@@ -1,0 +1,186 @@
+row 92   open-metadata/OpenMetadata#24234
+============================================================================
+CONTRACT org.openmetadata.service.notifications.recipients.downstream.DownstreamHandler   members=1.0 implementers=1.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       31  public interface DownstreamHandler {
+       32    /**
+       33     * Resolve recipients from downstream entities for lineage propagation using ChangeEvent.
+       34     *
+       35     * Uses the entity snapshot from the ChangeEvent payload, which allows this method to work
+       36     * correctly for deleted entities (where the repository no longer has the entity data).
+       37     *
+       38     * @param action the subscription action
+       39     * @param destination the subscription destination with type and configuration
+       40     * @param changeEvent the ChangeEvent containing entity snapshot and ID/type information
+       41     * @param maxDepth the maximum depth to traverse (null for unlimited with cycle protection)
+       42     * @return set of recipients from downstream entities
+       43     */
+       44    Set<Recipient> resolveDownstreamRecipients(
+       45        SubscriptionAction action,
+       46        SubscriptionDestination destination,
+       47        ChangeEvent changeEvent,
+       48        Integer maxDepth);
+       49  }
+
+---------- IMPLEMENTER org.openmetadata.service.notifications.recipients.downstream.impl.LineageBasedDownstreamHandler  stubs=0/1 ----------
+       48  @Slf4j
+       49  public class LineageBasedDownstreamHandler implements DownstreamHandler {
+       50  
+       51    private final Map<String, EntityLineageResolver> lineageResolvers;
+       52    private final RecipientResolutionStrategy downstreamStrategy;
+       53  
+       54    public LineageBasedDownstreamHandler(
+       55        Map<String, EntityLineageResolver> lineageResolvers,
+       56        RecipientResolutionStrategy downstreamStrategy) {
+       57      this.lineageResolvers = lineageResolvers;
+       58      this.downstreamStrategy = downstreamStrategy;
+       59    }
+       60  
+       61    @Override
+       62    public Set<Recipient> resolveDownstreamRecipients(
+       63        SubscriptionAction action,
+       64        SubscriptionDestination destination,
+       65        ChangeEvent changeEvent,
+       66        Integer maxDepth) {
+       67  
+       68      Set<String> visited = new HashSet<>();
+       69  
+       70      String entityType = changeEvent.getEntityType();
+       71  
+       72      // Step 1: Resolve recipients from the source entity itself
+       73      Set<Recipient> sourceRecipients = downstreamStrategy.resolve(changeEvent, action, destination);
+       74      Set<Recipient> allRecipients = new HashSet<>(sourceRecipients);
+       75  
+       76      // Step 2: Resolve source entity parent using ChangeEvent (handles deleted entities)
+       77      EntityLineageResolver resolver =
+       78          lineageResolvers.getOrDefault(entityType, lineageResolvers.get("*"));
+       79      Set<EntityReference> parentRefs = resolver.resolveTraversalEntities(changeEvent);
+       80  
+       81      // Step 3: If parent exists, recurse and traverse lineage
+       82      if (!parentRefs.isEmpty()) {
+       83        parentRefs.forEach(
+       84            parentRef -> {
+       85              try {
+       86                // Recursively resolve lineage for parent entity
+       87                Set<Recipient> parentLineageRecipients =
+       88                    resolveParentLineageRecipients(
+       89                        parentRef.getId(),
+       90                        parentRef.getType(),
+       91                        visited,
+       92                        action,
+       93                        destination,
+       94                        maxDepth);
+       95                allRecipients.addAll(parentLineageRecipients);
+       96              } catch (Exception e) {
+       97                LOG.error(
+       98                    "Failed to resolve downstream for parent {} {}",
+       99                    parentRef.getType(),
+      100                    parentRef.getId(),
+      101                    e);
+      102              }
+      103            });
+      104      }
+      105  
+      106      return allRecipients;
+      107    }
+      108  
+      109    /**
+      110     * Recursively resolves recipients from a parent entity and its downstream lineage.
+      111     * Walks the parent chain and resolves recipients at each level.
+      112     *
+      113     * @param entityId parent entity ID
+      114     * @param entityType parent entity type
+      115     * @param visited set to track visited entities and prevent cycles
+      116     * @param action subscription action
+      117     * @param destination subscription destination
+      118     * @param maxDepth maximum lineage depth to traverse
+      119     * @return aggregated recipients from parent and downstream entities
+      120     */
+      121    private Set<Recipient> resolveParentLineageRecipients(
+      122        UUID entityId,
+      123        String entityType,
+      124        Set<String> visited,
+      125        SubscriptionAction action,
+      126        SubscriptionDestination destination,
+      127        Integer maxDepth) {
+      128  
+      129      Set<Recipient> allRecipients = new HashSet<>();
+      130  
+      131      try {
+      132        String entityKey = createEntityKey(entityType, entityId);
+      133  
+      134        // Detect circular reference
+      135        if (visited.contains(entityKey)) {
+      136          LOG.warn("Detected circular reference cycle - stopping at {} {}", entityType, entityId);
+      137          return allRecipients;
+      138        }
+      139  
+      140        visited.add(entityKey);
+      141  
+      142        // Step 1: Resolve recipients from this parent entity
+      143        Set<Recipient> parentRecipients =
+      144            downstreamStrategy.resolve(entityId, entityType, action, destination);
+      145        allRecipients.addAll(parentRecipients);
+      146  
+      147        // Step 2: Traverse lineage downstream from this parent
+      148        LineageGraphExplorer lineageExplorer = new LineageGraphExplorer(Entity.getCollectionDAO());
+      149        Set<EntityReference> downstreamEntities =
+      150            lineageExplorer.findUniqueEntitiesDownstream(entityId, entityType, maxDepth);
+      151  
+      152        // Step 3: Resolve recipients from each downstream entity
+      153        downstreamEntities.forEach(
+      154            downstream -> {
+      155              try {
+      156                Set<Recipient> downstreamRecipients =
+      157                    downstreamStrategy.resolve(
+      158                        downstream.getId(), downstream.getType(), action, destination);
+      159                allRecipients.addAll(downstreamRecipients);
+      160              } catch (Exception e) {
+      161                LOG.warn(
+      162                    "Failed to resolve recipients for downstream {} {}",
+      163                    downstream.getType(),
+      164                    downstream.getId(),
+      165                    e);
+      166              }
+      167            });
+      168  
+      169        // Step 4: Check if this parent entity has its own parent (recursive case)
+      170        EntityLineageResolver resolver =
+      171            lineageResolvers.getOrDefault(entityType, lineageResolvers.get("*"));
+      172        Set<EntityReference> ancestorRefs = resolver.resolveTraversalEntities(entityId, entityType);
+      173  
+      174        // Step 5: If parent has parent, recursively resolve its lineage
+      175        ancestorRefs.forEach(
+      176            ancestorRef -> {
+      177              try {
+      178                // Only recurse if ancestor type differs (prevent same-type cycles)
+      179                if (!ancestorRef.getType().equals(entityType)) {
+      180                  LOG.debug(
+      181                      "Resolved {} {} to ancestor {} {}, recursively resolving",
+      182                      entityType,
+      183                      entityId,
+      184                      ancestorRef.getType(),
+      185                      ancestorRef.getId());
+      186  
+      187                  Set<Recipient> ancestorLineageRecipients =
+      188                      resolveParentLineageRecipients(
+      189                          ancestorRef.getId(),
+      190                          ancestorRef.getType(),
+      191                          visited,
+      192                          action,
+      193                          destination,
+      194                          maxDepth);
+      195                  allRecipients.addAll(ancestorLineageRecipients);
+      196                }
+      197              } catch (Exception e) {
+      198                LOG.warn(
+      199                    "Failed to resolve upstream lineage for ancestor {} {}",
+      200                    ancestorRef.getType(),
+      201                    ancestorRef.getId(),
+      202                    e);
+      203              }
+      204            });
+      205  
+      206      } catch (Exception e) {
+      207        LOG.error("Failed to resolve lineage recipients for {} {}", entityType, entityId, e);

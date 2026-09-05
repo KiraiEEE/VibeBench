@@ -1,0 +1,494 @@
+row 59   mr3project/hive-mr3#78
+============================================================================
+CONTRACT org.apache.hadoop.hive.ql.exec.IConfigureJobConf   members=1.0 implementers=4.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       28  public interface IConfigureJobConf {
+       29    void configureJobConf(JobConf job);
+       30  }
+
+---------- IMPLEMENTER org.apache.hadoop.hive.ql.exec.FileSinkOperator  stubs=0/1 ----------
+      109  @SuppressWarnings("deprecation")
+      110  public class FileSinkOperator extends TerminalOperator<FileSinkDesc> implements
+      111      Serializable, IConfigureJobConf {
+      112  
+      113    public static final Logger LOG = LoggerFactory.getLogger(FileSinkOperator.class);
+      114  
+      115    protected transient HashMap<String, FSPaths> valToPaths;
+      116    protected transient int numDynParts;
+      117    protected transient List<String> dpColNames;
+      118    protected transient DynamicPartitionCtx dpCtx;
+      119    protected transient boolean isCompressed;
+      120    protected transient boolean isTemporary;
+      121    protected transient Path parent;
+      122    protected transient HiveOutputFormat<?, ?> hiveOutputFormat;
+      123    protected transient Path specPath;
+      124    protected transient String unionPath;
+      125    protected transient boolean isUnionDp;
+      126    protected transient int dpStartCol; // start column # for DP columns
+      127    protected transient List<String> dpVals; // array of values corresponding to DP columns
+      128    protected transient List<Object> dpWritables;
+      129    protected transient RecordWriter[] rowOutWriters; // row specific RecordWriters
+      130    protected transient int maxPartitions;
+      131    protected transient ListBucketingCtx lbCtx;
+      132    protected transient boolean isSkewedStoredAsSubDirectories;
+      133    protected transient boolean[] statsFromRecordWriter;
+      134    protected transient boolean isCollectRWStats;
+      135    private transient FSPaths prevFsp;
+      136    private transient FSPaths fpaths;
+      137    private StructField recIdField; // field to find record identifier in
+      138    private StructField bucketField; // field bucket is in in record id
+      139    private StructObjectInspector recIdInspector; // OI for inspecting record id
+      140    private IntObjectInspector bucketInspector; // OI for inspecting bucket id
+      141    protected transient long numRows = 0;
+      142    protected transient long cntr = 1;
+      143    protected transient long logEveryNRows = 0;
+      144    protected transient int rowIndex = 0;
+      145    private transient Path destTablePath;
+      146    private transient boolean isInsertOverwrite;
+      147    private transient String counterGroup;
+      148    private transient BiFunction<Object[], ObjectInspector[], Integer> hashFunc;
+      149    public static final String TOTAL_TABLE_ROWS_WRITTEN = "TOTAL_TABLE_ROWS_WRITTEN";
+      150    private transient Set<String> dynamicPartitionSpecs = new HashSet<>();
+      151  
+      152    /**
+      153     * Counters.
+      154     */
+      155    public static enum Counter {
+      156      RECORDS_OUT
+      157    }
+      158  
+      159    /**
+      160     * RecordWriter.
+      161     *
+      162     */
+      163    public interface RecordWriter {
+      164      void write(Writable w) throws IOException;
+      165  
+      166      void close(boolean abort) throws IOException;
+      167    }
+      168  
+      169    public class FSPaths implements Cloneable {
+      170      private Path tmpPathRoot;
+      171      private String subdirBeforeTxn, subdirAfterTxn;
+      172      private final String subdirForTxn;
+      173      private Path taskOutputTempPathRoot;
+      174      Path[] outPaths;
+      175      // The bucket files we successfully wrote to in this writer
+      176      Path[] outPathsCommitted;
+      177      Path[] finalPaths;
+      178      RecordWriter[] outWriters;
+      179      RecordUpdater[] updaters;
+      180      Stat stat;
+      181      int acidLastBucket = -1;
+      182      int acidFileOffset = -1;
+      183      private boolean isMmTable;
+      184      private boolean isDirectInsert;
+      185      private AcidUtils.Operation acidOperation;
+      186      private boolean isInsertOverwrite;
+      187      String dpDirForCounters;
+      188  
+      189      public FSPaths(Path specPath, boolean isMmTable, boolean isDirectInsert, boolean isInsertOverwrite,
+      190          AcidUtils.Operation acidOperation) {
+      191        this.isMmTable = isMmTable;
+      192        this.isDirectInsert = isDirectInsert;
+      193        this.acidOperation = acidOperation;
+      194        this.isInsertOverwrite = isInsertOverwrite;
+      195        if (!isMmTable && !isDirectInsert) {
+      196          tmpPathRoot = Utilities.toTempPath(specPath);
+      197          taskOutputTempPathRoot = Utilities.toTaskTempPath(specPath);
+      198          subdirForTxn = null;
+      199        } else {
+      200          tmpPathRoot = specPath;
+      201          taskOutputTempPathRoot = null; // Should not be used.
+      202          if (isMmTable) {
+      203            subdirForTxn = AcidUtils.baseOrDeltaSubdir(conf.getInsertOverwrite(),
+      204                conf.getTableWriteId(), conf.getTableWriteId(),  conf.getStatementId());
+      205          } else {
+      206            /**
+      207             * For direct write to final path during ACID insert, we create the delta directories
+      208             * later when we create the RecordUpdater using AcidOutputFormat.Options
+      209             */
+      210            subdirForTxn = null;
+      211          }
+      212        }
+      213        if (Utilities.FILE_OP_LOGGER.isTraceEnabled()) {
+      214          Utilities.FILE_OP_LOGGER.trace("new FSPaths for " + numFiles
+      215              + " files, dynParts = " + bDynParts + " (spec path " + specPath + ")");
+      216        }
+      217  
+      218        outPaths = new Path[numFiles];
+      219        outPathsCommitted = new Path[numFiles];
+      220        finalPaths = new Path[numFiles];
+      221        outWriters = new RecordWriter[numFiles];
+      222        updaters = new RecordUpdater[numFiles];
+      223        LOG.debug("Created slots for {}", numFiles);
+      224        stat = new Stat();
+      225      }
+      226  
+      227      public void closeWriters(boolean abort, List<Path> deleteDeltas) throws HiveException {
+      228        Exception exception = null;
+      229        for (int idx = 0; idx < outWriters.length; idx++) {
+      230          if (outWriters[idx] != null) {
+      231            try {
+      232              outWriters[idx].close(abort);
+      233              updateProgress();
+      234            } catch (IOException e) {
+      235              exception = e;
+      236              LOG.error("Error closing " + outWriters[idx].toString(), e);
+      237              // continue closing others
+      238            }
+      239          }
+      240        }
+      241        for (int i = 0; i < updaters.length; i++) {
+      242          if (updaters[i] != null) {
+      243            SerDeStats stats = updaters[i].getStats();
+      244            // Ignore 0 row files except in case of insert overwrite or delete or update
+      245            if (isDirectInsert
+      246                && (stats.getRowCount() > 0 || isInsertOverwrite || AcidUtils.Operation.DELETE.equals(acidOperation)
+      247                    || AcidUtils.Operation.UPDATE.equals(acidOperation))) {
+      248  
+      249              OrcRecordUpdater recordUpdater = (OrcRecordUpdater) updaters[i];
+      250              switch (acidOperation) {
+      251              case INSERT:
+      252                outPathsCommitted[i] = recordUpdater.getUpdatedFilePath();
+      253                break;
+      254              case UPDATE:
+      255                // In case of update operation, we need both the deleteFilePath and the updatedFilePath.
+      256                // The updateFilePath will be added to the outPathsCommitted array and the deleteFilePath
+      257                // will be collected in a separate list.
+      258                outPathsCommitted[i] = recordUpdater.getUpdatedFilePath();
+      259                if (deleteDeltas != null) {
+      260                  deleteDeltas.add(recordUpdater.getDeleteFilePath());
+      261                  LOG.debug("The following path has been added to the deleteDeltas list: "
+      262                      + recordUpdater.getDeleteFilePath().toString());
+      263                }
+      264                break;
+      265              case DELETE:
+      266                // In case of delete operation, the deleteFilePath has to be used, not the updatedFilePath
+      267                outPathsCommitted[i] = recordUpdater.getDeleteFilePath();
+      268                break;
+
+---------- IMPLEMENTER org.apache.hadoop.hive.ql.exec.GroupByOperator  stubs=0/1 ----------
+       78  public class GroupByOperator extends Operator<GroupByDesc> implements IConfigureJobConf {
+       79  
+       80    private static final long serialVersionUID = 1L;
+       81    private static final int NUMROWSESTIMATESIZE = 1000;
+       82  
+       83    private transient ExprNodeEvaluator[] keyFields;
+       84    private transient ObjectInspector[] keyObjectInspectors;
+       85  
+       86    private transient ExprNodeEvaluator[][] aggregationParameterFields;
+       87    private transient ObjectInspector[][] aggregationParameterObjectInspectors;
+       88    private transient ObjectInspector[][] aggregationParameterStandardObjectInspectors;
+       89    private transient Object[][] aggregationParameterObjects;
+       90  
+       91    // so aggregationIsDistinct is a boolean array instead of a single number.
+       92    private transient boolean[] aggregationIsDistinct;
+       93    // Map from integer tag to distinct aggrs
+       94    private transient Map<Integer, Set<Integer>> distinctKeyAggrs = new HashMap<>();
+       95    // Map from integer tag to non-distinct aggrs with key parameters.
+       96    private transient Map<Integer, Set<Integer>> nonDistinctKeyAggrs = new HashMap<>();
+       97    // List of non-distinct aggrs.
+       98    private transient Set<Integer> nonDistinctAggrs = new HashSet<>();
+       99    // Union expr for distinct keys
+      100    private transient ExprNodeEvaluator unionExprEval;
+      101  
+      102    private transient GenericUDAFEvaluator[] aggregationEvaluators;
+      103    private transient boolean[] estimableAggregationEvaluators;
+      104  
+      105    // Used by sort-based GroupBy: Mode = COMPLETE, PARTIAL1, PARTIAL2,
+      106    // MERGEPARTIAL
+      107    private transient KeyWrapper currentKeys;
+      108    private transient KeyWrapper newKeys;
+      109    private transient AggregationBuffer[] aggregations;
+      110    private transient Object[][] aggregationsParametersLastInvoke;
+      111  
+      112    // Used by hash-based GroupBy: Mode = HASH, PARTIALS
+      113    private transient HashMap<KeyWrapper, AggregationBuffer[]> hashAggregations;
+      114  
+      115    private transient boolean firstRow;
+      116    private transient boolean hashAggr;
+      117    private transient long numRowsInput;
+      118    private transient long numRowsHashTbl;
+      119    private transient int groupbyMapAggrInterval;
+      120    private transient long numRowsCompareHashAggr;
+      121    private transient float minReductionHashAggr;
+      122    private transient float hashAggrFlushPercent;
+      123  
+      124    private transient int outputKeyLength;
+      125  
+      126    // current Key ObjectInspectors are standard ObjectInspectors
+      127    private transient ObjectInspector[] currentKeyObjectInspectors;
+      128  
+      129    private transient MemoryMXBean memoryMXBean;
+      130  
+      131    private transient boolean groupingSetsPresent;      // generates grouping set
+      132    private transient int groupingSetsPosition;         // position of grouping set, generally the last of keys
+      133    private transient List<Long> groupingSets;       // declared grouping set values
+      134    private transient FastBitSet[] groupingSetsBitSet;  // bitsets acquired from grouping set values
+      135    private transient LongWritable[] newKeysGroupingSets;
+      136  
+      137    // for these positions, some variable primitive type (String) is used, so size
+      138    // cannot be estimated. sample it at runtime.
+      139    private transient List<Integer> keyPositionsSize;
+      140  
+      141    // for these positions, some variable primitive type (String) is used for the
+      142    // aggregation classes
+      143    private transient List<Field>[] aggrPositions;
+      144  
+      145    private transient int fixedRowSize;
+      146  
+      147    private transient int totalVariableSize;
+      148    private transient int numEntriesVarSize;
+      149  
+      150    private transient int countAfterReport;   // report or forward
+      151    private transient int heartbeatInterval;
+      152  
+      153    private transient boolean isTez;
+      154    private transient boolean isLlap;
+      155    private transient int numExecutors;
+      156  
+      157    /**
+      158     * Total amount of memory allowed for JVM heap.
+      159     */
+      160    protected transient long maxMemory;
+      161  
+      162    /**
+      163     * Max memory usable by the hashtable before it should flush.
+      164     */
+      165    protected transient long maxHashTblMemory;
+      166  
+      167    /**
+      168     * configure percent of memory threshold usable by QP.
+      169     */
+      170    protected transient float memoryThreshold;
+      171  
+      172    /**
+      173     * Current number of entries in the hash table.
+      174     */
+      175    protected transient int numEntriesHashTable;
+      176  
+      177    /**
+      178     * This method returns the big-endian representation of value.
+      179     * @param value
+      180     * @param length
+      181     * @return
+      182     */
+      183    public static FastBitSet groupingSet2BitSet(long value, int length) {
+      184      FastBitSet bits = new FastBitSet();
+      185      for (int index = length - 1; index >= 0; index--) {
+      186        if (value % 2 != 0) {
+      187          bits.set(index);
+      188        }
+      189        value = value >>> 1;
+      190      }
+      191      return bits;
+      192    }
+      193  
+      194    /** Kryo ctor. */
+      195    protected GroupByOperator() {
+      196      super();
+      197    }
+      198  
+      199    public GroupByOperator(CompilationOpContext ctx) {
+      200      super(ctx);
+      201    }
+      202  
+      203    @Override
+      204    protected void initializeOp(Configuration hconf) throws HiveException {
+      205      super.initializeOp(hconf);
+      206      numRowsInput = 0;
+      207      numRowsHashTbl = 0;
+      208  
+      209      heartbeatInterval = HiveConf.getIntVar(hconf,
+      210          HiveConf.ConfVars.HIVE_SEND_HEARTBEAT);
+      211      countAfterReport = 0;
+      212      ObjectInspector rowInspector = inputObjInspectors[0];
+      213  
+      214      // init keyFields
+      215      int numKeys = conf.getKeys().size();
+      216  
+      217      keyFields = new ExprNodeEvaluator[numKeys];
+      218      keyObjectInspectors = new ObjectInspector[numKeys];
+      219      currentKeyObjectInspectors = new ObjectInspector[numKeys];
+      220      for (int i = 0; i < numKeys; i++) {
+      221        keyFields[i] = ExprNodeEvaluatorFactory.get(conf.getKeys().get(i), hconf);
+      222        keyObjectInspectors[i] = keyFields[i].initialize(rowInspector);
+      223        currentKeyObjectInspectors[i] = ObjectInspectorUtils
+      224          .getStandardObjectInspector(keyObjectInspectors[i],
+      225          ObjectInspectorCopyOption.WRITABLE);
+      226      }
+      227  
+      228      // Initialize the constants for the grouping sets, so that they can be re-used for
+      229      // each row
+      230      groupingSetsPresent = conf.isGroupingSetsPresent();
+      231      if (groupingSetsPresent) {
+      232        groupingSets = conf.getListGroupingSets();
+      233        groupingSetsPosition = conf.getGroupingSetPosition();
+      234        newKeysGroupingSets = new LongWritable[groupingSets.size()];
+      235        groupingSetsBitSet = new FastBitSet[groupingSets.size()];
+      236  
+      237        int pos = 0;
+
+---------- IMPLEMENTER org.apache.hadoop.hive.ql.exec.vector.VectorGroupByOperator  stubs=0/1 ----------
+       83  public class VectorGroupByOperator extends Operator<GroupByDesc>
+       84      implements VectorizationOperator, VectorizationContextRegion, IConfigureJobConf {
+       85  
+       86    private static final Logger LOG = LoggerFactory.getLogger(
+       87        VectorGroupByOperator.class.getName());
+       88  
+       89    private VectorizationContext vContext;
+       90    private VectorGroupByDesc vectorDesc;
+       91  
+       92    /**
+       93     * This is the vector of aggregators. They are stateless and only implement
+       94     * the algorithm of how to compute the aggregation. state is kept in the
+       95     * aggregation buffers and is our responsibility to match the proper state for each key.
+       96     */
+       97    private VectorAggregationDesc[] vecAggrDescs;
+       98  
+       99    /**
+      100     * Key vector expressions.
+      101     */
+      102    private VectorExpression[] keyExpressions;
+      103    private int outputKeyLength;
+      104  
+      105    private TypeInfo[] outputTypeInfos;
+      106    private DataTypePhysicalVariation[] outputDataTypePhysicalVariations;
+      107  
+      108    // Create a new outgoing vectorization context because column name map will change.
+      109    private VectorizationContext vOutContext = null;
+      110  
+      111    // The above members are initialized by the constructor and must not be
+      112    // transient.
+      113    //---------------------------------------------------------------------------
+      114  
+      115    @VisibleForTesting
+      116    transient VectorAggregateExpression[] aggregators;
+      117    /**
+      118     * The aggregation buffers to use for the current batch.
+      119     */
+      120    private transient VectorAggregationBufferBatch aggregationBatchInfo;
+      121  
+      122    /**
+      123     * The current batch key wrappers.
+      124     * The very same instance gets reused for all batches.
+      125     */
+      126    private transient VectorHashKeyWrapperBatch keyWrappersBatch;
+      127  
+      128    private transient Object[] forwardCache;
+      129  
+      130    private transient VectorizedRowBatch outputBatch;
+      131    private transient VectorizedRowBatchCtx vrbCtx;
+      132  
+      133    /*
+      134     * Grouping sets members.
+      135     */
+      136    private transient boolean groupingSetsPresent;
+      137  
+      138    // The field bits (i.e. which fields to include) or "id" for each grouping set.
+      139    private transient long[] groupingSets;
+      140  
+      141    // The position in the column keys of the dummy grouping set id column.
+      142    private transient int groupingSetsPosition;
+      143  
+      144    // The planner puts a constant field in for the dummy grouping set id.  We will overwrite it
+      145    // as we process the grouping sets.
+      146    private transient ConstantVectorExpression groupingSetsDummyVectorExpression;
+      147  
+      148    // We translate the grouping set bit field into a boolean arrays.
+      149    private transient boolean[][] allGroupingSetsOverrideIsNulls;
+      150  
+      151    private transient int numEntriesHashTable;
+      152    private transient long numFlushedOutEntriesBeforeFinalFlush;
+      153  
+      154    private transient long maxHashTblMemory;
+      155  
+      156    private transient long maxMemory;
+      157  
+      158    private float hashTableMemoryPercentage;
+      159  
+      160    // tracks overall access count in map agg buffer any given time.
+      161    private long totalAccessCount;
+      162    private boolean batchNeedsClone;
+      163  
+      164    /**
+      165     * Interface for processing mode: global, hash, unsorted streaming, or group batch
+      166     */
+      167    private static interface IProcessingMode {
+      168      void initialize(Configuration hconf) throws HiveException;
+      169      void setNextVectorBatchGroupStatus(boolean isLastGroupBatch) throws HiveException;
+      170      void processBatch(VectorizedRowBatch batch) throws HiveException;
+      171      void close(boolean aborted) throws HiveException;
+      172    }
+      173  
+      174    /**
+      175     * Base class for all processing modes
+      176     */
+      177    private abstract class ProcessingModeBase implements IProcessingMode {
+      178      /**
+      179       * The VectorAggregationBufferRow instance. This field can be shared with ProcessingMode
+      180       * subclasses, where is only 1 VectorAggregationBufferRow instance needed at the same time. This
+      181       * is the case for ProcessingModeGlobalAggregate, ProcessingModeReduceMergePartial,
+      182       * ProcessingModeStreaming, but not for ProcessingModeHashAggregate where this field is not
+      183       * used.
+      184       */
+      185      protected VectorAggregationBufferRow aggregationBufferSet;
+      186  
+      187      // Overridden and used in ProcessingModeReduceMergePartial mode.
+      188      @Override
+      189      public void setNextVectorBatchGroupStatus(boolean isLastGroupBatch) throws HiveException {
+      190        // Ignore it.
+      191      }
+      192  
+      193      protected abstract void doProcessBatch(VectorizedRowBatch batch, boolean isFirstGroupingSet,
+      194          boolean[] currentGroupingSetsOverrideIsNulls) throws HiveException;
+      195  
+      196      @Override
+      197      public void processBatch(VectorizedRowBatch batch) throws HiveException {
+      198  
+      199        if (!groupingSetsPresent) {
+      200          doProcessBatch(batch, false, null);
+      201        } else {
+      202          // We drive the doProcessBatch logic with the same batch but different
+      203          // grouping set id and null variation.
+      204          // PERFORMANCE NOTE: We do not try to reuse columns and generate the KeyWrappers anew...
+      205  
+      206          final int size = groupingSets.length;
+      207          for (int i = 0; i < size; i++) {
+      208  
+      209            // NOTE: We are overwriting the constant vector value...
+      210            groupingSetsDummyVectorExpression.setLongValue(groupingSets[i]);
+      211            groupingSetsDummyVectorExpression.evaluate(batch);
+      212  
+      213            doProcessBatch(batch, (i == 0), allGroupingSetsOverrideIsNulls[i]);
+      214          }
+      215        }
+      216  
+      217        if (this instanceof ProcessingModeHashAggregate) {
+      218          // Check if we should turn into streaming mode
+      219          ((ProcessingModeHashAggregate)this).checkHashModeEfficiency();
+      220        }
+      221      }
+      222  
+      223      /**
+      224       * Evaluates the aggregators on the current batch.
+      225       * The aggregationBatchInfo must have been prepared
+      226       * by calling {@link #prepareBatchAggregationBufferSets} first.
+      227       */
+      228      protected void processAggregators(VectorizedRowBatch batch) throws HiveException {
+      229        // We now have a vector of aggregation buffer sets to use for each row
+      230        // We can start computing the aggregates.
+      231        // If the number of distinct keys in the batch is 1 we can
+      232        // use the optimized code path of aggregateInput
+      233        VectorAggregationBufferRow[] aggregationBufferSets =
+      234            aggregationBatchInfo.getAggregationBuffers();
+      235        if (aggregationBatchInfo.getDistinctBufferSetCount() == 1) {
+      236          VectorAggregateExpression.AggregationBuffer[] aggregationBuffers =
+      237              aggregationBufferSets[0].getAggregationBuffers();
+      238          for (int i = 0; i < aggregators.length; ++i) {
+      239            aggregators[i].aggregateInput(aggregationBuffers[i], batch);
+      240          }
+      241        } else {
+      242          for (int i = 0; i < aggregators.length; ++i) {

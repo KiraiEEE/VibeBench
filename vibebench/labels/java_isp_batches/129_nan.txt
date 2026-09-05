@@ -1,0 +1,398 @@
+row 129   micronaut-projects/micronaut-core#12329
+============================================================================
+CONTRACT io.micronaut.http.ssl.CertificateProvider   members=1.0 implementers=3.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       30  public interface CertificateProvider extends Named {
+       31      String CONFIG_PREFIX = "micronaut.certificate";
+       32  
+       33      /**
+       34       * Publisher that emits the key store containing private key and/or certificates.
+       35       * <b>To avoid weird initialization issues, it is highly recommended to return a publisher here
+       36       * that produces a key store immediately upon subscription, on the subscribing thread. This
+       37       * avoids race conditions where e.g. a server starts up before a key store is available, and
+       38       * there is a short interval where SSL connections will fail.</b>
+       39       *
+       40       * @return a publisher of {@link KeyStore} updates
+       41       */
+       42      Publisher<KeyStore> getKeyStore();
+       43  
+       44      /**
+       45       * Publisher that emits the trust store with trusted certificates. By default,
+       46       * this returns {@link #getKeyStore()}.
+       47       *
+       48       * @return a publisher of {@link KeyStore} updates for trust material
+       49       */
+       50      default Publisher<KeyStore> getTrustStore() {
+       51          return getKeyStore();
+       52      }
+       53  }
+
+---------- IMPLEMENTER io.micronaut.http.ssl.FileCertificateProvider  stubs=0/1 ----------
+       60  @EachBean(FileCertificateProvider.Config.class)
+       61  @BootstrapContextCompatible
+       62  public final class FileCertificateProvider implements CertificateProvider {
+       63      private static final Logger LOG = LoggerFactory.getLogger(FileCertificateProvider.class);
+       64  
+       65      private final String name;
+       66      private final Flux<KeyStore> flux;
+       67      private final WatchService watchService;
+       68  
+       69      /**
+       70       * Create a provider that loads and optionally refreshes certificate material from disk.
+       71       *
+       72       * @param config           file configuration
+       73       * @param scheduler        scheduled executor for periodic refresh
+       74       * @param blockingExecutor executor used for blocking file watching
+       75       * @throws Exception if the initial load fails or watcher setup fails
+       76       */
+       77      FileCertificateProvider(
+       78          Config config,
+       79          @jakarta.inject.Named(TaskExecutors.SCHEDULED) ExecutorService scheduler,
+       80          @jakarta.inject.Named(TaskExecutors.BLOCKING) Executor blockingExecutor
+       81      ) throws Exception {
+       82          if (config.refreshMode == RefreshMode.NONE) {
+       83              flux = Flux.just(load(config));
+       84              watchService = null;
+       85          } else {
+       86              Sinks.Many<KeyStore> sink = Sinks.many().replay().latest();
+       87              flux = sink.asFlux();
+       88  
+       89              WatchService ws = null;
+       90              if (config.refreshMode == RefreshMode.FILE_WATCHER || config.refreshMode == RefreshMode.FILE_WATCHER_OR_SCHEDULER) {
+       91                  Path directory = config.path.getParent();
+       92                  try {
+       93                      ws = directory.getFileSystem().newWatchService();
+       94                      directory.register(ws, StandardWatchEventKinds.ENTRY_CREATE, StandardWatchEventKinds.ENTRY_MODIFY);
+       95                  } catch (UnsupportedOperationException uoe) {
+       96                      if (ws != null) {
+       97                          try {
+       98                              ws.close();
+       99                          } catch (IOException ioe) {
+      100                              uoe.addSuppressed(ioe);
+      101                          }
+      102                          ws = null;
+      103                      }
+      104                      if (config.refreshMode == RefreshMode.FILE_WATCHER) {
+      105                          throw uoe;
+      106                      } else {
+      107                          LOG.debug("Failed to create watch service, falling back on scheduled refresh", uoe);
+      108                      }
+      109                  }
+      110              }
+      111              this.watchService = ws;
+      112  
+      113              sink.tryEmitNext(load(config)).orThrow();
+      114  
+      115              if (ws != null) {
+      116                  WatchService finalWs = ws;
+      117                  blockingExecutor.execute(() -> {
+      118                      while (true) {
+      119                          try {
+      120                              WatchKey key = finalWs.take();
+      121                              boolean changed = false;
+      122                              for (WatchEvent<?> event : key.pollEvents()) {
+      123                                  if (event.context() instanceof Path ctx && (ctx.getFileName().equals(config.path.getFileName()) || (config.certificatePath != null && ctx.getFileName().equals(config.certificatePath.getFileName())))) {
+      124                                      changed = true;
+      125                                      break;
+      126                                  }
+      127                              }
+      128                              key.reset();
+      129                              if (changed) {
+      130                                  loadSafe(sink, config);
+      131                              }
+      132                          } catch (InterruptedException e) {
+      133                              Thread.currentThread().interrupt();
+      134                              break;
+      135                          } catch (ClosedWatchServiceException e) {
+      136                              break;
+      137                          }
+      138                      }
+      139                  });
+      140              } else {
+      141                  ((ScheduledExecutorService) scheduler).scheduleWithFixedDelay(
+      142                      () -> loadSafe(sink, config),
+      143                      config.refreshInterval.toNanos(),
+      144                      config.refreshInterval.toNanos(),
+      145                      TimeUnit.NANOSECONDS);
+      146              }
+      147          }
+      148  
+      149          name = config.name;
+      150      }
+      151  
+      152      /**
+      153       * Stop watching files and release resources.
+      154       *
+      155       * @throws IOException if closing the watch service fails
+      156       */
+      157      @PreDestroy
+      158      void close() throws IOException {
+      159          watchService.close();
+      160      }
+      161  
+      162      private static void loadSafe(Sinks.Many<KeyStore> sink, Config config) {
+      163          try {
+      164              sink.tryEmitNext(load(config)).orThrow();
+      165          } catch (Exception e) {
+      166              LOG.error("Failed to load certificate file", e);
+      167          }
+      168      }
+      169  
+      170      private static KeyStore load(Config config) throws GeneralSecurityException, PemParser.NotPemException, IOException {
+      171          byte[] mainBytes = Files.readAllBytes(config.path);
+      172          byte[] certBytes;
+      173          if (config.certificatePath != null) {
+      174              if (config.format != Format.PEM) {
+      175                  throw new ConfigurationException("A separate certificate-path is only permitted for PEM format. Please mark this certificate as PEM format explicitly.");
+      176              }
+      177              certBytes = Files.readAllBytes(config.certificatePath);
+      178          } else {
+      179              certBytes = null;
+      180          }
+      181  
+      182          return load(config, mainBytes, certBytes);
+      183      }
+      184  
+      185      static KeyStore load(AbstractCertificateFileConfig config, byte[] mainBytes, byte[] certBytes) throws GeneralSecurityException, PemParser.NotPemException, IOException {
+      186          KeyStore ks;
+      187          if (config.format == null) {
+      188              try {
+      189                  ks = load(config, mainBytes, certBytes, Format.JKS);
+      190              } catch (IOException e) {
+      191                  if (e.getCause() instanceof UnrecoverableKeyException) {
+      192                      throw e;
+      193                  }
+      194                  try {
+      195                      ks = load(config, mainBytes, certBytes, Format.PEM);
+      196                  } catch (PemParser.NotPemException f) {
+      197                      // probably should have been loaded as KS
+      198                      e.addSuppressed(new Exception("Also tried and failed to load the input as PEM", f));
+      199                      throw e;
+      200                  } catch (Exception f) {
+      201                      // probably should have been loaded as PEM
+      202                      f.addSuppressed(new Exception("Also tried and failed to load the input as a key store", e));
+      203                      throw f;
+      204                  }
+      205              }
+      206          } else {
+      207              ks = load(config, mainBytes, certBytes, config.format);
+      208          }
+      209          return ks;
+      210      }
+      211  
+      212      private static KeyStore load(AbstractCertificateFileConfig config, byte[] mainBytes, byte @Nullable [] certBytes, Format format) throws GeneralSecurityException, IOException, PemParser.NotPemException {
+      213          KeyStore ks = KeyStore.getInstance(format == Format.JKS ? "JKS" : "PKCS12");
+      214          if (format == Format.PEM) {
+      215              ks.load(null, null);
+      216              PemParser pemParser = new PemParser(null, config.password);
+      217              List<Object> mainObjects = pemParser.loadPem(mainBytes);
+      218              if (mainObjects.get(0) instanceof PrivateKey pk) {
+      219                  List<Object> certObjects;
+
+---------- IMPLEMENTER io.micronaut.http.ssl.ResourceCertificateProvider  stubs=0/1 ----------
+       36  @EachBean(ResourceCertificateProvider.Config.class)
+       37  @BootstrapContextCompatible
+       38  public final class ResourceCertificateProvider implements CertificateProvider {
+       39      private final String name;
+       40      private final KeyStore ks;
+       41  
+       42      ResourceCertificateProvider(
+       43   Config config,
+       44   ResourceResolver resourceLoader
+       45      ) throws Exception {
+       46          name = config.name;
+       47          byte[] bytes;
+       48          try (InputStream stream = resourceLoader.getResourceAsStream(config.getResource()).orElseThrow(() -> new ConfigurationException("Resource unavailable: " + config.getResource()))) {
+       49              bytes = stream.readAllBytes();
+       50          }
+       51          ks = FileCertificateProvider.load(config, bytes, null);
+       52      }
+       53  
+       54      @Override
+       55      public Publisher<KeyStore> getKeyStore() {
+       56          return Publishers.just(ks);
+       57      }
+       58  
+       59      @Override
+       60      public String getName() {
+       61          return name;
+       62      }
+       63  
+       64      /**
+       65       * Configuration for resource-based certificate material. Supports JKS/PKCS12 and PEM.
+       66       */
+       67      @EachProperty(CONFIG_PREFIX + ".resource")
+       68      @BootstrapContextCompatible
+       69      public static final class Config extends AbstractCertificateFileConfig {
+       70          private String resource;
+       71  
+       72          public Config(@Parameter String name) {
+       73              super(name);
+       74          }
+       75  
+       76          /**
+       77           * Micronaut resource location of the certificate material to load, for example {@code classpath:certs/server.p12}
+       78           * or {@code file:/etc/ssl/server.pem}. The actual format and password handling are controlled by the common
+       79           * properties in {@link AbstractCertificateFileConfig} (e.g. {@code format}, {@code password}).
+       80           * @return the resource location of the certificate material
+       81           */
+       82          public String getResource() {
+       83              return resource;
+       84          }
+       85  
+       86          /**
+       87           * Micronaut resource location of the certificate material to load, for example {@code classpath:certs/server.p12}
+       88           * or {@code file:/etc/ssl/server.pem}. The actual format and password handling are controlled by the common
+       89           * properties in {@link AbstractCertificateFileConfig} (e.g. {@code format}, {@code password}).
+       90           * @param resource the resource location of the certificate material
+       91           */
+       92          public void setResource(String resource) {
+       93              this.resource = resource;
+       94          }
+       95      }
+       96  }
+
+---------- IMPLEMENTER io.micronaut.http.ssl.SelfSignedCertificateProvider  stubs=0/1 ----------
+       46  @EachBean(SelfSignedCertificateProvider.Config.class)
+       47  @Requires(classes = X509Bundle.class)
+       48  @BootstrapContextCompatible
+       49  public final class SelfSignedCertificateProvider implements CertificateProvider {
+       50      private static final Logger LOG = LoggerFactory.getLogger(SelfSignedCertificateProvider.class);
+       51  
+       52      private final String name;
+       53      private final Flux<KeyStore> bundleFlux;
+       54  
+       55      SelfSignedCertificateProvider(Config config, @jakarta.inject.Named(TaskExecutors.SCHEDULED) ExecutorService scheduler) throws Exception {
+       56          name = config.name;
+       57          Sinks.Many<KeyStore> sink = Sinks.many().replay().latest();
+       58          update(config, sink);
+       59          ((ScheduledExecutorService) scheduler).scheduleAtFixedRate(
+       60              () -> {
+       61                  try {
+       62                      update(config, sink);
+       63                  } catch (Exception e) {
+       64                      LOG.warn("Failed to build self-signed certificate '{}'", config.name, e);
+       65                  }
+       66              },
+       67              config.updateInterval.toNanos(),
+       68              config.updateInterval.toNanos(),
+       69              TimeUnit.NANOSECONDS);
+       70          bundleFlux = sink.asFlux();
+       71      }
+       72  
+       73      private static void update(Config config, Sinks. Many<KeyStore> sink) throws Exception {
+       74          X509Bundle bundle = new CertificateBuilder()
+       75              .algorithm(config.algorithm)
+       76              .subject(config.subject)
+       77              .notAfter(Instant.now().plus(config.lifetime))
+       78              .setIsCertificateAuthority(true)
+       79              .buildSelfSigned();
+       80          sink.tryEmitNext(bundle.toKeyStore(null));
+       81      }
+       82  
+       83      @Override
+       84      public Publisher<KeyStore> getKeyStore() {
+       85          return bundleFlux;
+       86      }
+       87  
+       88      @Override
+       89      public String getName() {
+       90          return name;
+       91      }
+       92  
+       93      /**
+       94       * Certificate provider that creates self-signed certificates using netty-pkitesting.
+       95       */
+       96      @EachProperty(CONFIG_PREFIX + ".self-signed")
+       97      @BootstrapContextCompatible
+       98      public static final class Config implements Named {
+       99          private final String name;
+      100  
+      101          private CertificateBuilder.Algorithm algorithm = CertificateBuilder.Algorithm.rsa4096;
+      102          private String subject = "CN=localhost";
+      103          private Duration updateInterval = Duration.ofDays(1);
+      104          private Duration lifetime = Duration.ofDays(7);
+      105  
+      106          public Config(@Parameter String name) {
+      107              this.name = name;
+      108          }
+      109  
+      110          @Override
+      111          public String getName() {
+      112              return name;
+      113          }
+      114  
+      115          /**
+      116           * Algorithm used to generate the self-signed key pair and certificate (e.g. RSA, EC). Controls the cryptographic
+      117           * parameters used by {@link io.netty.pkitesting.CertificateBuilder}. Defaults to {@code rsa4096}.
+      118           * @return the certificate generation algorithm
+      119           */
+      120          public CertificateBuilder. Algorithm getAlgorithm() {
+      121              return algorithm;
+      122          }
+      123  
+      124          /**
+      125           * Algorithm used to generate the self-signed key pair and certificate (e.g. RSA, EC). Controls the cryptographic
+      126           * parameters used by {@link io.netty.pkitesting.CertificateBuilder}. Defaults to {@code rsa4096}.
+      127           * @param algorithm the certificate generation algorithm
+      128           */
+      129          public void setAlgorithm(CertificateBuilder. Algorithm algorithm) {
+      130              this.algorithm = algorithm;
+      131          }
+      132  
+      133          /**
+      134           * X.500 subject distinguished name for the generated certificate, for example {@code CN=localhost}.
+      135           * This value is passed to the certificate builder and becomes the certificate's subject. Defaults to {@code CN=localhost}.
+      136           * @return the subject DN for the certificate
+      137           */
+      138          public String getSubject() {
+      139              return subject;
+      140          }
+      141  
+      142          /**
+      143           * X.500 subject distinguished name for the generated certificate, for example {@code CN=localhost}.
+      144           * This value is passed to the certificate builder and becomes the certificate's subject. Defaults to {@code CN=localhost}.
+      145           * @param subject the subject DN for the certificate
+      146           */
+      147          public void setSubject(String subject) {
+      148              this.subject = subject;
+      149          }
+      150  
+      151          /**
+      152           * Interval at which a new self-signed certificate is generated and emitted. Used to schedule periodic
+      153           * regeneration via a fixed-rate task so updated material is picked up automatically. Defaults to 1 day.
+      154           * @return the certificate regeneration interval
+      155           */
+      156          public Duration getUpdateInterval() {
+      157              return updateInterval;
+      158          }
+      159  
+      160          /**
+      161           * Interval at which a new self-signed certificate is generated and emitted. Used to schedule periodic
+      162           * regeneration via a fixed-rate task so updated material is picked up automatically. Defaults to 1 day.
+      163           * @param updateInterval the certificate regeneration interval
+      164           */
+      165          public void setUpdateInterval(Duration updateInterval) {
+      166              this.updateInterval = updateInterval;
+      167          }
+      168  
+      169          /**
+      170           * Validity period of the generated certificate. The certificate's {@code notAfter} is set to now plus this
+      171           * duration when building the self-signed certificate. Defaults to 7 days.
+      172           * @return the certificate lifetime
+      173           */
+      174          public Duration getLifetime() {
+      175              return lifetime;
+      176          }
+      177  
+      178          /**
+      179           * Validity period of the generated certificate. The certificate's {@code notAfter} is set to now plus this
+      180           * duration when building the self-signed certificate. Defaults to 7 days.
+      181           * @param lifetime the certificate lifetime
+      182           */
+      183          public void setLifetime(Duration lifetime) {
+      184              this.lifetime = lifetime;
+      185          }
+      186      }
+      187  }

@@ -1,0 +1,981 @@
+row 51   apache/solr#3826
+============================================================================
+CONTRACT org.apache.solr.util.plugin.PluginInfoInitialized   members=1.0 implementers=21.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       26  public interface PluginInfoInitialized {
+       27  
+       28    public void init(PluginInfo info);
+       29  }
+
+---------- IMPLEMENTER org.apache.solr.handler.component.ExpandComponent  stubs=0/1 ----------
+      110  public class ExpandComponent extends SearchComponent implements PluginInfoInitialized {
+      111    public static final String COMPONENT_NAME = "expand";
+      112    private static final int finishingStage = ResponseBuilder.STAGE_GET_FIELDS;
+      113    private PluginInfo info = PluginInfo.EMPTY_INFO;
+      114  
+      115    @Override
+      116    public void init(PluginInfo info) {
+      117      this.info = info;
+      118    }
+      119  
+      120    @Override
+      121    public void prepare(ResponseBuilder rb) throws IOException {
+      122      if (rb.req.getParams().getBool(ExpandParams.EXPAND, false)) {
+      123        if (rb.req.getParams().getBool(GroupParams.GROUP, false)) {
+      124          throw new SolrException(
+      125              SolrException.ErrorCode.BAD_REQUEST, "Can not use expand with Grouping enabled");
+      126        }
+      127        rb.doExpand = true;
+      128      }
+      129    }
+      130  
+      131    @Override
+      132    public void process(ResponseBuilder rb) throws IOException {
+      133  
+      134      if (!rb.doExpand) {
+      135        return;
+      136      }
+      137  
+      138      SolrQueryRequest req = rb.req;
+      139      SolrParams params = req.getParams();
+      140  
+      141      String field = params.get(ExpandParams.EXPAND_FIELD);
+      142      String hint = null;
+      143      if (field == null) {
+      144        List<Query> filters = rb.getFilters();
+      145        if (filters != null) {
+      146          int cost = Integer.MAX_VALUE;
+      147          for (Query q : filters) {
+      148            if (q instanceof CollapsingQParserPlugin.CollapsingPostFilter cp) {
+      149              // if there are multiple collapse pick the low cost one
+      150              // if cost are equal then first one is picked
+      151              if (cp.getCost() < cost) {
+      152                cost = cp.getCost();
+      153                field = cp.getField();
+      154                hint = cp.hint;
+      155              }
+      156            }
+      157          }
+      158        }
+      159      }
+      160  
+      161      if (field == null) {
+      162        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "missing expand field");
+      163      }
+      164  
+      165      String sortParam = params.get(ExpandParams.EXPAND_SORT);
+      166      String[] fqs = params.getParams(ExpandParams.EXPAND_FQ);
+      167      String qs = params.get(ExpandParams.EXPAND_Q);
+      168      int limit = params.getInt(ExpandParams.EXPAND_ROWS, 5);
+      169  
+      170      Sort sort = null;
+      171  
+      172      if (sortParam != null) {
+      173        sort = SortSpecParsing.parseSortSpec(sortParam, rb.req).getSort();
+      174      }
+      175  
+      176      final Query query;
+      177      List<Query> newFilters = new ArrayList<>();
+      178      try {
+      179        if (qs == null) {
+      180          query = rb.getQuery();
+      181        } else {
+      182          QParser parser = QParser.getParser(qs, req);
+      183          query = parser.getQuery();
+      184        }
+      185  
+      186        if (fqs == null) {
+      187          List<Query> filters = rb.getFilters();
+      188          if (filters != null) {
+      189            for (Query q : filters) {
+      190              if (!(q instanceof CollapsingQParserPlugin.CollapsingPostFilter)) {
+      191                newFilters.add(q);
+      192              }
+      193            }
+      194          }
+      195        } else {
+      196          for (String fq : fqs) {
+      197            if (StrUtils.isNotBlank(fq) && !fq.equals("*:*")) {
+      198              QParser fqp = QParser.getParser(fq, req);
+      199              newFilters.add(fqp.getQuery());
+      200            }
+      201          }
+      202        }
+      203      } catch (SyntaxError e) {
+      204        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, e);
+      205      }
+      206  
+      207      SolrIndexSearcher searcher = req.getSearcher();
+      208      LeafReader reader = searcher.getSlowAtomicReader();
+      209  
+      210      SchemaField schemaField = searcher.getSchema().getField(field);
+      211      FieldType fieldType = schemaField.getType();
+      212  
+      213      SortedDocValues values = null;
+      214  
+      215      if (fieldType instanceof StrField) {
+      216        // Get The Top Level SortedDocValues
+      217        if (CollapsingQParserPlugin.HINT_TOP_FC.equals(hint)) {
+      218          LeafReader uninvertingReader =
+      219              CollapsingQParserPlugin.getTopFieldCacheReader(searcher, field);
+      220          values = uninvertingReader.getSortedDocValues(field);
+      221        } else {
+      222          values = DocValues.getSorted(reader, field);
+      223        }
+      224      } else if (fieldType.getNumberType() == null) {
+      225        // possible if directly expand.field is specified
+      226        throw new SolrException(
+      227            SolrException.ErrorCode.BAD_REQUEST,
+      228            "Expand not supported for fieldType:'" + fieldType.getTypeName() + "'");
+      229      }
+      230  
+      231      FixedBitSet groupBits = null;
+      232      LongHashSet groupSet = null;
+      233      DocList docList = rb.getResults().docList;
+      234      IntHashSet collapsedSet = new IntHashSet(docList.size() * 2);
+      235  
+      236      // Gather the groups for the current page of documents
+      237      DocIterator idit = docList.iterator();
+      238      int[] globalDocs = new int[docList.size()];
+      239      int docsIndex = -1;
+      240      while (idit.hasNext()) {
+      241        globalDocs[++docsIndex] = idit.nextDoc();
+      242      }
+      243  
+      244      Arrays.sort(globalDocs);
+      245      Query groupQuery = null;
+      246  
+      247      /*
+      248       * This code gathers the group information for the current page.
+      249       */
+      250      List<LeafReaderContext> contexts = searcher.getTopReaderContext().leaves();
+      251  
+      252      if (contexts.size() == 0) {
+      253        // When no context is available we can skip the expanding
+      254        return;
+      255      }
+      256      QueryLimits queryLimits = QueryLimits.getCurrentLimits();
+      257      if (queryLimits.maybeExitWithPartialResults("Expand process")) {
+      258        return;
+      259      }
+      260  
+      261      boolean nullGroupOnCurrentPage = false;
+      262      int currentContext = 0;
+      263      int currentDocBase = contexts.get(currentContext).docBase;
+      264      int nextDocBase =
+      265          (currentContext + 1) < contexts.size()
+      266              ? contexts.get(currentContext + 1).docBase
+      267              : Integer.MAX_VALUE;
+      268      IntObjectHashMap<BytesRef> ordBytes = null;
+      269      if (values != null) {
+
+---------- IMPLEMENTER org.apache.solr.handler.component.HighlightComponent  stubs=0/1 ----------
+       55  public class HighlightComponent extends SearchComponent
+       56      implements PluginInfoInitialized, SolrCoreAware {
+       57    public enum HighlightMethod {
+       58      UNIFIED("unified"),
+       59      FAST_VECTOR("fastVector"),
+       60      ORIGINAL("original");
+       61  
+       62      private static final Map<String, HighlightMethod> METHODS =
+       63          Stream.of(values())
+       64              .collect(
+       65                  Collectors.toUnmodifiableMap(HighlightMethod::getMethodName, Function.identity()));
+       66  
+       67      private final String methodName;
+       68  
+       69      HighlightMethod(String method) {
+       70        this.methodName = method;
+       71      }
+       72  
+       73      public String getMethodName() {
+       74        return methodName;
+       75      }
+       76  
+       77      public static HighlightMethod parse(String method) {
+       78        return METHODS.get(method);
+       79      }
+       80    }
+       81  
+       82    public static final String COMPONENT_NAME = "highlight";
+       83  
+       84    protected PluginInfo info = PluginInfo.EMPTY_INFO;
+       85  
+       86    // TODO lets restructure the abstractions/relationships
+       87    protected SolrHighlighter solrConfigHighlighter;
+       88  
+       89    @Override
+       90    public void init(PluginInfo info) {
+       91      this.info = info;
+       92    }
+       93  
+       94    @Override
+       95    public void prepare(ResponseBuilder rb) throws IOException {
+       96      SolrParams params = rb.req.getParams();
+       97      rb.doHighlights = solrConfigHighlighter.isHighlightingEnabled(params);
+       98      if (rb.doHighlights) {
+       99        rb.setNeedDocList(true);
+      100        String hlq = params.get(HighlightParams.Q);
+      101        String hlparser =
+      102            Objects.requireNonNullElse(
+      103                params.get(HighlightParams.QPARSER),
+      104                params.get(QueryParsing.DEFTYPE, QParserPlugin.DEFAULT_QTYPE));
+      105        if (hlq != null) {
+      106          try {
+      107            QParser parser = QParser.getParser(hlq, hlparser, rb.req);
+      108            rb.setHighlightQuery(parser.getHighlightQuery());
+      109          } catch (SyntaxError e) {
+      110            throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, e);
+      111          }
+      112        }
+      113      }
+      114    }
+      115  
+      116    @Override
+      117    public void inform(SolrCore core) {
+      118      List<PluginInfo> children = info.getChildren("highlighting");
+      119      if (children.isEmpty()) {
+      120        DefaultSolrHighlighter defHighlighter = new DefaultSolrHighlighter(core);
+      121        defHighlighter.init(PluginInfo.EMPTY_INFO);
+      122        solrConfigHighlighter = defHighlighter;
+      123      } else {
+      124        solrConfigHighlighter =
+      125            core.createInitInstance(
+      126                children.get(0), SolrHighlighter.class, null, DefaultSolrHighlighter.class.getName());
+      127      }
+      128    }
+      129  
+      130    @Override
+      131    public void process(ResponseBuilder rb) throws IOException {
+      132  
+      133      if (rb.doHighlights) {
+      134        SolrQueryRequest req = rb.req;
+      135        SolrParams params = req.getParams();
+      136  
+      137        SolrHighlighter highlighter = getHighlighter(params);
+      138  
+      139        // TODO: get from builder by default?
+      140        String[] defaultHighlightFields =
+      141            rb.getQparser() != null ? rb.getQparser().getDefaultHighlightFields() : null;
+      142  
+      143        Query highlightQuery = rb.getHighlightQuery();
+      144        if (highlightQuery == null) {
+      145          if (rb.getQparser() != null) {
+      146            try {
+      147              highlightQuery = rb.getQparser().getHighlightQuery();
+      148              rb.setHighlightQuery(highlightQuery);
+      149            } catch (Exception e) {
+      150              throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, e);
+      151            }
+      152          } else {
+      153            highlightQuery = rb.getQuery();
+      154            rb.setHighlightQuery(highlightQuery);
+      155          }
+      156        }
+      157  
+      158        // No highlighting if there is no query -- consider q.alt=*:*
+      159        if (highlightQuery != null) {
+      160          NamedList<Object> sumData =
+      161              highlighter.doHighlighting(
+      162                  rb.getResults().docList, highlightQuery, req, defaultHighlightFields);
+      163  
+      164          if (sumData != null) {
+      165            // TODO ???? add this directly to the response?
+      166            rb.rsp.add(highlightingResponseField(), convertHighlights(sumData));
+      167          }
+      168          QueryLimits queryLimits = QueryLimits.getCurrentLimits();
+      169          queryLimits.maybeExitWithPartialResults("Highlighting process");
+      170        }
+      171      }
+      172    }
+      173  
+      174    /** The highlighter given the param {@link HighlightParams#METHOD}. Never returns null. */
+      175    public SolrHighlighter getHighlighter(SolrParams params) {
+      176      HighlightMethod method = HighlightMethod.parse(params.get(HighlightParams.METHOD, "unified"));
+      177  
+      178      switch (method) {
+      179        case UNIFIED:
+      180          if (solrConfigHighlighter instanceof UnifiedSolrHighlighter) {
+      181            return solrConfigHighlighter;
+      182          }
+      183          return new UnifiedSolrHighlighter(); // cheap
+      184        case FAST_VECTOR: // fall-through
+      185        case ORIGINAL:
+      186          // The configured highlighter might not actually be the original highlighter if
+      187          //  someone specified class= something custom.
+      188          // Perhaps we shouldn't even support custom SolrHighlighter impls, and instead
+      189          //  we ask users to subclass HighlightComponent instead?
+      190          return solrConfigHighlighter;
+      191        default:
+      192          throw new AssertionError();
+      193      }
+      194    }
+      195  
+      196    @Override
+      197    public void modifyRequest(ResponseBuilder rb, SearchComponent who, ShardRequest sreq) {
+      198      if (!rb.doHighlights) return;
+      199  
+      200      // Turn on highlighting only only when retrieving fields
+      201      if ((sreq.purpose & ShardRequest.PURPOSE_GET_FIELDS) != 0) {
+      202        sreq.purpose |= ShardRequest.PURPOSE_GET_HIGHLIGHTS;
+      203        // should already be true...
+      204        sreq.params.set(HighlightParams.HIGHLIGHT, "true");
+      205      } else {
+      206        sreq.params.set(HighlightParams.HIGHLIGHT, "false");
+      207      }
+      208    }
+      209  
+      210    @Override
+      211    public void handleResponses(ResponseBuilder rb, ShardRequest sreq) {}
+      212  
+      213    @Override
+      214    public void finishStage(ResponseBuilder rb) {
+
+---------- IMPLEMENTER org.apache.solr.handler.component.HttpShardHandlerFactory  stubs=0/1 ----------
+       68  public class HttpShardHandlerFactory extends ShardHandlerFactory
+       69      implements org.apache.solr.util.plugin.PluginInfoInitialized, SolrMetricProducer {
+       70    private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+       71    private static final String DEFAULT_SCHEME = "http";
+       72  
+       73    // We want an executor that doesn't take up any resources if
+       74    // it's not used, so it could be created statically for
+       75    // the distributed search component if desired.
+       76    //
+       77    // Consider CallerRuns policy and a lower max threads to throttle
+       78    // requests at some point (or should we simply return failure?)
+       79    //
+       80    // This executor is initialized in the init method
+       81    protected ExecutorService commExecutor;
+       82  
+       83    protected volatile Http2SolrClient defaultClient;
+       84    protected InstrumentedHttpListenerFactory httpListenerFactory;
+       85    protected LBHttp2SolrClient<Http2SolrClient> loadbalancer;
+       86  
+       87    int corePoolSize = 0;
+       88    int maximumPoolSize = Integer.MAX_VALUE;
+       89    int keepAliveTime = 5;
+       90    int queueSize = -1;
+       91    int permittedLoadBalancerRequestsMinimumAbsolute = 0;
+       92    float permittedLoadBalancerRequestsMaximumFraction = 1.0f;
+       93    boolean accessPolicy = false;
+       94    private SolrMetricsContext solrMetricsContext;
+       95  
+       96    private String scheme = null;
+       97  
+       98    private InstrumentedHttpListenerFactory.NameStrategy metricNameStrategy;
+       99  
+      100    protected final Random r = new Random();
+      101  
+      102    private RequestReplicaListTransformerGenerator requestReplicaListTransformerGenerator =
+      103        new RequestReplicaListTransformerGenerator();
+      104  
+      105    // URL scheme to be used in distributed search.
+      106    static final String INIT_URL_SCHEME = "urlScheme";
+      107  
+      108    // The core size of the threadpool servicing requests
+      109    static final String INIT_CORE_POOL_SIZE = "corePoolSize";
+      110  
+      111    // The maximum size of the threadpool servicing requests
+      112    static final String INIT_MAX_POOL_SIZE = "maximumPoolSize";
+      113  
+      114    // The amount of time idle threads persist for in the queue, before being killed
+      115    static final String MAX_THREAD_IDLE_TIME = "maxThreadIdleTime";
+      116  
+      117    // If the threadpool uses a backing queue, what is its maximum size (-1) to use direct handoff
+      118    static final String INIT_SIZE_OF_QUEUE = "sizeOfQueue";
+      119  
+      120    // The minimum number of replicas that may be used
+      121    static final String LOAD_BALANCER_REQUESTS_MIN_ABSOLUTE = "loadBalancerRequestsMinimumAbsolute";
+      122  
+      123    // The maximum proportion of replicas to be used
+      124    static final String LOAD_BALANCER_REQUESTS_MAX_FRACTION = "loadBalancerRequestsMaximumFraction";
+      125  
+      126    // Configure if the threadpool favours fairness over throughput
+      127    static final String INIT_FAIRNESS_POLICY = "fairnessPolicy";
+      128  
+      129    /** Get {@link ShardHandler} that uses the default http client. */
+      130    @Override
+      131    public ShardHandler getShardHandler() {
+      132      return new HttpShardHandler(this);
+      133    }
+      134  
+      135    private static NamedList<?> getNamedList(Object val) {
+      136      if (val instanceof NamedList) {
+      137        return (NamedList<?>) val;
+      138      } else {
+      139        throw new IllegalArgumentException(
+      140            "Invalid config for replicaRouting; expected NamedList, but got " + val);
+      141      }
+      142    }
+      143  
+      144    private static String checkDefaultReplicaListTransformer(
+      145        NamedList<?> c, String setTo, String extantDefaultRouting) {
+      146      if (!Boolean.TRUE.equals(c.getBooleanArg("default"))) {
+      147        return null;
+      148      } else {
+      149        if (extantDefaultRouting == null) {
+      150          return setTo;
+      151        } else {
+      152          throw new IllegalArgumentException("more than one routing scheme marked as default");
+      153        }
+      154      }
+      155    }
+      156  
+      157    private void initReplicaListTransformers(NamedList<?> routingConfig) {
+      158      String defaultRouting = null;
+      159      ReplicaListTransformerFactory stableRltFactory = null;
+      160      ReplicaListTransformerFactory defaultRltFactory;
+      161      if (routingConfig != null && routingConfig.size() > 0) {
+      162        Iterator<? extends Entry<String, ?>> iter = routingConfig.iterator();
+      163        do {
+      164          Entry<String, ?> e = iter.next();
+      165          String key = e.getKey();
+      166          switch (key) {
+      167            case ShardParams.REPLICA_RANDOM:
+      168              // Only positive assertion of default status (i.e., default=true) is supported.
+      169              // "random" is currently the implicit default, so explicitly configuring
+      170              // "random" as default would not currently be useful, but if the implicit default
+      171              // changes in the future, checkDefault could be relevant here.
+      172              defaultRouting =
+      173                  checkDefaultReplicaListTransformer(getNamedList(e.getValue()), key, defaultRouting);
+      174              break;
+      175            case ShardParams.REPLICA_STABLE:
+      176              NamedList<?> c = getNamedList(e.getValue());
+      177              defaultRouting = checkDefaultReplicaListTransformer(c, key, defaultRouting);
+      178              stableRltFactory = new AffinityReplicaListTransformerFactory(c);
+      179              break;
+      180            default:
+      181              throw new IllegalArgumentException("invalid replica routing spec name: " + key);
+      182          }
+      183        } while (iter.hasNext());
+      184      }
+      185      if (stableRltFactory == null) {
+      186        stableRltFactory = new AffinityReplicaListTransformerFactory();
+      187      }
+      188      if (ShardParams.REPLICA_STABLE.equals(defaultRouting)) {
+      189        defaultRltFactory = stableRltFactory;
+      190      } else {
+      191        defaultRltFactory = RequestReplicaListTransformerGenerator.RANDOM_RLTF;
+      192      }
+      193      this.requestReplicaListTransformerGenerator =
+      194          new RequestReplicaListTransformerGenerator(defaultRltFactory, stableRltFactory);
+      195    }
+      196  
+      197    /**
+      198     * Customizes {@link HttpShardHandler} instances that will be produced by this factory.
+      199     *
+      200     * <p>Supports the following parameters in {@code info}:
+      201     *
+      202     * <ul>
+      203     *   <li>socketTimeout - read timeout for requests, in milliseconds.
+      204     *   <li>connTimeout - connection timeout for requests, in milliseconds.
+      205     *   <li>urlScheme - "http" or "https"
+      206     *   <li>maxConnectionsPerHost - caps the number of concurrent connections per host
+      207     *   <li>corePoolSize - the initial size of the thread pool used to service requests
+      208     *   <li>maximumPoolSize - the maximum size of the thread pool used to service requests.
+      209     *   <li>maxThreadIdleTime - the amount of time (in seconds) that thread pool entries may sit idle
+      210     *       before being killed
+      211     *   <li>sizeOfQueue - the size of the queue (if any) used by the thread pool that services
+      212     *       shard-handler requests
+      213     *   <li>fairnessPolicy - true if the thread pool should prioritize fairness over throughput,
+      214     *       false otherwise
+      215     *   <li>replicaRouting - a NamedList of preferences used to select the order in which replicas
+      216     *       for a shard will be used by created ShardHandlers
+      217     * </ul>
+      218     *
+      219     * @param info configuration for the created factory, typically reflecting the contents of a
+      220     *     &lt;shardHandlerFactory&gt; XML tag from solr.xml or solrconfig.xml
+      221     */
+      222    @Override
+      223    public void init(PluginInfo info) {
+      224      StringBuilder sb = new StringBuilder();
+      225      NamedList<?> args = info.initArgs;
+      226      this.scheme = getParameter(args, INIT_URL_SCHEME, null, sb);
+      227      if (this.scheme != null && this.scheme.endsWith("://")) {
+
+---------- IMPLEMENTER org.apache.solr.handler.component.SearchHandler  stubs=0/1 ----------
+       92  public class SearchHandler extends RequestHandlerBase
+       93      implements SolrCoreAware, PluginInfoInitialized, PermissionNameProvider {
+       94  
+       95    public static final AttributeKey<Boolean> INTERNAL_ATTR = AttributeKey.booleanKey("internal");
+       96    static final String INIT_COMPONENTS = "components";
+       97    static final String INIT_FIRST_COMPONENTS = "first-components";
+       98    static final String INIT_LAST_COMPONENTS = "last-components";
+       99  
+      100    private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+      101  
+      102    /**
+      103     * A counter to ensure that no RID is equal, even if they fall in the same millisecond
+      104     *
+      105     * @deprecated this was replaced by the auto-generated trace ids
+      106     */
+      107    @Deprecated(since = "9.4")
+      108    private static final AtomicLong ridCounter = new AtomicLong();
+      109  
+      110    /**
+      111     * An opt-out flag to prevent the addition of {@link CommonParams#REQUEST_ID} tracing on
+      112     * distributed queries
+      113     *
+      114     * <p>Defaults to 'false' if not specified.
+      115     *
+      116     * @see CommonParams#DISABLE_REQUEST_ID
+      117     * @deprecated this was replaced by the auto-generated trace ids
+      118     */
+      119    @Deprecated(since = "9.4")
+      120    private static final boolean DISABLE_REQUEST_ID_DEFAULT =
+      121        Boolean.getBoolean("solr.disableRequestId");
+      122  
+      123    private HandlerMetrics metricsShard = HandlerMetrics.NO_OP;
+      124  
+      125    protected volatile List<SearchComponent> components;
+      126    private ShardHandlerFactory shardHandlerFactory;
+      127    private PluginInfo shfInfo;
+      128    private SolrCore core;
+      129  
+      130    protected List<String> getDefaultComponents() {
+      131      ArrayList<String> names = new ArrayList<>(9);
+      132      names.add(QueryComponent.COMPONENT_NAME);
+      133      names.add(FacetComponent.COMPONENT_NAME);
+      134      names.add(FacetModule.COMPONENT_NAME);
+      135      names.add(MoreLikeThisComponent.COMPONENT_NAME);
+      136      names.add(HighlightComponent.COMPONENT_NAME);
+      137      names.add(StatsComponent.COMPONENT_NAME);
+      138      names.add(DebugComponent.COMPONENT_NAME);
+      139      names.add(ExpandComponent.COMPONENT_NAME);
+      140      names.add(TermsComponent.COMPONENT_NAME);
+      141  
+      142      return names;
+      143    }
+      144  
+      145    @Override
+      146    public void init(PluginInfo info) {
+      147      init(info.initArgs);
+      148      for (PluginInfo child : info.children) {
+      149        if ("shardHandlerFactory".equals(child.type)) {
+      150          this.shfInfo = child;
+      151          break;
+      152        }
+      153      }
+      154    }
+      155  
+      156    @Override
+      157    public void initializeMetrics(SolrMetricsContext parentContext, Attributes attributes) {
+      158      super.initializeMetrics(
+      159          parentContext, Attributes.builder().putAll(attributes).put(INTERNAL_ATTR, false).build());
+      160      metricsShard =
+      161          new HandlerMetrics( // will register various metrics in the context
+      162              solrMetricsContext,
+      163              Attributes.builder()
+      164                  .putAll(attributes)
+      165                  .put(CATEGORY_ATTR, getCategory().toString())
+      166                  .put(INTERNAL_ATTR, true)
+      167                  .build(),
+      168              false);
+      169    }
+      170  
+      171    @Override
+      172    public HandlerMetrics getMetricsForThisRequest(SolrQueryRequest req) {
+      173      return req.getParams().getBool(ShardParams.IS_SHARD, false) ? this.metricsShard : this.metrics;
+      174    }
+      175  
+      176    @Override
+      177    public PermissionNameProvider.Name getPermissionName(AuthorizationContext ctx) {
+      178      return PermissionNameProvider.Name.READ_PERM;
+      179    }
+      180  
+      181    /**
+      182     * Initialize the components based on name. Note, if using <code>INIT_FIRST_COMPONENTS</code> or
+      183     * <code>INIT_LAST_COMPONENTS</code>, then the {@link DebugComponent} will always occur last. If
+      184     * this is not desired, then one must explicitly declare all components using the <code>
+      185     * INIT_COMPONENTS</code> syntax.
+      186     */
+      187    @Override
+      188    @SuppressWarnings("unchecked")
+      189    public void inform(SolrCore core) {
+      190      this.core = core;
+      191      List<String> c = (List<String>) initArgs.get(INIT_COMPONENTS);
+      192      Set<String> missing = new HashSet<>(core.getSearchComponents().checkContains(c));
+      193      List<String> first = (List<String>) initArgs.get(INIT_FIRST_COMPONENTS);
+      194      missing.addAll(core.getSearchComponents().checkContains(first));
+      195      List<String> last = (List<String>) initArgs.get(INIT_LAST_COMPONENTS);
+      196      missing.addAll(core.getSearchComponents().checkContains(last));
+      197      if (!missing.isEmpty())
+      198        throw new SolrException(
+      199            SolrException.ErrorCode.SERVER_ERROR, "Missing SearchComponents named : " + missing);
+      200      if (c != null && (first != null || last != null))
+      201        throw new SolrException(
+      202            SolrException.ErrorCode.SERVER_ERROR,
+      203            "First/Last components only valid if you do not declare 'components'");
+      204  
+      205      if (shfInfo == null) {
+      206        shardHandlerFactory = core.getCoreContainer().getShardHandlerFactory();
+      207      } else {
+      208        shardHandlerFactory = core.createInitInstance(shfInfo, ShardHandlerFactory.class, null, null);
+      209        core.addCloseHook(
+      210            new CloseHook() {
+      211              @Override
+      212              public void preClose(SolrCore core) {
+      213                shardHandlerFactory.close();
+      214              }
+      215            });
+      216        shardHandlerFactory.setSecurityBuilder(
+      217            core.getCoreContainer().getPkiAuthenticationSecurityBuilder());
+      218      }
+      219  
+      220      if (core.getCoreContainer().isZooKeeperAware()) {
+      221        core.getPackageListeners()
+      222            .addListener(
+      223                new PackageListeners.Listener() {
+      224                  @Override
+      225                  public String packageName() {
+      226                    return null;
+      227                  }
+      228  
+      229                  @Override
+      230                  public Map<String, PackageAPI.PkgVersion> packageDetails() {
+      231                    return Collections.emptyMap();
+      232                  }
+      233  
+      234                  @Override
+      235                  public void changed(SolrPackageLoader.SolrPackage pkg, Ctx ctx) {
+      236                    // we could optimize this by listening to only relevant packages,
+      237                    // but it is not worth optimizing as these are lightweight objects
+      238                    components = null;
+      239                  }
+      240                });
+      241      }
+      242    }
+      243  
+      244    @SuppressWarnings({"unchecked"})
+      245    private void initComponents() {
+      246      Object declaredComponents = initArgs.get(INIT_COMPONENTS);
+      247      List<String> first = (List<String>) initArgs.get(INIT_FIRST_COMPONENTS);
+      248      List<String> last = (List<String>) initArgs.get(INIT_LAST_COMPONENTS);
+      249  
+      250      List<String> list = null;
+      251      boolean makeDebugLast = true;
+
+---------- IMPLEMENTER org.apache.solr.highlight.DefaultSolrHighlighter  stubs=0/1 ----------
+       90  public class DefaultSolrHighlighter extends SolrHighlighter implements PluginInfoInitialized {
+       91  
+       92    /**
+       93     * This constant was formerly part of HighlightParams. After deprecation it was removed so clients
+       94     * would no longer use it, but we still support it server side.
+       95     */
+       96    private static final String USE_FVH = HighlightParams.HIGHLIGHT + ".useFastVectorHighlighter";
+       97  
+       98    private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+       99  
+      100    protected final SolrCore solrCore;
+      101  
+      102    // Will be invoked via reflection
+      103    public DefaultSolrHighlighter(SolrCore solrCore) {
+      104      this.solrCore = solrCore;
+      105    }
+      106  
+      107    // Thread safe registry
+      108    protected final Map<String, SolrFormatter> formatters = new HashMap<>();
+      109  
+      110    // Thread safe registry
+      111    protected final Map<String, SolrEncoder> encoders = new HashMap<>();
+      112  
+      113    // Thread safe registry
+      114    protected final Map<String, SolrFragmenter> fragmenters = new HashMap<>();
+      115  
+      116    // Thread safe registry
+      117    protected final Map<String, SolrFragListBuilder> fragListBuilders = new HashMap<>();
+      118  
+      119    // Thread safe registry
+      120    protected final Map<String, SolrFragmentsBuilder> fragmentsBuilders = new HashMap<>();
+      121  
+      122    // Thread safe registry
+      123    protected final Map<String, SolrBoundaryScanner> boundaryScanners = new HashMap<>();
+      124  
+      125    @Override
+      126    public void init(PluginInfo info) {
+      127      formatters.clear();
+      128      encoders.clear();
+      129      fragmenters.clear();
+      130      fragListBuilders.clear();
+      131      fragmentsBuilders.clear();
+      132      boundaryScanners.clear();
+      133  
+      134      // Load the fragmenters
+      135      SolrFragmenter frag =
+      136          solrCore.initPlugins(
+      137              info.getChildren("fragmenter"), fragmenters, SolrFragmenter.class, null);
+      138      if (frag == null) {
+      139        frag = new GapFragmenter();
+      140        solrCore.initDefaultPlugin(frag, SolrFragmenter.class);
+      141      }
+      142      fragmenters.put("", frag);
+      143      fragmenters.put(null, frag);
+      144  
+      145      // Load the formatters
+      146      SolrFormatter fmt =
+      147          solrCore.initPlugins(info.getChildren("formatter"), formatters, SolrFormatter.class, null);
+      148      if (fmt == null) {
+      149        fmt = new HtmlFormatter();
+      150        solrCore.initDefaultPlugin(fmt, SolrFormatter.class);
+      151      }
+      152      formatters.put("", fmt);
+      153      formatters.put(null, fmt);
+      154  
+      155      // Load the encoders
+      156      SolrEncoder enc =
+      157          solrCore.initPlugins(info.getChildren("encoder"), encoders, SolrEncoder.class, null);
+      158      if (enc == null) {
+      159        enc = new DefaultEncoder();
+      160        solrCore.initDefaultPlugin(enc, SolrEncoder.class);
+      161      }
+      162      encoders.put("", enc);
+      163      encoders.put(null, enc);
+      164  
+      165      // Load the FragListBuilders
+      166      SolrFragListBuilder fragListBuilder =
+      167          solrCore.initPlugins(
+      168              info.getChildren("fragListBuilder"), fragListBuilders, SolrFragListBuilder.class, null);
+      169      if (fragListBuilder == null) {
+      170        fragListBuilder = new SimpleFragListBuilder();
+      171        solrCore.initDefaultPlugin(fragListBuilder, SolrFragListBuilder.class);
+      172      }
+      173      fragListBuilders.put("", fragListBuilder);
+      174      fragListBuilders.put(null, fragListBuilder);
+      175  
+      176      // Load the FragmentsBuilders
+      177      SolrFragmentsBuilder fragsBuilder =
+      178          solrCore.initPlugins(
+      179              info.getChildren("fragmentsBuilder"),
+      180              fragmentsBuilders,
+      181              SolrFragmentsBuilder.class,
+      182              null);
+      183      if (fragsBuilder == null) {
+      184        fragsBuilder = new ScoreOrderFragmentsBuilder();
+      185        solrCore.initDefaultPlugin(fragsBuilder, SolrFragmentsBuilder.class);
+      186      }
+      187      fragmentsBuilders.put("", fragsBuilder);
+      188      fragmentsBuilders.put(null, fragsBuilder);
+      189  
+      190      // Load the BoundaryScanners
+      191      SolrBoundaryScanner boundaryScanner =
+      192          solrCore.initPlugins(
+      193              info.getChildren("boundaryScanner"), boundaryScanners, SolrBoundaryScanner.class, null);
+      194      if (boundaryScanner == null) {
+      195        boundaryScanner = new SimpleBoundaryScanner();
+      196        solrCore.initDefaultPlugin(boundaryScanner, SolrBoundaryScanner.class);
+      197      }
+      198      boundaryScanners.put("", boundaryScanner);
+      199      boundaryScanners.put(null, boundaryScanner);
+      200    }
+      201  
+      202    /**
+      203     * Return a phrase {@link org.apache.lucene.search.highlight.Highlighter} appropriate for this
+      204     * field.
+      205     *
+      206     * @param query The current Query
+      207     * @param fieldName The name of the field
+      208     * @param request The current SolrQueryRequest
+      209     * @param tokenStream document text tokenStream that implements reset() efficiently (e.g.
+      210     *     CachingTokenFilter). If it's used, call reset() first.
+      211     * @throws IOException If there is a low-level I/O error.
+      212     */
+      213    protected Highlighter getPhraseHighlighter(
+      214        Query query, String fieldName, SolrQueryRequest request, TokenStream tokenStream)
+      215        throws IOException {
+      216      SolrParams params = request.getParams();
+      217      Highlighter highlighter =
+      218          new Highlighter(
+      219              getFormatter(fieldName, params),
+      220              getEncoder(fieldName, params),
+      221              getSpanQueryScorer(query, fieldName, tokenStream, request));
+      222  
+      223      highlighter.setTextFragmenter(getFragmenter(fieldName, params));
+      224  
+      225      return highlighter;
+      226    }
+      227  
+      228    /**
+      229     * Return a {@link org.apache.lucene.search.highlight.Highlighter} appropriate for this field.
+      230     *
+      231     * @param query The current Query
+      232     * @param fieldName The name of the field
+      233     * @param request The current SolrQueryRequest
+      234     */
+      235    protected Highlighter getHighlighter(Query query, String fieldName, SolrQueryRequest request) {
+      236      SolrParams params = request.getParams();
+      237      Highlighter highlighter =
+      238          new Highlighter(
+      239              getFormatter(fieldName, params),
+      240              getEncoder(fieldName, params),
+      241              getQueryScorer(query, fieldName, request));
+      242      highlighter.setTextFragmenter(getFragmenter(fieldName, params));
+      243      return highlighter;
+      244    }
+      245  
+      246    /**
+      247     * Return a {@link org.apache.lucene.search.highlight.QueryScorer} suitable for this Query and
+      248     * field.
+      249     *
+
+---------- IMPLEMENTER org.apache.solr.highlight.UnifiedSolrHighlighter  stubs=1/1 ----------
+      134  public class UnifiedSolrHighlighter extends SolrHighlighter implements PluginInfoInitialized {
+      135  
+      136    protected static final String SNIPPET_SEPARATOR = "\u0000";
+      137  
+      138    @Override
+      139    public void init(PluginInfo info) {}
+      140  
+      141    @Override
+      142    public NamedList<Object> doHighlighting(
+      143        DocList docs, Query query, SolrQueryRequest req, String[] defaultFields) throws IOException {
+      144      final SolrParams params = req.getParams();
+      145  
+      146      // if highlighting isn't enabled, then why call doHighlighting?
+      147      if (!isHighlightingEnabled(params)) return null;
+      148  
+      149      int[] docIDs = toDocIDs(docs);
+      150  
+      151      // fetch the unique keys
+      152      String[] keys = getUniqueKeys(req.getSearcher(), docIDs);
+      153  
+      154      // query-time parameters
+      155      String[] fieldNames = getHighlightFields(query, req, defaultFields);
+      156  
+      157      int maxPassages[] = new int[fieldNames.length];
+      158      for (int i = 0; i < fieldNames.length; i++) {
+      159        maxPassages[i] = params.getFieldInt(fieldNames[i], HighlightParams.SNIPPETS, 1);
+      160      }
+      161  
+      162      UnifiedHighlighter highlighter = getHighlighter(req);
+      163      Map<String, String[]> snippets =
+      164          fieldNames.length == 0
+      165              ? Collections.emptyMap()
+      166              : highlighter.highlightFields(fieldNames, query, docIDs, maxPassages);
+      167      return encodeSnippets(keys, fieldNames, snippets);
+      168    }
+      169  
+      170    /**
+      171     * Creates an instance of the Lucene {@link UnifiedHighlighter}. Provided for subclass extension
+      172     * so that a subclass can return a subclass of {@link SolrExtendedUnifiedHighlighter}.
+      173     */
+      174    protected UnifiedHighlighter getHighlighter(SolrQueryRequest req) {
+      175      return new SolrExtendedUnifiedHighlighter(req);
+      176    }
+      177  
+      178    /**
+      179     * Encodes the resulting snippets into a namedlist
+      180     *
+      181     * @param keys the document unique keys
+      182     * @param fieldNames field names to highlight in the order
+      183     * @param snippets map from field name to snippet array for the docs
+      184     * @return encoded namedlist of summaries
+      185     */
+      186    protected NamedList<Object> encodeSnippets(
+      187        String[] keys, String[] fieldNames, Map<String, String[]> snippets) {
+      188      NamedList<Object> list = new SimpleOrderedMap<>();
+      189      for (int i = 0; i < keys.length; i++) {
+      190        NamedList<Object> summary = new SimpleOrderedMap<>();
+      191        for (String field : fieldNames) {
+      192          String snippet = snippets.get(field)[i];
+      193          if (snippet == null) {
+      194            // TODO reuse logic of DefaultSolrHighlighter.alternateField
+      195          } else {
+      196            // we used a special snippet separator char and we can now split on it.
+      197            summary.add(field, snippet.split(SNIPPET_SEPARATOR));
+      198          }
+      199        }
+      200        list.add(keys[i], summary);
+      201      }
+      202      return list;
+      203    }
+      204  
+      205    /** Converts solr's DocList to the int[] docIDs */
+      206    protected int[] toDocIDs(DocList docs) {
+      207      int[] docIDs = new int[docs.size()];
+      208      DocIterator iterator = docs.iterator();
+      209      for (int i = 0; i < docIDs.length; i++) {
+      210        if (!iterator.hasNext()) {
+      211          throw new AssertionError();
+      212        }
+      213        docIDs[i] = iterator.nextDoc();
+      214      }
+      215      if (iterator.hasNext()) {
+      216        throw new AssertionError();
+      217      }
+      218      return docIDs;
+      219    }
+      220  
+      221    /** Retrieves the unique keys for the topdocs to key the results */
+      222    protected String[] getUniqueKeys(SolrIndexSearcher searcher, int[] docIDs) throws IOException {
+      223      IndexSchema schema = searcher.getSchema();
+      224      SchemaField keyField = schema.getUniqueKeyField();
+      225      if (keyField != null) {
+      226        SolrReturnFields returnFields = new SolrReturnFields(keyField.getName(), null);
+      227        SolrDocumentFetcher docFetcher = searcher.getDocFetcher();
+      228        String[] uniqueKeys = new String[docIDs.length];
+      229        for (int i = 0; i < docIDs.length; i++) {
+      230          int docid = docIDs[i];
+      231          SolrDocument solrDoc = docFetcher.solrDoc(docid, returnFields);
+      232          uniqueKeys[i] = schema.printableUniqueKey(solrDoc);
+      233        }
+      234        return uniqueKeys;
+      235      } else {
+      236        return new String[docIDs.length];
+      237      }
+      238    }
+      239  
+      240    /** From {@link #getHighlighter(org.apache.solr.request.SolrQueryRequest)}. */
+      241    protected static class SolrExtendedUnifiedHighlighter extends UnifiedHighlighter {
+      242      protected static final Predicate<String> NOT_REQUIRED_FIELD_MATCH_PREDICATE = s -> true;
+      243      private final SolrIndexSearcher solrIndexSearcher;
+      244      protected final SolrParams params;
+      245  
+      246      protected final IndexSchema schema;
+      247      protected final RTimerTree loadFieldValuesTimer;
+      248  
+      249      public SolrExtendedUnifiedHighlighter(SolrQueryRequest req) {
+      250        super(req.getSearcher(), req.getSchema().getIndexAnalyzer());
+      251        this.solrIndexSearcher = req.getSearcher();
+      252        this.params = req.getParams();
+      253        this.schema = req.getSchema();
+      254        this.setMaxLength(params.getInt(HighlightParams.MAX_CHARS, DEFAULT_MAX_CHARS));
+      255        this.setCacheFieldValCharsThreshold(
+      256            params.getInt(
+      257                HighlightParams.CACHE_FIELD_VAL_CHARS_THRESHOLD, DEFAULT_CACHE_CHARS_THRESHOLD));
+      258  
+      259        final RTimerTree timerTree;
+      260        if (req.getRequestTimer() != null) { // It may be null if not used in a search context.
+      261          timerTree = req.getRequestTimer();
+      262        } else {
+      263          timerTree = new RTimerTree(); // since null checks are annoying
+      264        }
+      265        loadFieldValuesTimer =
+      266            timerTree.sub("loadFieldValues"); // we assume a new timer, state of STARTED
+      267        loadFieldValuesTimer.resume(); // ensure state is STARTED (some obscure test / use-case)
+      268        loadFieldValuesTimer
+      269            .pause(); // state of PAUSED now with about zero time. Will fail if state isn't STARTED.
+      270      }
+      271  
+      272      @Override
+      273      protected OffsetSource getOffsetSource(String field) {
+      274        String sourceStr = params.getFieldParam(field, HighlightParams.OFFSET_SOURCE);
+      275        if (sourceStr != null) {
+      276          return OffsetSource.valueOf(sourceStr.toUpperCase(Locale.ROOT));
+      277        } else {
+      278          return super.getOffsetSource(field);
+      279        }
+      280      }
+      281  
+      282      // optimization for Solr which keeps a FieldInfos on-hand
+      283      @Override
+      284      protected FieldInfo getFieldInfo(String field) {
+      285        return ((SolrIndexSearcher) searcher).getFieldInfos().fieldInfo(field);
+      286      }
+      287  
+      288      @Override
+      289      public int getMaxNoHighlightPassages(String field) {
+      290        boolean defaultSummary = params.getFieldBool(field, HighlightParams.DEFAULT_SUMMARY, false);
+      291        if (defaultSummary) {
+      292          return -1; // signifies return first hl.snippets passages worth of the content
+      293        } else {

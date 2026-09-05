@@ -1,0 +1,572 @@
+row 79   databricks/databricks-sdk-java#690
+============================================================================
+CONTRACT com.databricks.sdk.core.CredentialsProvider   members=2.0 implementers=17.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       15  public interface CredentialsProvider {
+       16    /**
+       17     * Returns the authentication type identifier for this credentials provider.
+       18     *
+       19     * <p><b>This method is called internally by the SDK</b> and should not be invoked directly by
+       20     * users. It is used for logging and user-agent identification purposes.
+       21     *
+       22     * @return the authentication type as a string
+       23     */
+       24    String authType();
+       25  
+       26    /**
+       27     * Creates and returns a new HeaderFactory to authenticate requests to the Databricks API.
+       28     *
+       29     * <p>Note: A new HeaderFactory instance is returned on each invocation.
+       30     *
+       31     * <p><b>This method is called internally by the SDK</b> during client initialization and should
+       32     * not be invoked directly by users. The SDK will call this method to obtain a HeaderFactory that
+       33     * will be used to add authentication headers to each API request.
+       34     *
+       35     * @param config the Databricks configuration to use for authentication
+       36     * @return a new HeaderFactory configured for authenticating API requests
+       37     */
+       38    HeaderFactory configure(DatabricksConfig config);
+       39  }
+
+---------- IMPLEMENTER com.databricks.sdk.core.AzureCliCredentialsProvider  stubs=0/2 ----------
+       13  @InternalApi
+       14  public class AzureCliCredentialsProvider implements CredentialsProvider {
+       15    private final ObjectMapper mapper = new ObjectMapper();
+       16    private static final Logger LOG = LoggerFactory.getLogger(AzureCliCredentialsProvider.class);
+       17  
+       18    public static final String AZURE_CLI = "azure-cli";
+       19  
+       20    @Override
+       21    public String authType() {
+       22      return AZURE_CLI;
+       23    }
+       24  
+       25    public CachedTokenSource tokenSourceFor(DatabricksConfig config, String resource) {
+       26      String azPath =
+       27          Optional.ofNullable(config.getEnv()).map(env -> env.get("AZ_PATH")).orElse("az");
+       28  
+       29      List<String> cmd =
+       30          new ArrayList<>(
+       31              Arrays.asList(
+       32                  azPath, "account", "get-access-token", "--resource", resource, "--output", "json"));
+       33      Optional<String> subscription = getSubscription(config);
+       34      if (subscription.isPresent()) {
+       35        // This will fail if the user has access to the workspace, but not to the subscription
+       36        // itself.
+       37        // In such case, we fall back to not using the subscription.
+       38        List<String> extendedCmd = new ArrayList<>(cmd);
+       39        extendedCmd.addAll(Arrays.asList("--subscription", subscription.get()));
+       40        try {
+       41          return getTokenSource(config, extendedCmd);
+       42        } catch (DatabricksException ex) {
+       43          LOG.warn("Failed to get token for subscription. Using resource only token.");
+       44        }
+       45      } else {
+       46        LOG.warn(
+       47            "azure_workspace_resource_id field not provided. "
+       48                + "It is recommended to specify this field in the Databricks configuration to avoid authentication errors.");
+       49      }
+       50  
+       51      return getTokenSource(config, cmd);
+       52    }
+       53  
+       54    protected CachedTokenSource getTokenSource(DatabricksConfig config, List<String> cmd) {
+       55      CliTokenSource tokenSource =
+       56          new CliTokenSource(cmd, "tokenType", "accessToken", "expiresOn", config.getEnv());
+       57      CachedTokenSource cachedTokenSource =
+       58          new CachedTokenSource.Builder(tokenSource)
+       59              .setAsyncDisabled(config.getDisableAsyncTokenRefresh())
+       60              .build();
+       61      cachedTokenSource.getToken(); // Check if the CLI is installed and to validate the config.
+       62      return cachedTokenSource;
+       63    }
+       64  
+       65    private Optional<String> getSubscription(DatabricksConfig config) {
+       66      String resourceId = config.getAzureWorkspaceResourceId();
+       67      if (resourceId == null || resourceId.equals("")) {
+       68        return Optional.empty();
+       69      }
+       70      String[] components = resourceId.split("/");
+       71      if (components.length < 3) {
+       72        LOG.warn("Invalid azure workspace resource ID");
+       73        return Optional.empty();
+       74      }
+       75      return Optional.of(components[2]);
+       76    }
+       77  
+       78    @Override
+       79    public OAuthHeaderFactory configure(DatabricksConfig config) {
+       80      try {
+       81        AzureUtils.ensureHostPresent(config, mapper, this::tokenSourceFor);
+       82        String resource = config.getEffectiveAzureLoginAppId();
+       83        CachedTokenSource tokenSource = tokenSourceFor(config, resource);
+       84        CachedTokenSource mgmtTokenSource;
+       85        try {
+       86          mgmtTokenSource =
+       87              tokenSourceFor(config, config.getAzureEnvironment().getServiceManagementEndpoint());
+       88        } catch (Exception e) {
+       89          LOG.debug("Not including service management token in headers", e);
+       90          mgmtTokenSource = null;
+       91        }
+       92        CachedTokenSource finalMgmtTokenSource = mgmtTokenSource;
+       93        return OAuthHeaderFactory.fromSuppliers(
+       94            tokenSource::getToken,
+       95            () -> {
+       96              Token token = tokenSource.getToken();
+       97              Map<String, String> headers = new HashMap<>();
+       98              headers.put("Authorization", token.getTokenType() + " " + token.getAccessToken());
+       99              if (finalMgmtTokenSource != null) {
+      100                AzureUtils.addSpManagementToken(finalMgmtTokenSource, headers);
+      101              }
+      102              return AzureUtils.addWorkspaceResourceId(config, headers);
+      103            });
+      104      } catch (DatabricksException e) {
+      105        String stderr = e.getMessage();
+      106        if (stderr.contains("not found")) {
+      107          String doc = "https://docs.microsoft.com/en-us/cli/azure/?view=azure-cli-latest";
+      108          LOG.info(String.format("Most likely Azure CLI is not installed. See %s for details", doc));
+      109          return null;
+      110        }
+      111        throw e;
+      112      }
+      113    }
+      114  }
+
+---------- IMPLEMENTER com.databricks.sdk.core.BasicCredentialsProvider  stubs=0/2 ----------
+        8  @InternalApi
+        9  public class BasicCredentialsProvider implements CredentialsProvider {
+       10    public static final String BASIC = "basic";
+       11  
+       12    @Override
+       13    public String authType() {
+       14      return BASIC;
+       15    }
+       16  
+       17    @Override
+       18    public HeaderFactory configure(DatabricksConfig config) {
+       19      String username = config.getUsername();
+       20      String password = config.getPassword();
+       21      String host = config.getHost();
+       22      if (username == null || password == null || host == null) {
+       23        return null;
+       24      }
+       25      byte[] bytes = String.format("%s:%s", config.getUsername(), config.getPassword()).getBytes();
+       26      String base64 = Base64.getEncoder().encodeToString(bytes);
+       27      Map<String, String> headers = new HashMap<>();
+       28      headers.put("Authorization", String.format("Basic %s", base64));
+       29      return () -> headers;
+       30    }
+       31  }
+
+---------- IMPLEMENTER com.databricks.sdk.core.DatabricksCliCredentialsProvider  stubs=0/2 ----------
+       11  @InternalApi
+       12  public class DatabricksCliCredentialsProvider implements CredentialsProvider {
+       13  
+       14    private static final Logger LOG = LoggerFactory.getLogger(DatabricksCliCredentialsProvider.class);
+       15  
+       16    public static final String DATABRICKS_CLI = "databricks-cli";
+       17  
+       18    @Override
+       19    public String authType() {
+       20      return DATABRICKS_CLI;
+       21    }
+       22  
+       23    /**
+       24     * Builds the CLI command arguments using --host (legacy path).
+       25     *
+       26     * @param cliPath Path to the databricks CLI executable
+       27     * @param config Configuration containing host, account ID, workspace ID, etc.
+       28     * @return List of command arguments
+       29     */
+       30    List<String> buildHostArgs(String cliPath, DatabricksConfig config) {
+       31      List<String> cmd =
+       32          new ArrayList<>(Arrays.asList(cliPath, "auth", "token", "--host", config.getHost()));
+       33      if (config.getExperimentalIsUnifiedHost() != null && config.getExperimentalIsUnifiedHost()) {
+       34        // For unified hosts, pass account_id, workspace_id, and experimental flag
+       35        cmd.add("--experimental-is-unified-host");
+       36        if (config.getAccountId() != null) {
+       37          cmd.add("--account-id");
+       38          cmd.add(config.getAccountId());
+       39        }
+       40        if (config.getWorkspaceId() != null) {
+       41          cmd.add("--workspace-id");
+       42          cmd.add(config.getWorkspaceId());
+       43        }
+       44      } else if (config.getClientType() == ClientType.ACCOUNT) {
+       45        cmd.add("--account-id");
+       46        cmd.add(config.getAccountId());
+       47      }
+       48      return cmd;
+       49    }
+       50  
+       51    private CliTokenSource getDatabricksCliTokenSource(DatabricksConfig config) {
+       52      String cliPath = config.getDatabricksCliPath();
+       53      if (cliPath == null) {
+       54        cliPath = OSUtils.get(config.getEnv()).getDatabricksCliPath();
+       55      }
+       56      if (cliPath == null) {
+       57        LOG.debug("Databricks CLI could not be found");
+       58        return null;
+       59      }
+       60  
+       61      List<String> cmd;
+       62      List<String> fallbackCmd = null;
+       63  
+       64      if (config.getProfile() != null) {
+       65        // When profile is set, use --profile as the primary command.
+       66        // The profile contains the full config (host, account_id, etc.).
+       67        cmd =
+       68            new ArrayList<>(
+       69                Arrays.asList(cliPath, "auth", "token", "--profile", config.getProfile()));
+       70        // Build a --host fallback for older CLIs that don't support --profile.
+       71        if (config.getHost() != null) {
+       72          fallbackCmd = buildHostArgs(cliPath, config);
+       73        }
+       74      } else {
+       75        cmd = buildHostArgs(cliPath, config);
+       76      }
+       77  
+       78      return new CliTokenSource(
+       79          cmd, "token_type", "access_token", "expiry", config.getEnv(), fallbackCmd);
+       80    }
+       81  
+       82    @Override
+       83    public OAuthHeaderFactory configure(DatabricksConfig config) {
+       84      String host = config.getHost();
+       85      if (host == null) {
+       86        return null;
+       87      }
+       88  
+       89      try {
+       90        CliTokenSource tokenSource = getDatabricksCliTokenSource(config);
+       91        if (tokenSource == null) {
+       92          return null;
+       93        }
+       94  
+       95        CachedTokenSource cachedTokenSource =
+       96            new CachedTokenSource.Builder(tokenSource)
+       97                .setAsyncDisabled(config.getDisableAsyncTokenRefresh())
+       98                .build();
+       99        cachedTokenSource.getToken(); // We need this for checking if databricks CLI is installed.
+      100  
+      101        return OAuthHeaderFactory.fromTokenSource(cachedTokenSource);
+      102      } catch (DatabricksException e) {
+      103        String stderr = e.getMessage();
+      104        if (stderr.contains("not found")) {
+      105          LOG.warn("Most likely databricks CLI is not installed");
+      106          return null;
+      107        }
+      108        if (stderr.contains("databricks OAuth is not")) {
+      109          LOG.info("OAuth not configured or not available");
+      110          return null;
+      111        }
+      112        throw e;
+      113      }
+      114    }
+      115  }
+
+---------- IMPLEMENTER com.databricks.sdk.core.DefaultCredentialsProvider  stubs=0/2 ----------
+       21  @InternalApi
+       22  public class DefaultCredentialsProvider implements CredentialsProvider {
+       23    private static final Logger LOG = LoggerFactory.getLogger(DefaultCredentialsProvider.class);
+       24  
+       25    // cloudRequirements declares the cloud each strategy requires. DefaultCredentialsProvider uses
+       26    // this to skip cloud-specific strategies in auto-detect mode when the host cloud does not match.
+       27    // Cloud filtering is bypassed when authType is explicitly set.
+       28    private static final Map<String, Cloud> CLOUD_REQUIREMENTS;
+       29  
+       30    static {
+       31      Map<String, Cloud> m = new HashMap<>();
+       32      m.put("github-oidc-azure", Cloud.AZURE);
+       33      m.put("azure-client-secret", Cloud.AZURE);
+       34      m.put("azure-cli", Cloud.AZURE);
+       35      m.put("google-credentials", Cloud.GCP);
+       36      m.put("google-id", Cloud.GCP);
+       37      CLOUD_REQUIREMENTS = Collections.unmodifiableMap(m);
+       38    }
+       39  
+       40    /* List of credential providers that will be tried in sequence */
+       41    private List<CredentialsProvider> providers = new ArrayList<>();
+       42  
+       43    /* The currently selected authentication type */
+       44    private String authType = "default";
+       45  
+       46    /**
+       47     * Internal class to associate an ID token source with a name for identification purposes. Used
+       48     * primarily for OIDC (OpenID Connect) authentication flows.
+       49     */
+       50    private static class NamedIDTokenSource {
+       51      private final String name;
+       52      private final IDTokenSource idTokenSource;
+       53  
+       54      public NamedIDTokenSource(String name, IDTokenSource idTokenSource) {
+       55        this.name = name;
+       56        this.idTokenSource = idTokenSource;
+       57      }
+       58    }
+       59  
+       60    public DefaultCredentialsProvider() {}
+       61  
+       62    /** For testing: creates a provider with a fixed list of credential providers. */
+       63    DefaultCredentialsProvider(List<CredentialsProvider> providers) {
+       64      this.providers = new ArrayList<>(providers);
+       65    }
+       66  
+       67    /**
+       68     * Returns the current authentication type being used
+       69     *
+       70     * @return String representing the authentication type
+       71     */
+       72    public String authType() {
+       73      return authType;
+       74    }
+       75  
+       76    /**
+       77     * Configures the credentials provider with the given Databricks configuration. This method tries
+       78     * each available credential provider in sequence until one succeeds.
+       79     *
+       80     * @param config The Databricks configuration containing authentication details
+       81     * @return HeaderFactory for making authenticated requests
+       82     * @throws DatabricksException if no valid credentials can be configured
+       83     */
+       84    @Override
+       85    public synchronized HeaderFactory configure(DatabricksConfig config) {
+       86      addDefaultCredentialsProviders(config);
+       87      boolean explicitAuthType = config.getAuthType() != null && !config.getAuthType().isEmpty();
+       88      for (CredentialsProvider provider : providers) {
+       89        if (explicitAuthType && !provider.authType().equals(config.getAuthType())) {
+       90          LOG.info(
+       91              "Ignoring {} auth, because {} is preferred", provider.authType(), config.getAuthType());
+       92          continue;
+       93        }
+       94        // In auto-detect mode, skip cloud-specific strategies whose required cloud does not match
+       95        // the detected host cloud. When authType is explicitly set, cloud filtering is bypassed so
+       96        // that users can request any strategy regardless of detected cloud (e.g. "azure-cli" on GCP).
+       97        if (!explicitAuthType) {
+       98          Cloud requiredCloud = CLOUD_REQUIREMENTS.get(provider.authType());
+       99          if (requiredCloud != null
+      100              && config.getDatabricksEnvironment().getCloud() != requiredCloud) {
+      101            LOG.debug(
+      102                "Skipping \"{}\" auth: not configured for {}", provider.authType(), requiredCloud);
+      103            continue;
+      104          }
+      105        }
+      106        try {
+      107          LOG.info("Trying {} auth", provider.authType());
+      108          HeaderFactory headerFactory = provider.configure(config);
+      109          if (headerFactory == null) {
+      110            continue;
+      111          }
+      112          authType = provider.authType();
+      113          return headerFactory;
+      114        } catch (DatabricksException e) {
+      115          throw new DatabricksException(
+      116              String.format("%s: %s", provider.authType(), e.getMessage()), e);
+      117        }
+      118      }
+      119      String authFlowUrl =
+      120          "https://docs.databricks.com/en/dev-tools/auth.html#databricks-client-unified-authentication";
+      121      throw new DatabricksException(
+      122          "cannot configure default credentials, please check "
+      123              + authFlowUrl
+      124              + " to configure credentials for your preferred authentication method");
+      125    }
+      126  
+      127    /**
+      128     * Adds OpenID Connect (OIDC) based credential providers to the list of available providers.
+      129     *
+      130     * @param config The Databricks configuration containing OIDC settings
+      131     */
+      132    private void addOIDCCredentialsProviders(DatabricksConfig config) {
+      133      // TODO: refactor the code so that the IdTokenSources are created within the
+      134      // configure call of their corresponding CredentialsProvider. This will allow
+      135      // us to simplify the code by validating IdTokenSources when they are created.
+      136      // This would also need to be updated to support unified hosts.
+      137      OpenIDConnectEndpoints endpoints = null;
+      138      try {
+      139        endpoints = config.getDatabricksOidcEndpoints();
+      140      } catch (Exception e) {
+      141        LOG.warn("Failed to get OpenID Connect endpoints", e);
+      142      }
+      143  
+      144      List<NamedIDTokenSource> namedIdTokenSources = new ArrayList<>();
+      145      namedIdTokenSources.add(
+      146          new NamedIDTokenSource(
+      147              "env-oidc",
+      148              new EnvVarIDTokenSource(
+      149                  // Use configured environment variable name if set, otherwise default to
+      150                  // DATABRICKS_OIDC_TOKEN
+      151                  Strings.isNullOrEmpty(config.getOidcTokenEnv())
+      152                      ? "DATABRICKS_OIDC_TOKEN"
+      153                      : config.getOidcTokenEnv(),
+      154                  config.getEnv())));
+      155  
+      156      namedIdTokenSources.add(
+      157          new NamedIDTokenSource("file-oidc", new FileIDTokenSource(config.getOidcTokenFilepath())));
+      158  
+      159      namedIdTokenSources.add(
+      160          new NamedIDTokenSource(
+      161              "github-oidc",
+      162              new GithubIDTokenSource(
+      163                  config.getActionsIdTokenRequestUrl(),
+      164                  config.getActionsIdTokenRequestToken(),
+      165                  config.getHttpClient())));
+      166  
+      167      // Try to create Azure DevOps token source - if environment variables are missing,
+      168      // skip this provider gracefully.
+      169      try {
+      170        namedIdTokenSources.add(
+      171            new NamedIDTokenSource(
+      172                "azure-devops-oidc", new AzureDevOpsIDTokenSource(config.getHttpClient())));
+      173      } catch (DatabricksException e) {
+      174        LOG.debug("Azure DevOps OIDC provider not available: {}", e.getMessage());
+      175      }
+      176      // Add new IDTokenSources and ID providers here. Example:
+      177      // namedIdTokenSources.add(new NamedIDTokenSource("custom-oidc", new CustomIDTokenSource(...)));
+      178  
+      179      // Configure OAuth token sources for each ID token source
+      180      for (NamedIDTokenSource namedIdTokenSource : namedIdTokenSources) {
+
+---------- IMPLEMENTER com.databricks.sdk.core.GoogleCredentialsCredentialsProvider  stubs=0/2 ----------
+       18  @InternalApi
+       19  public class GoogleCredentialsCredentialsProvider implements CredentialsProvider {
+       20  
+       21    private static final Logger LOG =
+       22        LoggerFactory.getLogger(GoogleCredentialsCredentialsProvider.class);
+       23  
+       24    @Override
+       25    public String authType() {
+       26      return "google-credentials";
+       27    }
+       28  
+       29    @Override
+       30    public HeaderFactory configure(DatabricksConfig config) {
+       31      String host = config.getHost();
+       32      String googleCredentials = config.getGoogleCredentials();
+       33      if (host == null || googleCredentials == null) {
+       34        return null;
+       35      }
+       36  
+       37      ServiceAccountCredentials serviceAccountCredentials;
+       38  
+       39      try {
+       40        serviceAccountCredentials =
+       41            ServiceAccountCredentials.fromStream(Files.newInputStream(Paths.get(googleCredentials)));
+       42      } catch (IOException e) {
+       43        try {
+       44          // If file doesn't exist, we try to parse the config as the content.
+       45          serviceAccountCredentials =
+       46              ServiceAccountCredentials.fromStream(
+       47                  new ByteArrayInputStream(googleCredentials.getBytes(StandardCharsets.UTF_8)));
+       48        } catch (IOException ex) {
+       49          LOG.warn("Failed to get Google service account credentials." + ex);
+       50          return null;
+       51        }
+       52      }
+       53  
+       54      List<Option> tokenOption = Collections.emptyList();
+       55  
+       56      ServiceAccountCredentials finalServiceAccountCredentials = serviceAccountCredentials;
+       57      return () -> {
+       58        IdToken idToken;
+       59        try {
+       60          idToken = finalServiceAccountCredentials.idTokenWithAudience(host, tokenOption);
+       61        } catch (IOException e) {
+       62          String message = "Failed to get id token from Google service account credentials.";
+       63          LOG.error(message + e);
+       64          throw new DatabricksException(message, e);
+       65        }
+       66        Map<String, String> headers = new HashMap<>();
+       67        headers.put("Authorization", String.format("Bearer %s", idToken.getTokenValue()));
+       68  
+       69        if (config.getClientType() == ClientType.ACCOUNT) {
+       70          AccessToken token;
+       71          try {
+       72            token = finalServiceAccountCredentials.createScoped(GCP_SCOPES).refreshAccessToken();
+       73          } catch (IOException e) {
+       74            String message =
+       75                "Failed to refresh access token from Google service account credentials.";
+       76            LOG.error(message + e);
+       77            throw new DatabricksException(message, e);
+       78          }
+       79          headers.put(SA_ACCESS_TOKEN_HEADER, token.getTokenValue());
+       80        }
+       81  
+       82        return headers;
+       83      };
+       84    }
+       85  }
+
+---------- IMPLEMENTER com.databricks.sdk.core.GoogleIdCredentialsProvider  stubs=0/2 ----------
+       16  @InternalApi
+       17  public class GoogleIdCredentialsProvider implements CredentialsProvider {
+       18  
+       19    private static final Logger LOG = LoggerFactory.getLogger(GoogleIdCredentialsProvider.class);
+       20  
+       21    @Override
+       22    public String authType() {
+       23      return "google-id";
+       24    }
+       25  
+       26    @Override
+       27    public HeaderFactory configure(DatabricksConfig config) {
+       28      String host = config.getHost();
+       29      String googleServiceAccount = config.getGoogleServiceAccount();
+       30      if (host == null || googleServiceAccount == null) {
+       31        return null;
+       32      }
+       33  
+       34      GoogleCredentials googleCredentials;
+       35      try {
+       36        googleCredentials = GoogleCredentials.getApplicationDefault();
+       37      } catch (IOException e) {
+       38        LOG.warn("Failed to get Google application default credential." + e);
+       39        return null;
+       40      }
+       41  
+       42      // Create the impersonated credential. Use 3600s as the lifetime, which is the default value in
+       43      // google-auth.
+       44      ImpersonatedCredentials impersonatedCredentials =
+       45          ImpersonatedCredentials.create(
+       46              googleCredentials, googleServiceAccount, null, new ArrayList<>(), 3600);
+       47  
+       48      IdTokenCredentials idTokenCredentials =
+       49          IdTokenCredentials.newBuilder()
+       50              .setIdTokenProvider(impersonatedCredentials)
+       51              .setTargetAudience(host)
+       52              // Setting this will include email in the id token.
+       53              .setOptions(Collections.singletonList(IdTokenProvider.Option.INCLUDE_EMAIL))
+       54              .build();
+       55  
+       56      ImpersonatedCredentials gcpScopedCredentials =
+       57          ImpersonatedCredentials.create(
+       58              googleCredentials, googleServiceAccount, null, GCP_SCOPES, 3600);
+       59  
+       60      return () -> {
+       61        Map<String, String> headers = new HashMap<>();
+       62        try {
+       63          headers.put(
+       64              "Authorization",
+       65              String.format("Bearer %s", idTokenCredentials.refreshAccessToken().getTokenValue()));
+       66        } catch (IOException e) {
+       67          String message = "Failed to refresh access token from id token credentials.";
+       68          LOG.error(message + e);
+       69          throw new DatabricksException(message, e);
+       70        }
+       71  
+       72        if (config.getClientType() == ClientType.ACCOUNT) {
+       73          try {
+       74            headers.put(
+       75                SA_ACCESS_TOKEN_HEADER, gcpScopedCredentials.refreshAccessToken().getTokenValue());
+       76          } catch (IOException e) {
+       77            String message = "Failed to refresh access token from scoped id token credentials.";
+       78            LOG.error(message + e);
+       79            throw new DatabricksException(message, e);
+       80          }
+       81        }
+       82  
+       83        return headers;
+       84      };
+       85    }
+       86  }

@@ -1,0 +1,548 @@
+row 88   apache/pulsar#24592
+============================================================================
+CONTRACT org.apache.pulsar.broker.authentication.AuthenticationState   members=4.0 implementers=9.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       41  public interface AuthenticationState {
+       42      /**
+       43       * After the authentication between client and broker completed,
+       44       * get authentication role represent for the client.
+       45       * It should throw exception if auth not complete.
+       46       */
+       47      String getAuthRole() throws AuthenticationException;
+       48  
+       49      /**
+       50       * Challenge passed in auth data and get response data.
+       51       * @deprecated use and implement {@link AuthenticationState#authenticateAsync(AuthData)} instead.
+       52       */
+       53      @Deprecated
+       54      AuthData authenticate(AuthData authData) throws AuthenticationException;
+       55  
+       56      /**
+       57       * Challenge passed in auth data. If authentication is complete after the execution of this method, return null.
+       58       * Otherwise, return response data to be sent to the client.
+       59       *
+       60       * <p>Note: the implementation of {@link AuthenticationState#authenticate(AuthData)} converted a null result into a
+       61       * zero length byte array when {@link AuthenticationState#isComplete()} returned false after authentication. In
+       62       * order to simplify this interface, the determination of whether to send a challenge back to the client is only
+       63       * based on the result of this method. In order to maintain backwards compatibility, the default implementation of
+       64       * this method calls {@link AuthenticationState#isComplete()} and returns a result compliant with the new
+       65       * paradigm.</p>
+       66       */
+       67      default CompletableFuture<AuthData> authenticateAsync(AuthData authData) {
+       68          try {
+       69              AuthData result = this.authenticate(authData);
+       70              if (isComplete()) {
+       71                  return CompletableFuture.completedFuture(null);
+       72              } else {
+       73                  return result != null
+       74                          ? CompletableFuture.completedFuture(result)
+       75                          : CompletableFuture.completedFuture(AuthData.of(new byte[0]));
+       76              }
+       77          } catch (Exception e) {
+       78              return FutureUtil.failedFuture(e);
+       79          }
+       80      }
+       81  
+       82      /**
+       83       * Return AuthenticationDataSource.
+       84       */
+       85      AuthenticationDataSource getAuthDataSource();
+       86  
+       87      /**
+       88       * Whether the authentication is completed or not.
+       89       * @deprecated this method's logic is captured by the result of
+       90       * {@link AuthenticationState#authenticateAsync(AuthData)}. When the result is a {@link CompletableFuture} with a
+       91       * null result, authentication is complete. When the result is a {@link CompletableFuture} with a nonnull result,
+       92       * authentication is incomplete and requires an auth challenge.
+       93       */
+       94      @Deprecated
+       95      boolean isComplete();
+       96  
+       97      /**
+       98       * Get AuthenticationState ID.
+       99       */
+      100      default long getStateId() {
+      101          return -1L;
+      102      }
+      103  
+      104      /**
+      105       * If the authentication state is expired, it will force the connection to be re-authenticated.
+      106       */
+      107      default boolean isExpired() {
+      108          return false;
+      109      }
+      110  
+      111      /**
+      112       * If the authentication state supports refreshing and the credentials are expired,
+      113       * the auth provider will call this method to initiate the refresh process.
+      114       * <p>
+      115       * The auth state here will return the broker side data that will be used to send
+      116       * a challenge to the client.
+      117       *
+      118       * @return the {@link AuthData} for the broker challenge to client
+      119       * @throws AuthenticationException
+      120       */
+      121      default AuthData refreshAuthentication() throws AuthenticationException {
+      122          return AuthData.REFRESH_AUTH_DATA;
+      123      }
+      124  }
+
+---------- IMPLEMENTER org.apache.pulsar.broker.authentication.oidc.AuthenticationStateOpenID  stubs=0/4 ----------
+       34  class AuthenticationStateOpenID implements AuthenticationState {
+       35      private final AuthenticationProviderOpenID provider;
+       36      private AuthenticationDataSource authenticationDataSource;
+       37      private volatile String role;
+       38      private final SocketAddress remoteAddress;
+       39      private final SSLSession sslSession;
+       40      private volatile long expiration;
+       41  
+       42      AuthenticationStateOpenID(
+       43              AuthenticationProviderOpenID provider,
+       44              SocketAddress remoteAddress,
+       45              SSLSession sslSession) {
+       46          this.provider = provider;
+       47          this.remoteAddress = remoteAddress;
+       48          this.sslSession = sslSession;
+       49      }
+       50  
+       51      @Override
+       52      public String getAuthRole() throws AuthenticationException {
+       53          if (role == null) {
+       54              throw new AuthenticationException("Authentication has not completed");
+       55          }
+       56          return role;
+       57      }
+       58  
+       59      @Deprecated
+       60      @Override
+       61      public AuthData authenticate(AuthData authData) throws AuthenticationException {
+       62          // This method is not expected to be called and is subject to removal.
+       63          throw new AuthenticationException("Not supported");
+       64      }
+       65  
+       66      @Override
+       67      public CompletableFuture<AuthData> authenticateAsync(AuthData authData) {
+       68          final String token = new String(authData.getBytes(), UTF_8);
+       69          this.authenticationDataSource = new AuthenticationDataCommand(token, remoteAddress, sslSession);
+       70          return provider
+       71                  .authenticateTokenAsync(authenticationDataSource)
+       72                  .thenApply(jwt -> {
+       73                      this.role = provider.getRole(jwt);
+       74                      // OIDC requires setting the exp claim, so this should never be null.
+       75                      // We verify it is not null during token validation.
+       76                      this.expiration = jwt.getExpiresAt().getTime();
+       77                      // Single stage authentication, so return null here
+       78                      return null;
+       79                  });
+       80      }
+       81  
+       82      @Override
+       83      public AuthenticationDataSource getAuthDataSource() {
+       84          return authenticationDataSource;
+       85      }
+       86  
+       87      @Override
+       88      public boolean isComplete() {
+       89          return role != null;
+       90      }
+       91  
+       92      @Override
+       93      public boolean isExpired() {
+       94          return System.currentTimeMillis() > expiration;
+       95      }
+       96  }
+
+---------- IMPLEMENTER org.apache.pulsar.broker.authentication.SaslAuthenticationState  stubs=0/4 ----------
+       32  @Slf4j
+       33  public class SaslAuthenticationState implements AuthenticationState {
+       34      private final long stateId;
+       35      private static final AtomicLong stateIdGenerator = new AtomicLong(0L);
+       36      private final SaslAuthenticationDataSource authenticationDataSource;
+       37      private PulsarSaslServer pulsarSaslServer;
+       38  
+       39      public SaslAuthenticationState(PulsarSaslServer server) {
+       40          stateId = stateIdGenerator.incrementAndGet();
+       41          this.authenticationDataSource = new SaslAuthenticationDataSource(server);
+       42          this.pulsarSaslServer = server;
+       43      }
+       44  
+       45      @Override
+       46      public String getAuthRole() {
+       47          return pulsarSaslServer.getAuthorizationID();
+       48      }
+       49  
+       50      @Override
+       51      public AuthenticationDataSource getAuthDataSource() {
+       52          return authenticationDataSource;
+       53      }
+       54  
+       55      @Override
+       56      public boolean isComplete() {
+       57          return pulsarSaslServer.isComplete();
+       58      }
+       59  
+       60      /**
+       61       * Returns null if authentication has completed, and no auth data is required to send back to client.
+       62       * Do auth and Returns the auth data back to client, if authentication has not completed.
+       63       */
+       64      @Override
+       65      public AuthData authenticate(AuthData authData) throws AuthenticationException {
+       66          return pulsarSaslServer.response(authData);
+       67      }
+       68  
+       69      @Override
+       70      public long getStateId() {
+       71          return stateId;
+       72      }
+       73  
+       74  
+       75  }
+
+---------- IMPLEMENTER org.apache.pulsar.broker.authentication.AuthenticationProviderList.AuthenticationListState  stubs=0/4 ----------
+       92      private static class AuthenticationListState implements AuthenticationState {
+       93  
+       94          private final List<AuthenticationState> states;
+       95          private volatile AuthenticationState authState;
+       96          private final AuthenticationMetrics metrics;
+       97  
+       98          AuthenticationListState(List<AuthenticationState> states, AuthenticationMetrics metrics) {
+       99              if (states == null || states.isEmpty()) {
+      100                  throw new IllegalArgumentException("Authentication state requires at least one state");
+      101              }
+      102              this.states = states;
+      103              this.authState = states.get(0);
+      104              this.metrics = metrics;
+      105          }
+      106  
+      107          private AuthenticationState getAuthState() throws AuthenticationException {
+      108              if (authState != null) {
+      109                  return authState;
+      110              } else {
+      111                  throw new AuthenticationException("Authentication state is not initialized");
+      112              }
+      113          }
+      114  
+      115          @Override
+      116          public String getAuthRole() throws AuthenticationException {
+      117              return getAuthState().getAuthRole();
+      118          }
+      119  
+      120          @Override
+      121          public CompletableFuture<AuthData> authenticateAsync(AuthData authData) {
+      122              // First, attempt to authenticate with the current auth state
+      123              CompletableFuture<AuthData> authChallengeFuture = new CompletableFuture<>();
+      124              authState
+      125                      .authenticateAsync(authData)
+      126                      .whenComplete((authChallenge, ex) -> {
+      127                          if (ex == null) {
+      128                              // Current authState is still correct. Just need to return the authChallenge.
+      129                              authChallengeFuture.complete(authChallenge);
+      130                          } else {
+      131                              if (log.isDebugEnabled()) {
+      132                                  log.debug("Authentication failed for auth provider " + authState.getClass() + ": ", ex);
+      133                              }
+      134                              authenticateRemainingAuthStates(authChallengeFuture, authData, ex,
+      135                                      states.isEmpty() ? -1 : 0);
+      136                          }
+      137                      });
+      138              return authChallengeFuture;
+      139          }
+      140  
+      141          private void authenticateRemainingAuthStates(CompletableFuture<AuthData> authChallengeFuture,
+      142                                                       AuthData clientAuthData,
+      143                                                       Throwable previousException,
+      144                                                       int index) {
+      145              if (index < 0 || index >= states.size()) {
+      146                  if (previousException == null) {
+      147                      previousException = new AuthenticationException("Authentication required");
+      148                  }
+      149                  metrics.recordFailure(AuthenticationProviderList.class.getSimpleName(),
+      150                          "authentication-provider-list",
+      151                          ErrorCode.AUTH_REQUIRED);
+      152                  authChallengeFuture.completeExceptionally(previousException);
+      153                  return;
+      154              }
+      155              AuthenticationState state = states.get(index);
+      156              if (state == authState) {
+      157                  // Skip the current auth state
+      158                  authenticateRemainingAuthStates(authChallengeFuture, clientAuthData, null, index + 1);
+      159              } else {
+      160                  state.authenticateAsync(clientAuthData)
+      161                          .whenComplete((authChallenge, ex) -> {
+      162                              if (ex == null) {
+      163                                  // Found the correct auth state
+      164                                  authState = state;
+      165                                  authChallengeFuture.complete(authChallenge);
+      166                              } else {
+      167                                  if (log.isDebugEnabled()) {
+      168                                      log.debug("Authentication failed for auth provider "
+      169                                              + authState.getClass() + ": ", ex);
+      170                                  }
+      171                                  authenticateRemainingAuthStates(authChallengeFuture, clientAuthData, ex, index + 1);
+      172                              }
+      173                          });
+      174              }
+      175          }
+      176  
+      177          @Override
+      178          public AuthData authenticate(AuthData authData) throws AuthenticationException {
+      179              return applyAuthProcessor(
+      180                  states,
+      181                  metrics,
+      182                  as -> {
+      183                      AuthData ad = as.authenticate(authData);
+      184                      AuthenticationListState.this.authState = as;
+      185                      return ad;
+      186                  }
+      187              );
+      188          }
+      189  
+      190          @Override
+      191          public AuthenticationDataSource getAuthDataSource() {
+      192              return authState.getAuthDataSource();
+      193          }
+      194  
+      195          @Override
+      196          public boolean isComplete() {
+      197              return authState.isComplete();
+      198          }
+      199  
+      200          @Override
+      201          public long getStateId() {
+      202              if (null != authState) {
+      203                  return authState.getStateId();
+      204              } else {
+      205                  return states.get(0).getStateId();
+      206              }
+      207          }
+      208  
+      209          @Override
+      210          public boolean isExpired() {
+      211              return authState.isExpired();
+      212          }
+      213  
+      214          @Override
+      215          public AuthData refreshAuthentication() throws AuthenticationException {
+      216              return getAuthState().refreshAuthentication();
+      217          }
+      218      }
+
+---------- IMPLEMENTER org.apache.pulsar.broker.authentication.AuthenticationProviderToken.TokenAuthenticationState  stubs=0/4 ----------
+      356      private static final class TokenAuthenticationState implements AuthenticationState {
+      357          private final AuthenticationProviderToken provider;
+      358          private final SocketAddress remoteAddress;
+      359          private final SSLSession sslSession;
+      360          private AuthenticationDataSource authenticationDataSource;
+      361          private Jwt<?, Claims> jwt;
+      362          private long expiration;
+      363  
+      364          TokenAuthenticationState(
+      365                  AuthenticationProviderToken provider,
+      366                  AuthData authData,
+      367                  SocketAddress remoteAddress,
+      368                  SSLSession sslSession) throws AuthenticationException {
+      369              this.provider = provider;
+      370              this.remoteAddress = remoteAddress;
+      371              this.sslSession = sslSession;
+      372          }
+      373  
+      374          TokenAuthenticationState(
+      375                  AuthenticationProviderToken provider,
+      376                  HttpServletRequest request) throws AuthenticationException {
+      377              this.provider = provider;
+      378  
+      379              // Set this for backwards compatibility with AuthenticationProvider#newHttpAuthState
+      380              this.authenticationDataSource = new AuthenticationDataHttps(request);
+      381  
+      382              // These are not used when this constructor is invoked, set them to null.
+      383              this.sslSession = null;
+      384              this.remoteAddress = null;
+      385          }
+      386  
+      387          @Override
+      388          public String getAuthRole() throws AuthenticationException {
+      389              if (jwt == null) {
+      390                  throw new AuthenticationException("Must authenticate before calling getAuthRole");
+      391              }
+      392              return provider.getPrincipal(jwt);
+      393          }
+      394  
+      395          /**
+      396           * @param authData Authentication data.
+      397           * @return null. Explanation of returning null values, {@link AuthenticationState#authenticateAsync(AuthData)}
+      398           * @throws AuthenticationException
+      399           */
+      400          @Override
+      401          public AuthData authenticate(AuthData authData) throws AuthenticationException {
+      402              String token = new String(authData.getBytes(), UTF_8);
+      403              checkExpiration(token);
+      404              this.authenticationDataSource = new AuthenticationDataCommand(token, remoteAddress, sslSession);
+      405              return null;
+      406          }
+      407  
+      408          private void checkExpiration(String token) throws AuthenticationException {
+      409              this.jwt = provider.authenticateToken(token);
+      410              if (jwt.getBody().getExpiration() != null) {
+      411                  this.expiration = jwt.getBody().getExpiration().getTime();
+      412              } else {
+      413                  // Disable expiration
+      414                  this.expiration = Long.MAX_VALUE;
+      415              }
+      416          }
+      417  
+      418          @Override
+      419          public AuthenticationDataSource getAuthDataSource() {
+      420              return authenticationDataSource;
+      421          }
+      422  
+      423          @Override
+      424          public boolean isComplete() {
+      425              // The authentication of tokens is always done in one single stage, so once jwt is set, it is "complete"
+      426              return jwt != null;
+      427          }
+      428  
+      429          @Override
+      430          public boolean isExpired() {
+      431              return expiration < System.currentTimeMillis();
+      432          }
+      433      }
+
+---------- IMPLEMENTER org.apache.pulsar.broker.authentication.OneStageAuthenticationState  stubs=0/4 ----------
+       38  public class OneStageAuthenticationState implements AuthenticationState {
+       39  
+       40      private AuthenticationDataSource authenticationDataSource;
+       41      private final SocketAddress remoteAddress;
+       42      private final SSLSession sslSession;
+       43      private final AuthenticationProvider provider;
+       44      private volatile String authRole;
+       45  
+       46  
+       47      /**
+       48       * Constructor for a {@link OneStageAuthenticationState} where there is no authentication performed during
+       49       * initialization.
+       50       * @param remoteAddress - remoteAddress associated with the {@link AuthenticationState}
+       51       * @param sslSession - sslSession associated with the {@link AuthenticationState}
+       52       * @param provider - {@link AuthenticationProvider} to use to verify {@link AuthData}
+       53       */
+       54      public OneStageAuthenticationState(AuthData authData,
+       55                                         SocketAddress remoteAddress,
+       56                                         SSLSession sslSession,
+       57                                         AuthenticationProvider provider) {
+       58          this.provider = provider;
+       59          this.remoteAddress = remoteAddress;
+       60          this.sslSession = sslSession;
+       61      }
+       62  
+       63      public OneStageAuthenticationState(HttpServletRequest request, AuthenticationProvider provider) {
+       64          // Must initialize this here for backwards compatibility with http authentication
+       65          this.authenticationDataSource = new AuthenticationDataHttps(request);
+       66          this.provider = provider;
+       67          // These are not used when invoking this constructor.
+       68          this.remoteAddress = null;
+       69          this.sslSession = null;
+       70      }
+       71  
+       72      @Override
+       73      public String getAuthRole() throws AuthenticationException {
+       74          if (authRole == null) {
+       75              throw new AuthenticationException("Must authenticate before calling getAuthRole");
+       76          }
+       77          return authRole;
+       78      }
+       79  
+       80      @Override
+       81      public AuthenticationDataSource getAuthDataSource() {
+       82          return authenticationDataSource;
+       83      }
+       84  
+       85      /**
+       86       * Warning: this method is not intended to be called concurrently.
+       87       */
+       88      @Override
+       89      public CompletableFuture<AuthData> authenticateAsync(AuthData authData) {
+       90          if (authRole != null) {
+       91              // Authentication is already completed
+       92              return CompletableFuture.completedFuture(null);
+       93          }
+       94          this.authenticationDataSource = new AuthenticationDataCommand(
+       95                  new String(authData.getBytes(), UTF_8), remoteAddress, sslSession);
+       96  
+       97          return provider
+       98                  .authenticateAsync(authenticationDataSource)
+       99                  .thenApply(role -> {
+      100                      this.authRole = role;
+      101                      // Single stage authentication always returns null
+      102                      return null;
+      103                  });
+      104      }
+      105  
+      106      /**
+      107       * @deprecated use {@link #authenticateAsync(AuthData)}
+      108       */
+      109      @Deprecated(since = "3.0.0")
+      110      @Override
+      111      public AuthData authenticate(AuthData authData) throws AuthenticationException {
+      112          try {
+      113              return authenticateAsync(authData).get();
+      114          } catch (InterruptedException | ExecutionException e) {
+      115              throw new RuntimeException(e);
+      116          }
+      117      }
+      118  
+      119      /**
+      120       * @deprecated rely on result from {@link #authenticateAsync(AuthData)}. For more information, see the Javadoc
+      121       * for {@link AuthenticationState#isComplete()}.
+      122       */
+      123      @Deprecated(since = "3.0.0")
+      124      @Override
+      125      public boolean isComplete() {
+      126          return authRole != null;
+      127      }
+      128  }
+
+---------- IMPLEMENTER org.apache.pulsar.broker.auth.MockMultiStageAuthenticationState  stubs=0/4 ----------
+       32  public class MockMultiStageAuthenticationState implements AuthenticationState {
+       33  
+       34      private final MockMultiStageAuthenticationProvider provider;
+       35      private String authRole = null;
+       36  
+       37      MockMultiStageAuthenticationState(MockMultiStageAuthenticationProvider provider) {
+       38          this.provider = provider;
+       39      }
+       40  
+       41      @Override
+       42      public String getAuthRole() throws AuthenticationException {
+       43          if (authRole == null) {
+       44              throw new AuthenticationException("Must authenticate first");
+       45          }
+       46          return null;
+       47      }
+       48  
+       49      @Override
+       50      public AuthData authenticate(AuthData authData) throws AuthenticationException {
+       51          String data = new String(authData.getBytes(), UTF_8);
+       52          String[] parts = data.split("\\.");
+       53          if (parts.length == 2) {
+       54              if ("challenge".equals(parts[0])) {
+       55                  return AuthData.of("challenged".getBytes());
+       56              } else {
+       57                  AuthenticationDataCommand command = new AuthenticationDataCommand(data);
+       58                  authRole = provider.authenticate(command);
+       59                  // Auth successful, no more auth required
+       60                  return null;
+       61              }
+       62          }
+       63          throw new AuthenticationException("Failed to authenticate");
+       64      }
+       65  
+       66      @Override
+       67      public AuthenticationDataSource getAuthDataSource() {
+       68          return null;
+       69      }
+       70  
+       71      @Override
+       72      public boolean isComplete() {
+       73          return authRole != null;
+       74      }
+       75  }

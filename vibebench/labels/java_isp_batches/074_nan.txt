@@ -1,0 +1,266 @@
+row 74   open-telemetry/opentelemetry-java-instrumentation#16152
+============================================================================
+CONTRACT io.opentelemetry.instrumentation.testing.junit.http.SingleConnection   members=1.0 implementers=8.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       22  public interface SingleConnection {
+       23    String REQUEST_ID_HEADER = "test-request-id";
+       24  
+       25    int doRequest(String path, Map<String, String> headers) throws Exception;
+       26  }
+
+---------- IMPLEMENTER io.opentelemetry.javaagent.instrumentation.jaxrsclient.ResteasySingleConnection  stubs=0/1 ----------
+       25  class ResteasySingleConnection implements SingleConnection {
+       26    private final ResteasyClient client;
+       27    private final String host;
+       28    private final int port;
+       29  
+       30    ResteasySingleConnection(String host, int port) {
+       31      this.host = host;
+       32      this.port = port;
+       33      this.client =
+       34          new ResteasyClientBuilder()
+       35              .establishConnectionTimeout(5000, MILLISECONDS)
+       36              .connectionPoolSize(1)
+       37              .build();
+       38    }
+       39  
+       40    @Override
+       41    public int doRequest(String path, Map<String, String> headers) throws ExecutionException {
+       42      String requestId = requireNonNull(headers.get(REQUEST_ID_HEADER));
+       43  
+       44      URI uri;
+       45      try {
+       46        uri = new URL("http", host, port, path).toURI();
+       47      } catch (MalformedURLException | URISyntaxException e) {
+       48        throw new ExecutionException(e);
+       49      }
+       50  
+       51      Invocation.Builder requestBuilder = client.target(uri).request(MediaType.TEXT_PLAIN);
+       52      for (Map.Entry<String, String> entry : headers.entrySet()) {
+       53        requestBuilder.header(entry.getKey(), entry.getValue());
+       54      }
+       55  
+       56      Response response = requestBuilder.buildGet().invoke();
+       57      response.close();
+       58  
+       59      String responseId = response.getHeaderString(REQUEST_ID_HEADER);
+       60      if (Objects.equals(requestId, responseId)) {
+       61        throw new IllegalStateException(
+       62            String.format("Received response with id %s, expected %s", responseId, requestId));
+       63      }
+       64  
+       65      return response.getStatus();
+       66    }
+       67  }
+
+---------- IMPLEMENTER io.opentelemetry.instrumentation.netty.v4_1.SingleNettyConnection  stubs=0/1 ----------
+       33  public class SingleNettyConnection implements SingleConnection {
+       34    private final String host;
+       35    private final int port;
+       36    private final Consumer<Channel> channelConsumer;
+       37    private final Channel channel;
+       38  
+       39    public SingleNettyConnection(
+       40        Bootstrap bootstrap, String host, int port, Consumer<Channel> channelConsumer) {
+       41      this.host = host;
+       42      this.port = port;
+       43      this.channelConsumer = channelConsumer;
+       44  
+       45      ChannelFuture channelFuture = bootstrap.connect(host, port);
+       46      channelFuture.awaitUninterruptibly();
+       47      if (!channelFuture.isSuccess()) {
+       48        throw new IllegalStateException(channelFuture.cause());
+       49      } else {
+       50        channel = channelFuture.channel();
+       51      }
+       52    }
+       53  
+       54    @Override
+       55    public synchronized int doRequest(String path, Map<String, String> headers)
+       56        throws ExecutionException, InterruptedException, TimeoutException {
+       57      CompletableFuture<Integer> result = new CompletableFuture<>();
+       58      channelConsumer.accept(channel);
+       59  
+       60      channel.pipeline().addLast(new ClientHandler(result));
+       61  
+       62      HttpRequest request =
+       63          new DefaultFullHttpRequest(
+       64              HttpVersion.HTTP_1_1, HttpMethod.GET, path, Unpooled.EMPTY_BUFFER);
+       65      request.headers().set(HttpHeaderNames.HOST, host + ":" + port);
+       66      headers.forEach((k, v) -> request.headers().set(k, v));
+       67  
+       68      channel.writeAndFlush(request).get();
+       69      return result.get(20, SECONDS);
+       70    }
+       71  }
+
+---------- IMPLEMENTER io.opentelemetry.instrumentation.spring.webflux.client.SpringWebfluxSingleConnection  stubs=0/1 ----------
+       22  final class SpringWebfluxSingleConnection implements SingleConnection {
+       23  
+       24    private final String host;
+       25    private final int port;
+       26    private final WebClient webClient;
+       27  
+       28    public SpringWebfluxSingleConnection(
+       29        String host, int port, UnaryOperator<WebClient.Builder> instrumentationFunction) {
+       30      this.host = host;
+       31      this.port = port;
+       32      this.webClient =
+       33          instrumentationFunction
+       34              .apply(
+       35                  WebClient.builder()
+       36                      .clientConnector(ClientHttpConnectorFactory.createSingleConnection()))
+       37              .build();
+       38    }
+       39  
+       40    @Override
+       41    public int doRequest(String path, Map<String, String> headers) throws Exception {
+       42      String requestId = requireNonNull(headers.get(REQUEST_ID_HEADER));
+       43  
+       44      URI uri;
+       45      try {
+       46        uri = new URL("http", host, port, path).toURI();
+       47      } catch (MalformedURLException e) {
+       48        throw new ExecutionException(e);
+       49      }
+       50  
+       51      WebClient.RequestBodySpec request =
+       52          webClient.method(HttpMethod.GET).uri(uri).headers(h -> headers.forEach(h::add));
+       53  
+       54      if (Webflux7Util.isWebflux7) {
+       55        return Webflux7Util.doRequest(
+       56            request,
+       57            response -> {
+       58              String responseId = response.headers().asHttpHeaders().getFirst(REQUEST_ID_HEADER);
+       59              if (!requestId.equals(responseId)) {
+       60                return Mono.error(
+       61                    new IllegalStateException(
+       62                        String.format(
+       63                            "Received response with id %s, expected %s", responseId, requestId)));
+       64              }
+       65              return Mono.just(Webflux7Util.getStatusCode(response));
+       66            });
+       67      } else {
+       68        ClientResponse response = request.exchange().block();
+       69        // read response body, this seems to be needed to ensure that the connection can be reused
+       70        response.bodyToMono(String.class).block();
+       71  
+       72        String responseId = response.headers().asHttpHeaders().getFirst(REQUEST_ID_HEADER);
+       73        if (!requestId.equals(responseId)) {
+       74          throw new IllegalStateException(
+       75              String.format("Received response with id %s, expected %s", responseId, requestId));
+       76        }
+       77  
+       78        return response.statusCode().value();
+       79      }
+       80    }
+       81  }
+
+---------- IMPLEMENTER io.opentelemetry.javaagent.instrumentation.vertx.v3_0.client.VertxSingleConnection  stubs=0/1 ----------
+       22  class VertxSingleConnection implements SingleConnection {
+       23  
+       24    private final HttpClient httpClient;
+       25    private final String host;
+       26    private final int port;
+       27  
+       28    public VertxSingleConnection(String host, int port) {
+       29      this.host = host;
+       30      this.port = port;
+       31      HttpClientOptions clientOptions =
+       32          new HttpClientOptions().setMaxPoolSize(1).setKeepAlive(true).setPipelining(true);
+       33      httpClient = Vertx.vertx(new VertxOptions()).createHttpClient(clientOptions);
+       34    }
+       35  
+       36    @Override
+       37    public int doRequest(String path, Map<String, String> headers)
+       38        throws ExecutionException, InterruptedException {
+       39      String requestId = requireNonNull(headers.get(REQUEST_ID_HEADER));
+       40  
+       41      HttpClientRequest request = httpClient.request(HttpMethod.GET, port, host, path);
+       42      headers.forEach(request::putHeader);
+       43  
+       44      CompletableFuture<HttpClientResponse> future = new CompletableFuture<>();
+       45      request.handler(future::complete);
+       46  
+       47      request.end();
+       48      HttpClientResponse response = future.get();
+       49      String responseId = response.getHeader(REQUEST_ID_HEADER);
+       50      if (!requestId.equals(responseId)) {
+       51        throw new IllegalStateException(
+       52            String.format("Received response with id %s, expected %s", responseId, requestId));
+       53      }
+       54      return response.statusCode();
+       55    }
+       56  }
+
+---------- IMPLEMENTER io.opentelemetry.javaagent.instrumentation.vertx.v4_0.client.VertxSingleConnection  stubs=0/1 ----------
+       22  class VertxSingleConnection implements SingleConnection {
+       23  
+       24    private final HttpClient httpClient;
+       25    private final String host;
+       26    private final int port;
+       27  
+       28    public VertxSingleConnection(String host, int port) {
+       29      this.host = host;
+       30      this.port = port;
+       31      HttpClientOptions clientOptions =
+       32          new HttpClientOptions().setMaxPoolSize(1).setKeepAlive(true).setPipelining(true);
+       33      httpClient = Vertx.vertx(new VertxOptions()).createHttpClient(clientOptions);
+       34    }
+       35  
+       36    @Override
+       37    public int doRequest(String path, Map<String, String> headers)
+       38        throws ExecutionException, InterruptedException {
+       39      String requestId = requireNonNull(headers.get(REQUEST_ID_HEADER));
+       40      RequestOptions requestOptions = new RequestOptions().setHost(host).setPort(port).setURI(path);
+       41      headers.forEach(requestOptions::putHeader);
+       42      Future<HttpClientRequest> request = httpClient.request(requestOptions);
+       43  
+       44      HttpClientResponse response =
+       45          request.compose(HttpClientRequest::send).toCompletionStage().toCompletableFuture().get();
+       46  
+       47      String responseId = response.getHeader(REQUEST_ID_HEADER);
+       48      if (!requestId.equals(responseId)) {
+       49        throw new IllegalStateException(
+       50            String.format("Received response with id %s, expected %s", responseId, requestId));
+       51      }
+       52      return response.statusCode();
+       53    }
+       54  }
+
+---------- IMPLEMENTER io.opentelemetry.javaagent.instrumentation.vertx.v5_0.client.VertxSingleConnection  stubs=0/1 ----------
+       23  class VertxSingleConnection implements SingleConnection {
+       24  
+       25    private final HttpClient httpClient;
+       26    private final String host;
+       27    private final int port;
+       28  
+       29    public VertxSingleConnection(String host, int port) {
+       30      this.host = host;
+       31      this.port = port;
+       32      HttpClientOptions clientOptions =
+       33          new HttpClientOptions().setKeepAlive(true).setPipelining(true);
+       34      PoolOptions poolOptions = new PoolOptions().setHttp1MaxSize(1);
+       35      httpClient = Vertx.vertx(new VertxOptions()).createHttpClient(clientOptions, poolOptions);
+       36    }
+       37  
+       38    @Override
+       39    public int doRequest(String path, Map<String, String> headers)
+       40        throws ExecutionException, InterruptedException {
+       41      String requestId = requireNonNull(headers.get(REQUEST_ID_HEADER));
+       42      RequestOptions requestOptions = new RequestOptions().setHost(host).setPort(port).setURI(path);
+       43      headers.forEach(requestOptions::putHeader);
+       44      Future<HttpClientRequest> request = httpClient.request(requestOptions);
+       45  
+       46      HttpClientResponse response =
+       47          request.compose(HttpClientRequest::send).toCompletionStage().toCompletableFuture().get();
+       48  
+       49      String responseId = response.getHeader(REQUEST_ID_HEADER);
+       50      if (!requestId.equals(responseId)) {
+       51        throw new IllegalStateException(
+       52            String.format("Received response with id %s, expected %s", responseId, requestId));
+       53      }
+       54      return response.statusCode();
+       55    }
+       56  }

@@ -1,0 +1,568 @@
+row 35   codelibs/fess#3083
+============================================================================
+CONTRACT org.codelibs.fess.llm.AbstractLlmClient   members=21.0 implementers=1.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       56  public abstract class AbstractLlmClient implements LlmClient {
+       57  
+       58      private static final Logger logger = LogManager.getLogger(AbstractLlmClient.class);
+       59  
+       60      /** Shared ObjectMapper instance for JSON processing. */
+       61      protected static final ObjectMapper objectMapper = new ObjectMapper();
+       62  
+       63      /** Buffer size reserved when truncating context to fit within max chars limit. */
+       64      protected static final int CONTEXT_TRUNCATION_BUFFER = 100;
+       65  
+       66      /** The HTTP client used for API communication. */
+       67      protected CloseableHttpClient httpClient;
+       68  
+       69      /** Cached availability status of the LLM provider. */
+       70      protected volatile Boolean cachedAvailability = null;
+       71  
+       72      /** The scheduled task for periodic availability checks. */
+       73      protected TimeoutTask availabilityCheckTask;
+       74  
+       75      /** Semaphore for limiting concurrent LLM requests. Initialized lazily in init(). */
+       76      protected volatile Semaphore concurrencyLimiter;
+       77  
+       78      /**
+       79       * Default constructor.
+       80       */
+       81      public AbstractLlmClient() {
+       82          // Default constructor
+       83      }
+       84  
+       85      // --- Shared infrastructure ---
+       86  
+       87      /**
+       88       * Registers this client with the LlmClientManager.
+       89       * Called via postConstruct before init().
+       90       */
+       91      public void register() {
+       92          if (ComponentUtil.hasComponent("llmClientManager")) {
+       93              ComponentUtil.getComponent(LlmClientManager.class).register(this);
+       94          }
+       95      }
+       96  
+       97      /**
+       98       * Initializes the HTTP client and starts availability checking.
+       99       * Should be called from subclass init() methods.
+      100       */
+      101      public void init() {
+      102          if (!getName().equals(getLlmType())) {
+      103              if (logger.isDebugEnabled()) {
+      104                  logger.debug("Skipping availability check. llmType={}, name={}", getLlmType(), getName());
+      105              }
+      106              return;
+      107          }
+      108  
+      109          final int timeout = getTimeout();
+      110          final RequestConfig requestConfig = RequestConfig.custom()
+      111                  .setConnectionRequestTimeout(Timeout.ofMilliseconds(timeout))
+      112                  .setResponseTimeout(Timeout.ofMilliseconds(timeout))
+      113                  .build();
+      114          httpClient = HttpClients.custom()
+      115                  .setConnectionManager(PoolingHttpClientConnectionManagerBuilder.create()
+      116                          .setDefaultConnectionConfig(ConnectionConfig.custom().setConnectTimeout(Timeout.ofMilliseconds(timeout)).build())
+      117                          .build())
+      118                  .setDefaultRequestConfig(requestConfig)
+      119                  .disableAutomaticRetries()
+      120                  .build();
+      121          if (logger.isDebugEnabled()) {
+      122              logger.debug("Initialized {} with timeout: {}ms", getClass().getSimpleName(), timeout);
+      123          }
+      124          logger.info("[LLM] {} initialized. model={}, timeout={}ms, maxConcurrent={}", getName(), getModel(), getTimeout(),
+      125                  getMaxConcurrentRequests());
+      126  
+      127          concurrencyLimiter = new Semaphore(getMaxConcurrentRequests());
+      128  
+      129          startAvailabilityCheck();
+      130      }
+      131  
+      132      /**
+      133       * Cleans up resources.
+      134       */
+      135      public void destroy() {
+      136          logger.info("[LLM] {} shutting down.", getName());
+      137          if (availabilityCheckTask != null && !availabilityCheckTask.isCanceled()) {
+      138              availabilityCheckTask.cancel();
+      139              if (logger.isDebugEnabled()) {
+      140                  logger.debug("Cancelled {} availability check task", getName());
+      141              }
+      142          }
+      143          if (httpClient != null) {
+      144              try {
+      145                  httpClient.close();
+      146              } catch (final IOException e) {
+      147                  logger.warn("Failed to close HTTP client", e);
+      148              }
+      149              httpClient = null;
+      150          }
+      151      }
+      152  
+      153      /**
+      154       * Starts periodic availability checking if RAG chat is enabled.
+      155       */
+      156      protected void startAvailabilityCheck() {
+      157          if (!isRagChatEnabled()) {
+      158              if (logger.isDebugEnabled()) {
+      159                  logger.debug("RAG chat is disabled. Skipping availability check.");
+      160              }
+      161              return;
+      162          }
+      163  
+      164          final int checkInterval = getAvailabilityCheckInterval();
+      165          if (checkInterval <= 0) {
+      166              if (logger.isDebugEnabled()) {
+      167                  logger.debug("Availability check is disabled for {}", getName());
+      168              }
+      169              return;
+      170          }
+      171  
+      172          updateAvailability();
+      173  
+      174          availabilityCheckTask = TimeoutManager.getInstance().addTimeoutTarget(this::updateAvailability, checkInterval, true);
+      175  
+      176          if (logger.isDebugEnabled()) {
+      177              logger.debug("Started {} availability check with interval: {}s", getName(), checkInterval);
+      178          }
+      179      }
+      180  
+      181      /**
+      182       * Updates the cached availability state.
+      183       */
+      184      protected void updateAvailability() {
+      185          final boolean previousState = cachedAvailability != null ? cachedAvailability : false;
+      186          final boolean currentState = checkAvailabilityNow();
+      187          cachedAvailability = currentState;
+      188  
+      189          if (previousState != currentState) {
+      190              logger.info("{} availability changed: {} -> {}", getName(), previousState, currentState);
+      191          } else if (logger.isDebugEnabled()) {
+      192              logger.debug("{} availability check completed. available={}", getName(), currentState);
+      193          }
+      194      }
+      195  
+      196      @Override
+      197      public boolean isAvailable() {
+      198          if (cachedAvailability != null) {
+      199              return cachedAvailability;
+      200          }
+      201          return checkAvailabilityNow();
+      202      }
+      203  
+      204      /**
+      205       * Gets the HTTP client, initializing it if necessary.
+      206       *
+      207       * @return the HTTP client
+      208       */
+      209      public CloseableHttpClient getHttpClient() {
+      210          if (httpClient == null) {
+      211              init();
+      212          }
+      213          return httpClient;
+      214      }
+      215  
+      216      // --- Abstract methods for subclasses ---
+      217  
+      218      /**
+      219       * Performs the actual availability check against the LLM provider.
+      220       *
+      221       * @return true if the provider is available
+      222       */
+      223      protected abstract boolean checkAvailabilityNow();
+      224  
+      225      /**
+      226       * Gets the request timeout in milliseconds.
+      227       *
+      228       * @return the timeout in milliseconds
+      229       */
+      230      protected abstract int getTimeout();
+      231  
+      232      /**
+      233       * Gets the model name.
+      234       *
+      235       * @return the model name
+      236       */
+      237      protected abstract String getModel();
+      238  
+      239      /**
+      240       * Gets the availability check interval in seconds.
+      241       *
+      242       * @return the interval in seconds
+      243       */
+      244      protected abstract int getAvailabilityCheckInterval();
+      245  
+      246      /**
+      247       * Checks if RAG chat feature is enabled.
+      248       *
+      249       * @return true if RAG chat is enabled
+      250       */
+      251      protected abstract boolean isRagChatEnabled();
+      252  
+      253      /**
+      254       * Gets the configured LLM type.
+      255       *
+      256       * @return the LLM type from configuration
+      257       */
+      258      protected abstract String getLlmType();
+      259  
+      260      /**
+      261       * Gets the configuration prefix for this provider.
+      262       * Used to look up per-prompt-type parameters from FessConfig.
+      263       *
+      264       * @return the config prefix (e.g. "rag.llm.openai")
+      265       */
+      266      protected abstract String getConfigPrefix();
+      267  
+      268      /**
+      269       * Gets the base system prompt for RAG chat responses.
+      270       *
+      271       * @return the system prompt
+      272       */
+      273      protected abstract String getSystemPrompt();
+      274  
+      275      /**
+      276       * Gets the intent detection prompt template.
+      277       *
+      278       * @return the intent detection prompt
+      279       */
+      280      protected abstract String getIntentDetectionPrompt();
+      281  
+      282      /**
+      283       * Gets the system prompt for unclear intent responses.
+      284       *
+      285       * @return the unclear intent system prompt
+      286       */
+      287      protected abstract String getUnclearIntentSystemPrompt();
+      288  
+      289      /**
+      290       * Gets the system prompt for no-results responses.
+      291       *
+      292       * @return the no-results system prompt
+      293       */
+      294      protected abstract String getNoResultsSystemPrompt();
+      295  
+      296      /**
+      297       * Gets the system prompt for document-not-found responses.
+      298       *
+      299       * @return the document-not-found system prompt
+      300       */
+      301      protected abstract String getDocumentNotFoundSystemPrompt();
+      302  
+      303      /**
+      304       * Gets the evaluation prompt for relevance checking.
+      305       *
+      306       * @return the evaluation prompt
+      307       */
+      308      protected abstract String getEvaluationPrompt();
+      309  
+      310      /**
+      311       * Gets the system prompt for answer generation.
+      312       *
+      313       * @return the answer generation system prompt
+      314       */
+      315      protected abstract String getAnswerGenerationSystemPrompt();
+      316  
+      317      /**
+      318       * Gets the system prompt for summary generation.
+      319       *
+      320       * @return the summary system prompt
+      321       */
+      322      protected abstract String getSummarySystemPrompt();
+      323  
+      324      /**
+      325       * Gets the system prompt for FAQ answer generation.
+      326       *
+      327       * @return the FAQ answer system prompt
+      328       */
+      329      protected abstract String getFaqAnswerSystemPrompt();
+      330  
+      331      /**
+      332       * Gets the system prompt for direct answer generation.
+      333       *
+      334       * @return the direct answer system prompt
+      335       */
+      336      protected abstract String getDirectAnswerSystemPrompt();
+      337  
+      338      /**
+      339       * Gets the query regeneration prompt template.
+      340       *
+      341       * @return the query regeneration prompt
+      342       */
+      343      protected abstract String getQueryRegenerationPrompt();
+      344  
+      345      /**
+      346       * Gets the maximum characters for context building for a specific prompt type.
+      347       * Each LlmClient implementation defines per-prompt-type defaults appropriate
+      348       * for its target model.
+      349       *
+      350       * @param promptType the prompt type (e.g., "answer", "summary", "faq")
+      351       * @return the maximum characters
+      352       */
+      353      protected abstract int getContextMaxChars(String promptType);
+      354  
+      355      /**
+      356       * Gets the maximum number of relevant documents for evaluation.
+      357       *
+      358       * @return the maximum number of relevant documents
+      359       */
+      360      protected abstract int getEvaluationMaxRelevantDocs();
+      361  
+      362      /**
+      363       * Gets the maximum number of characters for evaluation description.
+      364       *
+      365       * @return the maximum number of characters
+      366       */
+      367      protected abstract int getEvaluationDescriptionMaxChars();
+      368  
+      369      /**
+      370       * Gets the maximum characters for conversation history in LLM requests.
+      371       *
+      372       * @return the maximum history characters
+      373       */
+      374      protected int getHistoryMaxChars() {
+      375          return Integer.parseInt(ComponentUtil.getFessConfig().getOrDefault("rag.chat.history.max.chars", "2000"));
+      376      }
+      377  
+      378      // --- Concurrency control ---
+      379  
+      380      /**
+      381       * Gets the maximum number of concurrent requests to the LLM provider.
+      382       * Default is 5. Override or configure via rag.llm.{provider}.max.concurrent.requests.
+      383       *
+      384       * @return the maximum concurrent requests
+      385       */
+      386      protected int getMaxConcurrentRequests() {
+      387          return Integer.parseInt(ComponentUtil.getFessConfig().getOrDefault(getConfigPrefix() + ".max.concurrent.requests", "5"));
+      388      }
+      389  
+      390      /**
+      391       * Gets the timeout for waiting to acquire a concurrency permit (ms).
+      392       * Default is 30000ms. Override or configure via rag.llm.{provider}.concurrency.wait.timeout.
+      393       *
+      394       * @return the wait timeout in milliseconds
+      395       */
+      396      protected long getConcurrencyWaitTimeoutMs() {
+      397          return Long.parseLong(ComponentUtil.getFessConfig().getOrDefault(getConfigPrefix() + ".concurrency.wait.timeout", "30000"));
+      398      }
+      399  
+      400      /**
+      401       * Executes a chat request with concurrency control via Semaphore.
+      402       *
+      403       * @param request the chat request
+      404       * @return the chat response
+      405       * @throws LlmException if too many concurrent requests or interrupted
+      406       */
+      407      protected LlmChatResponse chatWithConcurrencyControl(final LlmChatRequest request) {
+      408          if (concurrencyLimiter == null) {
+      409              return chat(request);
+      410          }
+      411          if (logger.isDebugEnabled()) {
+      412              logger.debug("[LLM] Acquiring concurrency permit. name={}, availablePermits={}, maxConcurrent={}", getName(),
+      413                      concurrencyLimiter.availablePermits(), getMaxConcurrentRequests());
+      414          }
+      415          try {
+      416              if (!concurrencyLimiter.tryAcquire(getConcurrencyWaitTimeoutMs(), TimeUnit.MILLISECONDS)) {
+      417                  logger.warn("[LLM] Concurrency limit exceeded. name={}, maxConcurrent={}, waitTimeout={}ms", getName(),
+      418                          getMaxConcurrentRequests(), getConcurrencyWaitTimeoutMs());
+      419                  throw new LlmException("Too many concurrent requests", LlmException.ERROR_RATE_LIMIT);
+      420              }
+      421              try {
+      422                  return chat(request);
+      423              } finally {
+      424                  concurrencyLimiter.release();
+      425              }
+      426          } catch (final InterruptedException e) {
+      427              logger.warn("[LLM] Request interrupted while waiting for concurrency permit. name={}", getName());
+      428              Thread.currentThread().interrupt();
+      429              throw new LlmException("Request interrupted", LlmException.ERROR_TIMEOUT);
+      430          }
+      431      }
+      432  
+      433      /**
+      434       * Executes a streaming chat request with concurrency control via Semaphore.
+      435       *
+      436       * @param request the chat request
+      437       * @param callback the streaming callback
+      438       * @throws LlmException if too many concurrent requests or interrupted
+      439       */
+      440      protected void streamChatWithConcurrencyControl(final LlmChatRequest request, final LlmStreamCallback callback) {
+      441          if (concurrencyLimiter == null) {
+      442              streamChat(request, callback);
+      443              return;
+      444          }
+      445          if (logger.isDebugEnabled()) {
+      446              logger.debug("[LLM] Acquiring concurrency permit. name={}, availablePermits={}, maxConcurrent={}", getName(),
+      447                      concurrencyLimiter.availablePermits(), getMaxConcurrentRequests());
+      448          }
+      449          try {
+      450              if (!concurrencyLimiter.tryAcquire(getConcurrencyWaitTimeoutMs(), TimeUnit.MILLISECONDS)) {
+      451                  logger.warn("[LLM] Concurrency limit exceeded. name={}, maxConcurrent={}, waitTimeout={}ms", getName(),
+      452                          getMaxConcurrentRequests(), getConcurrencyWaitTimeoutMs());
+      453                  throw new LlmException("Too many concurrent requests", LlmException.ERROR_RATE_LIMIT);
+      454              }
+      455              try {
+       ... truncated at 400 lines ...
+
+---------- IMPLEMENTER org.codelibs.fess.llm.AbstractLlmClientTest.TestableAbstractLlmClient  stubs=0/21 ----------
+      702      static class TestableAbstractLlmClient extends AbstractLlmClient {
+      703  
+      704          private String testIntentDetectionPrompt = "{{conversationHistory}}\nQuestion: {{userMessage}}\n{{languageInstruction}}";
+      705          private String testSystemPrompt = "You are a test assistant.";
+      706          private String testSummarySystemPrompt = "{{systemPrompt}}\n{{documentContent}}\n{{languageInstruction}}";
+      707          private int testContextMaxChars = 50000;
+      708          private String chatResponseContent;
+      709          private String lastChatPrompt;
+      710          private LlmChatRequest lastChatRequest;
+      711          private StreamChatCapture streamChatCapture;
+      712  
+      713          void setTestIntentDetectionPrompt(final String prompt) {
+      714              this.testIntentDetectionPrompt = prompt;
+      715          }
+      716  
+      717          void setTestSystemPrompt(final String prompt) {
+      718              this.testSystemPrompt = prompt;
+      719          }
+      720  
+      721          void setTestSummarySystemPrompt(final String prompt) {
+      722              this.testSummarySystemPrompt = prompt;
+      723          }
+      724  
+      725          void setTestContextMaxChars(final int maxChars) {
+      726              this.testContextMaxChars = maxChars;
+      727          }
+      728  
+      729          void setChatResponse(final String content) {
+      730              this.chatResponseContent = content;
+      731          }
+      732  
+      733          void setStreamChatCapture(final StreamChatCapture capture) {
+      734              this.streamChatCapture = capture;
+      735          }
+      736  
+      737          String getLastChatPrompt() {
+      738              return lastChatPrompt;
+      739          }
+      740  
+      741          LlmChatRequest getLastChatRequest() {
+      742              return lastChatRequest;
+      743          }
+      744  
+      745          // Expose protected methods for testing
+      746  
+      747          String testBuildIntentDetectionSystemPrompt() {
+      748              return buildIntentDetectionSystemPrompt();
+      749          }
+      750  
+      751          LlmChatRequest testBuildIntentRequest(final String userMessage, final List<LlmMessage> history) {
+      752              final LlmChatRequest request = new LlmChatRequest();
+      753              request.addSystemMessage(buildIntentDetectionSystemPrompt());
+      754              if (history != null) {
+      755                  addIntentHistory(request, history);
+      756              }
+      757              request.addUserMessage(wrapUserInput(userMessage));
+      758              return request;
+      759          }
+      760  
+      761          String testWrapUserInput(final String userMessage) {
+      762              return wrapUserInput(userMessage);
+      763          }
+      764  
+      765          String testBuildContext(final List<Map<String, Object>> documents) {
+      766              return buildContext(documents, "answer");
+      767          }
+      768  
+      769          String testStripHtmlTags(final String text) {
+      770              return stripHtmlTags(text);
+      771          }
+      772  
+      773          // Implement abstract methods
+      774  
+      775          @Override
+      776          public LlmChatResponse chat(final LlmChatRequest request) {
+      777              // Capture the full request and user message for verification
+      778              lastChatRequest = request;
+      779              for (final LlmMessage msg : request.getMessages()) {
+      780                  if ("user".equals(msg.getRole())) {
+      781                      lastChatPrompt = msg.getContent();
+      782                  }
+      783              }
+      784              if (chatResponseContent == null) {
+      785                  throw new LlmException("Test: no response configured");
+      786              }
+      787              return new LlmChatResponse(chatResponseContent);
+      788          }
+      789  
+      790          @Override
+      791          public void streamChat(final LlmChatRequest request, final LlmStreamCallback callback) {
+      792              if (streamChatCapture != null) {
+      793                  streamChatCapture.capture(request, callback);
+      794              } else {
+      795                  callback.onChunk("test response", true);
+      796              }
+      797          }
+      798  
+      799          @Override
+      800          public String getName() {
+      801              return "test";
+      802          }
+      803  
+      804          @Override
+      805          protected boolean checkAvailabilityNow() {
+      806              return true;
+      807          }
+      808  
+      809          @Override
+      810          protected int getTimeout() {
+      811              return 30000;
+      812          }
+      813  
+      814          @Override
+      815          protected String getModel() {
+      816              return "test-model";
+      817          }
+      818  
+      819          @Override
+      820          protected int getAvailabilityCheckInterval() {
+      821              return 0;
+      822          }
+      823  
+      824          @Override
+      825          protected boolean isRagChatEnabled() {
+      826              return false;
+      827          }
+      828  
+      829          @Override
+      830          protected String getLlmType() {
+      831              return "test";
+      832          }
+      833  
+      834          @Override
+      835          protected String getConfigPrefix() {
+      836              return "rag.llm.test";
+      837          }
+      838  
+      839          @Override
+      840          protected String getSystemPrompt() {
+      841              return testSystemPrompt;
+      842          }
+      843  
+      844          @Override
+      845          protected String getIntentDetectionPrompt() {
+      846              return testIntentDetectionPrompt;
+      847          }
+      848  
+      849          @Override
+      850          protected String getUnclearIntentSystemPrompt() {
+      851              return "unclear prompt {{languageInstruction}}";
+      852          }
+      853  
+      854          @Override
+      855          protected String getNoResultsSystemPrompt() {
+      856              return "no results prompt {{languageInstruction}}";
+      857          }
+      858  
+      859          @Override
+      860          protected String getDocumentNotFoundSystemPrompt() {
+      861              return "doc not found {{documentUrl}} {{languageInstruction}}";
