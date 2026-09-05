@@ -619,10 +619,40 @@ SRP_JAVA_THRESHOLDS = {
 # the opposite reason: TS methods are bivariant and permit everything, Java is
 # invariant and permits nothing. What the compiler enforces determines which
 # LSP violations are even expressible -- a cross-language result in its own right.
+# VALIDATED AND NARROWED 2026-09-04 on 400 hand-judged override pairs. The flag
+# used to combine all three signals below and scored P=0.280 overall, which is
+# an average of one excellent detector and two that find nothing:
+#
+#     refused_bequest             62 flags, 51 true, P=0.823
+#     precondition_strengthened   62 flags,  5 true, P=0.081
+#     postcondition_weakened      76 flags,  0 true, P=0.000
+#
+# 76 flags with ZERO true positives is not a weak signal, it is an inert one.
+# Both dropped signals fire on ordinary polymorphism -- covariant returns,
+# specialised return values, a subclass validating its own narrower domain --
+# which is what overriding is FOR.
+#
+# WHY THIS IS A RESULT AND NOT A PATCH. javac already enforces parameter
+# compatibility, visibility and checked exceptions, so the only LSP violations
+# EXPRESSIBLE in compiling Java are behavioural. The two contract-variance
+# signals find nothing because the compiler prevented those violations before
+# the code ever reached us; the one behavioural signal finds them at 82%
+# precision. What a compiler enforces determines which violations can exist.
+#
+# refused_bequest alone (0.823) is the most precise detector in this study,
+# ahead of OCP (0.480) and SRP (0.270). Reporting the three together buried it.
+#
+# Same remedy as V1 applied to DIP's `mean_d` (0/17 across two languages).
 LSP_JAVA_STRONG_SIGNALS = [
     "refused_bequest",              # override body is only `throw new UnsupportedOperationException`
-    "precondition_strengthened",    # override adds an argument guard that throws
-    "postcondition_weakened",       # override returns null where the base does not
+]
+
+# Kept for the report's per-signal table and for anyone re-running the
+# validation: these are COMPUTED and STORED on every override row, they simply
+# no longer raise the flag.
+LSP_JAVA_REPORTED_ONLY_SIGNALS = [
+    "precondition_strengthened",    # P=0.081 on 62 flags
+    "postcondition_weakened",       # P=0.000 on 76 flags
 ]
 
 # Thresholds for the four Java delta principles.

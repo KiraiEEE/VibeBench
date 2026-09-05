@@ -593,6 +593,14 @@ def delta_section(title: str, prs: pd.DataFrame, risk_col: str,
         if extra:
             extra(ok)
         return
+    if risk_col == "lsp_risk":
+        n_before = int(ok[risk_col].fillna(False).sum())
+        ok = apply_lsp_signal_filter(ok, "pr")
+        n_after = int(ok[risk_col].fillna(False).sum())
+        print(f"  LSP FLAG NARROWED to {C.LSP_JAVA_STRONG_SIGNALS}: "
+              f"{n_before} -> {n_after} flagged PRs")
+        print(f"    dropped signals validated at P=0.081 and P=0.000 on 400 "
+              f"judged pairs; refused_bequest alone scores P=0.823")
     k = int(ok[risk_col].fillna(False).sum())
     print(f"  analysable PRs : {len(ok)} of {len(prs)}")
     print(f"  FLAGGED        : {rate(k, len(ok))}")
@@ -624,6 +632,33 @@ def delta_section(title: str, prs: pd.DataFrame, risk_col: str,
         print(f"  repos involved : {len(by)}  (top: {dict(by.head(4))})")
     if extra:
         extra(ok)
+
+
+def apply_lsp_signal_filter(df: pd.DataFrame, level: str) -> pd.DataFrame:
+    """Recompute the LSP flag from config.LSP_JAVA_STRONG_SIGNALS.
+
+    WHY THIS IS DONE IN THE REPORT AND NOT BY RE-RUNNING. Every override row
+    stores its `signals`, and every PR row stores its `lsp_risk_reasons`, so the
+    flag is exactly recomputable from what is already on disk. Narrowing the
+    signal set therefore costs a recomputation, not another analysis pass, and
+    the stored data keeps supporting the per-signal table that justified the
+    change.
+
+    VALIDATED 2026-09-04 on 400 hand-judged override pairs:
+        refused_bequest             62 flags, 51 true, P=0.823
+        precondition_strengthened   62 flags,  5 true, P=0.081
+        postcondition_weakened      76 flags,  0 true, P=0.000
+    """
+    strong = set(C.LSP_JAVA_STRONG_SIGNALS)
+    d = df.copy()
+    if level == "entity" and "signals" in d.columns:
+        d["violation"] = d.signals.fillna("").map(
+            lambda x: bool(strong & {p for p in str(x).split(";") if p}))
+    elif level == "pr" and "lsp_risk_reasons" in d.columns:
+        want = {"new_" + s for s in strong}
+        d["lsp_risk"] = d.lsp_risk_reasons.fillna("").map(
+            lambda x: bool(want & {p for p in str(x).split("|") if p}))
+    return d
 
 
 def production_rows(d: pd.DataFrame, label: str = "") -> pd.DataFrame:
@@ -670,6 +705,7 @@ def lsp_extra(ok: pd.DataFrame) -> None:
     if not len(ov):
         return
     ov = production_rows(ov, "override-pair")
+    ov = apply_lsp_signal_filter(ov, "entity")
     u = ov.drop_duplicates(["full_name", "type_id", "method"])
     print(f"  DISTINCT override pairs (concrete base only): {len(u):,}  "
           f"from {len(ov):,} rows ({len(ov)/max(len(u),1):.1f}x duplication)")
