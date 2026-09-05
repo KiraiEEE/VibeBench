@@ -1,0 +1,674 @@
+row 131   StarRocks/starrocks#70764
+============================================================================
+CONTRACT com.starrocks.connector.iceberg.procedure.IcebergTableProcedure   members=1.0 implementers=8.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       24  public abstract class IcebergTableProcedure {
+       25      private final String procedureName;
+       26      private final IcebergTableOperation operation;
+       27      private final List<NamedArgument> arguments;
+       28  
+       29  
+       30      public IcebergTableProcedure(String procedureName, List<NamedArgument> arguments, IcebergTableOperation operation) {
+       31          this.procedureName = procedureName;
+       32          this.arguments = arguments;
+       33          this.operation = operation;
+       34      }
+       35  
+       36      public String getProcedureName() {
+       37          return this.procedureName;
+       38      }
+       39  
+       40      public List<NamedArgument> getArguments() {
+       41          return this.arguments;
+       42      }
+       43  
+       44      public IcebergTableOperation getOperation() {
+       45          return this.operation;
+       46      }
+       47  
+       48      public abstract ShowResultSet execute(IcebergTableProcedureContext context, Map<String, ConstantOperator> args);
+       49  }
+
+---------- IMPLEMENTER com.starrocks.connector.iceberg.procedure.AddFilesProcedure  stubs=0/1 ----------
+       72  public class AddFilesProcedure extends IcebergTableProcedure {
+       73      private static final Logger LOGGER = LoggerFactory.getLogger(AddFilesProcedure.class);
+       74  
+       75      private static final String PROCEDURE_NAME = "add_files";
+       76  
+       77      public static final String SOURCE_TABLE = "source_table";
+       78      public static final String LOCATION = "location";
+       79      public static final String FILE_FORMAT = "file_format";
+       80      public static final String RECURSIVE = "recursive";
+       81  
+       82      private static final AddFilesProcedure INSTANCE = new AddFilesProcedure();
+       83  
+       84      public static AddFilesProcedure getInstance() {
+       85          return INSTANCE;
+       86      }
+       87  
+       88      private AddFilesProcedure() {
+       89          super(
+       90                  PROCEDURE_NAME,
+       91                  List.of(
+       92                          new NamedArgument(SOURCE_TABLE, VarcharType.VARCHAR, false),
+       93                          new NamedArgument(LOCATION, VarcharType.VARCHAR, false),
+       94                          new NamedArgument(FILE_FORMAT, VarcharType.VARCHAR, false),
+       95                          new NamedArgument(RECURSIVE, BooleanType.BOOLEAN, false)
+       96                  ),
+       97                  IcebergTableOperation.ADD_FILES
+       98          );
+       99      }
+      100  
+      101      @Override
+      102      public ShowResultSet execute(IcebergTableProcedureContext context, Map<String, ConstantOperator> args) {
+      103          // Validate arguments - either source_table or location must be provided, but not both
+      104          ConstantOperator sourceTableArg = args.get(SOURCE_TABLE);
+      105          ConstantOperator tableLocationArg = args.get(LOCATION);
+      106          ConstantOperator fileFormatArg = args.get(FILE_FORMAT);
+      107  
+      108          if (sourceTableArg == null && tableLocationArg == null) {
+      109              throw new StarRocksConnectorException(
+      110                      "Either 'source_table' or 'location' must be provided for add_files operation");
+      111          }
+      112  
+      113          if (sourceTableArg != null && tableLocationArg != null) {
+      114              throw new StarRocksConnectorException(
+      115                      "Cannot specify both 'source_table' and 'location' for add_files operation");
+      116          }
+      117  
+      118          if (tableLocationArg != null && fileFormatArg == null) {
+      119              throw new StarRocksConnectorException(
+      120                      "'file_format' must be provided when 'location' is specified");
+      121          }
+      122  
+      123          String fileFormat = null;
+      124          if (fileFormatArg != null) {
+      125              fileFormat = fileFormatArg.getVarchar().toLowerCase();
+      126              if (!fileFormat.equals("parquet") && !fileFormat.equals("orc")) {
+      127                  throw new StarRocksConnectorException(
+      128                          "Unsupported file format: %s. Supported formats are: parquet, orc", fileFormat);
+      129              }
+      130          }
+      131  
+      132          boolean recursive = true;
+      133          ConstantOperator recursiveArg = args.get(RECURSIVE);
+      134          if (recursiveArg != null) {
+      135              recursive = recursiveArg.getBoolean();
+      136          }
+      137  
+      138          Table table = context.table();
+      139          PartitionSpec spec = table.spec();
+      140          if (spec.isPartitioned() && spec.fields().stream().anyMatch(f -> !f.transform().isIdentity())) {
+      141              throw new StarRocksConnectorException(
+      142                      "Adding files to partitioned tables with non-identity partitioning is not supported, " +
+      143                              "which will cause data inconsistency");
+      144          }
+      145  
+      146          Transaction transaction = context.transaction();
+      147          try {
+      148              if (tableLocationArg != null) {
+      149                  // Add files from a specific location
+      150                  String tableLocation = tableLocationArg.getVarchar();
+      151                  addFilesFromLocation(context, table, transaction, tableLocation, recursive, fileFormat);
+      152              } else {
+      153                  // Add files from source table
+      154                  String sourceTable = sourceTableArg.getVarchar();
+      155                  addFilesFromSourceTable(context, table, transaction, sourceTable, recursive);
+      156              }
+      157          } catch (Exception e) {
+      158              LOGGER.error("Failed to execute add_files procedure", e);
+      159              throw new StarRocksConnectorException("Failed to add files: %s", e.getMessage(), e);
+      160          }
+      161  
+      162          return null;
+      163      }
+      164  
+      165      private void addFilesFromLocation(IcebergTableProcedureContext context, Table table, Transaction transaction,
+      166                                        String location, boolean recursive, String fileFormat) throws IOException {
+      167          LOGGER.info("Adding files from location: {}", location);
+      168  
+      169          // Get the file system for the location
+      170          URI locationUri = new Path(location).toUri();
+      171          FileSystem fileSystem = FileSystem.get(locationUri,
+      172                  context.hdfsEnvironment().getConfiguration());
+      173  
+      174          // Discover data files in the location
+      175          List<DataFile> dataFiles = discoverDataFiles(context, table, fileSystem, location, recursive, fileFormat);
+      176  
+      177          if (dataFiles.isEmpty()) {
+      178              LOGGER.warn("No data files found at location: {}", location);
+      179              return;
+      180          }
+      181  
+      182          // Add the files to the table using a transaction
+      183          AppendFiles appendFiles = transaction.newAppend();
+      184          for (DataFile dataFile : dataFiles) {
+      185              appendFiles.appendFile(dataFile);
+      186          }
+      187  
+      188          // Commit the transaction
+      189          appendFiles.commit();
+      190          LOGGER.info("Successfully added {} files to table", dataFiles.size());
+      191      }
+      192  
+      193      private List<DataFile> discoverDataFiles(IcebergTableProcedureContext context, Table table, FileSystem fileSystem,
+      194                                               String location, boolean recursive, String fileFormat) throws IOException {
+      195          List<DataFile> dataFiles = new ArrayList<>();
+      196          Path locationPath = new Path(location);
+      197  
+      198          if (!fileSystem.exists(locationPath)) {
+      199              throw new StarRocksConnectorException("Location does not exist: %s", location);
+      200          }
+      201  
+      202          FileStatus fileStatus = fileSystem.getFileStatus(locationPath);
+      203          if (fileStatus.isFile()) {
+      204              // Single file
+      205              if (isDataFile(fileStatus)) {
+      206                  DataFile dataFile = createDataFileFromLocation(context, table, fileStatus, fileFormat);
+      207                  if (dataFile != null) {
+      208                      dataFiles.add(dataFile);
+      209                  }
+      210              } else {
+      211                  LOGGER.warn("The specified location is a file but not a recognized data file: {}",
+      212                          fileStatus.getPath());
+      213                  throw new StarRocksConnectorException("No valid data files found at location: %s", location);
+      214              }
+      215              return dataFiles;
+      216          } else if (fileStatus.isDirectory()) {
+      217              // List all files recursively
+      218              FileStatus[] files = fileSystem.listStatus(locationPath);
+      219              for (FileStatus file : files) {
+      220                  if (file.isFile() && isDataFile(file)) {
+      221                      try {
+      222                          DataFile dataFile = createDataFileFromLocation(context, table, file, fileFormat);
+      223                          if (dataFile != null) {
+      224                              dataFiles.add(dataFile);
+      225                          }
+      226                      } catch (Exception e) {
+      227                          LOGGER.warn("Failed to process file: {}. Error: {}",
+      228                                  file.getPath(), e.getMessage());
+      229                          throw new StarRocksConnectorException("Failed to process file: %s, error: %s",
+      230                                  file.getPath(), e.getMessage(), e);
+      231                      }
+
+---------- IMPLEMENTER com.starrocks.connector.iceberg.procedure.CherryPickSnapshotProcedure  stubs=0/1 ----------
+       26  public class CherryPickSnapshotProcedure extends IcebergTableProcedure {
+       27      private static final String PROCEDURE_NAME = "cherrypick_snapshot";
+       28  
+       29      private static final String SNAPSHOT_ID = "snapshot_id";
+       30  
+       31      private static final CherryPickSnapshotProcedure INSTANCE = new CherryPickSnapshotProcedure();
+       32  
+       33      public static CherryPickSnapshotProcedure getInstance() {
+       34          return INSTANCE;
+       35      }
+       36  
+       37      private CherryPickSnapshotProcedure() {
+       38          super(
+       39                  PROCEDURE_NAME,
+       40                  List.of(
+       41                          new NamedArgument(SNAPSHOT_ID, IntegerType.BIGINT, true)
+       42                  ),
+       43                  IcebergTableOperation.CHERRYPICK_SNAPSHOT
+       44          );
+       45      }
+       46  
+       47      @Override
+       48      public ShowResultSet execute(IcebergTableProcedureContext context, Map<String, ConstantOperator> args) {
+       49          if (args.size() != 1) {
+       50              throw new StarRocksConnectorException("invalid args. cherrypick snapshot must contain `snapshot id`");
+       51          }
+       52          if (!args.containsKey(SNAPSHOT_ID)) {
+       53              throw new StarRocksConnectorException("missing required argument: %s", SNAPSHOT_ID);
+       54          }
+       55          ConstantOperator snapshotIdArg = args.get(SNAPSHOT_ID);
+       56          long snapshotId = snapshotIdArg.castTo(IntegerType.BIGINT)
+       57                  .map(ConstantOperator::getBigint)
+       58                  .orElseThrow(() -> new StarRocksConnectorException("invalid argument type for %s, expected BIGINT", SNAPSHOT_ID));
+       59  
+       60          context.transaction().manageSnapshots().cherrypick(snapshotId).commit();
+       61          return null;
+       62      }
+       63  }
+
+---------- IMPLEMENTER com.starrocks.connector.iceberg.procedure.ExpireSnapshotsProcedure  stubs=0/1 ----------
+       31  public class ExpireSnapshotsProcedure extends IcebergTableProcedure {
+       32      private static final String PROCEDURE_NAME = "expire_snapshots";
+       33  
+       34      public static final String OLDER_THAN = "older_than";
+       35      public static final String RETAIN_LAST = "retain_last";
+       36  
+       37      private static final ExpireSnapshotsProcedure INSTANCE = new ExpireSnapshotsProcedure();
+       38  
+       39      public static ExpireSnapshotsProcedure getInstance() {
+       40          return INSTANCE;
+       41      }
+       42  
+       43      private ExpireSnapshotsProcedure() {
+       44          super(
+       45                  PROCEDURE_NAME,
+       46                  List.of(
+       47                          new NamedArgument(OLDER_THAN, DateType.DATETIME, false),
+       48                          new NamedArgument(RETAIN_LAST, IntegerType.INT, false)
+       49                  ),
+       50                  IcebergTableOperation.EXPIRE_SNAPSHOTS
+       51          );
+       52      }
+       53  
+       54      @Override
+       55      public ShowResultSet execute(IcebergTableProcedureContext context, Map<String, ConstantOperator> args) {
+       56          if (args.size() > 2) {
+       57              throw new StarRocksConnectorException(
+       58                      "invalid args. only support `older_than` and `retain_last` in the expire snapshot operation");
+       59          }
+       60  
+       61          long olderThanMillis;
+       62          ConstantOperator olderThanArg = args.get(OLDER_THAN);
+       63          if (olderThanArg == null) {
+       64              olderThanMillis = -1L;
+       65          } else {
+       66              LocalDateTime time = olderThanArg.castTo(DateType.DATETIME).map(ConstantOperator::getDatetime)
+       67                      .orElseThrow(() ->
+       68                              new StarRocksConnectorException("invalid argument type for %s, expected DATETIME", OLDER_THAN));
+       69              olderThanMillis = Duration.ofSeconds(time.atZone(TimeUtils.getTimeZone().toZoneId()).toEpochSecond()).toMillis();
+       70          }
+       71  
+       72          int retainLast = -1;
+       73          ConstantOperator retainLastArg = args.get(RETAIN_LAST);
+       74          if (retainLastArg != null) {
+       75              retainLast = retainLastArg.castTo(IntegerType.INT).map(ConstantOperator::getInt)
+       76                      .orElseThrow(() ->
+       77                              new StarRocksConnectorException("invalid argument type for %s, expected INT", RETAIN_LAST));
+       78              if (retainLast < 1) {
+       79                  throw new StarRocksConnectorException("invalid argument value for %s, must be >= 1, got %d", RETAIN_LAST,
+       80                          retainLast);
+       81              }
+       82          }
+       83  
+       84          ExpireSnapshots expireSnapshots = context.transaction().expireSnapshots();
+       85          if (olderThanMillis != -1) {
+       86              expireSnapshots = expireSnapshots.expireOlderThan(olderThanMillis);
+       87          }
+       88          if (retainLast != -1) {
+       89              expireSnapshots = expireSnapshots.retainLast(retainLast);
+       90          }
+       91          expireSnapshots.commit();
+       92          return null;
+       93      }
+       94  }
+
+---------- IMPLEMENTER com.starrocks.connector.iceberg.procedure.FastForwardProcedure  stubs=0/1 ----------
+       26  public class FastForwardProcedure extends IcebergTableProcedure {
+       27      private static final String PROCEDURE_NAME = "fast_forward";
+       28  
+       29      private static final String FROM_BRANCH = "from_branch";
+       30      private static final String TO_BRANCH = "to_branch";
+       31  
+       32      private static final FastForwardProcedure INSTANCE = new FastForwardProcedure();
+       33  
+       34      public static FastForwardProcedure getInstance() {
+       35          return INSTANCE;
+       36      }
+       37  
+       38      private FastForwardProcedure() {
+       39          super(
+       40                  PROCEDURE_NAME,
+       41                  Arrays.asList(
+       42                          new NamedArgument(FROM_BRANCH, VarcharType.VARCHAR, true),
+       43                          new NamedArgument(TO_BRANCH, VarcharType.VARCHAR, true)
+       44                  ),
+       45                  IcebergTableOperation.FAST_FORWARD
+       46          );
+       47      }
+       48  
+       49      @Override
+       50      public ShowResultSet execute(IcebergTableProcedureContext context, Map<String, ConstantOperator> args) {
+       51          if (args.size() != 2) {
+       52              throw new StarRocksConnectorException("invalid args. fast forward must contain `from branch` and `to branch`");
+       53          }
+       54  
+       55          if (!args.containsKey(FROM_BRANCH) || !args.containsKey(TO_BRANCH)) {
+       56              throw new StarRocksConnectorException("missing required argument: %s or %s", FROM_BRANCH, TO_BRANCH);
+       57          }
+       58  
+       59          String from = args.get(FROM_BRANCH)
+       60                  .castTo(VarcharType.VARCHAR)
+       61                  .map(ConstantOperator::getChar)
+       62                  .orElseThrow(() -> new StarRocksConnectorException("invalid argument type for %s, expected STRING",
+       63                          FROM_BRANCH));
+       64  
+       65          String to = args.get(TO_BRANCH)
+       66                  .castTo(VarcharType.VARCHAR)
+       67                  .map(ConstantOperator::getChar)
+       68                  .orElseThrow(() -> new StarRocksConnectorException("invalid argument type for %s, expected STRING",
+       69                          TO_BRANCH));
+       70  
+       71          context.transaction().manageSnapshots().fastForwardBranch(from, to).commit();
+       72          return null;
+       73      }
+       74  }
+
+---------- IMPLEMENTER com.starrocks.connector.iceberg.procedure.RemoveOrphanFilesProcedure  stubs=0/1 ----------
+       62  public class RemoveOrphanFilesProcedure extends IcebergTableProcedure {
+       63      private static final Logger LOGGER = LoggerFactory.getLogger(RemoveOrphanFilesProcedure.class);
+       64  
+       65      private static final Duration DEFAULT_RETENTION_THRESHOLD = Duration.ofDays(7);
+       66      private static final int DELETE_BATCH_SIZE = 1000;
+       67  
+       68      private static final String PROCEDURE_NAME = "remove_orphan_files";
+       69  
+       70      public static final String OLDER_THAN = "older_than";
+       71      public static final String LOCATION = "location";
+       72  
+       73      private static final RemoveOrphanFilesProcedure INSTANCE = new RemoveOrphanFilesProcedure();
+       74  
+       75      public static RemoveOrphanFilesProcedure getInstance() {
+       76          return INSTANCE;
+       77      }
+       78  
+       79      private RemoveOrphanFilesProcedure() {
+       80          super(
+       81                  PROCEDURE_NAME,
+       82                  List.of(
+       83                          new NamedArgument(OLDER_THAN, DateType.DATETIME, false),
+       84                          new NamedArgument(LOCATION, VarcharType.VARCHAR, false)
+       85                  ),
+       86                  IcebergTableOperation.REMOVE_ORPHAN_FILES
+       87          );
+       88      }
+       89  
+       90      @Override
+       91      public ShowResultSet execute(IcebergTableProcedureContext context, Map<String, ConstantOperator> args) {
+       92          if (args.size() > 2) {
+       93              throw new StarRocksConnectorException("invalid args. only support " +
+       94                      "`older_than` and `location` in the remove orphan files operation");
+       95          }
+       96  
+       97          long olderThanMillis;
+       98          ConstantOperator olderThanArg = args.get(OLDER_THAN);
+       99          if (olderThanArg == null) {
+      100              LocalDateTime time = LocalDateTime.now(TimeUtils.getTimeZone().toZoneId());
+      101              olderThanMillis = time.minus(DEFAULT_RETENTION_THRESHOLD).toInstant(ZoneOffset.UTC).toEpochMilli();
+      102          } else {
+      103              LocalDateTime time = olderThanArg.castTo(DateType.DATETIME).
+      104                      map(ConstantOperator::getDatetime).orElseThrow(() ->
+      105                              new StarRocksConnectorException("invalid argument type for %s, expected DATETIME", OLDER_THAN));
+      106              olderThanMillis = Duration.ofSeconds(time.atZone(TimeUtils.getTimeZone().toZoneId()).toEpochSecond()).toMillis();
+      107          }
+      108  
+      109          Table table = context.table();
+      110          if (table.currentSnapshot() == null) {
+      111              return null;
+      112          }
+      113          if (table.location() == null || table.location().isEmpty()) {
+      114              throw new StarRocksConnectorException("table location is empty");
+      115          }
+      116  
+      117          String location;
+      118          ConstantOperator locationArg = args.get(LOCATION);
+      119          if (locationArg != null) {
+      120              location = validateAndResolveScanLocation(locationArg.getVarchar(), table.location());
+      121          } else {
+      122              location = table.location();
+      123          }
+      124  
+      125          Set<String> processedManifestFilePaths = new HashSet<>();
+      126          Set<String> validFileNames = new HashSet<>();
+      127  
+      128          for (Snapshot snapshot : table.snapshots()) {
+      129              if (snapshot.manifestListLocation() != null) {
+      130                  validFileNames.add(fileName(snapshot.manifestListLocation()));
+      131              }
+      132  
+      133              try (CloseableIterable<ManifestFile> manifests = readManifests(snapshot, table.io())) {
+      134                  for (ManifestFile manifest : manifests) {
+      135                      if (!processedManifestFilePaths.add(manifest.path())) {
+      136                          continue;
+      137                      }
+      138  
+      139                      validFileNames.add(fileName(manifest.path()));
+      140                      try (ManifestReader<? extends ContentFile<?>> manifestReader = readerForManifest(table, manifest)) {
+      141                          for (ContentFile<?> contentFile : manifestReader) {
+      142                              validFileNames.add(fileName(contentFile.location()));
+      143                          }
+      144                      } catch (IOException e) {
+      145                          throw new StarRocksConnectorException("Unable to list manifest file content from " + manifest.path(), e);
+      146                      }
+      147                  }
+      148              } catch (IOException e) {
+      149                  throw new StarRocksConnectorException("Unable to read manifests for snapshot " + snapshot.snapshotId(), e);
+      150              }
+      151          }
+      152  
+      153          metadataFileLocations(table, false).stream()
+      154                  .map(IcebergUtil::fileName)
+      155                  .forEach(validFileNames::add);
+      156  
+      157          statisticsFilesLocations(table).stream()
+      158                  .map(IcebergUtil::fileName)
+      159                  .forEach(validFileNames::add);
+      160  
+      161          validFileNames.add("version-hint.text");
+      162  
+      163          scanAndDeleteInvalidFiles(location, olderThanMillis, validFileNames, context.hdfsEnvironment());
+      164          return null;
+      165      }
+      166  
+      167      /**
+      168       * Reads manifest files for a snapshot. When the snapshot has a manifest list file,
+      169       * reads from it directly (AVRO) for better efficiency; otherwise falls back to
+      170       * snapshot.allManifests(). Aligned with Iceberg FileCleanupStrategy.readManifests().
+      171       */
+      172      private static final Schema MANIFEST_PROJECTION =
+      173              ManifestFile.schema().select(
+      174                      "manifest_path",
+      175                      "manifest_length",
+      176                      "content",
+      177                      "partition_spec_id",
+      178                      "added_snapshot_id",
+      179                      "deleted_data_files_count");
+      180  
+      181      private static CloseableIterable<ManifestFile> readManifests(Snapshot snapshot, FileIO fileIO) {
+      182          if (snapshot.manifestListLocation() != null) {
+      183              return InternalData.read(
+      184                              FileFormat.AVRO, fileIO.newInputFile(snapshot.manifestListLocation()))
+      185                      .setRootType(GenericManifestFile.class)
+      186                      .project(MANIFEST_PROJECTION)
+      187                      .reuseContainers()
+      188                      .build();
+      189          } else {
+      190              return CloseableIterable.withNoopClose(snapshot.allManifests(fileIO));
+      191          }
+      192      }
+      193  
+      194      /**
+      195       * Validates that the given location is non-empty and is the table root or a subdirectory of it
+      196       * Returns the normalized path for use in scanning.
+      197       */
+      198      private static String validateAndResolveScanLocation(String location, String tableLocation) {
+      199          if (location == null || location.isEmpty()) {
+      200              throw new StarRocksConnectorException("invalid argument value for %s, expected non-empty string",
+      201                      LOCATION);
+      202          }
+      203  
+      204          if (tableLocation.equals(location)) {
+      205              return location;
+      206          }
+      207  
+      208          URI tableUri = new Path(tableLocation).toUri();
+      209          URI locationUri = new Path(location).toUri();
+      210          String tablePath = stripTrailingSlash(tableUri.getPath());
+      211          String locationPath = stripTrailingSlash(locationUri.getPath());
+      212  
+      213          if (!Objects.equals(tableUri.getScheme(), locationUri.getScheme()) ||
+      214                  !Objects.equals(tableUri.getAuthority(), locationUri.getAuthority()) ||
+      215                  !locationPath.startsWith(tablePath + Path.SEPARATOR)) {
+      216              throw new StarRocksConnectorException("invalid argument value for %s, location must be a subdirectory of " +
+      217                      "table location %s, got %s", LOCATION, tableLocation, location);
+      218          }
+      219  
+      220          return locationUri.toString();
+      221      }
+
+---------- IMPLEMENTER com.starrocks.connector.iceberg.procedure.RewriteDataFilesProcedure  stubs=0/1 ----------
+       45  public class RewriteDataFilesProcedure extends IcebergTableProcedure {
+       46      private static final Logger LOGGER = LoggerFactory.getLogger(RewriteDataFilesProcedure.class);
+       47  
+       48      private static final String PROCEDURE_NAME = "rewrite_data_files";
+       49  
+       50      private static final String REWRITE_ALL = "rewrite_all";
+       51      private static final String MIN_FILE_SIZE_BYTES = "min_file_size_bytes";
+       52      private static final String BATCH_SIZE = "batch_size";
+       53      private static final String BATCH_PARALLELISM = "batch_parallelism";
+       54  
+       55      private static final long DEFAULT_MIN_FILE_SIZE_BYTES = 256L * 1024 * 1024;
+       56      private static final long DEFAULT_BATCH_SIZE = 10L * 1024 * 1024 * 1024;
+       57      private static final long DEFAULT_BATCH_PARALLELISM = 1L;
+       58  
+       59      private static final RewriteDataFilesProcedure INSTANCE = new RewriteDataFilesProcedure();
+       60  
+       61      public static RewriteDataFilesProcedure getInstance() {
+       62          return INSTANCE;
+       63      }
+       64  
+       65      private RewriteDataFilesProcedure() {
+       66          super(
+       67                  PROCEDURE_NAME,
+       68                  Arrays.asList(
+       69                          new NamedArgument(REWRITE_ALL, BooleanType.BOOLEAN, false),
+       70                          new NamedArgument(MIN_FILE_SIZE_BYTES, IntegerType.BIGINT, false),
+       71                          new NamedArgument(BATCH_SIZE, IntegerType.BIGINT, false),
+       72                          new NamedArgument(BATCH_PARALLELISM, IntegerType.BIGINT, false)
+       73                  ),
+       74                  IcebergTableOperation.REWRITE_DATA_FILES
+       75          );
+       76      }
+       77  
+       78      @Override
+       79      public ShowResultSet execute(IcebergTableProcedureContext context, Map<String, ConstantOperator> args) {
+       80          if (args.size() > 4) {
+       81              throw new StarRocksConnectorException("invalid args. only support `rewrite_all`, " +
+       82                      "`min_file_size_bytes`, `batch_size` and `batch_parallelism` in the rewrite data files operation");
+       83          }
+       84  
+       85          boolean rewriteAll = args.get(REWRITE_ALL) != null && args.get(REWRITE_ALL)
+       86                  .castTo(BooleanType.BOOLEAN)
+       87                  .map(ConstantOperator::getBoolean)
+       88                  .orElseThrow(() -> new StarRocksConnectorException("invalid argument type for %s, expected BOOLEAN",
+       89                          REWRITE_ALL));
+       90          long minFileSizeBytes = args.get(MIN_FILE_SIZE_BYTES) != null ? args.get(MIN_FILE_SIZE_BYTES)
+       91                  .castTo(IntegerType.BIGINT)
+       92                  .map(ConstantOperator::getBigint)
+       93                  .filter(v -> v > 0)
+       94                  .orElseThrow(() -> new StarRocksConnectorException("invalid argument type for %s, expected positive BIGINT",
+       95                          MIN_FILE_SIZE_BYTES))
+       96                  : DEFAULT_MIN_FILE_SIZE_BYTES;
+       97          long batchSize = args.get(BATCH_SIZE) != null ? args.get(BATCH_SIZE)
+       98                  .castTo(IntegerType.BIGINT)
+       99                  .map(ConstantOperator::getBigint)
+      100                  .filter(v -> v > 0)
+      101                  .orElseThrow(() -> new StarRocksConnectorException("invalid argument type for %s, expected positive BIGINT",
+      102                          BATCH_SIZE))
+      103                  : DEFAULT_BATCH_SIZE;
+      104          long batchParallelism = args.get(BATCH_PARALLELISM) != null ? args.get(BATCH_PARALLELISM)
+      105                  .castTo(IntegerType.BIGINT)
+      106                  .map(ConstantOperator::getBigint)
+      107                  .filter(v -> v > 0)
+      108                  .orElseThrow(() -> new StarRocksConnectorException("invalid argument type for %s, expected positive BIGINT",
+      109                          BATCH_PARALLELISM))
+      110                  : DEFAULT_BATCH_PARALLELISM;
+      111  
+      112          AlterTableStmt stmt = context.stmt();
+      113          Expr partitionFilter = context.clause().getWhere();
+      114          String catalogName = context.stmt().getCatalogName();
+      115          String dbName = context.stmt().getDbName();
+      116          String tableName = context.stmt().getTableName();
+      117          long startMs = System.currentTimeMillis();
+      118          boolean success = false;
+      119          String failureReason = IcebergMetricsMgr.classifyFailReason((String) null);
+      120          IcebergRewriteDataJob.RewriteMetrics metrics = IcebergRewriteDataJob.RewriteMetrics.EMPTY;
+      121  
+      122          VelocityContext velCtx = new VelocityContext();
+      123          velCtx.put("catalogName", catalogName);
+      124          velCtx.put("dbName", dbName);
+      125          velCtx.put("tableName", tableName);
+      126  
+      127          String partitionFilterSql = null;
+      128          if (partitionFilter != null) {
+      129              List<SlotRef> slots = new ArrayList<>();
+      130              partitionFilter.collect(SlotRef.class, slots);
+      131              for (SlotRef slot : slots) {
+      132                  slot.setTblName(new TableName(dbName, tableName));
+      133              }
+      134              partitionFilterSql = ExprToSql.toSql(partitionFilter);
+      135          }
+      136          velCtx.put("partitionFilterSql", partitionFilterSql);
+      137          VelocityEngine defaultVelocityEngine = new VelocityEngine();
+      138          defaultVelocityEngine.setProperty(VelocityEngine.RUNTIME_LOG_REFERENCE_LOG_INVALID, false);
+      139          StringWriter writer = new StringWriter();
+      140          defaultVelocityEngine.evaluate(velCtx, writer, "InsertSelectTemplate",
+      141                  "INSERT INTO $catalogName.$dbName.$tableName" +
+      142                          " SELECT * FROM $catalogName.$dbName.$tableName" +
+      143                          " #if ($partitionFilterSql)" +
+      144                          " WHERE $partitionFilterSql" +
+      145                          " #end"
+      146          );
+      147          String executeStmt = writer.toString();
+      148          IcebergRewriteDataJob job = new IcebergRewriteDataJob(executeStmt, rewriteAll,
+      149                  minFileSizeBytes, batchSize, batchParallelism, context.context(), stmt);
+      150          long durationMs = 0L;
+      151          try {
+      152              job.prepare();
+      153              metrics = job.execute();
+      154              success = true;
+      155          } catch (Exception e) {
+      156              failureReason = IcebergMetricsMgr.classifyFailReason(e);
+      157              LOGGER.error("failed to rewrite data files for iceberg table {}.{}",
+      158                      stmt.getDbName(), stmt.getTableName(), e);
+      159              throw new StarRocksConnectorException("execute rewrite data files for iceberg table %s.%s failed: %s",
+      160                      stmt.getDbName(), stmt.getTableName(), e.getMessage(), e);
+      161          } finally {
+      162              durationMs = Math.max(0, System.currentTimeMillis() - startMs);
+      163              recordManualCompactionMetrics(success, durationMs, metrics, failureReason);
+      164          }
+      165          return getRewriteResult(context, metrics, durationMs);
+      166      }
+      167  
+      168      private ShowResultSet getRewriteResult(IcebergTableProcedureContext context, 
+      169                                                              IcebergRewriteDataJob.RewriteMetrics metrics,
+      170                                                              long durationMs) {
+      171          ShowResultSetMetaData metaData = ShowResultSetMetaData.builder()
+      172                  .column("db_name", TypeFactory.createVarcharType(128))
+      173                  .column("table_name", TypeFactory.createVarcharType(128))
+      174                  .column("input_data_files", TypeFactory.createType(PrimitiveType.BIGINT))
+      175                  .column("output_data_files", TypeFactory.createType(PrimitiveType.BIGINT))
+      176                  .column("removed_delete_files", TypeFactory.createType(PrimitiveType.BIGINT))
+      177                  .column("duration_ms", TypeFactory.createType(PrimitiveType.BIGINT))
+      178                  .column("status", TypeFactory.createVarcharType(128))
+      179                  .build();
+      180          List<List<String>> rows = new ArrayList<>();
+      181          rows.add(Arrays.asList(
+      182                  context.stmt().getDbName(),
+      183                  context.stmt().getTableName(),
+      184                  String.valueOf(metrics.getRewrittenDataFilesCount()),
+      185                  String.valueOf(metrics.getAddedDataFilesCount()),
+      186                  String.valueOf(metrics.getRewrittenDeleteFilesCount()),
+      187                  String.valueOf(durationMs),
+      188                  "success"
+      189          ));
+      190          String message = String.format(
+      191                  "Iceberg compaction finished [%s.%s]: input_data_files=%d, output_data_files=%d, " +
+      192                          "removed_delete_files=%d, duration_ms=%d",
+      193                  context.stmt().getDbName(),
+      194                  context.stmt().getTableName(),
+      195                  metrics.getRewrittenDataFilesCount(),
+      196                  metrics.getAddedDataFilesCount(),
+      197                  metrics.getRewrittenDeleteFilesCount(),
+      198                  durationMs);
+      199          Tracers.record(Tracers.Module.EXTERNAL,
+      200                  String.format("ICEBERG.RewriteDataFiles.%s.%s", context.stmt().getDbName(), context.stmt().getTableName()),
+      201                  message);
+      202          context.context().getState().setOk(0, 0, message);
+      203          return new ShowResultSet(metaData, rows);
+      204      }

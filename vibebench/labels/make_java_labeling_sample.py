@@ -72,6 +72,15 @@ def main() -> None:
     ap.add_argument("--principle", required=True, choices=sorted(SPEC))
     ap.add_argument("--holdout", action="store_true")
     ap.add_argument("--n-per-stratum", type=int, default=30)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="override the sampling seed to draw a FRESH round. The "
+                         "2026-09-05 audit voided the first round; re-drawing on "
+                         "the same seed would hand back the identical rows, and a "
+                         "judge who has already labelled a row is anchored on it "
+                         "rather than reading it again.")
+    ap.add_argument("--suffix", default="",
+                    help="filename suffix, so a re-judged round does not silently "
+                         "overwrite the round it is replacing.")
     a = ap.parse_args()
 
     path, pred, judge, keys, flt = SPEC[a.principle]
@@ -98,7 +107,8 @@ def main() -> None:
     d = d.drop_duplicates(keys)
     print(f"{a.principle}: {before:,} rows -> {len(d):,} distinct entities")
 
-    out = C.LABELS_DIR / f"java_{a.principle}_labeling_sample{'_holdout' if a.holdout else ''}.csv"
+    out = C.LABELS_DIR / (f"java_{a.principle}_labeling_sample"
+                          f"{'_holdout' if a.holdout else ''}{a.suffix}.csv")
     tuning = C.LABELS_DIR / f"java_{a.principle}_labeling_sample.csv"
 
     d["row_key"] = d[keys].astype(str).agg("||".join, axis=1)
@@ -116,7 +126,8 @@ def main() -> None:
         d = d[~d.row_key.isin(burned)]
         print(f"  excluded {n0 - len(d):,} tuning rows; {len(d):,} remain")
 
-    seed = C.RANDOM_SEED + (1000 if a.holdout else 0)
+    seed = a.seed if a.seed is not None else C.RANDOM_SEED + (1000 if a.holdout else 0)
+    print(f"  seed={seed}")
     parts = []
     for val, g in d.groupby(pred):
         n = min(a.n_per_stratum, len(g))

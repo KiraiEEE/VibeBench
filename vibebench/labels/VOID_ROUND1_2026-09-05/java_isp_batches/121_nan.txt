@@ -1,0 +1,271 @@
+row 121   StarRocks/starrocks#70757
+============================================================================
+CONTRACT com.starrocks.common.util.concurrent.lock.Lock   members=9.0 implementers=2.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       20  public abstract class Lock {
+       21      public abstract LockGrantType lock(Locker locker, LockType lockType) throws LockException;
+       22  
+       23      public abstract Set<Locker> release(Locker locker, LockType lockType) throws LockException;
+       24  
+       25      public abstract boolean isOwner(Locker locker, LockType lockType);
+       26  
+       27      public abstract int ownerNum();
+       28  
+       29      public abstract int waiterNum();
+       30  
+       31      public abstract Set<LockHolder> getOwners();
+       32  
+       33      public abstract Set<LockHolder> cloneOwners();
+       34  
+       35      public abstract void removeWaiter(Locker locker, LockType lockType);
+       36  
+       37      public abstract List<LockHolder> cloneWaiters();
+       38  }
+
+---------- IMPLEMENTER com.starrocks.common.util.concurrent.lock.LightWeightLock  stubs=1/9 ----------
+       21  public class LightWeightLock extends Lock {
+       22      private LockHolder lockHolder;
+       23  
+       24      public LightWeightLock() {
+       25      }
+       26  
+       27      @Override
+       28      public LockGrantType lock(Locker locker, LockType requestLockType) {
+       29          assert lockHolder == null;
+       30          this.lockHolder = new LockHolder(locker, requestLockType);
+       31          this.lockHolder.setLockAcquireTimeMs(System.currentTimeMillis());
+       32          return LockGrantType.NEW;
+       33      }
+       34  
+       35      @Override
+       36      public Set<Locker> release(Locker locker, LockType lockType) {
+       37          if (lockHolder.equals(new LockHolder(locker, lockType))) {
+       38              this.lockHolder = null;
+       39              return null;
+       40          } else {
+       41              throw new IllegalMonitorStateException("Attempt to unlock lock, not locked by current locker");
+       42          }
+       43      }
+       44  
+       45      @Override
+       46      public boolean isOwner(Locker locker, LockType lockType) {
+       47          LockHolder requestLockHolder = new LockHolder(locker, lockType);
+       48          return requestLockHolder.equals(lockHolder);
+       49      }
+       50  
+       51      @Override
+       52      public int ownerNum() {
+       53          return lockHolder == null ? 0 : 1;
+       54      }
+       55  
+       56      @Override
+       57      public int waiterNum() {
+       58          return 0;
+       59      }
+       60  
+       61      @Override
+       62      public Set<LockHolder> getOwners() {
+       63          Set<LockHolder> ret = new HashSet<>();
+       64          if (lockHolder != null) {
+       65              ret.add(lockHolder);
+       66          }
+       67          return ret;
+       68      }
+       69  
+       70      @Override
+       71      public Set<LockHolder> cloneOwners() {
+       72          Set<LockHolder> ret = new HashSet<>();
+       73          if (lockHolder != null) {
+       74              ret.add(lockHolder.clone());
+       75          }
+       76          return ret;
+       77      }
+       78  
+       79      @Override
+       80      public void removeWaiter(Locker locker, LockType lockType) {
+       81  
+       82      }
+       83  
+       84      @Override
+       85      public List<LockHolder> cloneWaiters() {
+       86          return Collections.emptyList();
+       87      }
+       88  
+       89      @Override
+       90      public String toString() {
+       91          StringBuilder sb = new StringBuilder();
+       92          sb.append(" LockAddr:").append(System.identityHashCode(this));
+       93          sb.append(" Owner:");
+       94          if (ownerNum() == 0) {
+       95              sb.append(" (none)");
+       96          } else {
+       97              sb.append(lockHolder);
+       98          }
+       99  
+      100          sb.append(" Waiters: (none)");
+      101          return sb.toString();
+      102      }
+      103  }
+
+---------- IMPLEMENTER com.starrocks.common.util.concurrent.lock.MultiUserLock  stubs=0/9 ----------
+       25  public class MultiUserLock extends Lock {
+       26      private static final Logger LOG = LogManager.getLogger(MultiUserLock.class);
+       27      /*
+       28       * The owner of the current Lock. For efficiency reasons, the first owner is stored separately.
+       29       * If Locker successfully obtains the lock, it will be added to the owner.
+       30       **/
+       31      protected LockHolder firstOwner;
+       32      private Set<LockHolder> otherOwners;
+       33  
+       34      /*
+       35       * The waiter of the current Lock. For efficiency reasons, the first waiter is stored separately.
+       36       * When a lock conflict occurs and the lock cannot be obtained immediately,
+       37       * the Locker will be added to the waiter to wait
+       38       *
+       39       * Using the fair lock strategy, when release occurs, wake up in order from the waiter list
+       40       **/
+       41      protected LockHolder firstWaiter;
+       42      private List<LockHolder> otherWaiters;
+       43  
+       44      public MultiUserLock(LockHolder lockHolder) {
+       45          this.firstOwner = lockHolder;
+       46      }
+       47  
+       48      @Override
+       49      public LockGrantType lock(Locker locker, LockType lockType) throws LockException {
+       50          LockHolder lockHolderRequest = new LockHolder(locker, lockType);
+       51          LockGrantType lockGrantType = tryLock(lockHolderRequest, waiterNum() == 0);
+       52          if (lockGrantType == LockGrantType.NEW) {
+       53              addOwner(lockHolderRequest);
+       54          } else if (lockGrantType == LockGrantType.WAIT) {
+       55              addWaiterToEnd(lockHolderRequest);
+       56          }
+       57  
+       58          return lockGrantType;
+       59      }
+       60  
+       61      /**
+       62       * @param noWaiters indicates whether there are other waiters. This will determine whether the lock
+       63       *                  can be directly acquired. If there are other waiters, the current locker cannot jump in
+       64       *                  line to acquire the lock first. A special scenario is to notify waiters in the
+       65       *                  existing wait list during release. At this time, the wait list needs to be ignored and
+       66       *                  as many waiters as possible need to be awakened.
+       67       * @return LockGrantType.NEW means that the lock ownership can be obtained.
+       68       * LockGrantType.EXISTING means that the current lock already exists and needs to be re-entered.
+       69       * LockGrantType.WAIT means that there is a lock conflict with the current owner and it is necessary to wait.
+       70       */
+       71      private LockGrantType tryLock(LockHolder lockHolderRequest, boolean noWaiters) throws LockException {
+       72          if (ownerNum() == 0) {
+       73              return LockGrantType.NEW;
+       74          }
+       75  
+       76          LockHolder lockOwner = null;
+       77          Iterator<LockHolder> ownerIterator = null;
+       78          if (otherOwners != null) {
+       79              ownerIterator = otherOwners.iterator();
+       80          }
+       81  
+       82          if (firstOwner != null) {
+       83              lockOwner = firstOwner;
+       84          } else {
+       85              if (ownerIterator != null && ownerIterator.hasNext()) {
+       86                  lockOwner = ownerIterator.next();
+       87              }
+       88          }
+       89  
+       90          boolean hasConflicts = false;
+       91          boolean hasSameLockerWithDifferentLockType = false;
+       92          while (lockOwner != null) {
+       93              /*
+       94               * If there is a Locker of the same Lock Type, directly increase the reference count and return.
+       95               * If the types are different, need to continue traversing to determine
+       96               * whether there are other Lockers with the same LockType.
+       97               */
+       98              if (lockHolderRequest.getLocker().equals(lockOwner.getLocker())) {
+       99                  LockType lockOwnerLockType = lockOwner.getLockType();
+      100                  LockType lockRequestLockType = lockHolderRequest.getLockType();
+      101  
+      102                  if (lockRequestLockType.equals(lockOwnerLockType)) {
+      103                      lockOwner.increaseRefCount();
+      104                      return LockGrantType.EXISTING;
+      105                  } else {
+      106                      /*
+      107                       * This does not conform to the use of hierarchical locks.
+      108                       * The outer layer has already obtained the intention lock,
+      109                       * and the inner layer code should not apply for read-write locks.
+      110                       */
+      111  
+      112                      if (lockOwnerLockType.isIntentionLock() && !lockRequestLockType.isIntentionLock()) {
+      113                          throw new NotSupportLockException("Can't request Database " + lockRequestLockType + " Lock "
+      114                                  + lockHolderRequest.getLocker()
+      115                                  + " in the scope of Database " + lockOwnerLockType
+      116                                  + " Lock " + lockOwner.getLocker());
+      117                      }
+      118  
+      119                      /*
+      120                       * The same Locker can upgrade or degrade locks when it requests different types of locks
+      121                       *
+      122                       * If you acquire an exclusive lock first and then request a shared lock,
+      123                       * you can successfully acquire the lock. This scenario is generally called "lock downgrade",
+      124                       * but this lock does not actually reduce the original write lock directly to a read lock.
+      125                       * In fact, it is still two independent read and write locks, and the two locks still need
+      126                       * to be released independently. The actual scenario is that before releasing the write lock,
+      127                       * acquire the read lock first, so that there is no gap time to release the lock.
+      128                       */
+      129                      hasSameLockerWithDifferentLockType = true;
+      130                  }
+      131              } else {
+      132                  if (lockOwner.isConflict(lockHolderRequest)) {
+      133                      hasConflicts = true;
+      134                  }
+      135              }
+      136  
+      137              if (ownerIterator != null && ownerIterator.hasNext()) {
+      138                  lockOwner = ownerIterator.next();
+      139              } else {
+      140                  break;
+      141              }
+      142          }
+      143  
+      144          if (!hasConflicts && (hasSameLockerWithDifferentLockType || noWaiters)) {
+      145              return LockGrantType.NEW;
+      146          } else {
+      147              return LockGrantType.WAIT;
+      148          }
+      149      }
+      150  
+      151      @Override
+      152      public Set<Locker> release(Locker locker, LockType lockType) throws LockException {
+      153          boolean hasOwner = false;
+      154          boolean reentrantLock = false;
+      155          LockHolder lockHolder = new LockHolder(locker, lockType);
+      156  
+      157          if (firstOwner != null && firstOwner.equals(lockHolder)) {
+      158              hasOwner = true;
+      159              firstOwner.decreaseRefCount();
+      160              if (firstOwner.getRefCount() > 0) {
+      161                  reentrantLock = true;
+      162              }
+      163  
+      164              if (firstOwner.getRefCount() == 0) {
+      165                  firstOwner = null;
+      166              }
+      167          } else if (otherOwners != null) {
+      168              Iterator<LockHolder> iter = otherOwners.iterator();
+      169              while (iter.hasNext()) {
+      170                  LockHolder o = iter.next();
+      171                  if (o.equals(lockHolder)) {
+      172                      hasOwner = true;
+      173                      o.decreaseRefCount();
+      174  
+      175                      if (o.getRefCount() > 0) {
+      176                          reentrantLock = true;
+      177                      }
+      178  
+      179                      if (o.getRefCount() == 0) {
+      180                          iter.remove();
+      181                      }
+      182                  }
+      183              }
+      184          }

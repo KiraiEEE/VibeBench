@@ -1,0 +1,311 @@
+row 125   apache/atlas#529
+============================================================================
+CONTRACT org.apache.atlas.service.redis.RedisService   members=10.0 implementers=3.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+        7  public interface RedisService {
+        8  
+        9    boolean acquireDistributedLock(String key) throws Exception;
+       10  
+       11    Lock acquireDistributedLockV2(String key) throws Exception;
+       12  
+       13    void releaseDistributedLock(String key);
+       14  
+       15    void releaseDistributedLockV2(Lock lock, String key);
+       16  
+       17    String getValue(String key);
+       18  
+       19    String getValue(String key, String defaultValue);
+       20  
+       21    String putValue(String key, String value);
+       22  
+       23    String putValue(String key, String value, int timeout);
+       24  
+       25    void removeValue(String key);
+       26  
+       27    Logger getLogger();
+       28  
+       29  }
+
+---------- IMPLEMENTER org.apache.atlas.service.redis.AbstractRedisService  stubs=0/9 ----------
+       26  public abstract class AbstractRedisService implements RedisService {
+       27  
+       28      private static final String REDIS_URL_PREFIX = "redis://";
+       29      private static final String ATLAS_REDIS_URL = "atlas.redis.url";
+       30      private static final String ATLAS_REDIS_SENTINEL_URLS = "atlas.redis.sentinel.urls";
+       31      private static final String ATLAS_REDIS_USERNAME = "atlas.redis.username";
+       32      private static final String ATLAS_REDIS_PASSWORD = "atlas.redis.password";
+       33      private static final String ATLAS_REDIS_MASTER_NAME = "atlas.redis.master_name";
+       34      private static final String ATLAS_REDIS_LOCK_WAIT_TIME_MS = "atlas.redis.lock.wait_time.ms";
+       35      private static final String ATLAS_REDIS_LOCK_WATCHDOG_TIMEOUT_MS = "atlas.redis.lock.watchdog_timeout.ms";
+       36      private static final String ATLAS_REDIS_LEASE_TIME_MS = "atlas.redis.lease_time.ms";
+       37      private static final String CHECK_SENTINELS_LIST = "atlas.redis.sentinel.check_list.enabled";
+       38      private static final int DEFAULT_REDIS_WAIT_TIME_MS = 15_000;
+       39      private static final int DEFAULT_REDIS_LOCK_WATCHDOG_TIMEOUT_MS = 600_000;
+       40      private static final int DEFAULT_REDIS_LEASE_TIME_MS = 60_000;
+       41      private static final String ATLAS_METASTORE_SERVICE = "atlas-metastore-service";
+       42      // Heartbeat monitoring for lock health checking (not for renewal)
+       43      private final ScheduledExecutorService heartbeatExecutor = Executors.newScheduledThreadPool(1);
+       44      private final long HEARTBEAT_INTERVAL_MS = 30000; // 30 seconds - only for health monitoring
+       45      private final Map<String, LockInfo> activeLocks = new ConcurrentHashMap<>();
+       46  
+       47      RedissonClient redisClient;
+       48      RedissonClient redisCacheClient;
+       49      Map<String, RLock> keyLockMap;
+       50      Configuration atlasConfig;
+       51      long waitTimeInMS;
+       52      long leaseTimeInMS;
+       53      long watchdogTimeoutInMS;
+       54      boolean checkSentinelsList;
+       55  
+       56      // Inner class to track lock information
+       57      private static class LockInfo {
+       58          final RLock lock;
+       59          final long lockAcquiredTime;
+       60          final String ownerThreadName;
+       61          volatile ScheduledFuture<?> healthCheckTask;
+       62  
+       63          LockInfo(RLock lock, String ownerThreadName) {
+       64              this.lock = lock;
+       65              this.lockAcquiredTime = System.currentTimeMillis();
+       66              this.ownerThreadName = ownerThreadName;
+       67          }
+       68      }
+       69  
+       70      @Override
+       71      public boolean acquireDistributedLock(String key) throws Exception {
+       72          getLogger().info("Attempting to acquire distributed lock for {}, host:{}", key, getHostAddress());
+       73          RLock lock = redisClient.getFairLock(key);
+       74          String currentThreadName = Thread.currentThread().getName();
+       75          try {
+       76              // Redisson automatically handles lock renewal via its watchdog mechanism
+       77              // when leaseTime is -1 (which is the default for tryLock without leaseTime)
+       78              boolean isLockAcquired = lock.tryLock(waitTimeInMS, TimeUnit.MILLISECONDS);
+       79              if (isLockAcquired) {
+       80                  getLogger().info("Lock with key {} is acquired, host: {}, thread: {}", key, getHostAddress(), currentThreadName);
+       81  
+       82                  // Store lock information
+       83                  keyLockMap.put(key, lock);
+       84                  LockInfo lockInfo = new LockInfo(lock, currentThreadName);
+       85                  activeLocks.put(key, lockInfo);
+       86  
+       87                  // Start health monitoring (not renewal - Redisson handles that automatically)
+       88                  ScheduledFuture<?> healthCheckTask = heartbeatExecutor.scheduleAtFixedRate(() -> {
+       89                      monitorLockHealth(key, lockInfo);
+       90                  }, HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
+       91                  lockInfo.healthCheckTask = healthCheckTask;
+       92              } else {
+       93                  getLogger().info("Attempt failed as fair lock {} is already acquired, host: {}", key, getHostAddress());
+       94              }
+       95              return isLockAcquired;
+       96          } catch (InterruptedException e) {
+       97              getLogger().error("Failed to acquire distributed lock for {}, host: {}", key, getHostAddress(), e);
+       98              throw new AtlasException(e);
+       99          }
+      100      }
+      101      // Health monitoring method - does not attempt to renew locks
+      102      private void monitorLockHealth(String key, LockInfo lockInfo) {
+      103          try {
+      104              RLock lock = lockInfo.lock;
+      105              if (lock != null && lock.isLocked()) {
+      106                  long lockDuration = System.currentTimeMillis() - lockInfo.lockAcquiredTime;
+      107                  getLogger().debug("Lock health check for {}: locked for {} ms, owner: {}",
+      108                          key, lockDuration, lockInfo.ownerThreadName);
+      109              } else {
+      110                  // Lock is no longer held, cleanup monitoring
+      111                  getLogger().debug("Lock {} is no longer held, stopping health monitoring", key);
+      112                  cleanupLockMonitoring(key);
+      113              }
+      114          } catch (Exception e) {
+      115              getLogger().warn("Health check failed for lock {}", key, e);
+      116          }
+      117      }
+      118  
+      119      @Override
+      120      public Lock acquireDistributedLockV2(String key) throws Exception {
+      121          getLogger().info("Attempting to acquire distributed lock for {}, host:{}", key, getHostAddress());
+      122          RLock lock = null;
+      123          try {
+      124              lock = redisClient.getFairLock(key);
+      125              // Use Redisson's automatic renewal by not specifying leaseTime
+      126              boolean isLockAcquired = lock.tryLock(waitTimeInMS, TimeUnit.MILLISECONDS);
+      127              if (isLockAcquired) {
+      128                  getLogger().info("Lock with key {} is acquired, host: {}.", key, getHostAddress());
+      129                  return lock;
+      130              } else {
+      131                  getLogger().info("Attempt failed as fair lock {} is already acquired, host: {}.", key, getHostAddress());
+      132                  return null;
+      133              }
+      134  
+      135          } catch (InterruptedException e) {
+      136              getLogger().error("Failed to acquire distributed lock for {}, host: {}", key, getHostAddress(), e);
+      137              if (lock != null && lock.isHeldByCurrentThread()) {
+      138                  lock.unlock();
+      139              }
+      140              throw new AtlasException(e);
+      141          }
+      142      }
+      143  
+      144  
+      145      @Override
+      146      public void releaseDistributedLock(String key) {
+      147          if (!keyLockMap.containsKey(key)) {
+      148              return;
+      149          }
+      150          try {
+      151              RLock lock = keyLockMap.get(key);
+      152              if (lock != null && lock.isHeldByCurrentThread()) {
+      153                  lock.unlock();
+      154                  getLogger().info("Released distributed lock for {}", key);
+      155              }
+      156              // Cleanup monitoring and tracking
+      157              cleanupLockMonitoring(key);
+      158              keyLockMap.remove(key);
+      159  
+      160          } catch (Exception e) {
+      161              getLogger().error("Failed to release distributed lock for {}", key, e);
+      162          }
+      163      }
+      164  
+      165      // Thread-safe cleanup of lock monitoring
+      166      private void cleanupLockMonitoring(String key) {
+      167          LockInfo lockInfo = activeLocks.remove(key);
+      168          if (lockInfo != null && lockInfo.healthCheckTask != null) {
+      169              lockInfo.healthCheckTask.cancel(false);
+      170          }
+      171      }
+      172  
+      173      @Override
+      174      public void releaseDistributedLockV2(Lock lock, String key) {
+      175          try {
+      176              if (lock != null) {
+      177                  lock.unlock();
+      178              }
+      179          } catch (Exception e) {
+      180              getLogger().error("Failed to release distributed lock for {}", key, e);
+      181          }
+      182      }
+      183  
+      184      @Override
+      185      public String getValue(String key) {
+
+---------- IMPLEMENTER org.apache.atlas.service.redis.RedisServiceImpl  stubs=0/1 ----------
+       16  @Component
+       17  @ConditionalOnAtlasProperty(property = "atlas.redis.service.impl")
+       18  @Order(Ordered.HIGHEST_PRECEDENCE)
+       19  @Profile("!local")  // Don't use in tests (local profile) - use RedisServiceLocalImpl instead
+       20  public class RedisServiceImpl extends AbstractRedisService {
+       21  
+       22      private static final Logger LOG = LoggerFactory.getLogger(RedisServiceImpl.class);
+       23      private static final long RETRY_DELAY_MS = 1000L;
+       24  
+       25      @PostConstruct
+       26      public void init() throws InterruptedException {
+       27          LOG.info("==> RedisServiceImpl.init() - Starting Redis service initialization.");
+       28  
+       29          // This loop will block the main application thread until a connection is successful.
+       30          while (true) {
+       31              try {
+       32                  LOG.info("Attempting to connect to Redis...");
+       33  
+       34                  redisClient = Redisson.create(getProdConfig());
+       35                  redisCacheClient = Redisson.create(getCacheImplConfig());
+       36  
+       37                  if (redisClient == null || redisCacheClient == null) {
+       38                      throw new AtlasException("Failed to create Sentinel redis client.");
+       39                  }
+       40  
+       41                  // Test basic connectivity to ensure clients are working.
+       42                  testRedisConnectivity();
+       43  
+       44                  LOG.info("RedisServiceImpl initialization completed successfully!");
+       45                  break;
+       46              } catch (Exception e) {
+       47                  LOG.warn("Redis connection failed: {}. Application startup is BLOCKED. Retrying in {} seconds...", e.getMessage(), RETRY_DELAY_MS / 1000);
+       48                  MetricUtils.recordRedisConnectionFailure();
+       49                  // Clean up any partially created clients before retrying.
+       50                  shutdownClients();
+       51                  Thread.sleep(RETRY_DELAY_MS);
+       52              }
+       53          }
+       54      }
+       55      
+       56      /**
+       57       * Test Redis connectivity with basic operations
+       58       */
+       59      private void testRedisConnectivity() throws Exception {
+       60          String testKey = "atlas:startup:connectivity:test:" + System.currentTimeMillis();
+       61          String testValue = "connectivity-test";
+       62          
+       63          try {
+       64              // Test cache client
+       65              LOG.debug("Testing Redis cache client connectivity");
+       66              redisCacheClient.getBucket(testKey).set(testValue);
+       67              String retrievedValue = (String) redisCacheClient.getBucket(testKey).get();
+       68              
+       69              if (!testValue.equals(retrievedValue)) {
+       70                  throw new RuntimeException("Redis cache client connectivity test failed - value mismatch");
+       71              }
+       72              
+       73              redisCacheClient.getBucket(testKey).delete();
+       74              LOG.debug("Redis connectivity test completed successfully");
+       75              
+       76          } catch (Exception e) {
+       77              MetricUtils.recordRedisConnectionFailure();
+       78              throw new Exception("Redis connectivity test failed", e);
+       79          }
+       80      }
+       81  
+       82      private void shutdownClients() {
+       83          if (redisClient != null && !redisClient.isShutdown()) {
+       84              redisClient.shutdown();
+       85          }
+       86          if (redisCacheClient != null && !redisCacheClient.isShutdown()) {
+       87              redisCacheClient.shutdown();
+       88          }
+       89          redisClient = null;
+       90          redisCacheClient = null;
+       91      }
+       92  
+       93      @Override
+       94      public Logger getLogger() {
+       95          return LOG;
+       96      }
+       97  
+       98  }
+
+---------- IMPLEMENTER org.apache.atlas.service.redis.RedisServiceLocalImpl  stubs=0/4 ----------
+       12  @Component("redisServiceImpl")
+       13  @Profile("local")  // Use this simple Redis implementation in tests (no conditional check needed)
+       14  public class RedisServiceLocalImpl extends AbstractRedisService {
+       15  
+       16      private static final Logger LOG = LoggerFactory.getLogger(RedisServiceLocalImpl.class);
+       17  
+       18      @PostConstruct
+       19      public void init() throws AtlasException {
+       20          LOG.info("==> RedisServiceLocalImpl.init() - Starting local Redis service initialization.");
+       21          redisClient = Redisson.create(getLocalConfig());
+       22          redisCacheClient = Redisson.create(getLocalConfig());
+       23          LOG.info("Local redis client created successfully.");
+       24      }
+       25  
+       26      @Override
+       27      public String getValue(String key) {
+       28          return super.getValue(key);
+       29      }
+       30  
+       31      @Override
+       32      public String putValue(String key, String value, int timeout) {
+       33          return super.putValue(key, value, timeout);
+       34      }
+       35  
+       36      @Override
+       37      public void removeValue(String key) {
+       38          super.removeValue(key);
+       39      }
+       40  
+       41      @Override
+       42      public Logger getLogger() {
+       43          return LOG;
+       44      }
+       45  }

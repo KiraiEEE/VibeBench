@@ -17,6 +17,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -138,6 +139,11 @@ def main() -> None:
     ap.add_argument("--principle", required=True, choices=["srp", "ocp", "lsp", "isp", "dip"])
     ap.add_argument("--file", required=True)
     ap.add_argument("--out-dir")
+    ap.add_argument("--only-missing", action="store_true",
+                    help="skip rows whose batch file already exists. Extraction has been "
+                         "killed mid-run before, leaving a PARTIAL batch directory that "
+                         "looks complete; this makes the repair cheap instead of a full "
+                         "re-extract.")
     ap.add_argument("--show-verdict", action="store_true",
                     help="print the rubric's own flag in each batch header. OFF BY DEFAULT: "
                          "showing the tool's answer before the judge reads the code is an "
@@ -161,7 +167,19 @@ def main() -> None:
     # residency to a few hundred MB.
     CACHE_MAX = 4
     cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+    n_written = n_empty = 0
+    have = set()
+    if a.only_missing:
+        for fn in out.iterdir():
+            m = re.match(r"^(\d+)_", fn.name)
+            if m:
+                have.add(int(m.group(1)))
+        print(f"[extract] {len(have)} batches already on disk, extracting "
+              f"{len(df) - len(have)} missing", flush=True)
+
     for i, r in df.iterrows():
+        if i in have:
+            continue
         key = (r.full_name, int(r.pr_number))
         if key in cache:
             cache.move_to_end(key)
@@ -301,10 +319,36 @@ def main() -> None:
         # unique even when two rows share a type (which OCP rows do).
         raw = str(r.get("type_id", r.full_name) or r.full_name)
         slug = re.sub(r"[^0-9A-Za-z_.-]", "_", raw).replace(".", "_")[:60]
+
+        # A HEADER IS NOT MATERIAL. When the entity cannot be located in the
+        # index (renamed, moved, or resolved to a different type) `body` comes
+        # out empty and this used to write a file containing nothing but the
+        # question. On disk that is indistinguishable from a real batch, so the
+        # row looks judgeable and gets a label -- 7 SRP rows and 2 ISP rows were
+        # labelled this way. Naming it UNJUDGEABLE makes the audit catch it.
+        text = "\n".join(body).strip()
+        if not text:
+            (out / f"{i:03d}_UNJUDGEABLE_{slug}.txt").write_text(
+                "\n".join(head)
+                + "\n\n<entity not found in the parsed tree -- "
+                  "DO NOT JUDGE THIS ROW>\n",
+                encoding="utf-8")
+            n_empty += 1
+            continue
         (out / f"{i:03d}_{slug}.txt").write_text(
             "\n".join(head + [""] + body), encoding="utf-8")
+        n_written += 1
 
-    print(f"wrote {len(df)} batches to {out}")
+    # COMPLETION MARKER. Extraction has been killed partway at least twice, and
+    # a directory holding 106 of 400 files looks exactly like a finished one
+    # unless somebody counts. The manifest is written LAST and only on a clean
+    # exit, so its absence proves the run did not finish.
+    (out / "_manifest.json").write_text(json.dumps({
+        "sample_file": f.name, "rows": int(len(df)),
+        "written": n_written, "unjudgeable": n_empty, "complete": True,
+    }, indent=2), encoding="utf-8")
+
+    print(f"wrote {n_written} batches ({n_empty} unjudgeable) to {out}")
     print(f"fill the judge column in {f}, then:")
     print(f"  python vibebench/labels/score_labels.py --file {f.name} "
           f"--pred-col <pred> --label-col llm_{a.principle}_risk")
