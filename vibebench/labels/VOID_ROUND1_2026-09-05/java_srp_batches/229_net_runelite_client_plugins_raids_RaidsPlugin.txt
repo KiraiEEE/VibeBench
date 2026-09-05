@@ -1,0 +1,406 @@
+row 229   chsami/Microbot#1697
+============================================================================
+CLASS net.runelite.client.plugins.raids.RaidsPlugin   loc=807 methods=22 wmc=109 lcom=0.0952380952380952 c3=0.0990018031450849
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       96  @PluginDescriptor(
+       97  	name = "Chambers Of Xeric",
+       98  	description = "Show helpful information for the Chambers of Xeric raid",
+       99  	tags = {"combat", "raid", "overlay", "pve", "pvm", "bosses", "cox"}
+      100  )
+      101  @Slf4j
+      102  public class RaidsPlugin extends Plugin
+      103  {
+      104  	private static final int LOBBY_PLANE = 3;
+      105  	private static final int SECOND_FLOOR_PLANE = 2;
+      106  	private static final int ROOMS_PER_PLANE = 8;
+      107  	private static final int AMOUNT_OF_ROOMS_PER_X_AXIS_PER_PLANE = 4;
+      108  	private static final String RAID_START_MESSAGE = "The raid has begun!";
+      109  	private static final String LEVEL_COMPLETE_MESSAGE = "level complete!";
+      110  	private static final String RAID_COMPLETE_MESSAGE = "Congratulations - your raid is complete!";
+      111  	private static final DecimalFormat DECIMAL_FORMAT = new DecimalFormat("###.##");
+      112  	private static final DecimalFormat POINTS_FORMAT = new DecimalFormat("#,###");
+      113  	private static final String LAYOUT_COMMAND = "!layout";
+      114  	private static final int MAX_LAYOUT_LEN = 300;
+      115  
+      116  	@Inject
+      117  	private RuneLiteConfig runeLiteConfig;
+      118  
+      119  	@Inject
+      120  	private ChatMessageManager chatMessageManager;
+      121  
+      122  	@Inject
+      123  	private InfoBoxManager infoBoxManager;
+      124  
+      125  	@Inject
+      126  	private Client client;
+      127  
+      128  	@Inject
+      129  	private RaidsConfig config;
+      130  
+      131  	@Inject
+      132  	private OverlayManager overlayManager;
+      133  
+      134  	@Inject
+      135  	private RaidsOverlay overlay;
+      136  
+      137  	@Inject
+      138  	private LayoutSolver layoutSolver;
+      139  
+      140  	@Inject
+      141  	private SpriteManager spriteManager;
+      142  
+      143  	@Inject
+      144  	private ClientThread clientThread;
+      145  
+      146  	@Inject
+      147  	private ChatCommandManager chatCommandManager;
+      148  
+      149  	@Inject
+      150  	private ChatClient chatClient;
+      151  
+      152  	@Inject
+      153  	private ScheduledExecutorService scheduledExecutorService;
+      154  
+      155  	@Inject
+      156  	private KeyManager keyManager;
+      157  
+      158  	@Inject
+      159  	private ImageCapture imageCapture;
+      160  
+      161  	@Inject
+      162  	private EventBus eventBus;
+      163  
+      164  	@Getter
+      165  	private final Set<String> roomWhitelist = new HashSet<>();
+      166  
+      167  	@Getter
+      168  	private final Set<String> roomBlacklist = new HashSet<>();
+      169  
+      170  	@Getter
+      171  	private final Set<String> rotationWhitelist = new HashSet<>();
+      172  
+      173  	@Getter
+      174  	private final Set<String> layoutWhitelist = new HashSet<>();
+      175  
+      176  	@Setter(AccessLevel.PACKAGE) // for the test
+      177  	@Getter
+      178  	private Raid raid;
+      179  
+      180  	// if the player is inside of a raid or not
+      181  	@Getter
+      182  	private boolean inRaidChambers;
+      183  
+      184  	/*
+      185  	 * if the player is in a raid party or not
+      186  	 * This will be set when someone in the friends chat clicks the "make party" button on the raids widget
+      187  	 * It will change again when someone from your friends chat enters the raid to generate it
+      188  	 * It will be reset when the raid starts but not if they leave the raid while it has not started yet
+      189  	 */
+      190  	@Getter
+      191  	private int raidPartyID;
+      192  	private RaidsTimer timer;
+      193  
+      194  	@Provides
+      195  	RaidsConfig provideConfig(ConfigManager configManager)
+      196  	{
+      197  		return configManager.getConfig(RaidsConfig.class);
+      198  	}
+      199  
+      200  	@Override
+      201  	public void configure(Binder binder)
+      202  	{
+      203  		binder.bind(RaidsOverlay.class);
+      204  	}
+      205  
+      206  	@Override
+      207  	protected void startUp() throws Exception
+      208  	{
+      209  		overlayManager.add(overlay);
+      210  		updateLists();
+      211  		clientThread.invokeLater(this::scoutRaid);
+      212  		chatCommandManager.registerCommandAsync(LAYOUT_COMMAND, this::lookupRaid, this::submitRaid);
+      213  		keyManager.registerKeyListener(screenshotHotkeyListener);
+      214  	}
+      215  
+      216  	@Override
+      217  	protected void shutDown() throws Exception
+      218  	{
+      219  		chatCommandManager.unregisterCommand(LAYOUT_COMMAND);
+      220  		overlayManager.remove(overlay);
+      221  		infoBoxManager.removeInfoBox(timer);
+      222  		timer = null;
+      223  		inRaidChambers = false;
+      224  		reset();
+      225  		keyManager.unregisterKeyListener(screenshotHotkeyListener);
+      226  	}
+      227  
+      228  	@Subscribe
+      229  	public void onConfigChanged(ConfigChanged event)
+      230  	{
+      231  		if (!event.getGroup().equals("raids"))
+      232  		{
+      233  			return;
+      234  		}
+      235  
+      236  		if (event.getKey().equals("raidsTimer"))
+      237  		{
+      238  			updateInfoBoxState();
+      239  			return;
+      240  		}
+      241  
+      242  		updateLists();
+      243  	}
+      244  
+      245  	@Subscribe
+      246  	public void onVarbitChanged(VarbitChanged event)
+      247  	{
+      248  		// if the player's party state has changed
+      249  		if (event.getVarpId() == VarPlayerID.RAIDS_PARTY_GROUPHOLDER)
+      250  		{
+      251  			boolean inRaid = inRaidChambers;
+      252  			int prevRaidID = raidPartyID;
+      253  			raidPartyID = event.getValue();
+      254  
+      255  			if (client.getGameState() == GameState.LOGGED_IN)
+      256  			{
+      257  				// Party dissolution
+      258  				if (!inRaid || (prevRaidID != -1 && raidPartyID != -1 && prevRaidID != raidPartyID))
+      259  				{
+      260  					log.debug("Raid party has been dissolved");
+      261  					reset();
+      262  				}
+      263  			}
+      264  		}
+      265  
+      266  		// if the player's raid state has changed
+      267  		if (event.getVarbitId() == VarbitID.RAIDS_CLIENT_INDUNGEON)
+      268  		{
+      269  			boolean inRaid = event.getValue() == 1;
+      270  			inRaidChambers = inRaid;
+      271  
+      272  			if (client.getGameState() == GameState.LOGGED_IN)
+      273  			{
+      274  				// if the player is inside of a raid then check the raid
+      275  				if (inRaid)
+      276  				{
+      277  					scoutRaid();
+      278  				}
+      279  				else if (raidPartyID == -1)
+      280  				{
+      281  					log.debug("Raid has ended");
+      282  					reset();
+      283  				}
+      284  			}
+      285  		}
+      286  	}
+      287  
+      288  	@Subscribe
+      289  	public void onChatMessage(ChatMessage event)
+      290  	{
+      291  		if (inRaidChambers && event.getType() == ChatMessageType.FRIENDSCHATNOTIFICATION)
+      292  		{
+      293  			String message = Text.removeTags(event.getMessage());
+      294  
+      295  			if (config.raidsTimer() && message.startsWith(RAID_START_MESSAGE))
+      296  			{
+      297  				timer = new RaidsTimer(this, Instant.now(), config);
+      298  				spriteManager.getSpriteAsync(SpriteID.SideiconsInterface.RAIDING_PARTY, 0, timer);
+      299  				infoBoxManager.addInfoBox(timer);
+      300  			}
+      301  
+      302  			if (timer != null && message.contains(LEVEL_COMPLETE_MESSAGE))
+      303  			{
+      304  				timer.timeFloor();
+      305  			}
+      306  
+      307  			if (message.startsWith(RAID_COMPLETE_MESSAGE))
+      308  			{
+      309  				if (timer != null)
+      310  				{
+      311  					timer.timeOlm();
+      312  					timer.setStopped(true);
+      313  				}
+      314  
+      315  				if (config.pointsMessage())
+      316  				{
+      317  					int totalPoints = client.getVarbitValue(VarbitID.RAIDS_CLIENT_PARTYSCORE);
+      318  					int personalPoints = client.getVarpValue(VarPlayerID.RAIDS_PLAYERSCORE);
+      319  
+      320  					double percentage = personalPoints / (totalPoints / 100.0);
+      321  
+      322  					String chatMessage = new ChatMessageBuilder()
+      323  						.append(ChatColorType.NORMAL)
+      324  						.append("Total points: ")
+      325  						.append(ChatColorType.HIGHLIGHT)
+      326  						.append(POINTS_FORMAT.format(totalPoints))
+      327  						.append(ChatColorType.NORMAL)
+      328  						.append(", Personal points: ")
+      329  						.append(ChatColorType.HIGHLIGHT)
+      330  						.append(POINTS_FORMAT.format(personalPoints))
+      331  						.append(ChatColorType.NORMAL)
+      332  						.append(" (")
+      333  						.append(ChatColorType.HIGHLIGHT)
+      334  						.append(DECIMAL_FORMAT.format(percentage))
+      335  						.append(ChatColorType.NORMAL)
+      336  						.append("%)")
+      337  						.build();
+      338  
+      339  					chatMessageManager.queue(QueuedMessage.builder()
+      340  						.type(ChatMessageType.FRIENDSCHATNOTIFICATION)
+      341  						.runeLiteFormattedMessage(chatMessage)
+      342  						.build());
+      343  				}
+      344  			}
+      345  		}
+      346  	}
+      347  
+      348  	@Subscribe
+      349  	public void onGameStateChanged(GameStateChanged event)
+      350  	{
+      351  		if (client.getGameState() == GameState.LOGGED_IN)
+      352  		{
+      353  			// solve additional unknown rooms
+      354  			scoutRaid();
+      355  		}
+      356  	}
+      357  
+      358  	private void scoutRaid()
+      359  	{
+      360  		if (client.getGameState() != GameState.LOGGED_IN)
+      361  		{
+      362  			return;
+      363  		}
+      364  
+      365  		inRaidChambers = client.getVarbitValue(VarbitID.RAIDS_CLIENT_INDUNGEON) == 1;
+      366  
+      367  		if (!inRaidChambers)
+      368  		{
+      369  			return;
+      370  		}
+      371  
+      372  		boolean firstSolve = (raid == null);
+      373  		raid = buildRaid(raid);
+      374  
+      375  		if (raid == null)
+      376  		{
+      377  			log.debug("Failed to build raid");
+      378  			return;
+      379  		}
+      380  
+      381  		if (raid.getLayout() == null)
+      382  		{
+      383  			Layout layout = layoutSolver.findLayout(raid.toCode());
+      384  
+      385  			if (layout == null)
+      386  			{
+      387  				log.debug("Could not find layout match");
+      388  				raid = null;
+      389  				return;
+      390  			}
+      391  
+      392  			raid.updateLayout(layout);
+      393  		}
+      394  
+      395  		RaidRoom[] rooms = raid.getCombatRooms();
+      396  		RotationSolver.solve(rooms);
+      397  		raid.setCombatRooms(rooms);
+      398  
+      399  		if (config.layoutMessage() && firstSolve)
+      400  		{
+      401  			sendRaidLayoutMessage();
+      402  		}
+      403  
+      404  		eventBus.post(new RaidScouted(raid, firstSolve));
+      405  	}
+      406  
+      407  	private void sendRaidLayoutMessage()
+      408  	{
+      409  		final String layout = getRaid().getLayout().toCodeString();
+      410  		final String rooms = getRaid().toRoomString();
+      411  		final String raidData = "[" + layout + "]: " + rooms;
+      412  
+      413  		final String layoutMessage = new ChatMessageBuilder()
+      414  			.append(ChatColorType.HIGHLIGHT)
+      415  			.append("Layout: ")
+      416  			.append(ChatColorType.NORMAL)
+      417  			.append(raidData)
+      418  			.build();
+      419  
+      420  		chatMessageManager.queue(QueuedMessage.builder()
+      421  			.type(ChatMessageType.FRIENDSCHATNOTIFICATION)
+      422  			.runeLiteFormattedMessage(layoutMessage)
+      423  			.build());
+      424  
+      425  	}
+      426  
+      427  	private void updateInfoBoxState()
+      428  	{
+      429  		if (timer != null && !inRaidChambers)
+      430  		{
+      431  			infoBoxManager.removeInfoBox(timer);
+      432  			timer = null;
+      433  		}
+      434  	}
+      435  
+      436  	@VisibleForTesting
+      437  	void updateLists()
+      438  	{
+      439  		updateList(roomWhitelist, config.whitelistedRooms());
+      440  		updateList(roomBlacklist, config.blacklistedRooms());
+      441  		updateList(layoutWhitelist, config.whitelistedLayouts());
+      442  
+      443  		// Update rotation whitelist
+      444  		rotationWhitelist.clear();
+      445  		for (String line : config.whitelistedRotations().split("\\n"))
+      446  		{
+      447  			rotationWhitelist.add(line.toLowerCase().replace(" ", ""));
+      448  		}
+      449  	}
+      450  
+      451  	private void updateList(Collection<String> list, String input)
+      452  	{
+      453  		list.clear();
+      454  		for (String s : Text.fromCSV(input.toLowerCase()))
+      455  		{
+      456  			if (s.equals("unknown"))
+      457  			{
+      458  				list.add("unknown (combat)");
+      459  				list.add("unknown (puzzle)");
+      460  			}
+      461  			else
+      462  			{
+      463  				list.add(s);
+      464  			}
+      465  		}
+      466  	}
+      467  
+      468  	boolean getRotationMatches()
+      469  	{
+      470  		RaidRoom[] combatRooms = raid.getCombatRooms();
+      471  		String rotation = Arrays.stream(combatRooms)
+      472  			.map(RaidRoom::getName)
+      473  			.map(String::toLowerCase)
+      474  			.collect(Collectors.joining(","));
+      475  
+      476  		return rotationWhitelist.contains(rotation);
+      477  	}
+      478  
+      479  	private Point findLobbyBase()
+      480  	{
+      481  		Tile[][] tiles = client.getScene().getTiles()[LOBBY_PLANE];
+      482  
+      483  		for (int x = 0; x < SCENE_SIZE; x++)
+      484  		{
+      485  			for (int y = 0; y < SCENE_SIZE; y++)
+      486  			{
+      487  				if (tiles[x][y] == null || tiles[x][y].getWallObject() == null)
+      488  				{
+      489  					continue;
+      490  				}
+      491  
+      492  				if (tiles[x][y].getWallObject().getId() == ObjectID.BLACK_WALL)
+      493  				{
+      494  					return tiles[x][y].getSceneLocation();
+      495  				}
+       ... truncated at 400 lines ...

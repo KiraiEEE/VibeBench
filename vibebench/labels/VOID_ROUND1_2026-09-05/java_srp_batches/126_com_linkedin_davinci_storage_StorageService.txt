@@ -1,0 +1,406 @@
+row 126   linkedin/venice#2528
+============================================================================
+CLASS com.linkedin.davinci.storage.StorageService   loc=686 methods=27 wmc=78 lcom=0.0384615384615384 c3=0.2703771658221306
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       64  public class StorageService extends AbstractVeniceService {
+       65    private static final Logger LOGGER = LogManager.getLogger(StorageService.class);
+       66  
+       67    private final StorageEngineRepository storageEngineRepository;
+       68    private final VeniceConfigLoader configLoader;
+       69    private final VeniceServerConfig serverConfig;
+       70    private final Map<PersistenceType, StorageEngineFactory> persistenceTypeToStorageEngineFactoryMap;
+       71    private final AggVersionedStorageEngineStats aggVersionedStorageEngineStats;
+       72    private final RocksDBMemoryStats rocksDBMemoryStats;
+       73    private final InternalAvroSpecificSerializer<StoreVersionState> storeVersionStateSerializer;
+       74    private final InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer;
+       75    private final ReadOnlyStoreRepository storeRepository;
+       76  
+       77    /**
+       78     * This map tracks the storage engines for which some other component needs to latch onto their lifecycle.
+       79     *
+       80     * At the time of writing this JavaDoc, the only component which needs such lifecycle latch is the
+       81     * {@link com.linkedin.davinci.kafka.consumer.StoreIngestionTask}. The latching is achieved via
+       82     * {@link ReferenceCounted}, which the dependent component(s) will release when it no longer needs it.
+       83     *
+       84     * Note that it is possible for storage engines to exist within the {@link #storageEngineRepository}
+       85     * without existing within this map, if no component has latched on to its lifecycle.
+       86     *
+       87     * Here is an example of the steps involved in the components discussed above:
+       88     *
+       89     * 1. A store-version gets assigned to a server for the first time.
+       90     * 2. The storage engine gets created for the first time via {@link #openStore(VeniceStoreVersionConfig, Supplier)}.
+       91     * 3. The {@link com.linkedin.davinci.kafka.consumer.StoreIngestionTask} then gets created for the first time, and it
+       92     *    gets its own handle to the storage engine via {@link #getRefCountedStorageEngine(String)}. This is the step
+       93     *    which establishes the latch from the SIT to the SE, via ref-counting.
+       94     *
+       95     * The above sequence is important, because in some cases, there can be a closing and re-opening of a store-version on
+       96     * a server, and it can be the case that the SE gets closed, and a new one gets created, while the SIT does not have
+       97     * time to get closed yet, and it instead gets reused. In that case, the value from this map can be retrieved such
+       98     * that the storage engine reference can be updated.
+       99     */
+      100    private final Map<String, ReferenceCounted<DelegatingStorageEngine>> storageEngines = new VeniceConcurrentHashMap<>();
+      101  
+      102    /**
+      103     * Allocates a new {@code StorageService} object.
+      104     * @param configLoader a config loader to load configs related to cluster and server.
+      105     * @param storageEngineStats storage engine related stats.
+      106     * @param rocksDBMemoryStats RocksDB memory consumption stats.
+      107     * @param storeVersionStateSerializer serializer for translating a store-version level state into avro-format.
+      108     * @param partitionStateSerializer serializer for translating a partition state into avro-format.
+      109     * @param storeRepository supports readonly operations to access stores
+      110     * @param restoreDataPartitions indicates if store data needs to be restored.
+      111     * @param restoreMetadataPartitions indicates if meta data needs to be restored.
+      112     * @param checkWhetherStorageEngineShouldBeKeptOrNot check whether the local storage engine should be kept or not.
+      113     */
+      114    StorageService(
+      115        VeniceConfigLoader configLoader,
+      116        AggVersionedStorageEngineStats storageEngineStats,
+      117        RocksDBMemoryStats rocksDBMemoryStats,
+      118        InternalAvroSpecificSerializer<StoreVersionState> storeVersionStateSerializer,
+      119        InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer,
+      120        ReadOnlyStoreRepository storeRepository,
+      121        boolean restoreDataPartitions,
+      122        boolean restoreMetadataPartitions,
+      123        Function<String, Boolean> checkWhetherStorageEngineShouldBeKeptOrNot,
+      124        Optional<Map<PersistenceType, StorageEngineFactory>> persistenceTypeToStorageEngineFactoryMapOptional) {
+      125      String dataPath = configLoader.getVeniceServerConfig().getDataBasePath();
+      126      if (!Utils.directoryExists(dataPath)) {
+      127        if (!configLoader.getVeniceServerConfig().isAutoCreateDataPath()) {
+      128          throw new VeniceException(
+      129              "Data directory '" + dataPath + "' does not exist and " + ConfigKeys.AUTOCREATE_DATA_PATH
+      130                  + " is disabled.");
+      131        }
+      132  
+      133        File dataDir = new File(dataPath);
+      134        LOGGER.info("Creating data directory {}", dataDir.getAbsolutePath());
+      135        dataDir.mkdirs();
+      136      }
+      137  
+      138      this.configLoader = configLoader;
+      139      this.serverConfig = configLoader.getVeniceServerConfig();
+      140      this.storageEngineRepository = new StorageEngineRepository();
+      141  
+      142      this.aggVersionedStorageEngineStats = storageEngineStats;
+      143      this.rocksDBMemoryStats = rocksDBMemoryStats;
+      144      this.storeVersionStateSerializer = storeVersionStateSerializer;
+      145      this.partitionStateSerializer = partitionStateSerializer;
+      146      this.storeRepository = storeRepository;
+      147      if (persistenceTypeToStorageEngineFactoryMapOptional.isPresent()) {
+      148        this.persistenceTypeToStorageEngineFactoryMap = persistenceTypeToStorageEngineFactoryMapOptional.get();
+      149      } else {
+      150        this.persistenceTypeToStorageEngineFactoryMap = new HashMap<>();
+      151        initInternalStorageEngineFactories();
+      152      }
+      153      if (restoreDataPartitions || restoreMetadataPartitions) {
+      154        restoreAllStores(
+      155            configLoader,
+      156            restoreDataPartitions,
+      157            restoreMetadataPartitions,
+      158            checkWhetherStorageEngineShouldBeKeptOrNot);
+      159      }
+      160    }
+      161  
+      162    public StorageService(
+      163        VeniceConfigLoader configLoader,
+      164        AggVersionedStorageEngineStats storageEngineStats,
+      165        RocksDBMemoryStats rocksDBMemoryStats,
+      166        InternalAvroSpecificSerializer<StoreVersionState> storeVersionStateSerializer,
+      167        InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer,
+      168        ReadOnlyStoreRepository storeRepository,
+      169        boolean restoreDataPartitions,
+      170        boolean restoreMetadataPartitions,
+      171        Function<String, Boolean> checkWhetherStorageEngineShouldBeKeptOrNot) {
+      172      this(
+      173          configLoader,
+      174          storageEngineStats,
+      175          rocksDBMemoryStats,
+      176          storeVersionStateSerializer,
+      177          partitionStateSerializer,
+      178          storeRepository,
+      179          restoreDataPartitions,
+      180          restoreMetadataPartitions,
+      181          checkWhetherStorageEngineShouldBeKeptOrNot,
+      182          Optional.empty());
+      183    }
+      184  
+      185    public StorageService(
+      186        VeniceConfigLoader configLoader,
+      187        AggVersionedStorageEngineStats storageEngineStats,
+      188        RocksDBMemoryStats rocksDBMemoryStats,
+      189        InternalAvroSpecificSerializer<StoreVersionState> storeVersionStateSerializer,
+      190        InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer,
+      191        ReadOnlyStoreRepository storeRepository,
+      192        boolean restoreDataPartitions,
+      193        boolean restoreMetadataPartitions) {
+      194      this(
+      195          configLoader,
+      196          storageEngineStats,
+      197          rocksDBMemoryStats,
+      198          storeVersionStateSerializer,
+      199          partitionStateSerializer,
+      200          storeRepository,
+      201          restoreDataPartitions,
+      202          restoreMetadataPartitions,
+      203          s -> true);
+      204    }
+      205  
+      206    /**
+      207     * @see #StorageService(VeniceConfigLoader, AggVersionedStorageEngineStats, RocksDBMemoryStats, InternalAvroSpecificSerializer, InternalAvroSpecificSerializer, ReadOnlyStoreRepository)
+      208     */
+      209    public StorageService(
+      210        VeniceConfigLoader configLoader,
+      211        AggVersionedStorageEngineStats storageEngineStats,
+      212        RocksDBMemoryStats rocksDBMemoryStats,
+      213        InternalAvroSpecificSerializer<StoreVersionState> storeVersionStateSerializer,
+      214        InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer,
+      215        ReadOnlyStoreRepository storeRepository) {
+      216      this(
+      217          configLoader,
+      218          storageEngineStats,
+      219          rocksDBMemoryStats,
+      220          storeVersionStateSerializer,
+      221          partitionStateSerializer,
+      222          storeRepository,
+      223          true,
+      224          true);
+      225    }
+      226  
+      227    public static boolean isMetadataPartition(int partitionId) {
+      228      return partitionId == AbstractStorageEngine.METADATA_PARTITION_ID;
+      229    }
+      230  
+      231    /**
+      232     * Initialize all the internal storage engine factories.
+      233     * Please add it here if you want to add more.
+      234     */
+      235    private void initInternalStorageEngineFactories() {
+      236      persistenceTypeToStorageEngineFactoryMap.put(IN_MEMORY, new InMemoryStorageEngineFactory(serverConfig));
+      237      persistenceTypeToStorageEngineFactoryMap.put(
+      238          ROCKS_DB,
+      239          new RocksDBStorageEngineFactory(
+      240              serverConfig,
+      241              rocksDBMemoryStats,
+      242              storeVersionStateSerializer,
+      243              partitionStateSerializer));
+      244      persistenceTypeToStorageEngineFactoryMap.put(BLACK_HOLE, new BlackHoleStorageEngineFactory());
+      245    }
+      246  
+      247    static void deleteStorageEngineOnRocksDBError(
+      248        String storageEngineName,
+      249        ReadOnlyStoreRepository storeRepository,
+      250        StorageEngineFactory factory) {
+      251      String storeName = Version.parseStoreFromKafkaTopicName(storageEngineName);
+      252      Store store;
+      253      boolean doDeleteStorageEngine;
+      254      try {
+      255        int versionNumber = Version.parseVersionFromKafkaTopicName(storageEngineName);
+      256        store = storeRepository.getStoreOrThrow(storeName);
+      257        doDeleteStorageEngine = store.getVersion(versionNumber) == null || versionNumber < store.getCurrentVersion();
+      258      } catch (VeniceNoStoreException e) {
+      259        // The store does not exist in Venice anymore, so it will be deleted.
+      260        doDeleteStorageEngine = true;
+      261      }
+      262  
+      263      if (doDeleteStorageEngine) {
+      264        LOGGER.info("Storage for {} does not exist, will delete it.", storageEngineName);
+      265        factory.removeStorageEngine(storageEngineName);
+      266      }
+      267    }
+      268  
+      269    private void restoreAllStores(
+      270        VeniceConfigLoader configLoader,
+      271        boolean restoreDataPartitions,
+      272        boolean restoreMetadataPartitions,
+      273        Function<String, Boolean> checkWhetherStorageEngineShouldBeKeptOrNot) {
+      274      LOGGER.info("Start restoring all the stores persisted previously");
+      275      for (Map.Entry<PersistenceType, StorageEngineFactory> entry: persistenceTypeToStorageEngineFactoryMap.entrySet()) {
+      276        PersistenceType pType = entry.getKey();
+      277        StorageEngineFactory factory = entry.getValue();
+      278        LOGGER.info("Start restoring all the stores with type: {}", pType);
+      279        Set<String> storeNames = factory.getPersistedStoreNames();
+      280        for (String storeName: storeNames) {
+      281          LOGGER.info("Start restoring store: {} with type: {}", storeName, pType);
+      282          /**
+      283           * Setup store-level persistence type based on current database setup.
+      284           */
+      285          VeniceStoreVersionConfig storeConfig = configLoader.getStoreConfig(storeName, pType);
+      286          // Load the metadata & data restore settings from config loader.
+      287          storeConfig.setRestoreDataPartitions(restoreDataPartitions);
+      288          storeConfig.setRestoreMetadataPartition(restoreMetadataPartitions);
+      289          StorageEngine storageEngine;
+      290  
+      291          if (checkWhetherStorageEngineShouldBeKeptOrNot.apply(storeName)) {
+      292            try {
+      293              storageEngine = openStore(storeConfig, () -> null);
+      294            } catch (Exception e) {
+      295              if (ExceptionUtils.recursiveClassEquals(e, RocksDBException.class)) {
+      296                LOGGER.warn("Encountered RocksDB error while opening store: {}", storeName, e);
+      297                // if store version does not exist, clean up the resources.
+      298                deleteStorageEngineOnRocksDBError(storeName, storeRepository, factory);
+      299                continue;
+      300              }
+      301              LOGGER.error("Could not load the following store : " + storeName, e);
+      302              aggVersionedStorageEngineStats.recordRocksDBOpenFailure(storeName);
+      303              throw new VeniceException("Error caught during opening store " + storeName, e);
+      304            }
+      305  
+      306            Set<Integer> partitionIds = storageEngine.getPartitionIds();
+      307            LOGGER.info(
+      308                "Loaded the following partitions: {}, for store: {}",
+      309                Arrays.toString(partitionIds.toArray()),
+      310                storeName);
+      311            LOGGER.info("Done restoring store: {} with type: {}", storeName, pType);
+      312          } else {
+      313            LOGGER.info("Starting deleting local storage engine: {} with type: {}", storeName, pType);
+      314            factory.removeStorageEngine(storeName);
+      315            LOGGER.info("Done deleting local storage engine: {} with type: {}", storeName, pType);
+      316          }
+      317        }
+      318        LOGGER.info("Done restoring all the stores with type: {}", pType);
+      319      }
+      320      LOGGER.info("Done restoring all the stores persisted previously");
+      321    }
+      322  
+      323    public synchronized StorageEngine openStoreForNewPartition(
+      324        VeniceStoreVersionConfig storeConfig,
+      325        int partitionId,
+      326        Supplier<StoreVersionState> initialStoreVersionStateSupplier) {
+      327      LOGGER.info("Opening store for {} partition {}", storeConfig.getStoreVersionName(), partitionId);
+      328      StorageEngine engine = openStore(storeConfig, initialStoreVersionStateSupplier);
+      329      engine.addStoragePartitionIfAbsent(partitionId);
+      330      LOGGER.info("Opened store for {} partition {}", storeConfig.getStoreVersionName(), partitionId);
+      331      return engine;
+      332    }
+      333  
+      334    public synchronized StorageEngine openStoreForNewPartition(
+      335        VeniceStoreVersionConfig storeConfig,
+      336        int partitionId,
+      337        Supplier<StoreVersionState> initialStoreVersionStateSupplier,
+      338        StoragePartitionConfig storagePartitionConfig) {
+      339      LOGGER.info("Opening store for replica: {}", Utils.getReplicaId(storeConfig.getStoreVersionName(), partitionId));
+      340      StorageEngine engine = openStore(storeConfig, initialStoreVersionStateSupplier);
+      341      engine.addStoragePartition(storagePartitionConfig);
+      342      LOGGER.info("Opened store for replica: {}", Utils.getReplicaId(storeConfig.getStoreVersionName(), partitionId));
+      343      return engine;
+      344    }
+      345  
+      346    /**
+      347     * This method should ideally be Private, but marked as public for validating the result.
+      348     *
+      349     * @param storeConfig StoreConfig of the store.
+      350     * @return Factory corresponding to the store.
+      351     */
+      352    public StorageEngineFactory getInternalStorageEngineFactory(VeniceStoreVersionConfig storeConfig) {
+      353      PersistenceType persistenceType = storeConfig.getStorePersistenceType();
+      354      // Instantiate the factory for this persistence type if not already present
+      355      if (persistenceTypeToStorageEngineFactoryMap.containsKey(persistenceType)) {
+      356        return persistenceTypeToStorageEngineFactoryMap.get(persistenceType);
+      357      }
+      358  
+      359      throw new VeniceException("Unrecognized persistence type " + persistenceType);
+      360    }
+      361  
+      362    public Optional<Statistics> getRocksDBAggregatedStatistics() {
+      363      if (persistenceTypeToStorageEngineFactoryMap.containsKey(ROCKS_DB)) {
+      364        return ((RocksDBStorageEngineFactory) persistenceTypeToStorageEngineFactoryMap.get(ROCKS_DB)).getAggStatistics();
+      365      }
+      366      return Optional.empty();
+      367    }
+      368  
+      369    /**
+      370     * Creates a StorageEngineFactory for the persistence type if not already present.
+      371     * Creates a new storage engine for the given store in the factory and registers the storage engine with the store repository.
+      372     *
+      373     * @param storeConfig   The store specific properties
+      374     * @param initialStoreVersionStateSupplier invoked to initialize the SVS when a brand-new storage engine is created
+      375     * @return StorageEngine that was created for the given store definition.
+      376     */
+      377    public synchronized StorageEngine openStore(
+      378        VeniceStoreVersionConfig storeConfig,
+      379        Supplier<StoreVersionState> initialStoreVersionStateSupplier) {
+      380      String topicName = storeConfig.getStoreVersionName();
+      381      StorageEngine engine = storageEngineRepository.getLocalStorageEngine(topicName);
+      382      if (engine != null) {
+      383        return engine;
+      384      }
+      385  
+      386      long startTimeInBuildingNewEngine = System.nanoTime();
+      387      /**
+      388       * For new store, it will use the storage engine configured in host level if it is not known.
+      389       */
+      390      if (!storeConfig.isStorePersistenceTypeKnown()) {
+      391        storeConfig.setStorePersistenceType(storeConfig.getPersistenceType());
+      392      }
+      393  
+      394      LOGGER.info("Creating/Opening Storage Engine {} with type: {}", topicName, storeConfig.getStorePersistenceType());
+      395      StorageEngineFactory factory = getInternalStorageEngineFactory(storeConfig);
+      396      PersistenceType persistenceType = factory.getPersistenceType();
+      397      boolean replicationMetadataEnabled = isReplicationMetadataEnabled(topicName, persistenceType);
+      398      boolean mergedCfEnabled = isMergedValueRmdColumnFamilyEnabled(topicName, persistenceType);
+      399      StorageEngine newEngine = factory.getStorageEngine(storeConfig, replicationMetadataEnabled, mergedCfEnabled);
+      400      newEngine.updateStoreVersionStateCache(initialStoreVersionStateSupplier.get());
+      401  
+      402      // Let's check if a previous incarnation of the storage engine existed earlier
+      403      ReferenceCounted<DelegatingStorageEngine> refCountedStorageEngine =
+      404          this.storageEngines.compute(topicName, (k, v) -> {
+      405            if (v != null) {
+      406              v.get().setDelegate(newEngine);
+      407              LOGGER.info(
+      408                  "Injected newly created storage engine into existing ref-counted delegating storage engine for {}.",
+      409                  k);
+      410            }
+      411            return v;
+      412          });
+      413      DelegatingStorageEngine delegatingStorageEngine =
+      414          refCountedStorageEngine == null ? new DelegatingStorageEngine(newEngine) : refCountedStorageEngine.get();
+      415  
+      416      storageEngineRepository.addLocalStorageEngine(delegatingStorageEngine);
+      417      // Setup storage engine stats
+      418      aggVersionedStorageEngineStats.setStorageEngine(topicName, delegatingStorageEngine);
+      419  
+      420      LOGGER.info(
+      421          "time spent on creating new storage Engine for store {}: {} ms",
+      422          topicName,
+      423          LatencyUtils.getElapsedTimeFromNSToMS(startTimeInBuildingNewEngine));
+      424      return delegatingStorageEngine;
+      425    }
+      426  
+      427    public synchronized void checkWhetherStoragePartitionsShouldBeKeptOrNot(SafeHelixManager manager) {
+      428      if (!serverConfig.isDeleteUnassignedPartitionsOnStartupEnabled()) {
+      429        return;
+      430      }
+      431  
+      432      if (manager == null) {
+      433        return;
+      434      }
+      435      for (StorageEngine storageEngine: getStorageEngineRepository().getAllLocalStorageEngines()) {
+      436        String storeName = storageEngine.getStoreVersionName();
+      437        Set<Integer> storageEnginePartitionIds = new HashSet<>(storageEngine.getPartitionIds());
+      438        String instanceHostName = manager.getInstanceName();
+      439        PropertyKey.Builder propertyKeyBuilder =
+      440            new PropertyKey.Builder(configLoader.getVeniceClusterConfig().getClusterName());
+      441        SafeHelixDataAccessor helixDataAccessor = manager.getHelixDataAccessor();
+      442        IdealState idealState = helixDataAccessor.getProperty(propertyKeyBuilder.idealStates(storeName));
+      443        /**
+      444         * In a helix ideal state, helix maintains information in listfields and mapfields.  The mapfields inform which
+      445         * messages needs to be sent based on the current LIVEINSTANCES, and will therefore be reflective of what
+      446         * nodes are available to receive messages.  The listfields however will contain the assignment, and will only
+      447         * change if a rebalance is calculated.  For this clean up code, we rely on entries in the listfield based
+      448         * on which state transitions we're anticipating to receive.
+      449         */
+      450        if (idealState != null) {
+      451          Map<String, List<String>> listFields = idealState.getRecord().getListFields();
+      452          for (Integer partitionId: storageEnginePartitionIds) {
+      453            if (isMetadataPartition(partitionId)) {
+      454              continue;
+      455            }
+      456            String partitionDbName = storeName + "_" + partitionId;
+      457            List<String> hostNames = listFields.get(partitionDbName);
+      458            if (hostNames == null || !hostNames.contains(instanceHostName)) {
+      459              LOGGER.info(
+      460                  "the following partition is not assigned to the current host {} and is being dropped from storage engine {}: {}",
+      461                  instanceHostName,
+      462                  storeName,
+      463                  String.valueOf(partitionId));
+       ... truncated at 400 lines ...

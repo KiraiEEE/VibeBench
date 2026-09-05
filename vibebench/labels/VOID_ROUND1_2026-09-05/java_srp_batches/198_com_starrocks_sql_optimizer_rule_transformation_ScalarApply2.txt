@@ -1,0 +1,406 @@
+row 198   StarRocks/starrocks#70342
+============================================================================
+CLASS com.starrocks.sql.optimizer.rule.transformation.ScalarApply2AnalyticRule.Transformer   loc=447 methods=14 wmc=63 lcom=0.0 c3=0.1530712313324999
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      168      private static final class Transformer {
+      169          private final OptimizerContext context;
+      170          private final OptExpression filter;
+      171          private final OptExpression project;
+      172          private final OptExpression apply;
+      173          private final OptExpression subAgg;
+      174          private final LogicalFilterOperator filterOp;
+      175          private final LogicalProjectOperator projectOp;
+      176          private final LogicalApplyOperator applyOp;
+      177          private final LogicalAggregationOperator subAggOp;
+      178  
+      179          // All logical operators of the applyOp's left/right subtree
+      180          private final List<LogicalOperator> leftOps = Lists.newArrayList();
+      181          private final List<LogicalOperator> rightOps = Lists.newArrayList();
+      182  
+      183          // ColumnRefMap which contains all the project's columnRefMap of the right subtree, and the mapping of the
+      184          // higher node will be replaced by the lower node
+      185          private final Map<ColumnRefOperator, ScalarOperator> rightColumnRefMap = Maps.newHashMap();
+      186  
+      187          // Equivalent ColumnRefOperator peer, key comes from subquery's relation while value comes from outer block's
+      188          private final Map<ColumnRefOperator, ColumnRefOperator> peerColumnRefMap = Maps.newHashMap();
+      189  
+      190          // Outer table of the correlated subquery
+      191          private Table correlatedOuterTable;
+      192  
+      193          // All the columnRefOperators of the outer block, i.e. left subtree of apply
+      194          private Set<ColumnRefOperator> outerColumnRefOperators;
+      195  
+      196          // The conjunct of outer block that is identical with the subquery's correlated conjunct
+      197          private final List<ScalarOperator> outerCorrelatedConjuncts = Lists.newArrayList();
+      198  
+      199          // The conjunct that contains the subquery
+      200          private ScalarOperator outerSubqueryConjunct;
+      201  
+      202          private ScalarOperator predicateBeforeWindow;
+      203          private ScalarOperator predicateAfterWindow;
+      204  
+      205          private LogicalWindowOperator windowOp;
+      206  
+      207          public Transformer(OptimizerContext context, OptExpression input) {
+      208              this.context = context;
+      209              this.filter = input;
+      210              this.project = this.filter.inputAt(0);
+      211              this.apply = this.project.inputAt(0);
+      212              this.subAgg = this.apply.inputAt(1);
+      213              this.filterOp = this.filter.getOp().cast();
+      214              this.projectOp = this.project.getOp().cast();
+      215              this.applyOp = this.apply.getOp().cast();
+      216              this.subAggOp = this.subAgg.getOp().cast();
+      217          }
+      218  
+      219          public List<OptExpression> transform() {
+      220              try {
+      221                  initOps();
+      222                  if (!checkOperatorType()
+      223                          || !checkJoinType()
+      224                          || !checkAggregate()
+      225                          || !checkReferencedTables()
+      226                          || !checkPredicate()) {
+      227                      return Collections.emptyList();
+      228                  }
+      229  
+      230                  createWindowOp();
+      231  
+      232                  rewriteOuterPredicate();
+      233  
+      234                  return getNewExpressionRoot();
+      235              } catch (UnsupportedOperationException e) {
+      236                  return Collections.emptyList();
+      237              }
+      238          }
+      239  
+      240          private void initOps() {
+      241              collectInLevelOrder(apply.inputAt(0), leftOps);
+      242              collectInLevelOrder(apply.inputAt(1), rightOps);
+      243  
+      244              // All the operators are collected in level order, so the mapping from upper project node will be
+      245              // replaced with the lower project node
+      246              rightOps.stream()
+      247                      .filter(LogicalProjectOperator.class::isInstance)
+      248                      .map(Operator::<LogicalProjectOperator>cast)
+      249                      .map(LogicalProjectOperator::getColumnRefMap)
+      250                      .forEach(rightColumnRefMap::putAll);
+      251          }
+      252  
+      253          private boolean checkOperatorType() {
+      254              return leftOps.stream()
+      255                      .allMatch(op -> op instanceof LogicalScanOperator
+      256                              || op instanceof LogicalLimitOperator
+      257                              || op instanceof LogicalJoinOperator
+      258                              || op instanceof LogicalProjectOperator)
+      259                      && rightOps.stream()
+      260                      .allMatch(op -> op instanceof LogicalScanOperator
+      261                              || op instanceof LogicalJoinOperator
+      262                              || op instanceof LogicalAggregationOperator
+      263                              || op instanceof LogicalFilterOperator
+      264                              || op instanceof LogicalProjectOperator)
+      265                      && rightOps.stream().noneMatch(op -> op.getLimit() >= 0);
+      266          }
+      267  
+      268          /**
+      269           * Currently, only cross join is allowed, we can loosen this condition later to support other types of join
+      270           */
+      271          private boolean checkJoinType() {
+      272              boolean outerAllCrossJoin = leftOps.stream()
+      273                      .filter(LogicalJoinOperator.class::isInstance)
+      274                      .map(Operator::<LogicalJoinOperator>cast)
+      275                      .allMatch(joinOp -> joinOp.getJoinType().isCrossJoin());
+      276              boolean subqueryAllCrossJoin = rightOps.stream()
+      277                      .filter(LogicalJoinOperator.class::isInstance)
+      278                      .map(Operator::<LogicalJoinOperator>cast)
+      279                      .allMatch(joinOp -> joinOp.getJoinType().isCrossJoin());
+      280  
+      281              return outerAllCrossJoin && subqueryAllCrossJoin;
+      282          }
+      283  
+      284          /**
+      285           * The following requirements should have been met
+      286           * 1. No other aggregate node allowed in the subquery
+      287           * 2. All the aggregate functions must have corresponding analytic version,
+      288           * which is defined in TRANSFORMABLE_AGGREGATE_FUNCTIONS
+      289           * 3. All the aggregate shouldn't be distinct
+      290           */
+      291          private boolean checkAggregate() {
+      292              if (rightOps.stream()
+      293                      .filter(LogicalAggregationOperator.class::isInstance)
+      294                      .count() > 1) {
+      295                  return false;
+      296              }
+      297  
+      298              Collection<CallOperator> aggregations = subAggOp.getAggregations().values();
+      299              if (aggregations.stream()
+      300                      .anyMatch(callOp -> !WHITE_LIST.contains(callOp.getFnName()))) {
+      301                  return false;
+      302              }
+      303  
+      304              return aggregations.stream().noneMatch(CallOperator::isDistinct);
+      305          }
+      306  
+      307          /*
+      308           * Check whether `outerTables = subqueryTables + correlatedOuterTable` satisfied
+      309           * The above requirement must be required, otherwise subquery cannot be eliminated through window function
+      310           * <p>
+      311           * Multi-relations pointed to the same table are out of consideration, example as follows
+      312           *
+      313           * select * from t0, t0 as t1
+      314           * where t0.v1 = t1.v1
+      315           * and t0.v2 < 5 and t1.v2 > 10
+      316           * and t0.v3 < (
+      317           *     select max(t1.v3) from t0 as t1
+      318           *     where t0.v1 = t1.v1 and t1.v2 > 10
+      319           * )
+      320           */
+      321          private boolean checkReferencedTables() {
+      322              List<Table> outerTables = getAllTables(leftOps);
+      323              List<Table> subqueryTables = getAllTables(rightOps);
+      324  
+      325              Set<Long> outerTableIds = outerTables.stream()
+      326                      .map(Table::getId)
+      327                      .collect(Collectors.toSet());
+      328              Set<Long> subqueryTableIds = subqueryTables.stream()
+      329                      .map(Table::getId)
+      330                      .collect(Collectors.toSet());
+      331              if (outerTables.size() != outerTableIds.size()
+      332                      || subqueryTables.size() != subqueryTableIds.size()) {
+      333                  return false;
+      334              }
+      335  
+      336              if (outerTables.size() != subqueryTables.size() + 1) {
+      337                  return false;
+      338              }
+      339  
+      340              List<Column> correlatedOuterColumns = applyOp.getCorrelationColumnRefs().stream()
+      341                      .map(context.getColumnRefFactory()::getColumn)
+      342                      .collect(Collectors.toList());
+      343              outerTables.removeAll(subqueryTables);
+      344              if (outerTables.size() != 1) {
+      345                  return false;
+      346              }
+      347  
+      348              correlatedOuterTable = outerTables.get(0);
+      349  
+      350              for (Column correlatedOuterColumn : correlatedOuterColumns) {
+      351                  if (!Objects.equals(correlatedOuterColumn,
+      352                          correlatedOuterTable.getColumn(correlatedOuterColumn.getName()))) {
+      353                      return false;
+      354                  }
+      355              }
+      356              return true;
+      357          }
+      358  
+      359          /**
+      360           * E.g.
+      361           * select * from t0, t1
+      362           * where t0.v1 = t1.v4
+      363           * and t0.v2 < 5
+      364           * and t1.v5 > 10
+      365           * and t0.v3 < (select max(v6) from t1 where t0.v1 = t1.v4 and t1.v5 >10 )
+      366           * <p>
+      367           * Technically, one of the sufficient condition in predicate is that we must guarantee that the subquery and
+      368           * the outer block yields the same row set, so all the predicates in the outer block should exist in subquery,
+      369           * except those not related to the subquery's table, so here comes the detailed requirements that should be met:
+      370           * 1. correlated conjunct must exist in the outer block, e.g. t0.v1 = t1.v4
+      371           * 2. conjuncts of outer block except those not related to the subquery must exist in the subquery, for example,
+      372           * t0.v2 < 5 is not related to the subquery's table, t1.v5 > 10 is related to the subquery's table
+      373           */
+      374          private boolean checkPredicate() {
+      375              List<ScalarOperator> outerConjuncts = Utils.extractConjuncts(filterOp.getPredicate());
+      376  
+      377              // First, check correlated predicate exists in outerConjuncts, and remove it if found
+      378              // E.g. t0.v1 = t1.v4 in the above case
+      379              List<ScalarOperator> subqueryCorrelationConjuncts =
+      380                      Utils.extractConjuncts(applyOp.getCorrelationConjuncts());
+      381              {
+      382                  Iterator<ScalarOperator> outerIt = outerConjuncts.iterator();
+      383                  Iterator<ScalarOperator> subIt = subqueryCorrelationConjuncts.iterator();
+      384                  while (outerIt.hasNext()) {
+      385                      ScalarOperator outerConjunct = outerIt.next();
+      386  
+      387                      while (subIt.hasNext()) {
+      388                          ScalarOperator correlationConjunct = subIt.next();
+      389                          if (PredicateComparator.isIdentical(correlationConjunct, outerConjunct,
+      390                                  context.getColumnRefFactory())) {
+      391                              outerCorrelatedConjuncts.add(outerConjunct);
+      392                              outerIt.remove();
+      393                              subIt.remove();
+      394                              break;
+      395                          }
+      396                      }
+      397                  }
+      398              }
+      399              if (outerCorrelatedConjuncts.isEmpty() || !subqueryCorrelationConjuncts.isEmpty()) {
+      400                  return false;
+      401              }
+      402  
+      403              // Second, remove the conjunct that contains the subquery
+      404              // E.g. t0.v3 < (<subquery>) in the above case
+      405              {
+      406                  Iterator<ScalarOperator> outerIt = outerConjuncts.iterator();
+      407                  while (outerIt.hasNext()) {
+      408                      ScalarOperator outerConjunct = outerIt.next();
+      409                      if (Utils.collect(outerConjunct, ColumnRefOperator.class).stream()
+      410                              .anyMatch(columnRefOperator -> Objects.equals(applyOp.getOutput(), columnRefOperator))) {
+      411                          outerSubqueryConjunct = outerConjunct;
+      412                          outerIt.remove();
+      413                          break;
+      414                      }
+      415                  }
+      416              }
+      417              if (outerSubqueryConjunct == null) {
+      418                  return false;
+      419              }
+      420  
+      421              // Third, remove all the conjuncts which only related to the correlated outer table from the outerConjuncts
+      422              // E.g. t0.v2 < 5 in the above case
+      423              {
+      424                  Iterator<ScalarOperator> outerIt = outerConjuncts.iterator();
+      425                  while (outerIt.hasNext()) {
+      426                      ScalarOperator outerConjunct = outerIt.next();
+      427                      List<ColumnRefOperator> colRefs = Utils.collect(outerConjunct, ColumnRefOperator.class);
+      428                      boolean relatedToOtherTable = false;
+      429                      for (ColumnRefOperator colRef : colRefs) {
+      430                          Column column = context.getColumnRefFactory().getColumn(colRef);
+      431                          if (column == null) {
+      432                              continue;
+      433                          }
+      434                          if (!Objects.equals(column, correlatedOuterTable.getColumn(column.getName()))) {
+      435                              relatedToOtherTable = true;
+      436                              break;
+      437                          }
+      438                      }
+      439                      if (!relatedToOtherTable) {
+      440                          outerIt.remove();
+      441                      }
+      442                  }
+      443              }
+      444  
+      445              // We assume that the right subtree only contains one FilterOperator, for other complex cases, we may
+      446              // support later
+      447              if (rightOps.stream().filter(LogicalFilterOperator.class::isInstance).count() > 1) {
+      448                  return false;
+      449              }
+      450  
+      451              // Forth, check all the conjuncts from the remaining outerConjuncts and subConjuncts are exactly the same
+      452              // E.g. t1.v5 >10 in the above case
+      453              LogicalFilterOperator subFilterOp = rightOps.stream()
+      454                      .filter(LogicalFilterOperator.class::isInstance)
+      455                      .map(Operator::<LogicalFilterOperator>cast)
+      456                      .findFirst()
+      457                      .orElse(null);
+      458              if (subFilterOp == null) {
+      459                  return outerConjuncts.isEmpty();
+      460              }
+      461              List<ScalarOperator> subConjuncts = Utils.extractConjuncts(subFilterOp.getPredicate());
+      462              if (outerConjuncts.size() != subConjuncts.size()) {
+      463                  return false;
+      464              }
+      465              {
+      466                  Iterator<ScalarOperator> outerIt = outerConjuncts.iterator();
+      467                  while (outerIt.hasNext()) {
+      468                      ScalarOperator outerConjunct = outerIt.next();
+      469                      Iterator<ScalarOperator> subIt = subConjuncts.iterator();
+      470                      boolean found = false;
+      471                      while (subIt.hasNext()) {
+      472                          ScalarOperator subConjunct = subIt.next();
+      473                          if (PredicateComparator.isIdentical(outerConjunct, subConjunct,
+      474                                  context.getColumnRefFactory())) {
+      475                              found = true;
+      476                              outerIt.remove();
+      477                              subIt.remove();
+      478                              break;
+      479                          }
+      480                      }
+      481                      if (!found) {
+      482                          return false;
+      483                      }
+      484                  }
+      485              }
+      486              Preconditions.checkState(outerConjuncts.isEmpty());
+      487              Preconditions.checkState(subConjuncts.isEmpty());
+      488  
+      489              return true;
+      490          }
+      491  
+      492          private void createWindowOp() {
+      493              outerColumnRefOperators = getAllColumnRefOperators(leftOps);
+      494  
+      495              Map<ColumnRefOperator, CallOperator> windows = Maps.newHashMap();
+      496              Map<ColumnRefOperator, CallOperator> aggregations = subAggOp.getAggregations();
+      497  
+      498              for (Map.Entry<ColumnRefOperator, CallOperator> entry : aggregations.entrySet()) {
+      499                  ColumnRefOperator columnRefOperator = entry.getKey();
+      500                  CallOperator callOp = entry.getValue();
+      501  
+      502                  CallOperator newCallOp = cloneCallOperator(callOp);
+      503                  ColumnRefOperator newColumnRefOperator = context.getColumnRefFactory()
+      504                          .create(newCallOp, newCallOp.getType(), newCallOp.isNullable());
+      505                  windows.put(newColumnRefOperator, newCallOp);
+      506                  peerColumnRefMap.put(columnRefOperator, newColumnRefOperator);
+      507              }
+      508  
+      509              List<ScalarOperator> partitionByColumns = Lists.newArrayList();
+      510              for (ScalarOperator outerCorrelatedConjunct : outerCorrelatedConjuncts) {
+      511                  Preconditions.checkState(outerCorrelatedConjunct instanceof BinaryPredicateOperator);
+      512                  // We can take either first or second child of outerCorrelatedConjunct as the partition by expr
+      513                  partitionByColumns.add(outerCorrelatedConjunct.getChild(0));
+      514              }
+      515  
+      516              windowOp = new LogicalWindowOperator.Builder()
+      517                      .setWindowCall(windows)
+      518                      .setPartitionExpressions(partitionByColumns)
+      519                      .setEnforceSortColumns(
+      520                              partitionByColumns.stream()
+      521                                      .map(ScalarOperator::<ColumnRefOperator>cast)
+      522                                      .map(columnRefOperator -> new Ordering(columnRefOperator, true, true))
+      523                                      .collect(Collectors.toList()))
+      524                      .build();
+      525          }
+      526  
+      527          /**
+      528           * Reform the outer block's predicate into two parts, one contains the subquery conjunct
+      529           * while the others forms another part.
+      530           */
+      531          private void rewriteOuterPredicate() {
+      532              LogicalFilterOperator filterOperator = filter.getOp().cast();
+      533              ScalarOperator predicate = filterOperator.getPredicate();
+      534              List<ScalarOperator> conjuncts = Utils.extractConjuncts(predicate);
+      535              conjuncts.removeIf(conjunct -> Objects.equals(outerSubqueryConjunct, conjunct));
+      536              predicateBeforeWindow = Utils.compoundAnd(conjuncts);
+      537  
+      538              SubqueryReplaceShuttle visitor = new SubqueryReplaceShuttle(applyOp, peerColumnRefMap);
+      539              predicateAfterWindow = outerSubqueryConjunct.accept(visitor, null);
+      540          }
+      541  
+      542          private List<OptExpression> getNewExpressionRoot() {
+      543              OptExpression beforeWindowFilter =
+      544                      OptExpression.create(new LogicalFilterOperator(predicateBeforeWindow), apply.inputAt(0));
+      545              OptExpression window = OptExpression.create(windowOp, beforeWindowFilter);
+      546              OptExpression afterWindowFilter =
+      547                      OptExpression.create(new LogicalFilterOperator(predicateAfterWindow), window);
+      548  
+      549              Map<ColumnRefOperator, ScalarOperator> newProjectMap = Maps.newHashMap(projectOp.getColumnRefMap());
+      550              windowOp.getWindowCall().keySet()
+      551                      .forEach(columnRefOperator -> newProjectMap.put(columnRefOperator, columnRefOperator));
+      552              subAggOp.getAggregations().keySet()
+      553                      .forEach(newProjectMap::remove);
+      554              newProjectMap.remove(applyOp.getOutput());
+      555              OptExpression newProject = OptExpression.create(new LogicalProjectOperator.Builder()
+      556                      .withOperator(project.getOp().cast())
+      557                      .setColumnRefMap(newProjectMap)
+      558                      .build(), afterWindowFilter);
+      559  
+      560              return Collections.singletonList(newProject);
+      561          }
+      562  
+      563          private void collectInLevelOrder(OptExpression root, List<LogicalOperator> collect) {
+      564              Queue<OptExpression> queue = Lists.newLinkedList();
+      565              queue.offer(root);
+      566              while (!queue.isEmpty()) {
+      567                  OptExpression top = queue.poll();
+       ... truncated at 400 lines ...

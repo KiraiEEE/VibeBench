@@ -1,0 +1,577 @@
+row 51   StarRocks/starrocks#67467
+============================================================================
+CONTRACT com.starrocks.qe.scheduler.WorkerProvider   members=14.0 implementers=6.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       33  public interface WorkerProvider {
+       34      interface Factory {
+       35          /**
+       36           * Capture the available workers from {@code systemInfoService}, which are alive and not in the blacklist.
+       37           *
+       38           * @param systemInfoService                   The service which provides all the backend nodes and compute nodes.
+       39           * @param preferComputeNode                   Whether to prefer using compute nodes over backend nodes.
+       40           * @param numUsedComputeNodes                 The maximum number of used compute nodes.
+       41           * @param computationFragmentSchedulingPolicy The schedule policy of backend and compute nodes.
+       42           */
+       43          WorkerProvider captureAvailableWorkers(SystemInfoService systemInfoService,
+       44                                                 boolean preferComputeNode,
+       45                                                 int numUsedComputeNodes,
+       46                                                 ComputationFragmentSchedulingPolicy computationFragmentSchedulingPolicy,
+       47                                                 ComputeResource computeResource);
+       48      }
+       49  
+       50      /**
+       51       * Select the next worker node.
+       52       *
+       53       * @return The id of the worker node to choose.
+       54       * @throws NonRecoverableException if there is no available worker.
+       55       */
+       56      long selectNextWorker() throws NonRecoverableException;
+       57  
+       58      /**
+       59       * Select the worker with the given id.
+       60       *
+       61       * @param workerId The id of the worker to choose.
+       62       * @throws NonRecoverableException if there is no available worker with the given id.
+       63       */
+       64      void selectWorker(long workerId) throws NonRecoverableException;
+       65  
+       66      /**
+       67       * Select all the available compute nodes.
+       68       *
+       69       * @return The id of the compute nodes to choose.
+       70       */
+       71      List<Long> selectAllComputeNodes();
+       72  
+       73      Collection<ComputeNode> getAllWorkers();
+       74  
+       75      ComputeNode getWorkerById(long workerId);
+       76  
+       77      boolean isDataNodeAvailable(long dataNodeId);
+       78  
+       79      void reportDataNodeNotFoundException() throws NonRecoverableException;
+       80  
+       81      void reportWorkerNotFoundException(String errorMessagePrefix) throws NonRecoverableException;
+       82  
+       83      default void reportWorkerNotFoundException() throws NonRecoverableException {
+       84          reportWorkerNotFoundException("");
+       85      }
+       86  
+       87      boolean isWorkerSelected(long workerId);
+       88  
+       89      List<Long> getSelectedWorkerIds();
+       90  
+       91      List<Long> getAllAvailableNodes();
+       92  
+       93      void selectWorkerUnchecked(long workerId);
+       94  
+       95      default boolean isPreferComputeNode() {
+       96          return false;
+       97      }
+       98  
+       99      default boolean allowUsingBackupNode() {
+      100          return false;
+      101      }
+      102  
+      103      /**
+      104       * choose a backup worker for the given workerId, it is up to the WorkerProvider decision how to select it.
+      105       *
+      106       * @return -1, no available backup worker
+      107       */
+      108      long selectBackupWorker(long workerId);
+      109  
+      110      ComputeResource getComputeResource();
+      111  }
+
+---------- IMPLEMENTER com.starrocks.lake.qe.scheduler.DefaultSharedDataWorkerProvider  stubs=0/14 ----------
+       65  public class DefaultSharedDataWorkerProvider implements WorkerProvider {
+       66      private static final Logger LOG = LogManager.getLogger(DefaultSharedDataWorkerProvider.class);
+       67      private static final AtomicInteger NEXT_COMPUTE_NODE_INDEX = new AtomicInteger(0);
+       68  
+       69      public static class Factory implements WorkerProvider.Factory {
+       70          @Override
+       71          public DefaultSharedDataWorkerProvider captureAvailableWorkers(
+       72                  SystemInfoService systemInfoService,
+       73                  boolean preferComputeNode,
+       74                  int numUsedComputeNodes,
+       75                  ComputationFragmentSchedulingPolicy computationFragmentSchedulingPolicy,
+       76                  ComputeResource computeResource) {
+       77  
+       78              final WarehouseManager warehouseManager = GlobalStateMgr.getCurrentState().getWarehouseMgr();
+       79              final ImmutableMap.Builder<Long, ComputeNode> builder = ImmutableMap.builder();
+       80              final List<Long> computeNodeIds = warehouseManager.getAllComputeNodeIds(computeResource);
+       81              computeNodeIds.forEach(nodeId -> builder.put(nodeId,
+       82                      GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackendOrComputeNode(nodeId)));
+       83              ImmutableMap<Long, ComputeNode> idToComputeNode = builder.build();
+       84              if (LOG.isDebugEnabled()) {
+       85                  LOG.debug("idToComputeNode: {}", idToComputeNode);
+       86              }
+       87  
+       88              ImmutableMap<Long, ComputeNode> availableComputeNodes = filterAvailableWorkers(idToComputeNode);
+       89              if (availableComputeNodes.isEmpty()) {
+       90                  Warehouse warehouse = warehouseManager.getWarehouse(computeResource.getWarehouseId());
+       91                  throw ErrorReportException.report(ErrorCode.ERR_NO_NODES_IN_WAREHOUSE, warehouse.getName());
+       92              }
+       93  
+       94              return new DefaultSharedDataWorkerProvider(idToComputeNode, availableComputeNodes, computeResource);
+       95          }
+       96      }
+       97  
+       98      /**
+       99       * All the compute nodes (including backends), including those that are not alive or in block list.
+      100       */
+      101      protected final ImmutableMap<Long, ComputeNode> id2ComputeNode;
+      102      /**
+      103       * The available compute nodes, which are alive and not in the block list when creating the snapshot. It is still
+      104       * possible that the node becomes unavailable later, it will be checked again in some of the interfaces.
+      105       */
+      106      protected final ImmutableMap<Long, ComputeNode> availableID2ComputeNode;
+      107  
+      108      /**
+      109       * List of the compute node ids, used to select buddy node in case some of the nodes are not available.
+      110       */
+      111      protected ImmutableList<Long> allComputeNodeIds;
+      112  
+      113      private final Set<Long> selectedWorkerIds;
+      114  
+      115      private final ComputeResource computeResource;
+      116  
+      117      @VisibleForTesting
+      118      public DefaultSharedDataWorkerProvider(ImmutableMap<Long, ComputeNode> id2ComputeNode,
+      119                                             ImmutableMap<Long, ComputeNode> availableID2ComputeNode,
+      120                                             ComputeResource computeResource
+      121      ) {
+      122          this.id2ComputeNode = id2ComputeNode;
+      123          this.availableID2ComputeNode = availableID2ComputeNode;
+      124          this.selectedWorkerIds = Sets.newConcurrentHashSet();
+      125          this.allComputeNodeIds = null;
+      126          this.computeResource = computeResource;
+      127      }
+      128  
+      129      @Override
+      130      public long selectNextWorker() throws NonRecoverableException {
+      131          ComputeNode worker;
+      132          worker = getNextWorker(availableID2ComputeNode,
+      133                  DefaultSharedDataWorkerProvider::getNextComputeNodeIndex, computeResource);
+      134  
+      135          if (worker == null) {
+      136              reportWorkerNotFoundException();
+      137          }
+      138          Preconditions.checkNotNull(worker);
+      139          selectWorkerUnchecked(worker.getId());
+      140          return worker.getId();
+      141      }
+      142  
+      143      @Override
+      144      public void selectWorker(long workerId) throws NonRecoverableException {
+      145          if (getWorkerById(workerId) == null) {
+      146              reportWorkerNotFoundException("", workerId);
+      147          }
+      148          selectWorkerUnchecked(workerId);
+      149      }
+      150  
+      151      @Override
+      152      public List<Long> selectAllComputeNodes() {
+      153          List<Long> nodeIds = availableID2ComputeNode.values().stream()
+      154                  .map(ComputeNode::getId)
+      155                  .collect(Collectors.toList());
+      156          nodeIds.forEach(this::selectWorkerUnchecked);
+      157          return nodeIds;
+      158      }
+      159  
+      160      @Override
+      161      public Collection<ComputeNode> getAllWorkers() {
+      162          return availableID2ComputeNode.values();
+      163      }
+      164  
+      165      @Override
+      166      public ComputeNode getWorkerById(long workerId) {
+      167          return availableID2ComputeNode.get(workerId);
+      168      }
+      169  
+      170      @Override
+      171      public boolean isDataNodeAvailable(long dataNodeId) {
+      172          // DataNode and ComputeNode is exchangeable in SHARED_DATA mode
+      173          return availableID2ComputeNode.containsKey(dataNodeId);
+      174      }
+      175  
+      176      @Override
+      177      public void reportDataNodeNotFoundException() throws NonRecoverableException {
+      178          reportWorkerNotFoundException();
+      179      }
+      180  
+      181      @Override
+      182      public boolean isWorkerSelected(long workerId) {
+      183          return selectedWorkerIds.contains(workerId);
+      184      }
+      185  
+      186      @Override
+      187      public List<Long> getSelectedWorkerIds() {
+      188          return new ArrayList<>(selectedWorkerIds);
+      189      }
+      190  
+      191      @Override
+      192      public List<Long> getAllAvailableNodes() {
+      193          return Lists.newArrayList(availableID2ComputeNode.keySet());
+      194      }
+      195  
+      196      @Override
+      197      public boolean isPreferComputeNode() {
+      198          return true;
+      199      }
+      200  
+      201      @Override
+      202      public void selectWorkerUnchecked(long workerId) {
+      203          selectedWorkerIds.add(workerId);
+      204      }
+      205  
+      206      @Override
+      207      public void reportWorkerNotFoundException(String errorMessagePrefix) throws NonRecoverableException {
+      208          reportWorkerNotFoundException(errorMessagePrefix, -1);
+      209      }
+      210  
+      211      private void reportWorkerNotFoundException(String errorMessagePrefix, long workerId) throws NonRecoverableException {
+      212          throw new NonRecoverableException(
+      213                  errorMessagePrefix + FeConstants.getNodeNotFoundError(true) + " nodeId: " + workerId + " " +
+      214                          computeNodesToString(false));
+      215      }
+      216  
+      217      @Override
+      218      public boolean allowUsingBackupNode() {
+      219          return true;
+      220      }
+      221  
+      222      /**
+      223       * Try to select the next workerId in the sorted list just after the workerId, if the next one is not available,
+      224       * e.g. also in BlockList, then try the next one in the list, until all nodes have benn tried.
+
+---------- IMPLEMENTER com.starrocks.lake.qe.scheduler.SkipBlacklistSharedDataWorkerProvider  stubs=0/1 ----------
+       39  public class SkipBlacklistSharedDataWorkerProvider extends DefaultSharedDataWorkerProvider {
+       40      private static final Logger LOG = LogManager.getLogger(SkipBlacklistSharedDataWorkerProvider.class);
+       41  
+       42      public static class Factory implements WorkerProvider.Factory {
+       43          @Override
+       44          public SkipBlacklistSharedDataWorkerProvider captureAvailableWorkers(
+       45                  SystemInfoService systemInfoService,
+       46                  boolean preferComputeNode,
+       47                  int numUsedComputeNodes,
+       48                  ComputationFragmentSchedulingPolicy computationFragmentSchedulingPolicy,
+       49                  ComputeResource computeResource) {
+       50  
+       51              final WarehouseManager warehouseManager = GlobalStateMgr.getCurrentState().getWarehouseMgr();
+       52              final ImmutableMap.Builder<Long, ComputeNode> builder = ImmutableMap.builder();
+       53              final List<Long> computeNodeIds = warehouseManager.getAllComputeNodeIds(computeResource);
+       54              computeNodeIds.forEach(nodeId -> builder.put(nodeId,
+       55                      GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackendOrComputeNode(nodeId)));
+       56              ImmutableMap<Long, ComputeNode> idToComputeNode = builder.build();
+       57              if (LOG.isDebugEnabled()) {
+       58                  LOG.debug("SkipBlacklistSharedDataWorkerProvider - idToComputeNode: {}", idToComputeNode);
+       59              }
+       60  
+       61              ImmutableMap<Long, ComputeNode> availableComputeNodes = filterAvailableWorkersSkipBlacklist(idToComputeNode);
+       62              if (availableComputeNodes.isEmpty()) {
+       63                  Warehouse warehouse = warehouseManager.getWarehouse(computeResource.getWarehouseId());
+       64                  throw ErrorReportException.report(ErrorCode.ERR_NO_NODES_IN_WAREHOUSE, warehouse.getName());
+       65              }
+       66  
+       67              return new SkipBlacklistSharedDataWorkerProvider(idToComputeNode, availableComputeNodes, computeResource);
+       68          }
+       69  
+       70          private static ImmutableMap<Long, ComputeNode> filterAvailableWorkersSkipBlacklist(
+       71                  ImmutableMap<Long, ComputeNode> workers) {
+       72              ImmutableMap.Builder<Long, ComputeNode> builder = new ImmutableMap.Builder<>();
+       73              for (Map.Entry<Long, ComputeNode> entry : workers.entrySet()) {
+       74                  // Only check if worker is alive, skip blacklist verification
+       75                  if (entry.getValue().isAlive()) {
+       76                      builder.put(entry);
+       77                  }
+       78              }
+       79              return builder.build();
+       80          }
+       81      }
+       82  
+       83      protected SkipBlacklistSharedDataWorkerProvider(ImmutableMap<Long, ComputeNode> id2ComputeNode,
+       84                                               ImmutableMap<Long, ComputeNode> availableID2ComputeNode,
+       85                                               ComputeResource computeResource) {
+       86          super(id2ComputeNode, availableID2ComputeNode, computeResource);
+       87      }
+       88  
+       89      /**
+       90       * Override selectBackupWorker to skip blacklist verification.
+       91       * This ensures consistent behavior with initial worker selection when skip_black_list is enabled.
+       92       */
+       93      @Override
+       94      public long selectBackupWorker(long workerId) {
+       95          if (availableID2ComputeNode.isEmpty() || !id2ComputeNode.containsKey(workerId)) {
+       96              return -1;
+       97          }
+       98          if (allComputeNodeIds == null) {
+       99              createAvailableIdList();
+      100          }
+      101          Preconditions.checkNotNull(allComputeNodeIds);
+      102          Preconditions.checkState(allComputeNodeIds.contains(workerId));
+      103  
+      104          int startPos = allComputeNodeIds.indexOf(workerId);
+      105          int attempts = allComputeNodeIds.size();
+      106          while (attempts-- > 0) {
+      107              startPos = (startPos + 1) % allComputeNodeIds.size();
+      108              long buddyId = allComputeNodeIds.get(startPos);
+      109              // Skip SimpleScheduler.isInBlocklist(buddyId) check - only verify buddyId != workerId and is in availableID2ComputeNode
+      110              if (buddyId != workerId && availableID2ComputeNode.containsKey(buddyId)) {
+      111                  return buddyId;
+      112              }
+      113          }
+      114          return -1;
+      115      }
+      116  }
+
+---------- IMPLEMENTER com.starrocks.qe.scheduler.DefaultWorkerProvider  stubs=0/14 ----------
+       52  public class DefaultWorkerProvider implements WorkerProvider {
+       53      private static final Logger LOG = LogManager.getLogger(DefaultWorkerProvider.class);
+       54  
+       55      private static final AtomicInteger NEXT_COMPUTE_NODE_INDEX = new AtomicInteger(0);
+       56      private static final AtomicInteger NEXT_BACKEND_INDEX = new AtomicInteger(0);
+       57  
+       58      /**
+       59       * All the backend nodes, including those that are not alive or in blacklist.
+       60       */
+       61      private final ImmutableMap<Long, ComputeNode> id2Backend;
+       62      /**
+       63       * All the compute nodes, including those that are not alive or in blacklist.
+       64       */
+       65      private final ImmutableMap<Long, ComputeNode> id2ComputeNode;
+       66      /**
+       67       * The available backend nodes, which are alive and not in the blacklist.
+       68       */
+       69      private final ImmutableMap<Long, ComputeNode> availableID2Backend;
+       70      /**
+       71       * The available compute nodes, which are alive and not in the blacklist.
+       72       */
+       73      private final ImmutableMap<Long, ComputeNode> availableID2ComputeNode;
+       74  
+       75      /**
+       76       * These three members record the workers used by the related job.
+       77       * They are updated when calling {@code chooseXXX} methods.
+       78       */
+       79      private final Set<Long> selectedWorkerIds;
+       80  
+       81      /**
+       82       * Indicates whether there are available compute nodes.
+       83       */
+       84      private final boolean hasComputeNode;
+       85      /**
+       86       * Indicates whether compute nodes should be used for non-HDFS operators.
+       87       * The HDFS operator always prefers to use compute nodes even if {@code usedComputeNode} is false.
+       88       */
+       89      private final boolean usedComputeNode;
+       90  
+       91      private final boolean preferComputeNode;
+       92  
+       93      private final ComputeResource computeResource;
+       94  
+       95      public static class Factory implements WorkerProvider.Factory {
+       96          @Override
+       97          public DefaultWorkerProvider captureAvailableWorkers(SystemInfoService systemInfoService,
+       98                                       boolean preferComputeNode, int numUsedComputeNodes,
+       99                                       ComputationFragmentSchedulingPolicy computationFragmentSchedulingPolicy,
+      100                                       ComputeResource computeResource) {
+      101  
+      102              ImmutableMap<Long, ComputeNode> idToComputeNode =
+      103                      buildComputeNodeInfo(systemInfoService, numUsedComputeNodes, 
+      104                                           computationFragmentSchedulingPolicy, computeResource);
+      105  
+      106              ImmutableMap<Long, ComputeNode> idToBackend = ImmutableMap.copyOf(systemInfoService.getIdToBackend());
+      107  
+      108              if (LOG.isDebugEnabled()) {
+      109                  LOG.debug("idToBackend size={}", idToBackend.size());
+      110                  for (Map.Entry<Long, ComputeNode> entry : idToBackend.entrySet()) {
+      111                      Long backendID = entry.getKey();
+      112                      ComputeNode backend = entry.getValue();
+      113                      LOG.debug("backend: {}-{}-{}", backendID, backend.getHost(), backend.getBePort());
+      114                  }
+      115  
+      116                  LOG.debug("idToComputeNode: {}", idToComputeNode);
+      117              }
+      118  
+      119              return new DefaultWorkerProvider(idToBackend, idToComputeNode,
+      120                      filterAvailableWorkers(idToBackend), filterAvailableWorkers(idToComputeNode),
+      121                      preferComputeNode, computeResource);
+      122          }
+      123      }
+      124  
+      125      @VisibleForTesting
+      126      public DefaultWorkerProvider(ImmutableMap<Long, ComputeNode> id2Backend,
+      127                                   ImmutableMap<Long, ComputeNode> id2ComputeNode,
+      128                                   ImmutableMap<Long, ComputeNode> availableID2Backend,
+      129                                   ImmutableMap<Long, ComputeNode> availableID2ComputeNode,
+      130                                   boolean preferComputeNode, ComputeResource computeResource) {
+      131          this.id2Backend = id2Backend;
+      132          this.id2ComputeNode = id2ComputeNode;
+      133  
+      134          this.availableID2Backend = availableID2Backend;
+      135          this.availableID2ComputeNode = availableID2ComputeNode;
+      136  
+      137          this.selectedWorkerIds = Sets.newConcurrentHashSet();
+      138  
+      139          this.hasComputeNode = MapUtils.isNotEmpty(availableID2ComputeNode);
+      140          if (MapUtils.isEmpty(availableID2Backend) && hasComputeNode) {
+      141              this.usedComputeNode = true;
+      142          } else {
+      143              this.usedComputeNode = hasComputeNode && preferComputeNode;
+      144          }
+      145          this.preferComputeNode = preferComputeNode;
+      146          this.computeResource = computeResource;
+      147      }
+      148  
+      149      @VisibleForTesting
+      150      public DefaultWorkerProvider(
+      151              ImmutableMap<Long, ComputeNode> id2ComputeNode,
+      152              ImmutableMap<Long, ComputeNode> availableID2ComputeNode) {
+      153          this.id2Backend = ImmutableMap.of();
+      154          this.id2ComputeNode = id2ComputeNode;
+      155  
+      156          this.availableID2Backend = ImmutableMap.of();
+      157          this.availableID2ComputeNode = availableID2ComputeNode;
+      158  
+      159          this.selectedWorkerIds = Sets.newConcurrentHashSet();
+      160  
+      161          this.hasComputeNode = true;
+      162          this.preferComputeNode = true;
+      163          this.usedComputeNode = true;
+      164          this.computeResource = WarehouseManager.DEFAULT_RESOURCE;
+      165      }
+      166  
+      167      @Override
+      168      public long selectNextWorker() throws NonRecoverableException {
+      169          ComputeNode worker;
+      170          if (usedComputeNode) {
+      171              worker = getNextWorker(availableID2ComputeNode, DefaultWorkerProvider::getNextComputeNodeIndex, computeResource);
+      172          } else {
+      173              worker = getNextWorker(availableID2Backend, DefaultWorkerProvider::getNextBackendIndex, computeResource);
+      174          }
+      175  
+      176          if (worker == null) {
+      177              reportWorkerNotFoundException();
+      178          }
+      179          Preconditions.checkNotNull(worker);
+      180  
+      181          selectWorkerUnchecked(worker.getId());
+      182          return worker.getId();
+      183      }
+      184  
+      185      @Override
+      186      public void selectWorker(long workerId) throws NonRecoverableException {
+      187          if (getWorkerById(workerId) == null) {
+      188              reportWorkerNotFoundException();
+      189          }
+      190          selectWorkerUnchecked(workerId);
+      191      }
+      192  
+      193      @Override
+      194      public List<Long> selectAllComputeNodes() {
+      195          if (!usedComputeNode) {
+      196              return Collections.emptyList();
+      197          }
+      198  
+      199          List<Long> nodeIds = availableID2ComputeNode.values().stream()
+      200                  .map(ComputeNode::getId)
+      201                  .collect(Collectors.toList());
+      202          nodeIds.forEach(this::selectWorkerUnchecked);
+      203  
+      204          return nodeIds;
+      205      }
+      206  
+      207      @Override
+      208      public Collection<ComputeNode> getAllWorkers() {
+      209          if (hasComputeNode) {
+      210              return availableID2ComputeNode.values();
+      211          } else {
+
+---------- IMPLEMENTER com.starrocks.qe.scheduler.LazyWorkerProviderTest.StubWorkerProvider  stubs=4/14 ----------
+       31      private static class StubWorkerProvider implements WorkerProvider {
+       32          private final String name;
+       33          
+       34          public StubWorkerProvider(String name) {
+       35              this.name = name;
+       36          }
+       37          
+       38          @Override
+       39          public String toString() {
+       40              return name;
+       41          }
+       42          
+       43          @Override
+       44          public long selectNextWorker() throws NonRecoverableException {
+       45              return 0;
+       46          }
+       47          
+       48          @Override
+       49          public void selectWorker(long workerId) throws NonRecoverableException {
+       50          }
+       51          
+       52          @Override
+       53          public List<Long> selectAllComputeNodes() {
+       54              return Collections.emptyList();
+       55          }
+       56          
+       57          @Override
+       58          public Collection<ComputeNode> getAllWorkers() {
+       59              return Collections.emptyList();
+       60          }
+       61          
+       62          @Override
+       63          public ComputeNode getWorkerById(long workerId) {
+       64              return null;
+       65          }
+       66          
+       67          @Override
+       68          public boolean isDataNodeAvailable(long dataNodeId) {
+       69              return false;
+       70          }
+       71          
+       72          @Override
+       73          public void reportDataNodeNotFoundException() throws NonRecoverableException {
+       74          }
+       75  
+       76          @Override
+       77          public void reportWorkerNotFoundException(String errorMessagePrefix) throws NonRecoverableException {
+       78  
+       79          }
+       80  
+       81  
+       82          @Override
+       83          public boolean isWorkerSelected(long workerId) {
+       84              return false;
+       85          }
+       86          
+       87          @Override
+       88          public List<Long> getSelectedWorkerIds() {
+       89              return Collections.emptyList();
+       90          }
+       91  
+       92          @Override
+       93          public List<Long> getAllAvailableNodes() {
+       94              return List.of();
+       95          }
+       96  
+       97          @Override
+       98          public void selectWorkerUnchecked(long workerId) {
+       99  
+      100          }
+      101  
+      102  
+      103          @Override
+      104          public boolean allowUsingBackupNode() {
+      105              return false;
+      106          }
+      107  
+      108          @Override
+      109          public long selectBackupWorker(long workerId) {
+      110              return 0;
+      111          }
+      112  
+      113          @Override
+      114          public ComputeResource getComputeResource() {
+      115              return null;
+      116          }
+      117      }

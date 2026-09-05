@@ -1,0 +1,328 @@
+row 384   StarRocks/starrocks#70342
+============================================================================
+CLASS com.starrocks.sql.spm.SQLPlanGlobalStorage   loc=323 methods=12 wmc=39 lcom=0.0 c3=0.2194066207151216
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       58  class SQLPlanGlobalStorage implements SQLPlanStorage {
+       59      private static final Logger LOG = LogManager.getLogger(SQLPlanGlobalStorage.class);
+       60      /*
+       61       * SPM baselines table
+       62       * id         | bigint
+       63       * is_enable  | boolean
+       64       * bind_sql   | varchar(65530)
+       65       * bind_sql_digest | varchar(65530)
+       66       * bind_sql_hash | bigint
+       67       * plan_sql   | varchar(65530)
+       68       * costs      | double
+       69       * query_ms   | double
+       70       * source     | varchar(100)
+       71       * update_time| datetime
+       72       */
+       73      private static final String QUERY_SQL = "SELECT * FROM " + StatsConstants.SPM_BASELINE_TABLE_NAME + " ";
+       74      private static final String INSERT_SQL = "INSERT INTO " + StatsConstants.SPM_BASELINE_TABLE_NAME + " VALUES ";
+       75      private static final String DELETE_SQL = "DELETE FROM " + StatsConstants.SPM_BASELINE_TABLE_NAME + " WHERE id IN ";
+       76      private static final String UPDATE_SQL = "UPDATE " + StatsConstants.SPM_BASELINE_TABLE_NAME + " SET is_enable = ";
+       77      private static final Map<String, String> BASELINE_FIELD_TO_COLUMN_MAPPING = ImmutableMap.<String, String>builder()
+       78              .put("id", "id")
+       79              .put("global", "global")
+       80              .put("enable", "is_enable")
+       81              .put("bindsqldigest", "bind_sql_digest")
+       82              .put("bindsqlhash", "bind_sql_hash")
+       83              .put("bindsql", "bind_sql")
+       84              .put("plansql", "plan_sql")
+       85              .put("costs", "costs")
+       86              .put("queryms", "query_ms")
+       87              .put("source", "source")
+       88              .put("updatetime", "update_time")
+       89              .build();
+       90  
+       91      // for lazy load baseline plan
+       92      private record BaselineId(long id, long bindSQLHash) {}
+       93  
+       94      // thread safe
+       95      private final Set<BaselineId> allBaselineIds = Sets.newConcurrentHashSet();
+       96  
+       97      private boolean hasInit = false;
+       98  
+       99      // cache
+      100      private final BaselinePlanLoader loader = new BaselinePlanLoader();
+      101      private final LoadingCache<Long, BaselinePlan> cache = Caffeine.newBuilder()
+      102              .maximumSize(Config.max_spm_cache_baseline_size)
+      103              .executor(Executors.newFixedThreadPool(1,
+      104                      new ThreadFactoryBuilder().setDaemon(true).setNameFormat("baseline-cache-%d").build()))
+      105              .build(loader);
+      106      private final SimpleExecutor executor = new SimpleExecutor("SPMExecutor", TResultSinkType.HTTP_PROTOCAL);
+      107  
+      108      public void init() {
+      109          if (hasInit) {
+      110              return;
+      111          }
+      112          List<BaselinePlan> bps = getBaselines(null);
+      113          bps.forEach(bp -> cache.put(bp.getId(), bp));
+      114          allBaselineIds.addAll(bps.stream().map(bp -> new BaselineId(bp.getId(), bp.getBindSqlHash())).toList());
+      115          hasInit = true;
+      116      }
+      117  
+      118      protected Optional<String> generateQuerySql(Expr where) {
+      119          String sql = QUERY_SQL;
+      120          if (where != null) {
+      121              ColumnRefFactory factory = new ColumnRefFactory();
+      122              ScalarOperator p = SqlToScalarOperatorTranslator.translateWithSlotRef(where, slotRef -> {
+      123                  if ("global".equalsIgnoreCase(slotRef.getColumnName())) {
+      124                      return ConstantOperator.TRUE;
+      125                  }
+      126                  return factory.create(BASELINE_FIELD_TO_COLUMN_MAPPING.get(slotRef.getColumnName().toLowerCase()),
+      127                          slotRef.getType(), true);
+      128              });
+      129              ScalarOperatorRewriter re = new ScalarOperatorRewriter();
+      130              ScalarOperator result = re.rewrite(p, ScalarOperatorRewriter.DEFAULT_REWRITE_RULES);
+      131              if (!result.isConstantRef()) {
+      132                  Expr2SQLPrinter<Void> print = new Expr2SQLPrinter<>();
+      133                  sql += " WHERE " + print.print(result);
+      134              } else if (result.isConstantNullOrFalse()) {
+      135                  return Optional.empty();
+      136              }
+      137          }
+      138          return Optional.of(sql);
+      139      }
+      140  
+      141      // only show stmt used, query be directly
+      142      public List<BaselinePlan> getBaselines(Expr where) {
+      143          if (!StatisticUtils.checkStatisticTables(List.of(StatsConstants.SPM_BASELINE_TABLE_NAME))) {
+      144              return Collections.emptyList();
+      145          }
+      146          try {
+      147              Optional<String> sql = generateQuerySql(where);
+      148              if (sql.isEmpty()) {
+      149                  return Collections.emptyList();
+      150              }
+      151              List<TResultBatch> datas = executor.executeDQL(sql.get());
+      152              List<BaselinePlan> bps = castToBaselinePlan(datas);
+      153              if (!hasInit) {
+      154                  bps.forEach(bp -> cache.put(bp.getId(), bp));
+      155                  allBaselineIds.addAll(bps.stream().map(bp -> new BaselineId(bp.getId(), bp.getBindSqlHash())).toList());
+      156              }
+      157              return bps;
+      158          } catch (Exception e) {
+      159              LOG.warn("sql plan baselines get all baseline fail", e);
+      160              return Collections.emptyList();
+      161          }
+      162      }
+      163  
+      164      public void storeBaselinePlan(List<BaselinePlan> plans) {
+      165          try {
+      166              if (!StatisticUtils.checkStatisticTables(List.of(StatsConstants.SPM_BASELINE_TABLE_NAME))) {
+      167                  return;
+      168              }
+      169              StringBuilder sb = new StringBuilder();
+      170              sb.append(INSERT_SQL).append(" ");
+      171              for (BaselinePlan plan : plans) {
+      172                  plan.setId(GlobalStateMgr.getCurrentState().getNextId());
+      173                  List<String> values = Lists.newArrayList();
+      174                  values.add(String.valueOf(plan.getId()));
+      175                  values.add(plan.isEnable() ? "true" : "false");
+      176                  values.add("'" + plan.getBindSql() + "'");
+      177                  values.add("'" + plan.getBindSqlDigest() + "'");
+      178                  values.add(String.valueOf(plan.getBindSqlHash()));
+      179                  values.add("'" + plan.getPlanSql() + "'");
+      180                  values.add(String.valueOf(plan.getCosts()));
+      181                  values.add(String.valueOf(plan.getQueryMs()));
+      182                  values.add("'" + plan.getSource() + "'");
+      183                  values.add("'" + DateUtils.formatDateTimeUnix(plan.getUpdateTime()) + "'");
+      184                  sb.append("(").append(String.join(",", values)).append("),");
+      185              }
+      186              sb.setLength(sb.length() - 1);
+      187              sb.append(";");
+      188              executor.executeDML(sb.toString());
+      189  
+      190              for (BaselinePlan plan : plans) {
+      191                  allBaselineIds.add(new BaselineId(plan.getId(), plan.getBindSqlHash()));
+      192              }
+      193  
+      194              BaselinePlan.Info info = new BaselinePlan.Info();
+      195              info.setReplayIds(plans.stream().map(BaselinePlan::getId).collect(Collectors.toList()));
+      196              info.setReplayBindSQLHash(plans.stream().map(BaselinePlan::getBindSqlHash).collect(Collectors.toList()));
+      197              GlobalStateMgr.getCurrentState().getEditLog().logCreateSPMBaseline(info);
+      198          } catch (Exception e) {
+      199              LOG.warn("sql plan baselines store baseline fail", e);
+      200          }
+      201      }
+      202  
+      203      public List<BaselinePlan> findBaselinePlan(String sqlDigest, long hash) {
+      204          init();
+      205          List<Long> ids = allBaselineIds.stream()
+      206                  .filter(baselineId -> baselineId.bindSQLHash == hash).map(f -> f.id).toList();
+      207          Map<Long, BaselinePlan> plans = cache.getAll(ids);
+      208          return plans.values().stream().filter(plan -> plan.getBindSqlDigest().equals(sqlDigest)).toList();
+      209      }
+      210  
+      211      public void dropBaselinePlan(List<Long> baseLineIds) {
+      212          try {
+      213              List<BaselineId> ids = allBaselineIds.stream().filter(b -> baseLineIds.contains(b.id)).toList();
+      214              for (BaselineId id : ids) {
+      215                  allBaselineIds.remove(id);
+      216                  cache.invalidate(id.id);
+      217              }
+      218              if (!StatisticUtils.checkStatisticTables(List.of(StatsConstants.SPM_BASELINE_TABLE_NAME))) {
+      219                  return;
+      220              }
+      221  
+      222              String s = ids.stream().map(BaselineId::id).map(String::valueOf).collect(Collectors.joining(","));
+      223              executor.executeDML(DELETE_SQL + "(" + s + ");");
+      224              BaselinePlan.Info p = new BaselinePlan.Info();
+      225              p.setReplayIds(ids.stream().map(BaselineId::id).collect(Collectors.toList()));
+      226              GlobalStateMgr.getCurrentState().getEditLog().logDropSPMBaseline(p);
+      227          } catch (Exception e) {
+      228              LOG.warn("sql plan baselines drop baseline fail", e);
+      229          }
+      230      }
+      231  
+      232      // for ut test use
+      233      public void dropAllBaselinePlans() {
+      234          allBaselineIds.clear();
+      235      }
+      236  
+      237      private List<BaselinePlan> castToBaselinePlan(List<TResultBatch> datas) {
+      238          List<BaselinePlan> result = Lists.newArrayList();
+      239          for (TResultBatch batch : ListUtils.emptyIfNull(datas)) {
+      240              for (ByteBuffer buffer : batch.getRows()) {
+      241                  ByteBuf copied = Unpooled.copiedBuffer(buffer);
+      242                  String jsonString = copied.toString(Charset.defaultCharset());
+      243                  /*
+      244                   * SPM baselines table
+      245                   * 0.id         | bigint
+      246                   * 1.enable     | boolean
+      247                   * 2.bind_sql   | varchar(65530)
+      248                   * 3.bind_sql_digest | varchar(65530)
+      249                   * 4.bind_sql_hash | bigint
+      250                   * 5.plan_sql   | varchar(65530)
+      251                   * 6.costs      | double
+      252                   * 7.query_ms   | double
+      253                   * 8.source     | varchar(100)
+      254                   * 9.update_time| datetime
+      255                   */
+      256                  JsonElement obj = JsonParser.parseString(jsonString);
+      257                  JsonArray data = obj.getAsJsonObject().get("data").getAsJsonArray();
+      258                  BaselinePlan bp =
+      259                          new BaselinePlan(data.get(2).getAsString(), data.get(3).getAsString(), data.get(4).getAsLong(),
+      260                                  data.get(5).getAsString(), data.get(6).getAsDouble());
+      261                  bp.setId(data.get(0).getAsLong());
+      262                  bp.setGlobal(true);
+      263                  bp.setEnable(data.get(1).getAsInt() == 1);
+      264                  bp.setQueryMs(data.get(7).getAsDouble());
+      265                  bp.setSource(data.get(8).getAsString());
+      266                  bp.setUpdateTime(DateUtils.parseUnixDateTime(data.get(9).getAsString()));
+      267                  result.add(bp);
+      268              }
+      269          }
+      270          return result;
+      271      }
+      272  
+      273      @Override
+      274      public void replayBaselinePlan(BaselinePlan.Info info, boolean isCreate) {
+      275          if (isCreate) {
+      276              for (int i = 0; i < info.getReplayIds().size(); i++) {
+      277                  allBaselineIds.add(new BaselineId(info.getReplayIds().get(i), info.getReplayBindSQLHash().get(i)));
+      278              }
+      279          } else {
+      280              allBaselineIds.removeIf(b -> info.getReplayIds().contains(b.id));
+      281          }
+      282      }
+      283  
+      284      public void replayUpdateBaselinePlan(BaselinePlan.Info info, boolean isEnable) {
+      285          // invalidate cache
+      286          cache.invalidateAll(info.getReplayIds());
+      287      }
+      288  
+      289      @Override
+      290      public void controlBaselinePlan(boolean isEnable, List<Long> baseLineIds) {
+      291          if (!StatisticUtils.checkStatisticTables(List.of(StatsConstants.SPM_BASELINE_TABLE_NAME))) {
+      292              return;
+      293          }
+      294          List<Long> ids = allBaselineIds.stream()
+      295                  .filter(b -> baseLineIds.contains(b.id))
+      296                  .map(BaselineId::id)
+      297                  .toList();
+      298          if (ids.isEmpty()) {
+      299              return;
+      300          }
+      301  
+      302          String sql = UPDATE_SQL + isEnable + " WHERE id IN (" +
+      303                  ids.stream().map(String::valueOf).collect(Collectors.joining(",")) + ");";
+      304          try {
+      305              executor.executeDML(sql);
+      306          } catch (Exception e) {
+      307              LOG.warn("sql plan baselines control baseline fail", e);
+      308          }
+      309  
+      310          BaselinePlan.Info p = new BaselinePlan.Info();
+      311          p.setReplayIds(ids);
+      312          GlobalStateMgr.getCurrentState().getEditLog().logUpdateSPMBaseline(p, isEnable);
+      313          // invalidate cache
+      314          cache.invalidateAll(ids);
+      315      }
+      316  
+      317      @Override
+      318      public List<BaselinePlan> queryBaselinePlan(List<String> sqlDigest, String source) {
+      319          if (sqlDigest.isEmpty()) {
+      320              return List.of();
+      321          }
+      322          if (!StatisticUtils.checkStatisticTables(List.of(StatsConstants.SPM_BASELINE_TABLE_NAME))) {
+      323              return Collections.emptyList();
+      324          }
+      325          StringBuilder sql = new StringBuilder(QUERY_SQL);
+      326          sql.append("WHERE ");
+      327          sql.append("source = ");
+      328          sql.append("'").append(source).append("'");
+      329  
+      330          sql.append(" and bind_sql_digest IN (");
+      331          sqlDigest.forEach(digest -> sql.append("'").append(digest).append("',"));
+      332          sql.setLength(sql.length() - 1);
+      333          sql.append(")");
+      334  
+      335          try {
+      336              List<TResultBatch> datas = executor.executeDQL(sql.toString());
+      337              return castToBaselinePlan(datas);
+      338          } catch (Exception e) {
+      339              LOG.warn("sql plan baselines get baseline failed, sql: " + sql, e);
+      340              return List.of();
+      341          }
+      342      }
+      343  
+      344      private class BaselinePlanLoader implements CacheLoader<Long, BaselinePlan> {
+      345          @Override
+      346          public BaselinePlan load(@NonNull Long key) {
+      347              try {
+      348                  if (!StatisticUtils.checkStatisticTables(List.of(StatsConstants.SPM_BASELINE_TABLE_NAME))) {
+      349                      return null;
+      350                  }
+      351                  List<TResultBatch> datas = executor.executeDQL(QUERY_SQL + "WHERE id = " + key + ";");
+      352                  if (!datas.isEmpty()) {
+      353                      return castToBaselinePlan(datas).get(0);
+      354                  }
+      355              } catch (Exception e) {
+      356                  LOG.warn("sql plan baselines load baseline fail", e);
+      357              }
+      358              return null;
+      359          }
+      360  
+      361          @NonNull
+      362          @Override
+      363          public Map<Long, BaselinePlan> loadAll(Iterable<? extends Long> keys) {
+      364              if (!StatisticUtils.checkStatisticTables(List.of(StatsConstants.SPM_BASELINE_TABLE_NAME))) {
+      365                  return Map.of();
+      366              }
+      367              List<String> ks = Lists.newArrayList();
+      368              keys.forEach(key -> ks.add(String.valueOf(key)));
+      369              try {
+      370                  List<TResultBatch> datas =
+      371                          executor.executeDQL(QUERY_SQL + "WHERE id IN (" + String.join(", ", ks) + ");");
+      372                  return castToBaselinePlan(datas).stream().collect(Collectors.toMap(BaselinePlan::getId, b -> b));
+      373              } catch (Exception e) {
+      374                  LOG.warn("sql plan baselines load all baseline fail", e);
+      375              }
+      376              return Map.of();
+      377          }
+      378      }
+      379  
+      380  }

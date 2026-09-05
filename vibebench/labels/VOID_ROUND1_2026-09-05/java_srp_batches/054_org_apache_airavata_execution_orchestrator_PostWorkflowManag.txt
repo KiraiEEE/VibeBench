@@ -1,0 +1,406 @@
+row 54   apache/airavata#599
+============================================================================
+CLASS org.apache.airavata.execution.orchestrator.PostWorkflowManager   loc=403 methods=11 wmc=49 lcom=0.2 c3=0.1548292740951855
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       55  public class PostWorkflowManager implements IServer {
+       56  
+       57      private static final Logger logger = LoggerFactory.getLogger(PostWorkflowManager.class);
+       58      private static final CountMonitor postwfCounter = new CountMonitor("post_wf_counter");
+       59  
+       60      private final WorkflowManager wfManager;
+       61      private final ExecutorService processingPool = Executors.newFixedThreadPool(10);
+       62      private IServer.ServerStatus status = IServer.ServerStatus.STOPPED;
+       63  
+       64      public PostWorkflowManager() throws ApplicationSettingsException {
+       65          wfManager = new WorkflowManager(
+       66                  ServerSettings.getSetting("post.workflow.manager.name"),
+       67                  Boolean.parseBoolean(ServerSettings.getSetting("post.workflow.manager.loadbalance.clusters")));
+       68      }
+       69  
+       70      public static void main(String[] args) throws Exception {
+       71  
+       72          if (ServerSettings.getBooleanSetting("post.workflow.manager.monitoring.enabled")) {
+       73              MonitoringServer monitoringServer = new MonitoringServer(
+       74                      ServerSettings.getSetting("post.workflow.manager.monitoring.host"),
+       75                      ServerSettings.getIntSetting("post.workflow.manager.monitoring.port"));
+       76              new Thread(monitoringServer, "monitoring-server").start();
+       77  
+       78              Runtime.getRuntime().addShutdownHook(new Thread(monitoringServer::stop));
+       79          }
+       80  
+       81          PostWorkflowManager postManager = new PostWorkflowManager();
+       82          postManager.run();
+       83      }
+       84  
+       85      private void init() throws Exception {
+       86          wfManager.initComponents();
+       87      }
+       88  
+       89      private Consumer<String, JobStatusResult> createConsumer() throws ApplicationSettingsException {
+       90          final Properties props = new Properties();
+       91          props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, ServerSettings.getSetting("kafka.broker.url"));
+       92          props.put(ConsumerConfig.GROUP_ID_CONFIG, ServerSettings.getSetting("job.monitor.broker.consumer.group"));
+       93          props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+       94          props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JobStatusResultDeserializer.class.getName());
+       95          props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+       96          props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 20);
+       97          // Create the consumer using props.
+       98          final Consumer<String, JobStatusResult> consumer = new KafkaConsumer<>(props);
+       99          // Subscribe to the topic.
+      100          consumer.subscribe(Collections.singletonList(ServerSettings.getSetting("job.monitor.broker.topic")));
+      101          return consumer;
+      102      }
+      103  
+      104      private boolean process(JobStatusResult jobStatusResult) {
+      105  
+      106          if (jobStatusResult == null) {
+      107              logger.error("Job result is null");
+      108              return false;
+      109          }
+      110  
+      111          RegistryService.Client registryClient =
+      112                  wfManager.getRegistryClientPool().getResource();
+      113  
+      114          var jobId = jobStatusResult.getJobId();
+      115          var jobName = jobStatusResult.getJobName();
+      116          var jobState = jobStatusResult.getState();
+      117          var publisherId = jobStatusResult.getPublisherName();
+      118          logger.info("processing JobStatusUpdate<{}> from {}: {}", jobId, publisherId, jobStatusResult);
+      119  
+      120          try {
+      121              List<JobModel> jobs = registryClient.getJobs("jobId", jobId);
+      122              logger.info("Found {} jobs in registry with id={}", jobs.size(), jobId);
+      123              if (!jobs.isEmpty()) {
+      124                  jobs = jobs.stream()
+      125                          .filter(jm -> jm.getJobName().equals(jobName))
+      126                          .toList();
+      127                  logger.info("Found {} jobs in registry with id={} and name={}", jobs.size(), jobId, jobName);
+      128              }
+      129              if (jobs.size() != 1) {
+      130                  logger.error("Found {} job(s) in registry with id={} and name={}", jobs.size(), jobId, jobName);
+      131                  wfManager.getRegistryClientPool().returnResource(registryClient);
+      132                  return false;
+      133              }
+      134              JobModel jobModel = jobs.get(0);
+      135              ProcessModel processModel = registryClient.getProcess(jobModel.getProcessId());
+      136              ExperimentModel experimentModel = registryClient.getExperiment(processModel.getExperimentId());
+      137              ProcessStatus processStatus = registryClient.getProcessStatus(processModel.getProcessId());
+      138  
+      139              var processState = processStatus.getState();
+      140              wfManager.getRegistryClientPool().returnResource(registryClient);
+      141  
+      142              if (experimentModel != null) {
+      143                  jobModel.getJobStatuses()
+      144                          .sort(Comparator.comparingLong(JobStatus::getTimeOfStateChange)
+      145                                  .reversed());
+      146                  JobState currentJobStatus = jobModel.getJobStatuses().get(0).getJobState();
+      147                  logger.info("Last known state of job {} is {}", jobId, jobName);
+      148  
+      149                  if (!JobStateValidator.isValid(currentJobStatus, jobState)) {
+      150                      logger.warn("JobStatusUpdate<{}> invalid. prev={} -> new={}", jobId, currentJobStatus, jobState);
+      151                      return true;
+      152                  }
+      153  
+      154                  String task = jobModel.getTaskId();
+      155                  String processId = processModel.getProcessId();
+      156                  String gateway = experimentModel.getGatewayId();
+      157                  String experimentId = experimentModel.getExperimentId();
+      158  
+      159                  logger.info(
+      160                          "saving JobStatusUpdate<{}>: pid={}, eid={}, gw={}, state={}",
+      161                          jobId,
+      162                          processId,
+      163                          experimentId,
+      164                          gateway,
+      165                          jobState);
+      166                  saveAndPublishJobStatus(jobId, task, processId, experimentId, gateway, jobState);
+      167  
+      168                  // TODO get cluster lock before that
+      169                  if (ProcessState.CANCELLING.equals(processState) || ProcessState.CANCELED.equals(processState)) {
+      170                      logger.info("Cancelled post workflow for process {} in experiment {}", processId, experimentId);
+      171                      // This will mark a canceling Experiment with CANCELED status for a set of valid job statuses
+      172                      // This is a safety check. Cancellation is originally handled in Job Cancellation Workflow
+      173                      switch (jobState) {
+      174                          case FAILED:
+      175                          case SUSPENDED:
+      176                          case CANCELED:
+      177                          case COMPLETE:
+      178                              logger.info("canceled job={}: eid={}, state={}", jobId, experimentId, jobState);
+      179                              wfManager.publishProcessStatus(processId, experimentId, gateway, ProcessState.CANCELED);
+      180                              break;
+      181                          default:
+      182                              logger.warn("skipping job={}: eid={}, state={}", jobId, experimentId, jobState);
+      183                      }
+      184                  } else {
+      185                      logger.info("Job {} is in state={}", jobId, jobState);
+      186                      if (jobState == JobState.COMPLETE || jobState == JobState.FAILED) {
+      187                          // If Job has FAILED, still run output staging tasks to debug the reason for failure. And
+      188                          // update the experiment status as COMPLETED as job failures are unrelated to Airavata scope.
+      189                          logger.info("running PostWorkflow for process {} of experiment {}", processId, experimentId);
+      190                          executePostWorkflow(processId, gateway, false);
+      191  
+      192                      } else if (jobStatusResult.getState() == JobState.CANCELED) {
+      193                          logger.info("Setting process {} of experiment {} to state=CANCELED", processId, experimentId);
+      194                          wfManager.publishProcessStatus(processId, experimentId, gateway, ProcessState.CANCELED);
+      195                      }
+      196                  }
+      197                  return true;
+      198              } else {
+      199                  logger.warn("Could not find a monitoring register for job id {}", jobId);
+      200                  return false;
+      201              }
+      202          } catch (Exception e) {
+      203              logger.error(
+      204                      "Failed to process job: {}, with status : {}",
+      205                      jobStatusResult.getJobId(),
+      206                      jobStatusResult.getState().name(),
+      207                      e);
+      208              wfManager.getRegistryClientPool().returnBrokenResource(registryClient);
+      209              return false;
+      210          }
+      211      }
+      212  
+      213      private void executePostWorkflow(String processId, String gateway, boolean forceRun) throws Exception {
+      214  
+      215          postwfCounter.inc();
+      216          RegistryService.Client registryClient =
+      217                  wfManager.getRegistryClientPool().getResource();
+      218  
+      219          ProcessModel processModel;
+      220          ExperimentModel experimentModel;
+      221          HelixTaskFactory taskFactory;
+      222          try {
+      223              processModel = registryClient.getProcess(processId);
+      224              var experimentId = processModel.getExperimentId();
+      225              var crId = processModel.getComputeResourceId();
+      226              var grpId = processModel.getGroupResourceProfileId();
+      227  
+      228              experimentModel = registryClient.getExperiment(experimentId);
+      229              ResourceType resourceType = registryClient
+      230                      .getGroupComputeResourcePreference(crId, grpId)
+      231                      .getResourceType();
+      232  
+      233              taskFactory = TaskFactory.getFactory(resourceType);
+      234              logger.info("Initialized task factory for resource type {} for process {}", resourceType, processId);
+      235  
+      236          } catch (Exception e) {
+      237              logger.error("Failed to fetch experiment/process from registry for pid={}", processId, e);
+      238              throw new Exception("Failed to fetch experiment/process from registry for pid=" + processId, e);
+      239          } finally {
+      240              wfManager.getRegistryClientPool().returnResource(registryClient);
+      241          }
+      242  
+      243          String taskDag = processModel.getTaskDag();
+      244          List<TaskModel> taskList = processModel.getTasks();
+      245  
+      246          String[] taskIds = taskDag.split(",");
+      247          final List<AiravataTask> allTasks = new ArrayList<>();
+      248  
+      249          AiravataTask jobVerificationTask = taskFactory.createJobVerificationTask(processId);
+      250          jobVerificationTask.setGatewayId(experimentModel.getGatewayId());
+      251          jobVerificationTask.setExperimentId(experimentModel.getExperimentId());
+      252          jobVerificationTask.setProcessId(processModel.getProcessId());
+      253          jobVerificationTask.setTaskId("Job-Verification-Task-" + UUID.randomUUID() + "-");
+      254          jobVerificationTask.setForceRunTask(forceRun);
+      255          jobVerificationTask.setSkipAllStatusPublish(true);
+      256  
+      257          allTasks.add(jobVerificationTask);
+      258  
+      259          boolean jobSubmissionFound = false;
+      260  
+      261          for (String taskId : taskIds) {
+      262              Optional<TaskModel> model = taskList.stream()
+      263                      .filter(taskModel -> taskModel.getTaskId().equals(taskId))
+      264                      .findFirst();
+      265  
+      266              if (model.isPresent()) {
+      267                  TaskModel taskModel = model.get();
+      268                  AiravataTask airavataTask = null;
+      269                  if (taskModel.getTaskType() == TaskTypes.JOB_SUBMISSION) {
+      270                      jobSubmissionFound = true;
+      271                  } else if (taskModel.getTaskType() == TaskTypes.DATA_STAGING) {
+      272                      if (jobSubmissionFound) {
+      273                          DataStagingTaskModel subTaskModel =
+      274                                  (DataStagingTaskModel) ThriftUtils.getSubTaskModel(taskModel);
+      275                          assert subTaskModel != null;
+      276                          switch (subTaskModel.getType()) {
+      277                              case OUPUT:
+      278                                  airavataTask = taskFactory.createOutputDataStagingTask(processId);
+      279                                  airavataTask.setForceRunTask(true);
+      280                                  break;
+      281                              case ARCHIVE_OUTPUT:
+      282                                  airavataTask = taskFactory.createArchiveTask(processId);
+      283                                  airavataTask.setForceRunTask(true);
+      284                                  break;
+      285                          }
+      286                      }
+      287                  }
+      288  
+      289                  if (airavataTask != null) {
+      290                      airavataTask.setGatewayId(experimentModel.getGatewayId());
+      291                      airavataTask.setExperimentId(experimentModel.getExperimentId());
+      292                      airavataTask.setProcessId(processModel.getProcessId());
+      293                      airavataTask.setTaskId(taskModel.getTaskId());
+      294                      airavataTask.setRetryCount(taskModel.getMaxRetry());
+      295                      if (allTasks.size() > 0) {
+      296                          allTasks.get(allTasks.size() - 1)
+      297                                  .setNextTask(new OutPort(airavataTask.getTaskId(), airavataTask));
+      298                      }
+      299                      allTasks.add(airavataTask);
+      300                  }
+      301              }
+      302          }
+      303  
+      304          AiravataTask completingTask = taskFactory.createCompletingTask(processId);
+      305          completingTask.setGatewayId(experimentModel.getGatewayId());
+      306          completingTask.setExperimentId(experimentModel.getExperimentId());
+      307          completingTask.setProcessId(processModel.getProcessId());
+      308          completingTask.setTaskId("Completing-Task-" + UUID.randomUUID() + "-");
+      309          completingTask.setForceRunTask(forceRun);
+      310          completingTask.setSkipAllStatusPublish(true);
+      311          if (allTasks.size() > 0) {
+      312              allTasks.get(allTasks.size() - 1).setNextTask(new OutPort(completingTask.getTaskId(), completingTask));
+      313          }
+      314          allTasks.add(completingTask);
+      315  
+      316          AiravataTask parsingTriggeringTask = taskFactory.createParsingTriggeringTask(processId);
+      317          parsingTriggeringTask.setGatewayId(experimentModel.getGatewayId());
+      318          parsingTriggeringTask.setExperimentId(experimentModel.getExperimentId());
+      319          parsingTriggeringTask.setProcessId(processModel.getProcessId());
+      320          parsingTriggeringTask.setTaskId("Parsing-Triggering-Task");
+      321          parsingTriggeringTask.setSkipAllStatusPublish(true);
+      322          if (allTasks.size() > 0) {
+      323              allTasks.get(allTasks.size() - 1)
+      324                      .setNextTask(new OutPort(parsingTriggeringTask.getTaskId(), parsingTriggeringTask));
+      325          }
+      326          allTasks.add(parsingTriggeringTask);
+      327  
+      328          String workflowName = wfManager
+      329                  .getWorkflowOperator()
+      330                  .launchWorkflow(processId + "-POST-" + UUID.randomUUID(), new ArrayList<>(allTasks), true, false);
+      331  
+      332          wfManager.registerWorkflowForProcess(processId, workflowName, "POST");
+      333      }
+      334  
+      335      @Override
+      336      public void run() {
+      337          status = ServerStatus.STARTED;
+      338          try {
+      339              startServer();
+      340          } catch (Exception e) {
+      341              logger.error("PostWorkflowManager failed", e);
+      342              status = ServerStatus.FAILED;
+      343          }
+      344      }
+      345  
+      346      private void startServer() throws Exception {
+      347  
+      348          init();
+      349          final Consumer<String, JobStatusResult> consumer = createConsumer();
+      350          new Thread(() -> {
+      351                      while (true) {
+      352                          final ConsumerRecords<String, JobStatusResult> consumerRecords = consumer.poll(Long.MAX_VALUE);
+      353                          var executorCompletionService = new ExecutorCompletionService<>(processingPool);
+      354                          var processingFutures = new ArrayList<>();
+      355  
+      356                          for (var topicPartition : consumerRecords.partitions()) {
+      357                              var partitionRecords = consumerRecords.records(topicPartition);
+      358                              logger.info("Received job records {}", partitionRecords.size());
+      359  
+      360                              for (var record : partitionRecords) {
+      361                                  var topic = topicPartition.topic();
+      362                                  var partition = topicPartition.partition();
+      363                                  var key = record.key();
+      364                                  var value = record.value();
+      365                                  logger.info("received post on {}/{}: {}->{}", topic, partition, key, value);
+      366                                  logger.info(
+      367                                          "Submitting {} to process in thread pool",
+      368                                          record.value().getJobId());
+      369  
+      370                                  // This avoids kafka read thread to wait until processing is completed before committing
+      371                                  // There is a risk of missing 20 messages in case of a restart, but this improves the
+      372                                  // robustness of the kafka read thread by avoiding wait timeouts
+      373                                  processingFutures.add(executorCompletionService.submit(() -> {
+      374                                      boolean success = process(record.value());
+      375                                      logger.info(
+      376                                              "Status of processing {} : {}",
+      377                                              record.value().getJobId(),
+      378                                              success);
+      379                                      return success;
+      380                                  }));
+      381  
+      382                                  consumer.commitSync(Collections.singletonMap(
+      383                                          topicPartition, new OffsetAndMetadata(record.offset() + 1)));
+      384                              }
+      385                          }
+      386  
+      387                          for (var f : processingFutures) {
+      388                              try {
+      389                                  executorCompletionService.take().get();
+      390                              } catch (Exception e) {
+      391                                  logger.error("Failed processing job", e);
+      392                              }
+      393                          }
+      394                          logger.info("All messages processed. Moving to next round");
+      395                      }
+      396                  })
+      397                  .start();
+      398      }
+      399  
+      400      private void saveAndPublishJobStatus(
+      401              String jobId, String taskId, String processId, String experimentId, String gateway, JobState jobState)
+      402              throws Exception {
+      403          try {
+      404  
+      405              JobStatus jobStatus = new JobStatus();
+      406              jobStatus.setReason(jobState.name());
+      407              jobStatus.setTimeOfStateChange(AiravataUtils.getCurrentTimestamp().getTime());
+      408              jobStatus.setJobState(jobState);
+      409  
+      410              if (jobStatus.getTimeOfStateChange() == 0 || jobStatus.getTimeOfStateChange() > 0) {
+      411                  jobStatus.setTimeOfStateChange(
+      412                          AiravataUtils.getCurrentTimestamp().getTime());
+      413              } else {
+      414                  jobStatus.setTimeOfStateChange(jobStatus.getTimeOfStateChange());
+      415              }
+      416  
+      417              RegistryService.Client registryClient =
+      418                      wfManager.getRegistryClientPool().getResource();
+      419  
+      420              try {
+      421                  registryClient.addJobStatus(jobStatus, taskId, jobId);
+      422                  wfManager.getRegistryClientPool().returnResource(registryClient);
+      423  
+      424              } catch (Exception e) {
+      425                  logger.error("Failed to add job status " + jobId, e);
+      426                  wfManager.getRegistryClientPool().returnBrokenResource(registryClient);
+      427              }
+      428  
+      429              JobIdentifier identifier = new JobIdentifier(jobId, taskId, processId, experimentId, gateway);
+      430  
+      431              JobStatusChangeEvent jobStatusChangeEvent = new JobStatusChangeEvent(jobStatus.getJobState(), identifier);
+      432              MessageContext msgCtx = new MessageContext(
+      433                      jobStatusChangeEvent, MessageType.JOB, AiravataUtils.getId(MessageType.JOB.name()), gateway);
+      434              msgCtx.setUpdatedTime(AiravataUtils.getCurrentTimestamp());
+      435              wfManager.getStatusPublisher().publish(msgCtx);
+      436  
+      437          } catch (Exception e) {
+      438              throw new Exception("Error persisting job status " + e.getLocalizedMessage(), e);
+      439          }
+      440      }
+      441  
+      442      @Override
+      443      public String getName() {
+      444          return "post_workflow_manager";
+      445      }
+      446  
+      447      @Override
+      448      public void stop() throws Exception {
+      449          status = ServerStatus.STOPPING;
+      450          status = ServerStatus.STOPPED;
+      451      }
+      452  
+      453      @Override
+      454      public ServerStatus getStatus() {
+       ... truncated at 400 lines ...

@@ -1,0 +1,986 @@
+row 85   ArcadeData/arcadedb#3756
+============================================================================
+CONTRACT com.arcadedb.query.QueryEngine   members=6.0 implementers=10.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       29  @ExcludeFromJacocoGeneratedReport
+       30  public interface QueryEngine {
+       31    interface AnalyzedQuery {
+       32      boolean isIdempotent();
+       33  
+       34      boolean isDDL();
+       35  
+       36      /**
+       37       * Returns the set of operation types this query performs.
+       38       * Provides semantic, parser-based classification of query operations
+       39       * for fine-grained permission checking.
+       40       *
+       41       * @return a non-empty set of {@link OperationType} values
+       42       */
+       43      default Set<OperationType> getOperationTypes() {
+       44        if (isDDL())
+       45          return CollectionUtils.singletonSet(OperationType.SCHEMA);
+       46        if (isIdempotent())
+       47          return CollectionUtils.singletonSet(OperationType.READ);
+       48        // Fallback: non-idempotent, non-DDL commands that don't override this method
+       49        return Set.of(OperationType.CREATE, OperationType.UPDATE, OperationType.DELETE);
+       50      }
+       51  
+       52      /**
+       53       * Executes this analyzed query, reusing the already-parsed AST to avoid double parsing.
+       54       * Returns null if direct execution is not supported, in which case the caller should
+       55       * fall back to the standard query/command methods.
+       56       */
+       57      default ResultSet execute(final Map<String, Object> parameters) {
+       58        return null;
+       59      }
+       60    }
+       61  
+       62    @ExcludeFromJacocoGeneratedReport
+       63    interface QueryEngineFactory {
+       64      String getLanguage();
+       65  
+       66      QueryEngine getInstance(DatabaseInternal database);
+       67    }
+       68  
+       69    String getLanguage();
+       70  
+       71    AnalyzedQuery analyze(String query);
+       72  
+       73    ResultSet query(String query, ContextConfiguration configuration, Map<String, Object> parameters);
+       74  
+       75    /**
+       76     * Optimized overload for queries with no parameters - avoids varargs array allocation.
+       77     */
+       78    default ResultSet query(String query, ContextConfiguration configuration) {
+       79      return query(query, configuration, Collections.emptyMap());
+       80    }
+       81  
+       82    ResultSet query(String query, ContextConfiguration configuration, Object... parameters);
+       83  
+       84    ResultSet command(String query, ContextConfiguration configuration, Map<String, Object> parameters);
+       85  
+       86    /**
+       87     * Optimized overload for commands with no parameters - avoids varargs array allocation.
+       88     */
+       89    default ResultSet command(String query, ContextConfiguration configuration) {
+       90      return command(query, configuration, Collections.emptyMap());
+       91    }
+       92  
+       93    ResultSet command(String query, ContextConfiguration configuration, Object... parameters);
+       94  
+       95    default QueryEngine registerFunctions(final String function) {
+       96      return this;
+       97    }
+       98  
+       99    default QueryEngine unregisterFunctions() {
+      100      return this;
+      101    }
+      102  
+      103    default boolean isExecutedByTheLeader() {
+      104      return false;
+      105    }
+      106  
+      107    default boolean isReusable() {
+      108      return true;
+      109    }
+      110  
+      111    default void close() {
+      112      // NO OPERATIONS
+      113    }
+      114  }
+
+---------- IMPLEMENTER com.arcadedb.query.java.JavaQueryEngine  stubs=2/6 ----------
+       37  public class JavaQueryEngine implements QueryEngine {
+       38    public static final String                       ENGINE_NAME       = "java";
+       39    private final       long                         timeout;
+       40    private final       ThreadPoolExecutor           userCodeExecutor;
+       41    private final       ArrayBlockingQueue<Runnable> userCodeExecutorQueue;
+       42    private final       Set<String>                  registeredClasses = new HashSet<>();
+       43    private final       Set<String>                  registeredMethods = new HashSet<>();
+       44  
+       45    private static final AnalyzedQuery ANALYZED_QUERY = new AnalyzedQuery() {
+       46      @Override
+       47      public boolean isIdempotent() {
+       48        return false;
+       49      }
+       50  
+       51      @Override
+       52      public boolean isDDL() {
+       53        return false;
+       54      }
+       55    };
+       56  
+       57    /**
+       58     * Registers a class to be used in a query via Java reflection.
+       59     *
+       60     * @param classFullName Full name of the class (with package). For inner classes, use $ as separator, example: `com.arcadedb.query.java.JavaFunctionsTest$Sum`.
+       61     *
+       62     * @return
+       63     */
+       64    @Override
+       65    public JavaQueryEngine registerFunctions(final String classFullName) {
+       66      if (classFullName.indexOf("::") > -1)
+       67        registeredMethods.add(classFullName);
+       68      else
+       69        registeredClasses.add(classFullName);
+       70  
+       71      return this;
+       72    }
+       73  
+       74    /**
+       75     * Unregister a class to be not used by the Java Query engine.
+       76     */
+       77    @Override
+       78    public QueryEngine unregisterFunctions() {
+       79      registeredClasses.clear();
+       80      registeredMethods.clear();
+       81      return this;
+       82    }
+       83  
+       84    public static class JavaQueryEngineFactory implements QueryEngineFactory {
+       85      @Override
+       86      public String getLanguage() {
+       87        return ENGINE_NAME;
+       88      }
+       89  
+       90      @Override
+       91      public QueryEngine getInstance(final DatabaseInternal database) {
+       92        return new JavaQueryEngine(database);
+       93      }
+       94    }
+       95  
+       96    protected JavaQueryEngine(final DatabaseInternal database) {
+       97      this.userCodeExecutorQueue = new ArrayBlockingQueue<>(1_000);
+       98      this.userCodeExecutor = new ThreadPoolExecutor(8, 8, 30, TimeUnit.SECONDS, userCodeExecutorQueue, new ThreadPoolExecutor.CallerRunsPolicy());
+       99      this.timeout = database.getConfiguration().getValueAsLong(GlobalConfiguration.POLYGLOT_COMMAND_TIMEOUT);
+      100    }
+      101  
+      102    @Override
+      103    public void close() {
+      104      userCodeExecutor.shutdown();
+      105      userCodeExecutorQueue.clear();
+      106    }
+      107  
+      108    @Override
+      109    public ResultSet command(final String query, ContextConfiguration configuration, final Object... parameters) {
+      110      try {
+      111        return executeUserCode(() -> {
+      112  
+      113          final String[] parts = query.split("::");
+      114          if (parts.length != 2)
+      115            throw new CommandParsingException(
+      116                "Java function name '" + query + "' must contain the full package of the class, :: and the method. Example: org.acme.Math::sum");
+      117  
+      118          if (!registeredMethods.contains(query)) {
+      119            if (!registeredClasses.contains(parts[0]))
+      120              throw new SecurityException("The Java class '" + parts[0] + "' or the method '" + query
+      121                  + "' was not registered to be used by the Java Query engine. Please register it before using.");
+      122          }
+      123  
+      124          final Class<?> impl = Class.forName(parts[0]);
+      125  
+      126          final Object[] parameterArray = new Object[parameters.length];
+      127  
+      128          // LOOK FOR THE RIGHT METHOD TO INVOKE
+      129          final Method rightMethod = searchMethod(parts, impl, parameterArray, parameters);
+      130  
+      131          if (rightMethod == null)
+      132            throw new NoSuchMethodException(
+      133                "Java function '" + query + "' not found on classpath (class '" + parts[0] + "' method '" + parts[1] + "' with parameters " + Arrays.toString(
+      134                    parameters) + ")");
+      135  
+      136          final Object instance = Modifier.isStatic(rightMethod.getModifiers()) ? null : impl.getConstructor().newInstance();
+      137  
+      138          final Object result = rightMethod.invoke(instance, parameterArray);
+      139  
+      140          final InternalResultSet resultSet;
+      141          if (result instanceof ResultSet)
+      142            resultSet = (InternalResultSet) result;
+      143          else if (result instanceof Iterable iterable) {
+      144            resultSet = new InternalResultSet();
+      145            for (final Object o : iterable)
+      146              resultSet.add(extractResult(o));
+      147          } else {
+      148            resultSet = new InternalResultSet();
+      149            resultSet.add(extractResult(result));
+      150          }
+      151  
+      152          return resultSet;
+      153  
+      154        }, timeout);
+      155  
+      156      } catch (final CommandExecutionException e) {
+      157        throw e;
+      158      } catch (final ExecutionException e) {
+      159        // USE THE UNDERLYING CAUSE BYPASSING THE NOT RELEVANT EXECUTION EXCEPTION
+      160        throw new CommandExecutionException("Error on executing user code", e.getCause());
+      161      } catch (final Exception e) {
+      162        throw new CommandExecutionException("Error on executing user code", e);
+      163      }
+      164  
+      165    }
+      166  
+      167    private Method searchMethod(final String[] parts, final Class<?> impl, final Object[] parameterArray, final Object[] parameters) {
+      168      Method rightMethod = null;
+      169      for (final Method method : impl.getMethods()) {
+      170        if (method.getName().equals(parts[1])) {
+      171          if (method.getParameterCount() == parameters.length) {
+      172  
+      173            // RESET PARAMETER ARRAY
+      174            Arrays.fill(parameterArray, null);
+      175  
+      176            boolean allParamsMatch = true;
+      177            final Parameter[] methodParameters = method.getParameters();
+      178            for (int i = 0; i < methodParameters.length; i++) {
+      179              final Object parameterValue = parameters[i];
+      180              if (parameterValue == null)
+      181                continue;
+      182  
+      183              final Parameter methodParameter = methodParameters[i];
+      184  
+      185              parameterArray[i] = parameterValue;
+      186  
+      187              final Class<?> methodParameterType = methodParameter.getType();
+      188              final Class<?> parameterValueClass = parameterValue.getClass();
+      189  
+      190              if (!parameterValueClass.isAssignableFrom(methodParameterType)) {
+      191                if (methodParameterType.isPrimitive()) {
+      192                  // CHECK FOR AUTOBOXING
+      193                  if (methodParameterType.equals(Integer.TYPE)) {
+      194                    if (!parameterValueClass.equals(Integer.class))
+      195                      allParamsMatch = false;
+      196                  } else if (methodParameterType.equals(Long.TYPE)) {
+
+---------- IMPLEMENTER com.arcadedb.query.opencypher.query.OpenCypherQueryEngine  stubs=0/6 ----------
+       57  public class OpenCypherQueryEngine implements QueryEngine {
+       58    public static final String ENGINE_NAME = "opencypher";
+       59  
+       60    // Shared stateless components - thread-safe and reusable
+       61    private static final DefaultSQLFunctionFactory SQL_FUNCTION_FACTORY = DefaultSQLFunctionFactory.getInstance();
+       62    private static final CypherFunctionFactory CYPHER_FUNCTION_FACTORY = new CypherFunctionFactory(SQL_FUNCTION_FACTORY);
+       63    private static final ExpressionEvaluator EXPRESSION_EVALUATOR = new ExpressionEvaluator(CYPHER_FUNCTION_FACTORY);
+       64  
+       65    private final DatabaseInternal database;
+       66  
+       67    protected OpenCypherQueryEngine(final DatabaseInternal database) {
+       68      this.database = database;
+       69    }
+       70  
+       71    @Override
+       72    public String getLanguage() {
+       73      return ENGINE_NAME;
+       74    }
+       75  
+       76    @Override
+       77    public AnalyzedQuery analyze(final String query) {
+       78      try {
+       79        // Use statement cache to avoid re-parsing
+       80        final CypherStatement statement = database.getCypherStatementCache().get(query);
+       81  
+       82        return new AnalyzedQuery() {
+       83          @Override
+       84          public boolean isIdempotent() {
+       85            return statement.isReadOnly();
+       86          }
+       87  
+       88          @Override
+       89          public boolean isDDL() {
+       90            return statement instanceof CypherDDLStatement;
+       91          }
+       92  
+       93          @Override
+       94          public Set<OperationType> getOperationTypes() {
+       95            if (statement instanceof CypherAdminStatement)
+       96              return CollectionUtils.singletonSet(OperationType.ADMIN);
+       97            if (statement instanceof CypherDDLStatement)
+       98              return CollectionUtils.singletonSet(OperationType.SCHEMA);
+       99            if (statement.isReadOnly())
+      100              return CollectionUtils.singletonSet(OperationType.READ);
+      101  
+      102            final EnumSet<OperationType> ops = EnumSet.noneOf(OperationType.class);
+      103            if (statement.hasCreate())
+      104              ops.add(OperationType.CREATE);
+      105            if (statement.hasMerge()) {
+      106              ops.add(OperationType.CREATE);
+      107              ops.add(OperationType.UPDATE);
+      108            }
+      109            if (statement.hasDelete())
+      110              ops.add(OperationType.DELETE);
+      111            if (statement.getSetClause() != null && !statement.getSetClause().isEmpty())
+      112              ops.add(OperationType.UPDATE);
+      113            if (!statement.getRemoveClauses().isEmpty())
+      114              ops.add(OperationType.UPDATE);
+      115            return ops.isEmpty() ? Set.of(OperationType.CREATE, OperationType.UPDATE, OperationType.DELETE) : Set.copyOf(ops);
+      116          }
+      117        };
+      118      } catch (final Exception e) {
+      119        throw new CommandParsingException("Error analyzing Cypher query: " + query, e);
+      120      }
+      121    }
+      122  
+      123    @Override
+      124    public ResultSet query(final String query, final ContextConfiguration configuration, final Map<String, Object> parameters) {
+      125      try {
+      126        // Check for EXPLAIN or PROFILE prefix
+      127        String actualQuery = query.trim();
+      128        final String upperQuery = actualQuery.toUpperCase();
+      129        boolean explain = false;
+      130        boolean profile = false;
+      131  
+      132        if (upperQuery.startsWith("EXPLAIN ")) {
+      133          explain = true;
+      134          actualQuery = actualQuery.substring(8).trim();
+      135        } else if (upperQuery.startsWith("PROFILE ")) {
+      136          profile = true;
+      137          actualQuery = actualQuery.substring(8).trim();
+      138        }
+      139  
+      140        // Also check for $profileExecution parameter (set by HTTP handler when Studio sends profileExecution: "detailed")
+      141        if (!profile && parameters != null && Boolean.TRUE.equals(parameters.get("$profileExecution")))
+      142          profile = true;
+      143  
+      144        // Use statement cache to avoid re-parsing
+      145        final CypherStatement statement = database.getCypherStatementCache().get(actualQuery);
+      146  
+      147        if (!statement.isReadOnly())
+      148          throw new QueryNotIdempotentException("Query '" + query + "' is not idempotent");
+      149  
+      150        return execute(actualQuery, statement, configuration, parameters, explain, profile);
+      151      } catch (final QueryNotIdempotentException | CommandExecutionException | CommandParsingException | SecurityException e) {
+      152        throw e;
+      153      } catch (final Exception e) {
+      154        throw new CommandExecutionException("Error executing Cypher query: " + query, e);
+      155      }
+      156    }
+      157  
+      158    @Override
+      159    public ResultSet query(final String query, final ContextConfiguration configuration, final Object... parameters) {
+      160      return query(query, configuration, convertPositionalParameters(parameters));
+      161    }
+      162  
+      163    @Override
+      164    public ResultSet command(final String query, final ContextConfiguration configuration, final Map<String, Object> parameters) {
+      165      try {
+      166        // Check for EXPLAIN or PROFILE prefix
+      167        String actualQuery = query.trim();
+      168        final String upperQuery = actualQuery.toUpperCase();
+      169        boolean explain = false;
+      170        boolean profile = false;
+      171  
+      172        if (upperQuery.startsWith("EXPLAIN ")) {
+      173          explain = true;
+      174          actualQuery = actualQuery.substring(8).trim();
+      175        } else if (upperQuery.startsWith("PROFILE ")) {
+      176          profile = true;
+      177          actualQuery = actualQuery.substring(8).trim();
+      178        }
+      179  
+      180        // Also check for $profileExecution parameter (set by HTTP handler when Studio sends profileExecution: "detailed")
+      181        if (!profile && parameters != null && Boolean.TRUE.equals(parameters.get("$profileExecution")))
+      182          profile = true;
+      183  
+      184        // Use statement cache to avoid re-parsing
+      185        final CypherStatement statement = database.getCypherStatementCache().get(actualQuery);
+      186  
+      187        // DDL statements (constraints) are executed directly without the planner pipeline
+      188        if (statement instanceof CypherDDLStatement)
+      189          return executeDDL((CypherDDLStatement) statement);
+      190  
+      191        // Admin statements (user management) are executed directly against the security manager
+      192        if (statement instanceof CypherAdminStatement)
+      193          return executeAdmin((CypherAdminStatement) statement);
+      194  
+      195        return execute(actualQuery, statement, configuration, parameters, explain, profile);
+      196      } catch (final CommandExecutionException | CommandParsingException | SecurityException e) {
+      197        throw e;
+      198      } catch (final Exception e) {
+      199        throw new CommandExecutionException("Error executing Cypher command: " + query, e);
+      200      }
+      201    }
+      202  
+      203    @Override
+      204    public ResultSet command(final String query, final ContextConfiguration configuration, final Object... parameters) {
+      205      return command(query, configuration, convertPositionalParameters(parameters));
+      206    }
+      207  
+      208    /**
+      209     * Executes a parsed Cypher statement.
+      210     *
+      211     * @param queryString   the original query string (for plan cache key)
+      212     * @param statement     the parsed Cypher statement
+      213     * @param configuration context configuration
+      214     * @param parameters    query parameters
+      215     * @param explain       if true, return EXPLAIN output instead of executing
+      216     * @param profile       if true, execute with profiling and return metrics
+
+---------- IMPLEMENTER com.arcadedb.query.polyglot.PolyglotQueryEngine  stubs=2/6 ----------
+       37  public class PolyglotQueryEngine implements QueryEngine {
+       38    private       GraalPolyglotEngine          polyglotEngine;
+       39    private final String                       language;
+       40    private final long                         timeout;
+       41    private final DatabaseInternal             database;
+       42    private       List<String>                 allowedPackages = null;
+       43    private final ExecutorService              userCodeExecutor;
+       44    private final ArrayBlockingQueue<Runnable> userCodeExecutorQueue;
+       45  
+       46    private static final AnalyzedQuery ANALYZED_QUERY = new AnalyzedQuery() {
+       47      @Override
+       48      public boolean isIdempotent() {
+       49        return false;
+       50      }
+       51  
+       52      @Override
+       53      public boolean isDDL() {
+       54        return false;
+       55      }
+       56    };
+       57  
+       58    public static class PolyglotQueryEngineFactory implements QueryEngineFactory {
+       59      private final String       language;
+       60      private       List<String> allowedPackages = null;
+       61  
+       62      public PolyglotQueryEngineFactory(final String language) {
+       63        this.language = language;
+       64      }
+       65  
+       66      public PolyglotQueryEngineFactory setAllowedPackages(final List<String> allowedPackages) {
+       67        this.allowedPackages = allowedPackages;
+       68        return this;
+       69      }
+       70  
+       71      @Override
+       72      public String getLanguage() {
+       73        return language;
+       74      }
+       75  
+       76      @Override
+       77      public QueryEngine getInstance(final DatabaseInternal database) {
+       78        return new PolyglotQueryEngine(database, language, allowedPackages);
+       79      }
+       80  
+       81      public static Iterable<String> getSupportedLanguages() {
+       82        return GraalPolyglotEngine.getSupportedLanguages();
+       83      }
+       84    }
+       85  
+       86    protected PolyglotQueryEngine(final DatabaseInternal database, final String language, final List<String> allowedPackages) {
+       87      this.language = language;
+       88      this.database = database;
+       89      this.allowedPackages = allowedPackages;
+       90      this.polyglotEngine = GraalPolyglotEngine.newBuilder(database, PolyglotEngineManager.getInstance().getSharedEngine())
+       91          .setLanguage(language).setAllowedPackages(allowedPackages).build();
+       92      this.userCodeExecutorQueue = new ArrayBlockingQueue<>(10000);
+       93      this.userCodeExecutor = new ThreadPoolExecutor(8, 8, 30, TimeUnit.SECONDS, userCodeExecutorQueue,
+       94          new ThreadPoolExecutor.CallerRunsPolicy());
+       95      this.timeout = database.getConfiguration().getValueAsLong(GlobalConfiguration.POLYGLOT_COMMAND_TIMEOUT);
+       96    }
+       97  
+       98    @Override
+       99    public String getLanguage() {
+      100      return language;
+      101    }
+      102  
+      103    @Override
+      104    public ResultSet command(final String query, ContextConfiguration configuration, final Object... parameters) {
+      105      if (parameters == null || parameters.length == 0)
+      106        return command(query, configuration, (Map) null);
+      107      throw new UnsupportedOperationException(
+      108          "Execution of a command with positional parameter is not supported for polyglot engine");
+      109    }
+      110  
+      111    @Override
+      112    public ResultSet command(final String query, final ContextConfiguration configuration, final Map<String, Object> parameters) {
+      113      try {
+      114        return executeUserCode(() -> {
+      115  
+      116          synchronized (polyglotEngine) {
+      117            if (parameters != null && !parameters.isEmpty()) {
+      118              for (final Map.Entry<String, Object> entry : parameters.entrySet())
+      119                polyglotEngine.setAttribute(entry.getKey(), entry.getValue());
+      120            }
+      121  
+      122            final Value result = polyglotEngine.eval(query);
+      123  
+      124            if (result.isHostObject()) {
+      125              final Object host = result.asHostObject();
+      126              if (host instanceof ResultSet)
+      127                return host;
+      128  
+      129              final InternalResultSet resultSet = new InternalResultSet();
+      130              if (host instanceof Iterable iterable) {
+      131                for (final Object o : iterable)
+      132                  resultSet.add(extractResult(o));
+      133              } else
+      134                resultSet.add(extractResult(host));
+      135  
+      136              return resultSet;
+      137  
+      138            }
+      139  
+      140            final InternalResultSet resultSet = new InternalResultSet();
+      141  
+      142            final Object value = JavascriptFunctionDefinition.jsValueToJava(result);
+      143  
+      144            resultSet.add(new ResultInternal(database).setProperty("value", value));
+      145            return resultSet;
+      146          }
+      147  
+      148        }, timeout);
+      149  
+      150      } catch (final CommandExecutionException e) {
+      151        throw e;
+      152      } catch (final ExecutionException e) {
+      153        // USE THE UNDERLYING CAUSE BYPASSING THE NOT RELEVANT EXECUTION EXCEPTION
+      154        throw new CommandExecutionException("Error on executing user code", e.getCause());
+      155      } catch (final Exception e) {
+      156        throw new CommandExecutionException("Error on executing user code", e);
+      157      }
+      158    }
+      159  
+      160    @Override
+      161    public QueryEngine registerFunctions(final String function) {
+      162      synchronized (polyglotEngine) {
+      163        try {
+      164          polyglotEngine.eval(function);
+      165        } catch (final CommandExecutionException e) {
+      166          throw e;
+      167        } catch (final Exception e) {
+      168          throw new CommandExecutionException("Error on executing user code", e);
+      169        }
+      170      }
+      171      return this;
+      172    }
+      173  
+      174    @Override
+      175    public QueryEngine unregisterFunctions() {
+      176      this.polyglotEngine = GraalPolyglotEngine.newBuilder(database, PolyglotEngineManager.getInstance().getSharedEngine())
+      177          .setLanguage(language).setAllowedPackages(allowedPackages).build();
+      178      return this;
+      179    }
+      180  
+      181    @Override
+      182    public AnalyzedQuery analyze(final String query) {
+      183      try {
+      184        executeUserCode(() -> {
+      185          synchronized (polyglotEngine) {
+      186            polyglotEngine.eval(query);
+      187          }
+      188          return null;
+      189        }, timeout);
+      190      } catch (final CommandExecutionException e) {
+      191        throw e;
+      192      } catch (final ExecutionException e) {
+      193        // USE THE UNDERLYING CAUSE BYPASSING THE NOT RELEVANT EXECUTION EXCEPTION
+      194        throw new CommandExecutionException("Error on executing user code", e.getCause());
+      195      } catch (final Exception e) {
+      196        throw new CommandExecutionException("Error on analyzing user code", e);
+
+---------- IMPLEMENTER com.arcadedb.query.sql.SQLQueryEngine  stubs=0/6 ----------
+       52  public class SQLQueryEngine implements QueryEngine {
+       53    public static final String                    ENGINE_NAME             = "sql";
+       54    public static final Set<String>               RESERVED_VARIABLE_NAMES = Set.of(
+       55        "parent", "current", "depth",
+       56        "path", "stack", "history");
+       57    protected final     DatabaseInternal          database;
+       58    protected final     DefaultSQLFunctionFactory functions;
+       59    protected final     DefaultSQLMethodFactory   methods;
+       60  
+       61    public static class SQLQueryEngineFactory implements QueryEngineFactory {
+       62      @Override
+       63      public String getLanguage() {
+       64        return ENGINE_NAME;
+       65      }
+       66  
+       67      @Override
+       68      public QueryEngine getInstance(final DatabaseInternal database) {
+       69        return new SQLQueryEngine(database);
+       70      }
+       71    }
+       72  
+       73    protected SQLQueryEngine(final DatabaseInternal database) {
+       74      this.database = database;
+       75      this.functions = DefaultSQLFunctionFactory.getInstance();
+       76      this.methods = DefaultSQLMethodFactory.getInstance();
+       77    }
+       78  
+       79    @Override
+       80    public String getLanguage() {
+       81      return ENGINE_NAME;
+       82    }
+       83  
+       84    @Override
+       85    public ResultSet query(final String query, ContextConfiguration configuration, final Map<String, Object> parameters) {
+       86      final Statement statement = parse(query, database);
+       87      if (!statement.isIdempotent())
+       88        throw new QueryNotIdempotentException("Query '" + query + "' is not idempotent");
+       89  
+       90      statement.setLimit(new Limit(JJTLIMIT).setValue((int) database.getResultSetLimit()));
+       91      return statement.execute(database, parameters);
+       92    }
+       93  
+       94    @Override
+       95    public ResultSet query(final String query, ContextConfiguration configuration, final Object... parameters) {
+       96      final Statement statement = parse(query, database);
+       97      if (!statement.isIdempotent())
+       98        throw new QueryNotIdempotentException("Query '" + query + "' is not idempotent");
+       99  
+      100      statement.setLimit(new Limit(JJTLIMIT).setValue((int) database.getResultSetLimit()));
+      101      return statement.execute(database, parameters);
+      102    }
+      103  
+      104    @Override
+      105    public ResultSet command(final String query, final ContextConfiguration configuration, final Map<String, Object> parameters) {
+      106      final Statement statement = parse(query, database);
+      107      statement.setLimit(new Limit(JJTLIMIT).setValue((int) database.getResultSetLimit()));
+      108  
+      109      final CommandContext context = new BasicCommandContext();
+      110      context.setInputParameters(parameters);
+      111      context.setConfiguration(configuration);
+      112  
+      113      return statement.execute(database, parameters, context);
+      114    }
+      115  
+      116    @Override
+      117    public ResultSet command(final String query, ContextConfiguration configuration, final Object... parameters) {
+      118      final Statement statement = parse(query, database);
+      119      statement.setLimit(new Limit(JJTLIMIT).setValue((int) database.getResultSetLimit()));
+      120      final CommandContext context = new BasicCommandContext();
+      121      context.setConfiguration(configuration);
+      122      return statement.execute(database, parameters, context);
+      123    }
+      124  
+      125    @Override
+      126    public AnalyzedQuery analyze(final String query) {
+      127      final Statement statement = parse(query, database);
+      128      return new AnalyzedQuery() {
+      129        @Override
+      130        public boolean isIdempotent() {
+      131          return statement.isIdempotent();
+      132        }
+      133  
+      134        @Override
+      135        public boolean isDDL() {
+      136          return statement.isDDL();
+      137        }
+      138  
+      139        @Override
+      140        public Set<OperationType> getOperationTypes() {
+      141          return statement.getOperationTypes();
+      142        }
+      143  
+      144        @Override
+      145        public ResultSet execute(final Map<String, Object> parameters) {
+      146          final long resultSetLimit = database.getResultSetLimit();
+      147          if (resultSetLimit > 0)
+      148            statement.setLimit(new Limit(JJTLIMIT).setValue((int) resultSetLimit));
+      149          return statement.execute(database, parameters);
+      150        }
+      151      };
+      152    }
+      153  
+      154    public static Object foreachRecord(final Callable<Object, Identifiable> iCallable, Object iCurrent,
+      155        final CommandContext context) {
+      156      if (iCurrent == null)
+      157        return null;
+      158  
+      159      if (iCurrent instanceof Iterable iterable) {
+      160        iCurrent = iterable.iterator();
+      161      }
+      162      if (MultiValue.isMultiValue(iCurrent) || iCurrent instanceof Iterator) {
+      163        final MultiIterator<Object> result = new MultiIterator<>();
+      164        for (final Object o : MultiValue.getMultiValueIterable(iCurrent, false)) {
+      165          if (MultiValue.isMultiValue(o) || o instanceof Iterator) {
+      166            for (final Object inner : MultiValue.getMultiValueIterable(o, false)) {
+      167              result.addIterator(iCallable.call((Identifiable) inner));
+      168            }
+      169          } else {
+      170            if (o instanceof Identifiable identifiable)
+      171              result.addIterator(iCallable.call(identifiable));
+      172            else if (o instanceof Result result1) {
+      173              if (result1.getIdentity().isPresent())
+      174                result.addIterator(iCallable.call(result1.getIdentity().get()));
+      175            }
+      176          }
+      177        }
+      178        return result;
+      179      } else if (iCurrent instanceof Identifiable identifiable) {
+      180        return iCallable.call(identifiable);
+      181      } else if (iCurrent instanceof Result result) {
+      182        return iCallable.call(result.toElement());
+      183      }
+      184  
+      185      return null;
+      186    }
+      187  
+      188    public DefaultSQLFunctionFactory getFunctionFactory() {
+      189      return functions;
+      190    }
+      191  
+      192    public DefaultSQLMethodFactory getMethodFactory() {
+      193      return methods;
+      194    }
+      195  
+      196    public SQLFunction getFunction(final String name) {
+      197      SQLFunction sqlFunction = functions.getFunctionInstance(name);
+      198      if (sqlFunction == null) {
+      199        final int pos = name.indexOf(".");
+      200        if (pos > -1) {
+      201          // LOOK INTO FUNCTION LIBRARY
+      202          final String libraryName = name.substring(0, pos);
+      203          final String fnName = name.substring(pos + 1);
+      204          final FunctionDefinition function = database.getSchema().getFunction(libraryName, fnName);
+      205          if (function != null) {
+      206            // WRAP LIBRARY FUNCTION TO SQL FUNCTION TO BE EXECUTED BY SQL ENGINE
+      207            sqlFunction = new SQLFunctionAbstract(name) {
+      208              @Override
+      209              public Object execute(final Object self, final Identifiable currentRecord, final Object currentResult,
+      210                  final Object[] params,
+      211                  final CommandContext context) {
+
+---------- IMPLEMENTER com.arcadedb.query.sql.SQLScriptQueryEngine  stubs=0/6 ----------
+       35  public class SQLScriptQueryEngine extends SQLQueryEngine {
+       36    public static final String ENGINE_NAME = "sqlscript";
+       37  
+       38    public static class SQLScriptQueryEngineFactory implements QueryEngineFactory {
+       39      @Override
+       40      public String getLanguage() {
+       41        return ENGINE_NAME;
+       42      }
+       43  
+       44      @Override
+       45      public QueryEngine getInstance(final DatabaseInternal database) {
+       46        return new SQLScriptQueryEngine(database);
+       47      }
+       48    }
+       49  
+       50    protected SQLScriptQueryEngine(final DatabaseInternal database) {
+       51      super(database);
+       52    }
+       53  
+       54    @Override
+       55    public String getLanguage() {
+       56      return ENGINE_NAME;
+       57    }
+       58  
+       59    @Override
+       60    public ResultSet query(final String query, ContextConfiguration configuration, final Map<String, Object> parameters) {
+       61      final List<Statement> statements = parseScript(query, database);
+       62      for (final Statement statement : statements)
+       63        if (!statement.isIdempotent())
+       64          throw new QueryNotIdempotentException("Query '" + query + "' is not idempotent");
+       65  
+       66      final BasicCommandContext context = new BasicCommandContext();
+       67      context.setDatabase(database.getWrappedDatabaseInstance());
+       68      context.setInputParameters(parameters);
+       69      return executeInternal(statements, context);
+       70    }
+       71  
+       72    @Override
+       73    public ResultSet query(final String query, ContextConfiguration configuration, final Object... parameters) {
+       74      final List<Statement> statements = parseScript(query, database);
+       75      for (final Statement statement : statements)
+       76        if (!statement.isIdempotent())
+       77          throw new QueryNotIdempotentException("Query '" + query + "' is not idempotent");
+       78  
+       79      final BasicCommandContext context = new BasicCommandContext();
+       80      context.setDatabase(database.getWrappedDatabaseInstance());
+       81      context.setInputParameters(parameters);
+       82      return executeInternal(statements, context);
+       83    }
+       84  
+       85    @Override
+       86    public ResultSet command(final String query, final ContextConfiguration configuration, final Map<String, Object> parameters) {
+       87      final List<Statement> statements = parseScript(query, database.getWrappedDatabaseInstance());
+       88  
+       89      final BasicCommandContext context = new BasicCommandContext();
+       90      context.setConfiguration(configuration);
+       91      context.setDatabase(database.getWrappedDatabaseInstance());
+       92      context.setInputParameters(parameters);
+       93      return executeInternal(statements, context);
+       94    }
+       95  
+       96    @Override
+       97    public ResultSet command(final String query, final ContextConfiguration configuration, final Object... parameters) {
+       98      final List<Statement> statements = parseScript(query, database.getWrappedDatabaseInstance());
+       99  
+      100      final BasicCommandContext context = new BasicCommandContext();
+      101      context.setConfiguration(configuration);
+      102      context.setDatabase(database.getWrappedDatabaseInstance());
+      103      context.setInputParameters(parameters);
+      104      return executeInternal(statements, context);
+      105    }
+      106  
+      107    @Override
+      108    public AnalyzedQuery analyze(final String query) {
+      109      final List<Statement> statements = parseScript(query, database);
+      110      return new AnalyzedQuery() {
+      111        @Override
+      112        public boolean isIdempotent() {
+      113          for (Statement s : statements)
+      114            if (!s.isIdempotent())
+      115              return false;
+      116          return true;
+      117        }
+      118  
+      119        @Override
+      120        public boolean isDDL() {
+      121          for (Statement s : statements)
+      122            if (s.isDDL())
+      123              return true;
+      124          return false;
+      125        }
+      126      };
+      127    }
+      128  
+      129    public static List<Statement> parseScript(final String script, final DatabaseInternal database) {
+      130      try {
+      131        return new SQLAntlrParser(database).parseScript(script);
+      132      } catch (final CommandSQLParsingException e) {
+      133        throw e.setCommand(script);
+      134      }
+      135    }
+      136  
+      137    @Override
+      138    public boolean isExecutedByTheLeader() {
+      139      // REPLICATE THE SCRIPT TO THE LEADER
+      140      return true;
+      141    }
+      142  
+      143    private ResultSet executeInternal(final List<Statement> statements, final CommandContext scriptContext) {
+      144      final ScriptExecutionPlan plan = new ScriptExecutionPlan(scriptContext);
+      145  
+      146      plan.setStatements(statements);
+      147  
+      148      List<Statement> lastRetryBlock = new ArrayList<>();
+      149      int nestedTxLevel = 0;
+      150  
+      151      for (final Statement stm : statements) {
+      152        stm.setOriginalStatement(stm);
+      153        stm.setLimit(new Limit(-1).setValue((int) database.getResultSetLimit()));
+      154  
+      155        if (stm instanceof BeginStatement)
+      156          nestedTxLevel++;
+      157  
+      158        if (nestedTxLevel <= 0) {
+      159          final InternalExecutionPlan sub = stm.createExecutionPlan(scriptContext);
+      160          plan.chain(sub);
+      161        } else
+      162          lastRetryBlock.add(stm);
+      163  
+      164        if (stm instanceof CommitStatement commitStatement) {
+      165          if (nestedTxLevel > 0) {
+      166            nestedTxLevel--;
+      167            if (nestedTxLevel == 0) {
+      168  
+      169              if (commitStatement.getRetry() != null) {
+      170                int nRetries = commitStatement.getRetry().getValue().intValue();
+      171                if (nRetries <= 0)
+      172                  throw new CommandExecutionException("Invalid retry number " + nRetries);
+      173  
+      174                final RetryStep step = new RetryStep(lastRetryBlock, nRetries, commitStatement.getElseStatements(),
+      175                    commitStatement.getElseFail(),
+      176                    scriptContext, false);
+      177                final RetryExecutionPlan retryPlan = new RetryExecutionPlan(scriptContext);
+      178                retryPlan.chain(step);
+      179                plan.chain(retryPlan);
+      180                lastRetryBlock = new ArrayList<>();
+      181              } else {
+      182                for (final Statement statement : lastRetryBlock) {
+      183                  final InternalExecutionPlan sub = statement.createExecutionPlan(scriptContext);
+      184                  plan.chain(sub);
+      185                }
+      186              }
+      187            }
+      188          } else
+      189            throw new CommandSQLParsingException("Found COMMIT statement without a BEGIN");
+      190        }
+      191  
+      192        if (stm instanceof LetStatement letStatement) {
+      193          scriptContext.declareScriptVariable(letStatement.getVariableName().getStringValue());
+      194        }
+
+---------- IMPLEMENTER com.arcadedb.graphql.query.GraphQLQueryEngine  stubs=0/6 ----------
+       38  public class GraphQLQueryEngine implements QueryEngine {
+       39    public static final String        ENGINE_NAME = "graphql";
+       40    private final       GraphQLSchema graphQLSchema;
+       41  
+       42    protected GraphQLQueryEngine(final GraphQLSchema graphQLSchema) {
+       43      this.graphQLSchema = graphQLSchema;
+       44    }
+       45  
+       46    @Override
+       47    public String getLanguage() {
+       48      return ENGINE_NAME;
+       49    }
+       50  
+       51    @Override
+       52    public AnalyzedQuery analyze(final String query) {
+       53      final Set<OperationType> ops = detectGraphQLOperationTypes(query);
+       54      return new AnalyzedQuery() {
+       55        @Override
+       56        public boolean isIdempotent() {
+       57          return ops.size() == 1 && ops.contains(OperationType.READ);
+       58        }
+       59  
+       60        @Override
+       61        public boolean isDDL() {
+       62          return false;
+       63        }
+       64  
+       65        @Override
+       66        public Set<OperationType> getOperationTypes() {
+       67          return ops;
+       68        }
+       69      };
+       70    }
+       71  
+       72    private static Set<OperationType> detectGraphQLOperationTypes(final String query) {
+       73      try {
+       74        final Document doc = GraphQLParser.parse(query);
+       75        for (final Definition def : doc.getDefinitions())
+       76          if (def instanceof OperationDefinition op && !op.isQuery())
+       77            return Set.of(OperationType.CREATE, OperationType.UPDATE, OperationType.DELETE);
+       78      } catch (final ParseException e) {
+       79        // Fall through to default READ — execution will report the parse error
+       80      }
+       81      return CollectionUtils.singletonSet(OperationType.READ);
+       82    }
+       83  
+       84    @Override
+       85    public ResultSet query(final String query, ContextConfiguration configuration, final Map<String, Object> parameters) {
+       86      if (!analyze(query).isIdempotent())
+       87        throw new QueryNotIdempotentException("Query '" + query + "' is not idempotent");
+       88      return command(query, null, parameters);
+       89    }
+       90  
+       91    @Override
+       92    public ResultSet query(final String query, ContextConfiguration configuration, final Object... parameters) {
+       93      if (!analyze(query).isIdempotent())
+       94        throw new QueryNotIdempotentException("Query '" + query + "' is not idempotent");
+       95      return command(query, null, parameters);
+       96    }
+       97  
+       98    @Override
+       99    public ResultSet command(final String query, ContextConfiguration configuration, final Map<String, Object> parameters) {
+      100      try {
+      101        final ResultSet resultSet = graphQLSchema.execute(query);
+      102        return resultSet;
+      103      } catch (final CommandParsingException e) {
+      104        throw e;
+      105      } catch (final Exception e) {
+      106        throw new CommandParsingException("Error on executing GraphQL query:\n" + FileUtils.printWithLineNumbers(query), e);
+      107      }
+      108    }
+      109  
+      110    @Override
+      111    public ResultSet command(final String query, ContextConfiguration configuration, final Object... parameters) {
+      112      if (parameters.length % 2 != 0)
+      113        throw new IllegalArgumentException("Command parameters must be as pairs `<key>, <value>`");
+      114  
+      115      final Map<String, Object> map = new HashMap<>(parameters.length / 2);
+      116      for (int i = 0; i < parameters.length; i += 2)
+      117        map.put((String) parameters[i], parameters[i + 1]);
+      118      return command(query, null, map);
+      119    }
+      120  }

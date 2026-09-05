@@ -1,0 +1,213 @@
+row 79   apache/atlas#529
+============================================================================
+CONTRACT org.apache.atlas.repository.store.graph.v2.tags.TagDAO   members=15.0 implementers=1.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       11  public interface TagDAO {
+       12  
+       13      List<AtlasClassification> getAllDirectClassificationsForVertex(String vertexId) throws AtlasBaseException;
+       14  
+       15      List<AtlasClassification> getAllClassificationsForVertex(String vertexId) throws AtlasBaseException;
+       16      List<Tag> getAllTagsByVertexId(String vertexId) throws AtlasBaseException;
+       17  
+       18      AtlasClassification findDirectDeletedTagByVertexIdAndTagTypeName(String vertexId, String tagTypeName) throws AtlasBaseException;
+       19  
+       20      Tag findDirectTagByVertexIdAndTagTypeNameWithAssetMetadata(String vertexId, String tagTypeName, boolean includeDeleted) throws AtlasBaseException;
+       21      PaginatedTagResult getPropagationsForAttachmentBatch(String sourceVertexId, String tagTypeName, String storedPagingState) throws AtlasBaseException;
+       22  
+       23      List<AtlasClassification> findByVertexIdAndPropagated(String vertexId) throws AtlasBaseException;
+       24  
+       25      AtlasClassification findDirectTagByVertexIdAndTagTypeName(String assetVertexId, String tagTypeName, boolean includeDeleted) throws AtlasBaseException;
+       26  
+       27      void putPropagatedTags(String sourceAssetId,
+       28                             String tagTypeName,
+       29                             Set<String> propagatedAssetVertexIds,
+       30                             Map<String, Map<String, Object>> assetMinAttrsMap,
+       31                             AtlasClassification tag) throws AtlasBaseException;
+       32  
+       33      void putDirectTag(String assetId, String tagTypeName,
+       34                        AtlasClassification tag,
+       35                        Map<String, Object> assetMetadata) throws AtlasBaseException;
+       36  
+       37      void deleteDirectTag(String sourceVertexId, AtlasClassification tagToDelete) throws AtlasBaseException;
+       38      void deleteTags(List<Tag> tagsToDelete) throws AtlasBaseException;
+       39  
+       40      List<AtlasClassification> getPropagationsForAttachment(String vertexId, String sourceEntityGuid) throws AtlasBaseException;
+       41  
+       42      /**
+       43       * Retrieves a paginated list of propagated tags for a given source vertex and tag type.
+       44       * 
+       45       * @param sourceVertexId The source vertex ID
+       46       * @param tagTypeName The tag type name
+       47       * @param pagingStateStr The paging state from a previous query (null for first page)
+       48       * @param pageSize The number of results to return per page
+       49       * @return A PaginatedTagResult containing the tags and pagination state
+       50       * @throws AtlasBaseException If an error occurs during retrieval
+       51       */
+       52      PaginatedTagResult getPropagationsForAttachmentBatchWithPagination(String sourceVertexId, String tagTypeName,
+       53                                                                         String pagingStateStr, int pageSize) throws AtlasBaseException;
+       54  
+       55      PaginatedVertexIdResult getVertexIdFromTagsByIdTableWithPagination(String pagingStateStr, int pageSize) throws AtlasBaseException;
+       56  }
+
+---------- IMPLEMENTER org.apache.atlas.repository.store.graph.v2.tags.TagDAOCassandraImpl  stubs=0/15 ----------
+       52  public class TagDAOCassandraImpl implements TagDAO, AutoCloseable {
+       53      private static final Logger LOG = LoggerFactory.getLogger(TagDAOCassandraImpl.class);
+       54      private static final ObjectMapper objectMapper = new ObjectMapper();
+       55  
+       56      // Configuration constants
+       57      private static final int MAX_RETRIES = 3;
+       58      private static final Duration INITIAL_BACKOFF = Duration.ofMillis(100);
+       59      private static final int BATCH_SIZE_LIMIT = 200;
+       60      private static final int BATCH_SIZE_LIMIT_FOR_DELETION = 10000;
+       61      private static final Duration CONNECTION_TIMEOUT = Duration.ofSeconds(5);
+       62      //private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(120);
+       63      private static final Duration HEARTBEAT_INTERVAL = Duration.ofSeconds(30);
+       64      public static final String DEFAULT_HOST = "localhost";
+       65      public static final String DATACENTER = "datacenter1";
+       66  
+       67      private static final TagDAOCassandraImpl INSTANCE;
+       68  
+       69      /**
+       70       * Static initializer block to create the singleton instance.
+       71       * This handles potential exceptions during initialization.
+       72       * Also, this will not block requests initializing or waiting due to lazy initialization
+       73       */
+       74      static {
+       75          try {
+       76              INSTANCE = new TagDAOCassandraImpl();
+       77          } catch (AtlasBaseException e) {
+       78              LOG.error("FATAL: Failed to initialize TagDAOCassandraImpl singleton", e);
+       79              throw new RuntimeException("Could not initialize TagDAO Cassandra implementation: TagDAOCassandraImpl", e);
+       80          }
+       81      }
+       82  
+       83      /**
+       84       * Provides the global point of access to the TagDAOCassandraImpl instance.
+       85       * @return The single instance of TagDAOCassandraImpl.
+       86       */
+       87      public static TagDAOCassandraImpl getInstance() {
+       88          return INSTANCE;
+       89      }
+       90  
+       91      private final CqlSession cassSession;
+       92  
+       93      // Prepared Statements for 'tags_by_id' table
+       94      private final PreparedStatement findAllTagsForAssetStmt;
+       95      private final PreparedStatement findDirectClassificationsForAssetStmt;
+       96      private final PreparedStatement findDirectTagsForAssetStmt;
+       97      private final PreparedStatement findPropagatedTagsForAssetStmt;
+       98      private final PreparedStatement findSpecificDirectTagStmt;
+       99      private final PreparedStatement findSpecificDeletedTagStmt;
+      100      private final PreparedStatement insertEffectiveTagStmt;
+      101      private final PreparedStatement deleteEffectiveTagStmt;
+      102      private final PreparedStatement findAllTagDetailsForAssetStmt;
+      103  
+      104      // Prepared Statements for new 'propagated_tags_by_source' table
+      105      private final PreparedStatement findPropagationsBySourceStmt;
+      106      private final PreparedStatement insertPropagationBySourceStmt;
+      107      private final PreparedStatement deletePropagationStmt;
+      108  
+      109      // Health check prepared statement
+      110      private final PreparedStatement healthCheckStmt;
+      111  
+      112  
+      113      private TagDAOCassandraImpl() throws AtlasBaseException {
+      114          try {
+      115              String hostname = ApplicationProperties.get().getString(CASSANDRA_HOSTNAME_PROPERTY, DEFAULT_HOST);
+      116              Map<String, String> replicationConfig = Map.of("class", "SimpleStrategy", "replication_factor", ApplicationProperties.get().getString(CASSANDRA_REPLICATION_FACTOR_PROPERTY, "3"));
+      117  
+      118              DriverConfigLoader configLoader = DriverConfigLoader.programmaticBuilder()
+      119                      //.withDuration(DefaultDriverOption.REQUEST_TIMEOUT, REQUEST_TIMEOUT)
+      120                      .withDuration(DefaultDriverOption.CONNECTION_INIT_QUERY_TIMEOUT, CONNECTION_TIMEOUT)
+      121                      .withDuration(DefaultDriverOption.CONNECTION_CONNECT_TIMEOUT, CONNECTION_TIMEOUT)
+      122                      .withDuration(DefaultDriverOption.CONTROL_CONNECTION_TIMEOUT, CONNECTION_TIMEOUT)
+      123                      .withInt(DefaultDriverOption.CONNECTION_POOL_LOCAL_SIZE, calculateOptimalLocalPoolSize())
+      124                      .withInt(DefaultDriverOption.CONNECTION_POOL_REMOTE_SIZE, calculateOptimalRemotePoolSize())
+      125                      .withDuration(DefaultDriverOption.HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL)
+      126                      .build();
+      127  
+      128              cassSession = CqlSession.builder()
+      129                      .addContactPoint(new InetSocketAddress(hostname, CASSANDRA_PORT))
+      130                      .withConfigLoader(configLoader)
+      131                      .withLocalDatacenter(DATACENTER)
+      132                      .build();
+      133  
+      134              initializeSchema(replicationConfig);
+      135  
+      136              // === Statements for 'tags_by_id' table ===
+      137              insertEffectiveTagStmt = prepare(String.format(
+      138                      "INSERT INTO %s.%s (bucket, id, is_propagated, source_id, tag_type_name, tag_meta_json, asset_metadata, is_deleted, updated_at) " +
+      139                              "VALUES (?, ?, ?, ?, ?, ?, ?, false, ?)", KEYSPACE, EFFECTIVE_TAGS_TABLE_NAME));
+      140  
+      141              deleteEffectiveTagStmt = prepare(String.format(
+      142                      "UPDATE %s.%s SET is_deleted = true, updated_at = ? WHERE bucket = ? AND id = ? AND is_propagated = ? AND source_id = ? AND tag_type_name = ?",
+      143                      KEYSPACE, EFFECTIVE_TAGS_TABLE_NAME));
+      144  
+      145              findAllTagsForAssetStmt = prepare(String.format(
+      146                      "SELECT tag_meta_json, is_deleted FROM %s.%s WHERE bucket = ? AND id = ?", KEYSPACE, EFFECTIVE_TAGS_TABLE_NAME));
+      147  
+      148              findAllTagDetailsForAssetStmt = prepare(String.format(
+      149                      "SELECT tag_meta_json, source_id, is_propagated, tag_type_name, is_deleted FROM %s.%s WHERE bucket = ? AND id = ?", KEYSPACE, EFFECTIVE_TAGS_TABLE_NAME));
+      150  
+      151              findDirectClassificationsForAssetStmt = prepare(String.format(
+      152                      "SELECT tag_meta_json, is_deleted FROM %s.%s WHERE bucket = ? AND id = ? AND is_propagated = false", KEYSPACE, EFFECTIVE_TAGS_TABLE_NAME));
+      153  
+      154              findDirectTagsForAssetStmt = prepare(String.format(
+      155                      "SELECT is_propagated, source_id, tag_type_name, tag_meta_json, is_deleted FROM %s.%s WHERE bucket = ? AND id = ? AND is_propagated = false", KEYSPACE, EFFECTIVE_TAGS_TABLE_NAME));
+      156  
+      157              findPropagatedTagsForAssetStmt = prepare(String.format(
+      158                      "SELECT tag_meta_json, source_id, is_deleted FROM %s.%s WHERE bucket = ? AND id = ? AND is_propagated = true", KEYSPACE, EFFECTIVE_TAGS_TABLE_NAME));
+      159  
+      160              findSpecificDirectTagStmt = prepare(String.format(
+      161                      "SELECT tag_meta_json, asset_metadata, is_deleted FROM %s.%s WHERE bucket = ? AND id = ? AND is_propagated = false AND source_id = ? AND tag_type_name = ?",
+      162                      KEYSPACE, EFFECTIVE_TAGS_TABLE_NAME));
+      163  
+      164              findSpecificDeletedTagStmt = prepare(String.format(
+      165                      "SELECT tag_meta_json, is_deleted FROM %s.%s WHERE bucket = ? AND id = ? AND is_propagated = false AND source_id = ? AND tag_type_name = ?",
+      166                      KEYSPACE, EFFECTIVE_TAGS_TABLE_NAME));
+      167  
+      168              // === Statements for 'propagated_tags_by_source' table (using HARD DELETES) ===
+      169              findPropagationsBySourceStmt = prepare(String.format(
+      170                      "SELECT propagated_asset_id, asset_metadata FROM %s.%s WHERE source_id = ? AND tag_type_name = ?", KEYSPACE, PROPAGATED_TAGS_TABLE_NAME));
+      171  
+      172              insertPropagationBySourceStmt = prepare(String.format(
+      173                      "INSERT INTO %s.%s (source_id, tag_type_name, propagated_asset_id, asset_metadata, updated_at) VALUES (?, ?, ?, ?, ?)",
+      174                      KEYSPACE, PROPAGATED_TAGS_TABLE_NAME));
+      175  
+      176              deletePropagationStmt = prepare(String.format(
+      177                      "DELETE FROM %s.%s WHERE source_id = ? AND tag_type_name = ? AND propagated_asset_id = ?", KEYSPACE, PROPAGATED_TAGS_TABLE_NAME));
+      178  
+      179              // === Health check statement ===
+      180              healthCheckStmt = prepare("SELECT release_version FROM system.local");
+      181  
+      182          } catch (Exception e) {
+      183              LOG.error("Failed to initialize TagDAO", e);
+      184              throw new AtlasBaseException("Failed to initialize TagDAO", e);
+      185          }
+      186      }
+      187  
+      188      private PreparedStatement prepare(String cql) {
+      189          return cassSession.prepare(SimpleStatement.builder(cql)
+      190                  .setConsistencyLevel(DefaultConsistencyLevel.LOCAL_QUORUM)
+      191                  .build());
+      192      }
+      193  
+      194      private void initializeSchema(Map<String, String> replicationConfig) throws AtlasBaseException {
+      195          String replicationConfigString = replicationConfig.entrySet().stream()
+      196                  .map(entry -> String.format("'%s': '%s'", entry.getKey(), entry.getValue()))
+      197                  .collect(Collectors.joining(", "));
+      198  
+      199          String createKeyspaceQuery = String.format(
+      200                  "CREATE KEYSPACE IF NOT EXISTS %s WITH replication = {%s} AND durable_writes = true;",
+      201                  KEYSPACE, replicationConfigString);
+      202          executeWithRetry(SimpleStatement.builder(createKeyspaceQuery).setConsistencyLevel(DefaultConsistencyLevel.ALL).build());
+      203          LOG.info("Ensured keyspace {} exists", KEYSPACE);
+      204  
+      205          String createEffectiveTagsTable = String.format(
+      206                  "CREATE TABLE IF NOT EXISTS %s.%s (" +
+      207                          "id text, " +
+      208                          "bucket int, " +
+      209                          "is_propagated boolean, " +
+      210                          "source_id text, " +
+      211                          "tag_type_name text, " +

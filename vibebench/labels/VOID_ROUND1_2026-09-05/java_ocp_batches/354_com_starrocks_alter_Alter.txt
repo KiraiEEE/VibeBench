@@ -1,0 +1,180 @@
+row 354   StarRocks/starrocks#70051
+============================================================================
+CHAIN in com.starrocks.alter.Alter.processAlterTable(AlterTableStmt)   kind=instanceof subject='alterClause' branches=4 closed_set=False
+cases: AddPartitionClause;TruncatePartitionClause;ModifyPartitionClause;ModifyTablePropertiesClause
+QUESTION: is the set of variants OPEN (a new one is expected, and
+          would force editing this chain) or CLOSED by nature?
+SHOWING THE WHOLE ENCLOSING METHOD -- a branch count alone cannot answer this.
+>>> marks the dispatch chain itself.
+
+      495      public void processAlterTable(AlterTableStmt stmt) throws UserException {
+      496          TableName dbTableName = stmt.getTbl();
+      497          String dbName = dbTableName.getDb();
+      498  
+      499          Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
+      500          if (db == null) {
+      501              ErrorReport.reportDdlException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
+      502          }
+      503  
+      504          // check conflict alter ops first
+      505          List<AlterClause> alterClauses = stmt.getOps();
+      506          AlterOperations currentAlterOps = new AlterOperations();
+      507          currentAlterOps.checkConflict(alterClauses);
+      508  
+      509          // check cluster capacity and db quota, only need to check once.
+      510          if (currentAlterOps.needCheckCapacity()) {
+      511              GlobalStateMgr.getCurrentSystemInfo().checkClusterCapacity();
+      512              db.checkQuota();
+      513          }
+      514  
+      515          // some operations will take long time to process, need to be done outside the databse lock
+      516          boolean needProcessOutsideDatabaseLock = false;
+      517          String tableName = dbTableName.getTbl();
+      518  
+      519          db.writeLock();
+      520          try {
+      521              Table table = db.getTable(tableName);
+      522              if (table == null) {
+      523                  ErrorReport.reportDdlException(ErrorCode.ERR_BAD_TABLE_ERROR, tableName);
+      524              }
+      525  
+      526              if (!table.isOlapOrLakeTable()) {
+      527                  throw new DdlException("Do not support alter non-OLAP or non-LAKE table[" + tableName + "]");
+      528              }
+      529              OlapTable olapTable = (OlapTable) table;
+      530  
+      531              if (olapTable.getState() != OlapTableState.NORMAL) {
+      532                  throw new DdlException(
+      533                          "Table[" + table.getName() + "]'s state is not NORMAL. Do not allow doing ALTER ops");
+      534              }
+      535  
+      536              if (currentAlterOps.hasSchemaChangeOp()) {
+      537                  // if modify storage type to v2, do schema change to convert all related tablets to segment v2 format
+      538                  schemaChangeHandler.process(alterClauses, db, olapTable);
+      539              } else if (currentAlterOps.hasRollupOp()) {
+      540                  materializedViewHandler.process(alterClauses, db, olapTable);
+      541              } else if (currentAlterOps.hasPartitionOp()) {
+      542                  Preconditions.checkState(alterClauses.size() == 1);
+      543                  AlterClause alterClause = alterClauses.get(0);
+      544                  if (alterClause instanceof DropPartitionClause) {
+      545                      if (!((DropPartitionClause) alterClause).isTempPartition()) {
+      546                          DynamicPartitionUtil.checkAlterAllowed((OlapTable) db.getTable(tableName));
+      547                      }
+      548                      GlobalStateMgr.getCurrentState().dropPartition(db, olapTable, ((DropPartitionClause) alterClause));
+      549                  } else if (alterClause instanceof ReplacePartitionClause) {
+      550                      GlobalStateMgr.getCurrentState()
+      551                              .replaceTempPartition(db, tableName, (ReplacePartitionClause) alterClause);
+      552                  } else if (alterClause instanceof ModifyPartitionClause) {
+      553                      ModifyPartitionClause clause = ((ModifyPartitionClause) alterClause);
+      554                      // expand the partition names if it is 'Modify Partition(*)'
+      555                      if (clause.isNeedExpand()) {
+      556                          List<String> partitionNames = clause.getPartitionNames();
+      557                          partitionNames.clear();
+      558                          for (Partition partition : olapTable.getPartitions()) {
+      559                              partitionNames.add(partition.getName());
+      560                          }
+      561                      }
+      562                      Map<String, String> properties = clause.getProperties();
+      563                      if (properties.containsKey(PropertyAnalyzer.PROPERTIES_INMEMORY)) {
+      564                          needProcessOutsideDatabaseLock = true;
+      565                      } else {
+      566                          List<String> partitionNames = clause.getPartitionNames();
+      567                          modifyPartitionsProperty(db, olapTable, partitionNames, properties);
+      568                      }
+      569                  } else if (alterClause instanceof AddPartitionClause) {
+      570                      needProcessOutsideDatabaseLock = true;
+      571                  } else {
+      572                      throw new DdlException("Invalid alter opertion: " + alterClause.getOpType());
+      573                  }
+      574              } else if (currentAlterOps.hasTruncatePartitionOp()) {
+      575                  needProcessOutsideDatabaseLock = true;
+      576              } else if (currentAlterOps.hasRenameOp()) {
+      577                  processRename(db, olapTable, alterClauses);
+      578              } else if (currentAlterOps.hasSwapOp()) {
+      579                  processSwap(db, olapTable, alterClauses);
+      580              } else if (currentAlterOps.contains(AlterOpType.MODIFY_TABLE_PROPERTY_SYNC)) {
+      581                  needProcessOutsideDatabaseLock = true;
+      582              } else {
+      583                  throw new DdlException("Invalid alter operations: " + currentAlterOps);
+      584              }
+      585          } finally {
+      586              db.writeUnlock();
+      587          }
+      588  
+      589          // the following ops should done outside db lock. because it contain synchronized create operation
+      590          if (needProcessOutsideDatabaseLock) {
+      591              Preconditions.checkState(alterClauses.size() == 1);
+      592              AlterClause alterClause = alterClauses.get(0);
+>>>   593              if (alterClause instanceof AddPartitionClause) {
+      594                  if (!((AddPartitionClause) alterClause).isTempPartition()) {
+      595                      DynamicPartitionUtil.checkAlterAllowed((OlapTable) db.getTable(tableName));
+      596                  }
+      597                  GlobalStateMgr.getCurrentState().addPartitions(db, tableName, (AddPartitionClause) alterClause);
+      598              } else if (alterClause instanceof TruncatePartitionClause) {
+      599                  // This logic is use to adapt mysql syntax.
+      600                  // ALTER TABLE test TRUNCATE PARTITION p1;
+      601                  TruncatePartitionClause clause = (TruncatePartitionClause) alterClause;
+      602                  TableRef tableRef = new TableRef(stmt.getTbl(), null, clause.getPartitionNames());
+      603                  TruncateTableStmt tStmt = new TruncateTableStmt(tableRef);
+      604                  GlobalStateMgr.getCurrentState().truncateTable(tStmt);
+      605              } else if (alterClause instanceof ModifyPartitionClause) {
+      606                  ModifyPartitionClause clause = ((ModifyPartitionClause) alterClause);
+      607                  Map<String, String> properties = clause.getProperties();
+      608                  List<String> partitionNames = clause.getPartitionNames();
+      609                  // currently, only in memory property could reach here
+      610                  Preconditions.checkState(properties.containsKey(PropertyAnalyzer.PROPERTIES_INMEMORY));
+      611                  OlapTable olapTable = (OlapTable) db.getTable(tableName);
+      612                  if (olapTable.isLakeTable()) {
+      613                      throw new DdlException("Lake table not support alter in_memory");
+      614                  }
+      615  
+      616                  ((SchemaChangeHandler) schemaChangeHandler).updatePartitionsInMemoryMeta(
+      617                          db, tableName, partitionNames, properties);
+      618  
+      619                  db.writeLock();
+      620                  try {
+      621                      modifyPartitionsProperty(db, olapTable, partitionNames, properties);
+      622                  } finally {
+      623                      db.writeUnlock();
+      624                  }
+      625              } else if (alterClause instanceof ModifyTablePropertiesClause) {
+      626                  Map<String, String> properties = alterClause.getProperties();
+      627                  Preconditions.checkState(properties.containsKey(PropertyAnalyzer.PROPERTIES_INMEMORY) ||
+      628                          properties.containsKey(PropertyAnalyzer.PROPERTIES_ENABLE_PERSISTENT_INDEX) ||
+      629                          properties.containsKey(PropertyAnalyzer.PROPERTIES_REPLICATED_STORAGE) ||
+      630                          properties.containsKey(PropertyAnalyzer.PROPERTIES_WRITE_QUORUM) ||
+      631                          properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_ENABLE) ||
+      632                          properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_TTL) ||
+      633                          properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_MAX_SIZE));
+      634  
+      635                  OlapTable olapTable = (OlapTable) db.getTable(tableName);
+      636                  if (olapTable.isLakeTable()) {
+      637                      throw new DdlException("Lake table not support alter in_memory or enable_persistent_index or write_quorum");
+      638                  }
+      639  
+      640                  if (properties.containsKey(PropertyAnalyzer.PROPERTIES_INMEMORY)) {
+      641                      ((SchemaChangeHandler) schemaChangeHandler).updateTableMeta(db, tableName,
+      642                              properties, TTabletMetaType.INMEMORY);
+      643                  } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_ENABLE_PERSISTENT_INDEX)) {
+      644                      ((SchemaChangeHandler) schemaChangeHandler).updateTableMeta(db, tableName, properties,
+      645                              TTabletMetaType.ENABLE_PERSISTENT_INDEX);
+      646                  } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_WRITE_QUORUM)) {
+      647                      ((SchemaChangeHandler) schemaChangeHandler).updateTableMeta(db, tableName, properties,
+      648                              TTabletMetaType.WRITE_QUORUM);
+      649                  } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_REPLICATED_STORAGE)) {
+      650                      ((SchemaChangeHandler) schemaChangeHandler).updateTableMeta(db, tableName, properties,
+      651                              TTabletMetaType.REPLICATED_STORAGE);
+      652                  } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_ENABLE) ||
+      653                          properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_TTL) ||
+      654                          properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_MAX_SIZE)) {
+      655                      boolean isSuccess = ((SchemaChangeHandler) schemaChangeHandler).updateBinlogConfigMeta(db, olapTable.getId(),
+      656                              properties, TTabletMetaType.BINLOG_CONFIG);
+      657                      if (!isSuccess) {
+      658                          throw new DdlException("modify binlog config of FEMeta failed or table has been droped");
+      659                      }
+      660                  } else {
+      661                      throw new DdlException("Invalid alter opertion: " + alterClause.getOpType());
+      662                  }
+      663              }
+      664          }
+      665      }

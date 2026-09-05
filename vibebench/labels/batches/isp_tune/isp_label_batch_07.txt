@@ -1,0 +1,1310 @@
+======================================================================
+ROW 56 | implementer | Copilot | zfit/zfit#644
+implementer zfit.models.conditional:ConditionalPDFV1 of zfit._interfaces:ZfitParametrized (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/zfit/_interfaces.py]
+METHOD INDEX:
+  L642: def get_params(...)
+  L676: def params(...)
+
+SOURCE:
+class ZfitParametrized(ZfitObject):
+    @abstractmethod
+    def get_params(
+        self,
+        floating: bool | None = True,
+        is_yield: bool | None = None,
+        extract_independent: bool | None = True,
+        *,
+        autograd: bool | None = None,
+    ) -> set[ZfitParameter]:
+        """Recursively collect parameters that this object depends on according to the filter criteria.
+
+        Which parameters should be included can be steered using the arguments as a filter.
+         - **None**: do not filter on this. E.g. `floating=None` will return parameters that are floating as well as
+            parameters that are fixed.
+         - **True**: only return parameters that fulfil this criterion
+         - **False**: only return parameters that do not fulfil this criterion. E.g. `floating=False` will return
+            only parameters that are not floating.
+
+        Args:
+
+            floating: if a parameter is floating, e.g. if :py:meth:`~ZfitParameter.floating` returns `True`
+            is_yield: if a parameter is a yield of the _current_ model. This won't be applied recursively, but may include
+               yields if they do also represent a parameter parametrizing the shape. So if the yield of the current
+               model depends on other yields (or also non-yields), this will be included. If, however, just submodels
+               depend on a yield (as their yield) and it is not correlated to the output of our model, they won't be
+               included.
+            extract_independent: If the parameter is an independent parameter, i.e. if it is a `ZfitIndependentParameter`.
+            autograd: Selection criteria if the parameter supports automatic differentiation. If `None`, no filtering
+                is done. If `True`, only parameters that support autograd are returned, if `False`, only parameters
+                that do not support autograd are returned.
+        """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def params(self) -> ztyping.ParameterType:
+        raise NotImplementedError
+
+--- IMPLEMENTER ---
+[src/zfit/models/conditional.py]
+METHOD INDEX:
+  L43: def __init__(...)
+  L96: def cond(...)
+  L99: def _check_input_cond(...)
+  L110: def _pdf(...)
+  L136: def _get_params(...)
+  L149: def _single_hook_integrate(...)
+  L180: def _single_hook_sample(...)
+  L210: def copy(...)
+  L125: def eval_pdf(...)
+  L170: def eval_int(...)
+  L201: def eval_sample(...)
+
+SOURCE:
+class ConditionalPDFV1(BaseFunctor):
+    @warn_experimental_feature
+    def __init__(
+        self,
+        pdf: ZfitPDF,
+        cond: Mapping[ZfitIndependentParameter, ZfitSpace],
+        *,
+        name: str = "ConditionalPDF",
+        extended: ExtendedInputType = None,
+        norm: NormInputType = None,
+        use_vectorized_map: bool = False,
+        sample_with_replacement: bool = True,
+        label: str | None = None,
+    ) -> None:
+        """EXPERIMENTAL! Implementation of a Conditional PDF, rather slow and for research purpose.
+
+        As an example, a Gaussian is wrapped in order to make 'sigma' conditional.
+
+        .. jupyter-execute::
+
+
+
+        Args:
+            pdf: PDF that will be wrapped. Convert one or several parameters of *pdf* to a conditional
+                parameter, meaning that the parameter *param* in the ``cond`` mapping will now be
+                determined by the data in the ``Space``, the value of the ``cond``.
+            cond: Mapping of parameter to input data.
+            extended: |@doc:pdf.init.extended| The overall yield of the PDF.
+               If this is parameter-like, it will be used as the yield,
+               the expected number of events, and the PDF will be extended.
+               An extended PDF has additional functionality, such as the
+               ``ext_*`` methods and the ``counts`` (for binned PDFs). |@docend:pdf.init.extended|
+            norm: |@doc:pdf.init.norm| Normalization of the PDF.
+               By default, this is the same as the default space of the PDF. |@docend:pdf.init.norm|
+            name: |@doc:pdf.init.name| Name of the PDF.
+               Maybe has implications on the serialization and deserialization of the PDF.
+               For a human-readable name, use the label. |@docend:pdf.init.name|
+            label: |@doc:pdf.init.label| Human-readable name
+               or label of
+               the PDF for a better description, to be used with plots etc.
+               Has no programmatical functional purpose as identification. |@docend:pdf.init.label|
+            use_vectorized_map:
+            sample_with_replacement:
+        """
+        # TODO: add to serializer, see below repr for problem
+        # original_init = {'pdf': pdf, 'cond': cond, 'name': name, 'extended': extended, 'norm': norm,
+        #                  'use_vectorized_map': use_vectorized_map, 'sample_with_replacement': sample_with_replacement}
+        self._sample_with_replacement = sample_with_replacement
+        self._use_vectorized_map = use_vectorized_map
+        self._cond, cond_obs = self._check_input_cond(cond)
+        obs = pdf.space * cond_obs
+        super().__init__(pdfs=pdf, obs=obs, name=name, extended=extended, norm=norm, label=label)
+        # self.hs3.original_init.update(original_init)  # TODO: add to serializer
+
+    @property
+    def cond(self) -> dict[ZfitIndependentParameter, ZfitSpace]:
+        return self._cond
+
+    def _check_input_cond(self, cond):
+        spaces = []
+        for param, obs in cond.items():
+            if not isinstance(param, ZfitIndependentParameter):
+                msg = f"parameter {param} not a ZfitIndependentParameter"
+                raise TypeError(msg)
+            spaces.append(convert_to_space(obs))
+        return cond, combine_spaces(*spaces)
+
+    @supports(norm=True, multiple_limits=True)
+    @z.function(wraps="conditional_pdf")
+    def _pdf(self, x, norm):
+        pdf = self.pdfs[0]
+        param_x_indices = {p: x.obs.index(p_space.obs[0]) for p, p_space in self._cond.items()}
+        x_values = x.value()
+
+        from zfit import run  # noqa: PLC0415
+
+        if self._use_vectorized_map and run.get_graph_mode() is not False:
+            tf_map = tf.vectorized_map
+        else:
+            output_signature = tf.TensorSpec(shape=(1, *x_values.shape[1:-1]), dtype=self.dtype)
+            tf_map = functools.partial(tf.map_fn, fn_output_signature=output_signature)
+
+        # TODO: reset parameters?
+
+        def eval_pdf(cond_and_data):
+            x_pdf = cond_and_data[None, ..., : pdf.n_obs]
+            for param, index in param_x_indices.items():
+                param.assign(cond_and_data[..., index])
+            return pdf.pdf(x_pdf, norm=norm)
+
+        params = tuple(param_x_indices.keys())
+        with set_values(params, params):
+            probs = tf_map(eval_pdf, x_values)
+        return probs[:, 0]  # removing stack dimension, implicitly in map_fn
+
+    def _get_params(
+        self,
+        floating: bool | None = True,
+        is_yield: bool | None = None,
+        extract_independent: bool | None = True,
+        *,
+        autograd: bool | None = None,
+    ) -> set[ZfitParameter]:
+        params = super()._get_params(floating, is_yield, extract_independent, autograd=autograd)
+        params -= OrderedSet(self._cond)
+        return params
+
+    @z.function(wraps="conditional_pdf")
+    def _single_hook_integrate(self, limits, norm, x, options):
+        from zfit import run  # noqa: PLC0415
+
+        if not run.get_graph_mode():
+            warnings.warn(
+                "Using the Conditional PDF in eager mode (no jit) maybe gets stuck.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        param_x_indices = {p: x.obs.index(p_space.obs[0]) for p, p_space in self._cond.items()}
+        x_values = x.value()
+... <<truncated, 52 more lines>>
+
+======================================================================
+ROW 57 | interface | Copilot | SkBlaz/py3plex#741
+interface py3plex.dynamics.core:DynamicsProcess kind=abc
+======================================================================
+[py3plex/dynamics/core.py]
+METHOD INDEX:
+  L57: def __init__(...)
+  L70: def set_seed(...)
+  L82: def initialize_state(...)
+  L99: def step(...)
+  L114: def run(...)
+
+SOURCE:
+class DynamicsProcess(ABC):
+    """Base class for discrete-time dynamical processes on (multi)layer networks.
+    
+    This class provides the foundation for implementing synchronous discrete-time
+    dynamics. Subclasses define the state representation, initialization logic,
+    and step-by-step update rules.
+    
+    The process uses a dedicated RNG for reproducibility and can work with both
+    NetworkX graphs and py3plex multilayer network objects.
+    
+    Attributes:
+        graph: The network (NetworkX graph or py3plex multilayer structure)
+        params: Model-specific parameters (e.g., infection rate, recovery rate)
+        rng: Dedicated random number generator for reproducibility
+        seed: Random seed used for initialization
+    
+    Example:
+        >>> class MyProcess(DynamicsProcess):
+        ...     def initialize_state(self, seed=None):
+        ...         # Initialize node states
+        ...         return {node: 0 for node in self.graph.nodes()}
+        ...     
+        ...     def step(self, state, t):
+        ...         # Update logic
+        ...         new_state = state.copy()
+        ...         # ... perform updates ...
+        ...         return new_state
+        >>> 
+        >>> G = nx.karate_club_graph()
+        >>> process = MyProcess(G, seed=42, param1=0.5)
+        >>> trajectory = process.run(steps=100)
+    """
+    
+    def __init__(self, graph: Any, seed: Optional[int] = None, **kwargs):
+        """Initialize the dynamics process.
+        
+        Args:
+            graph: NetworkX graph or py3plex multilayer network structure
+            seed: Optional random seed for reproducibility
+            **kwargs: Model-specific parameters stored in self.params
+        """
+        self.graph = graph
+        self.params = kwargs
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
+    
+    def set_seed(self, seed: int) -> None:
+        """Set or reset the random seed for the process.
+        
+        This method allows re-seeding the process without creating a new instance.
+        
+        Args:
+            seed: New random seed
+        """
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
+    
+    @abstractmethod
+    def initialize_state(self, seed: Optional[int] = None) -> Any:
+        """Construct and return the initial state for the process.
+        
+        The state representation is flexible and depends on the specific process:
+        - For node-level processes: dict mapping node -> value
+        - For multilayer: dict mapping (node, layer) -> value
+        - For walkers: current position or list of positions
+        
+        Args:
+            seed: Optional seed to override the instance seed
+        
+        Returns:
+            Initial state in the format expected by step()
+        """
+        pass
+    
+    @abstractmethod
+    def step(self, state: Any, t: int) -> Any:
+        """Perform one synchronous update step.
+        
+        Given the state at time t, compute and return the state at time t+1.
+        This should be a synchronous update over all nodes/entities.
+        
+        Args:
+            state: Current state at time t
+            t: Current time step (0-indexed)
+        
+        Returns:
+            New state at time t+1
+        """
+        pass
+    
+    def run(
+        self,
+        steps: int,
+        state: Optional[Any] = None,
+        record: bool = True,
+        callbacks: Optional[List[Callable[[Any, int], None]]] = None,
+    ) -> Union[Any, List[Any]]:
+        """Run the dynamics process for a specified number of steps.
+        
+        Args:
+            steps: Number of discrete time steps to simulate
+            state: Initial state (if None, calls initialize_state())
+            record: If True, return trajectory; if False, return final state only
+            callbacks: Optional list of callback functions called after each step
+                      with signature callback(state, t)
+        
+        Returns:
+            If record=True: list of states (trajectory)
+            If record=False: final state only
+        """
+        if state is None:
+            state = self.initialize_state()
+        
+        trajectory = [state] if record else None
+        
+        for t in range(steps):
+            state = self.step(state, t)
+            
+            if record:
+                trajectory.append(state)
+... <<truncated, 6 more lines>>
+
+======================================================================
+ROW 58 | implementer | Copilot | microsoft/graphrag#1956
+implementer graphrag.callbacks.progress_workflow_callbacks:ProgressWorkflowCallbacks of graphrag.callbacks.workflow_callbacks:WorkflowCallbacks (kind=protocol)
+======================================================================
+--- INTERFACE (the contract) ---
+[graphrag/callbacks/workflow_callbacks.py]
+METHOD INDEX:
+  L19: def pipeline_start(...)
+  L23: def pipeline_end(...)
+  L27: def workflow_start(...)
+  L31: def workflow_end(...)
+  L35: def progress(...)
+  L39: def error(...)
+  L49: def warning(...)
+  L53: def log(...)
+
+SOURCE:
+class WorkflowCallbacks(Protocol):
+    """
+    A collection of callbacks that can be used to monitor the workflow execution.
+
+    This base class is a "noop" implementation so that clients may implement just the callbacks they need.
+    """
+
+    def pipeline_start(self, names: list[str]) -> None:
+        """Execute this callback to signal when the entire pipeline starts."""
+        ...
+
+    def pipeline_end(self, results: list[PipelineRunResult]) -> None:
+        """Execute this callback to signal when the entire pipeline ends."""
+        ...
+
+    def workflow_start(self, name: str, instance: object) -> None:
+        """Execute this callback when a workflow starts."""
+        ...
+
+    def workflow_end(self, name: str, instance: object) -> None:
+        """Execute this callback when a workflow ends."""
+        ...
+
+    def progress(self, progress: Progress) -> None:
+        """Handle when progress occurs."""
+        ...
+
+    def error(
+        self,
+        message: str,
+        cause: BaseException | None = None,
+        stack: str | None = None,
+        details: dict | None = None,
+    ) -> None:
+        """Handle when an error occurs."""
+        ...
+
+    def warning(self, message: str, details: dict | None = None) -> None:
+        """Handle when a warning occurs."""
+        ...
+
+    def log(self, message: str, details: dict | None = None) -> None:
+        """Handle when a log message occurs."""
+        ...
+
+--- IMPLEMENTER ---
+[graphrag/callbacks/progress_workflow_callbacks.py]
+METHOD INDEX:
+  L18: def __init__(...)
+  L23: def _get_context(...)
+  L27: def workflow_start(...)
+  L33: def workflow_end(...)
+  L40: def progress(...)
+
+SOURCE:
+class ProgressWorkflowCallbacks(NoopWorkflowCallbacks):
+    """A callback manager that delegates to a standard Logger."""
+
+    _logger: logging.Logger
+    _workflow_stack: list[str]
+
+    def __init__(self, logger: logging.Logger) -> None:
+        """Create a new ProgressWorkflowCallbacks."""
+        self._logger = logger
+        self._workflow_stack = []
+
+    def _get_context(self) -> str:
+        """Get the current workflow context."""
+        return ".".join(self._workflow_stack) if self._workflow_stack else ""
+
+    def workflow_start(self, name: str, instance: object) -> None:
+        """Execute this callback when a workflow starts."""
+        self._workflow_stack.append(name)
+        context = self._get_context()
+        self._logger.info("Starting workflow: %s", context)
+
+    def workflow_end(self, name: str, instance: object) -> None:
+        """Execute this callback when a workflow ends."""
+        context = self._get_context()
+        self._logger.info("Completed workflow: %s", context)
+        if self._workflow_stack:
+            self._workflow_stack.pop()
+
+    def progress(self, progress: Progress) -> None:
+        """Handle when progress occurs."""
+        context = self._get_context()
+        if progress.description:
+            msg = f"[{context}] {progress.description}"
+        else:
+            msg = f"[{context}] Progress update"
+
+        if progress.percent is not None:
+            msg += f" ({progress.percent:.1%})"
+        elif progress.completed_items is not None and progress.total_items is not None:
+            msg += f" ({progress.completed_items}/{progress.total_items})"
+
+        self._logger.info(msg)
+
+======================================================================
+ROW 59 | implementer | Claude_Code | langchain-ai/langchain#32840
+implementer libs.core.langchain_core.runnables.base:RunnableSerializable of libs.core.langchain_core.runnables.base:Runnable (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[libs/core/langchain_core/runnables/base.py]
+METHOD INDEX:
+  L259: def get_name(...)
+  L300: def InputType(...)
+  L332: def OutputType(...)
+  L360: def input_schema(...)
+  L364: def get_input_schema(...)
+  L404: def get_input_jsonschema(...)
+  L436: def output_schema(...)
+  L443: def get_output_schema(...)
+  L483: def get_output_jsonschema(...)
+  L515: def config_specs(...)
+  L519: def config_schema(...)
+  L564: def get_config_jsonschema(...)
+  L580: def get_graph(...)
+  L601: def get_prompts(...)
+  L614: def __or__(...)
+  L637: def __ror__(...)
+  L660: def pipe(...)
+  L710: def pick(...)
+  L773: def assign(...)
+  L828: def invoke(...)
+  L849: def ainvoke(...)
+  L871: def batch(...)
+  L923: def batch_as_completed(...)
+  L933: def batch_as_completed(...)
+  L942: def batch_as_completed(...)
+  L1008: def abatch(...)
+  L1058: def abatch_as_completed(...)
+  L1068: def abatch_as_completed(...)
+  L1077: def abatch_as_completed(...)
+  L1136: def stream(...)
+  L1157: def astream(...)
+  L1179: def astream_log(...)
+  L1196: def astream_log(...)
+  L1212: def astream_log(...)
+  L1279: def astream_events(...)
+  L1543: def transform(...)
+  L1588: def atransform(...)
+  L1634: def bind(...)
+  L1670: def with_config(...)
+  L1695: def with_listeners(...)
+  L1769: def with_alisteners(...)
+  L1861: def with_types(...)
+  L1883: def with_retry(...)
+  L1950: def map(...)
+  L1975: def with_fallbacks(...)
+  L2054: def _call_with_config(...)
+  L2105: def _acall_with_config(...)
+  L2151: def _batch_with_config(...)
+  L2221: def _abatch_with_config(...)
+  L2302: def _transform_stream_with_config(...)
+  L2402: def _atransform_stream_with_config(...)
+  L2512: def as_tool(...)
+  L906: def invoke(...)
+  L974: def invoke(...)
+  L1043: def ainvoke(...)
+  L1112: def ainvoke_task(...)
+
+SOURCE:
+class Runnable(ABC, Generic[Input, Output]):
+    """A unit of work that can be invoked, batched, streamed, transformed and composed.
+
+    Key Methods
+    ===========
+
+    - **``invoke``/``ainvoke``**: Transforms a single input into an output.
+    - **``batch``/``abatch``**: Efficiently transforms multiple inputs into outputs.
+    - **``stream``/``astream``**: Streams output from a single input as it's produced.
+    - **``astream_log``**: Streams output and selected intermediate results from an
+      input.
+
+    Built-in optimizations:
+
+    - **Batch**: By default, batch runs invoke() in parallel using a thread pool
+      executor. Override to optimize batching.
+
+    - **Async**: Methods with ``'a'`` suffix are asynchronous. By default, they execute
+      the sync counterpart using asyncio's thread pool.
+      Override for native async.
+
+    All methods accept an optional config argument, which can be used to configure
+    execution, add tags and metadata for tracing and debugging etc.
+
+    Runnables expose schematic information about their input, output and config via
+    the ``input_schema`` property, the ``output_schema`` property and ``config_schema``
+    method.
+
+    LCEL and Composition
+    ====================
+
+    The LangChain Expression Language (LCEL) is a declarative way to compose
+    ``Runnables``into chains.
+    Any chain constructed this way will automatically have sync, async, batch, and
+    streaming support.
+
+    The main composition primitives are ``RunnableSequence`` and ``RunnableParallel``.
+
+    **``RunnableSequence``** invokes a series of runnables sequentially, with
+    one Runnable's output serving as the next's input. Construct using
+    the ``|`` operator or by passing a list of runnables to ``RunnableSequence``.
+
+    **``RunnableParallel``** invokes runnables concurrently, providing the same input
+    to each. Construct it using a dict literal within a sequence or by passing a
+    dict to ``RunnableParallel``.
+
+
+    For example,
+
+    .. code-block:: python
+
+        from langchain_core.runnables import RunnableLambda
+
+        # A RunnableSequence constructed using the `|` operator
+        sequence = RunnableLambda(lambda x: x + 1) | RunnableLambda(lambda x: x * 2)
+        sequence.invoke(1)  # 4
+        sequence.batch([1, 2, 3])  # [4, 6, 8]
+
+
+        # A sequence that contains a RunnableParallel constructed using a dict literal
+        sequence = RunnableLambda(lambda x: x + 1) | {
+            "mul_2": RunnableLambda(lambda x: x * 2),
+            "mul_5": RunnableLambda(lambda x: x * 5),
+        }
+        sequence.invoke(1)  # {'mul_2': 4, 'mul_5': 10}
+
+    Standard Methods
+    ================
+
+    All ``Runnable``s expose additional methods that can be used to modify their
+    behavior (e.g., add a retry policy, add lifecycle listeners, make them
+    configurable, etc.).
+
+    These methods will work on any ``Runnable``, including ``Runnable`` chains
+    constructed by composing other ``Runnable``s.
+    See the individual methods for details.
+
+    For example,
+
+    .. code-block:: python
+
+        from langchain_core.runnables import RunnableLambda
+
+        import random
+
+        def add_one(x: int) -> int:
+            return x + 1
+
+
+        def buggy_double(y: int) -> int:
+            \"\"\"Buggy code that will fail 70% of the time\"\"\"
+            if random.random() > 0.3:
+                print('This code failed, and will probably be retried!')  # noqa: T201
+                raise ValueError('Triggered buggy code')
+            return y * 2
+
+        sequence = (
+            RunnableLambda(add_one) |
+            RunnableLambda(buggy_double).with_retry( # Retry on failure
+                stop_after_attempt=10,
+                wait_exponential_jitter=False
+            )
+        )
+
+        print(sequence.input_schema.model_json_schema()) # Show inferred input schema
+        print(sequence.output_schema.model_json_schema()) # Show inferred output schema
+        print(sequence.invoke(2)) # invoke the sequence (note the retry above!!)
+
+    Debugging and tracing
+    =====================
+
+    As the chains get longer, it can be useful to be able to see intermediate results
+    to debug and trace the chain.
+
+    You can set the global debug flag to True to enable debug output for all chains:
+
+        .. code-block:: python
+
+            from langchain_core.globals import set_debug
+
+... <<truncated, 2388 more lines>>
+
+--- IMPLEMENTER ---
+[libs/core/langchain_core/runnables/base.py]
+METHOD INDEX:
+  L2644: def to_json(...)
+  L2656: def configurable_fields(...)
+  L2713: def configurable_alternatives(...)
+
+SOURCE:
+class RunnableSerializable(Serializable, Runnable[Input, Output]):
+    """Runnable that can be serialized to JSON."""
+
+    name: Optional[str] = None
+
+    model_config = ConfigDict(
+        # Suppress warnings from pydantic protected namespaces
+        # (e.g., `model_`)
+        protected_namespaces=(),
+    )
+
+    @override
+    def to_json(self) -> Union[SerializedConstructor, SerializedNotImplemented]:
+        """Serialize the ``Runnable`` to JSON.
+
+        Returns:
+            A JSON-serializable representation of the ``Runnable``.
+
+        """
+        dumped = super().to_json()
+        with contextlib.suppress(Exception):
+            dumped["name"] = self.get_name()
+        return dumped
+
+    def configurable_fields(
+        self, **kwargs: AnyConfigurableField
+    ) -> RunnableSerializable[Input, Output]:
+        """Configure particular ``Runnable`` fields at runtime.
+
+        Args:
+            **kwargs: A dictionary of ``ConfigurableField`` instances to configure.
+
+        Raises:
+            ValueError: If a configuration key is not found in the ``Runnable``.
+
+        Returns:
+            A new ``Runnable`` with the fields configured.
+
+        .. code-block:: python
+
+            from langchain_core.runnables import ConfigurableField
+            from langchain_openai import ChatOpenAI
+
+            model = ChatOpenAI(max_tokens=20).configurable_fields(
+                max_tokens=ConfigurableField(
+                    id="output_token_number",
+                    name="Max tokens in the output",
+                    description="The maximum number of tokens in the output",
+                )
+            )
+
+            # max_tokens = 20
+            print(
+                "max_tokens_20: ", model.invoke("tell me something about chess").content
+            )
+
+            # max_tokens = 200
+            print(
+                "max_tokens_200: ",
+                model.with_config(configurable={"output_token_number": 200})
+                .invoke("tell me something about chess")
+                .content,
+            )
+
+        """
+        # Import locally to prevent circular import
+        from langchain_core.runnables.configurable import (  # noqa: PLC0415
+            RunnableConfigurableFields,
+        )
+
+        model_fields = type(self).model_fields
+        for key in kwargs:
+            if key not in model_fields:
+                msg = (
+                    f"Configuration key {key} not found in {self}: "
+                    f"available keys are {model_fields.keys()}"
+                )
+                raise ValueError(msg)
+
+        return RunnableConfigurableFields(default=self, fields=kwargs)
+
+    def configurable_alternatives(
+        self,
+        which: ConfigurableField,
+        *,
+        default_key: str = "default",
+        prefix_keys: bool = False,
+        **kwargs: Union[Runnable[Input, Output], Callable[[], Runnable[Input, Output]]],
+    ) -> RunnableSerializable[Input, Output]:
+        """Configure alternatives for ``Runnables`` that can be set at runtime.
+
+        Args:
+            which: The ``ConfigurableField`` instance that will be used to select the
+                alternative.
+            default_key: The default key to use if no alternative is selected.
+                Defaults to ``'default'``.
+            prefix_keys: Whether to prefix the keys with the ``ConfigurableField`` id.
+                Defaults to False.
+            **kwargs: A dictionary of keys to ``Runnable`` instances or callables that
+                return ``Runnable`` instances.
+
+        Returns:
+            A new ``Runnable`` with the alternatives configured.
+
+        .. code-block:: python
+
+            from langchain_anthropic import ChatAnthropic
+            from langchain_core.runnables.utils import ConfigurableField
+            from langchain_openai import ChatOpenAI
+
+            model = ChatAnthropic(
+                model_name="claude-3-7-sonnet-20250219"
+            ).configurable_alternatives(
+                ConfigurableField(id="llm"),
+                default_key="anthropic",
+                openai=ChatOpenAI(),
+            )
+
+            # uses the default model ChatAnthropic
+            print(model.invoke("which organization created you?").content)
+... <<truncated, 21 more lines>>
+
+======================================================================
+ROW 60 | implementer | Copilot | NeuroTechX/moabb#950
+implementer moabb.tests.test_analysis:DummyEvaluation of moabb.evaluations.base:BaseEvaluation (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[moabb/evaluations/base.py]
+METHOD INDEX:
+  L94: def __init__(...)
+  L198: def process(...)
+  L279: def push_result(...)
+  L290: def get_results(...)
+  L294: def evaluate(...)
+  L314: def is_valid(...)
+  L330: def _get_incompatibility_reason(...)
+  L349: def _grid_search(...)
+
+SOURCE:
+class BaseEvaluation(ABC):
+    """Base class that defines necessary operations for an evaluation.
+    Evaluations determine what the train and test sets are and can implement
+    additional data preprocessing steps for more complicated algorithms.
+
+    Parameters
+    ----------
+    paradigm : Paradigm instance
+        The paradigm to use.
+    datasets : List of Dataset instance
+        The list of dataset to run the evaluation. If none, the list of
+        compatible dataset will be retrieved from the paradigm instance.
+    random_state: int, RandomState instance, default=None
+        If not None, can guarantee same seed for shuffling examples.
+    n_jobs: int, default=1
+        Number of jobs for fitting of pipeline.
+    overwrite: bool, default=False
+        If true, overwrite the results.
+    error_score: "raise" or numeric, default="raise"
+        Value to assign to the score if an error occurs in estimator fitting. If set to
+        ‘raise’, the error is raised.
+    suffix: str
+        Suffix for the results file.
+    hdf5_path: str
+        Specific path for storing the results.
+    additional_columns: None
+        Adding information to results.
+    return_epochs: bool, default=False
+        use MNE epoch to train pipelines.
+    return_raws: bool, default=False
+        use MNE raw to train pipelines.
+    mne_labels: bool, default=False
+        if returning MNE epoch, use original dataset label if True
+    n_splits: int, default=None
+        Number of splits for cross-validation. If None, the number of splits
+        is equal to the number of subjects.
+    save_model: bool, default=False
+        Save model after training, for each fold of cross-validation if needed
+    cache_config: bool, default=None
+        Configuration for caching of datasets. See :class:`moabb.datasets.base.CacheConfig` for details.
+    optuna:bool, default=False
+        If optuna is enable it will change the GridSearch to a RandomizedGridSearch with 15 minutes of cut off time.
+        This option is compatible with list of entries of type None, bool, int, float and string
+    time_out: default=60*15
+        Cut off time for the optuna search expressed in seconds, the default value is 15 minutes.
+        Only used with optuna equal to True.
+    verbose: bool, str, int, default=None
+        If not None, override the default MOABB logging level used by this evaluation
+        (see :func:`moabb.utils.verbose` for more information on how this is handled).
+        If used, it should be passed as a keyword-argument only.
+    codecarbon_config: dict of CodeCarbon parameters, default=dict(save_to_file=False, log_level="error")
+        Allow CodeCarbon script level configurations.
+        Can use combination of CodeCarbon environment variable and configuration files.
+        See CodeCarbon developer documentation for more information.
+
+    Notes
+    -----
+    .. versionadded:: 1.1.0
+       n_splits, save_model, cache_config parameters.
+    .. versionadded:: 1.1.1
+       optuna, time_out parameters.
+    .. versionadded:: 1.5
+       verbose parameter.
+    """
+
+    search = False
+
+    @verbose
+    def __init__(
+        self,
+        paradigm,
+        datasets=None,
+        random_state=None,
+        n_jobs=1,
+        overwrite=False,
+        error_score="raise",
+        suffix="",
+        hdf5_path=None,
+        additional_columns=None,
+        return_epochs=False,
+        return_raws=False,
+        mne_labels=False,
+        n_splits=None,
+        save_model=False,
+        cache_config=None,
+        optuna=False,
+        time_out=60 * 15,
+        verbose=None,
+        codecarbon_config=dict(save_to_file=False, log_level="error"),
+    ):
+        self.random_state = random_state
+        self.n_jobs = n_jobs
+        self.error_score = error_score
+        self.hdf5_path = hdf5_path
+        self.return_epochs = return_epochs
+        self.return_raws = return_raws
+        self.mne_labels = mne_labels
+        self.n_splits = n_splits
+        self.save_model = save_model
+        self.cache_config = cache_config
+        self.optuna = optuna
+        self.time_out = time_out
+        self.verbose = verbose
+        self.codecarbon_config = codecarbon_config
+
+        if self.optuna and not optuna_available:
+            raise ImportError("Optuna is not available. Please install it first.")
+        if (self.time_out != 60 * 15) and not self.optuna:
+            warn(
+                "time_out parameter is only used when optuna is enabled. "
+                "Ignoring time_out parameter."
+            )
+        # check paradigm
+        if not isinstance(paradigm, BaseParadigm):
+            raise (ValueError("paradigm must be an Paradigm instance"))
+        self.paradigm = paradigm
+
+        # check labels
+        if self.mne_labels and not self.return_epochs:
+            raise (ValueError("mne_labels could only be set with return_epochs"))
+... <<truncated, 239 more lines>>
+
+--- IMPLEMENTER ---
+[moabb/tests/test_analysis.py]
+METHOD INDEX:
+  L28: def evaluate(...)
+  L31: def is_valid(...)
+
+SOURCE:
+class DummyEvaluation(BaseEvaluation):
+    def evaluate(self, dataset, pipelines):
+        raise NotImplementedError("dummy")
+
+    def is_valid(self, dataset):
+        pass
+
+======================================================================
+ROW 61 | interface | OpenAI_Codex | openai/openai-agents-python#2446
+interface agents.computer:Computer kind=abc
+======================================================================
+[src/agents/computer.py]
+METHOD INDEX:
+  L14: def environment(...)
+  L19: def dimensions(...)
+  L23: def screenshot(...)
+  L27: def click(...)
+  L31: def double_click(...)
+  L35: def scroll(...)
+  L39: def type(...)
+  L43: def wait(...)
+  L47: def move(...)
+  L51: def keypress(...)
+  L55: def drag(...)
+
+SOURCE:
+class Computer(abc.ABC):
+    """A computer implemented with sync operations. The Computer interface abstracts the
+    operations needed to control a computer or browser."""
+
+    @property
+    @abc.abstractmethod
+    def environment(self) -> Environment:
+        pass
+
+    @property
+    @abc.abstractmethod
+    def dimensions(self) -> tuple[int, int]:
+        pass
+
+    @abc.abstractmethod
+    def screenshot(self) -> str:
+        pass
+
+    @abc.abstractmethod
+    def click(self, x: int, y: int, button: Button) -> None:
+        pass
+
+    @abc.abstractmethod
+    def double_click(self, x: int, y: int) -> None:
+        pass
+
+    @abc.abstractmethod
+    def scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
+        pass
+
+    @abc.abstractmethod
+    def type(self, text: str) -> None:
+        pass
+
+    @abc.abstractmethod
+    def wait(self) -> None:
+        pass
+
+    @abc.abstractmethod
+    def move(self, x: int, y: int) -> None:
+        pass
+
+    @abc.abstractmethod
+    def keypress(self, keys: list[str]) -> None:
+        pass
+
+    @abc.abstractmethod
+    def drag(self, path: list[tuple[int, int]]) -> None:
+        pass
+
+======================================================================
+ROW 62 | implementer | OpenAI_Codex | MontrealAI/AGI-Alpha-Agent-v0#893
+implementer tests.test_agents:DummyHB of alpha_factory_v1.backend.agents.base:AgentBase (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[alpha_factory_v1/backend/agents/base.py]
+METHOD INDEX:
+  L156: def __init__(...)
+  L164: def setup(...)
+  L169: def step(...)
+  L174: def run_cycle(...)
+  L178: def teardown(...)
+  L185: def mem_vector(...)
+  L189: def mem_graph(...)
+  L194: def world_model(...)
+  L198: def call_llm(...)
+  L204: def publish(...)
+  L207: def subscribe(...)
+  L212: def _run(...)
+  L241: def _safe_step(...)
+  L276: def stop(...)
+  L281: def load_weights(...)
+  L293: def __repr__(...)
+  L219: def _cron_wrapper(...)
+
+SOURCE:
+class AgentBase(abc.ABC):
+    # --- Class-level metadata (override in subclasses) ---
+    NAME: str = "base"  # snake-case, globally unique
+    VERSION: str = "0.1.0"
+    CAPABILITIES: List[str] = []  # e.g. ["forecast", "trade", "plan"]
+    COMPLIANCE_TAGS: List[str] = []  # e.g. ["GDPR", "HIPAA"]
+    REQUIRES_API_KEY: bool = False  # orchestrator will validate if True
+
+    # Scheduling ────────────────────────────────────────────────────────────
+    CYCLE_SECONDS: int | None = 60  # fixed-interval; None → use SCHED_SPEC
+    SCHED_SPEC: str | None = None   # cron-style, processed by aiocron
+
+    # Runtime-injected by orchestrator ──────────────────────────────────────
+    orchestrator: Any = None  # Fabric / bus / world-model / cfg
+
+    # ------------------------------------------------------------------ #
+    def __init__(self) -> None:
+        self._stop_evt: asyncio.Event = asyncio.Event()
+        self._metrics_run, self._metrics_err, self._metrics_lat = _prom_metrics(
+            self.NAME
+        )
+        self._kafka = _kafka_producer()
+
+    # ════ Life-cycle hooks ════
+    async def setup(self) -> None:  # noqa: D401
+        """One-time async initialization (DB warm-up, model load…)."""
+        return None
+
+    @abc.abstractmethod
+    async def step(self) -> None:  # noqa: D401
+        """The agent's main unit of work.  MUST be overridden."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    async def run_cycle(self) -> None:  # pragma: no cover - default wrapper
+        """Single orchestrator cycle – runs :meth:`step` once."""
+        await self.step()
+
+    async def teardown(self) -> None:  # noqa: D401
+        """Optional async clean-up (closing DB handles etc.)."""
+        return None
+
+    # ════ Convenience properties exposed by orchestrator ════
+    # Memory Fabric
+    @property
+    def mem_vector(self):  # -> MemoryVector | None
+        return getattr(self.orchestrator, "mem_vector", None)
+
+    @property
+    def mem_graph(self):  # -> MemoryGraph | None
+        return getattr(self.orchestrator, "mem_graph", None)
+
+    # Latent world-model / planner
+    @property
+    def world_model(self):
+        return getattr(self.orchestrator, "world_model", None)
+
+    # Unified LLM helper
+    async def call_llm(self, *args, **kwargs):
+        """LLM abstraction – delegates to orchestrator, supports transparent
+        fallback to local models when OPENAI_API_KEY is unset."""
+        return await self.orchestrator.llm(*args, **kwargs)  # type: ignore[attr-defined]
+
+    # Message-bus helpers
+    async def publish(self, topic: str, msg: Mapping[str, Any]):
+        await self.orchestrator.publish(topic, msg)  # type: ignore[attr-defined]
+
+    async def subscribe(self, topic: str):
+        async for m in self.orchestrator.subscribe(topic):  # type: ignore[attr-defined]
+            yield m
+
+    # ════ Internal run-loop (managed by orchestrator) ════
+    async def _run(self) -> None:  # pragma: no cover
+        log_ctx = {"agent": self.NAME}
+
+        # ── Option A: cron / rrule schedule ────────────────────────────────
+        if self.SCHED_SPEC and aiocron:
+            _logger.info("Cron schedule [%s] activated", self.SCHED_SPEC, extra=log_ctx)
+
+            async def _cron_wrapper():  # each cron tick triggers exactly ONE step
+                await self._safe_step(log_ctx)
+
+            aiocron.crontab(self.SCHED_SPEC)(_cron_wrapper)  # type: ignore[arg-type]
+            await self._stop_evt.wait()
+            return
+
+        # ── Option B: fixed interval (default) ────────────────────────────
+        interval = max(0, self.CYCLE_SECONDS or 0)
+        if interval == 0:
+            _logger.info("Event-driven mode (no automatic loop)", extra=log_ctx)
+            await self._stop_evt.wait()
+            return
+
+        jitter = max(0.2, float(os.getenv("AF_LOOP_JITTER_MS", "250"))) / 1000.0
+        _logger.info("Loop each %ss (+/- jitter)", interval, extra=log_ctx)
+
+        while not self._stop_evt.is_set():
+            await self._safe_step(log_ctx)
+            await asyncio.sleep(interval + random.uniform(0, jitter))
+
+    # ────────────────────────────────────────────────────────────────────
+    async def _safe_step(self, log_ctx: MutableMapping[str, Any]):  # pragma: no cover
+        t0 = time.perf_counter()
+        if self._metrics_run:
+            self._metrics_run.inc()
+
+        ok = True
+        try:
+            await self.step()
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            if self._metrics_err:
+                self._metrics_err.inc()
+            _logger.error("step() raised: %s", exc, extra=log_ctx)
+            _logger.debug("Traceback:\n%s", traceback.format_exc(), extra=log_ctx)
+
+        latency = time.perf_counter() - t0
+        if self._metrics_lat:
+            self._metrics_lat.set(latency)
+
+... <<truncated, 35 more lines>>
+
+--- IMPLEMENTER ---
+[tests/test_agents.py]
+METHOD INDEX:
+  L32: def step(...)
+
+SOURCE:
+class DummyHB(AgentBase):
+    NAME = "dummy_hb"
+    CAPABILITIES = ["x"]
+
+    async def step(self) -> None:
+        return None
+
+======================================================================
+ROW 63 | implementer | Claude_Code | nexi-lab/nexus#2148
+implementer tests.unit.backends.test_registry:AnotherBackend of nexus.backends.backend:Backend (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/nexus/backends/backend.py]
+METHOD INDEX:
+  L93: def resolve_database_url(...)
+  L119: def name(...)
+  L129: def user_scoped(...)
+  L156: def is_connected(...)
+  L171: def thread_safe(...)
+  L190: def supports_rename(...)
+  L203: def has_virtual_filesystem(...)
+  L217: def has_root_path(...)
+  L230: def has_token_manager(...)
+  L243: def has_data_dir(...)
+  L256: def is_passthrough(...)
+  L269: def supports_parallel_mmap_read(...)
+  L282: def describe(...)
+  L294: def connect(...)
+  L314: def disconnect(...)
+  L330: def check_connection(...)
+  L365: def write_content(...)
+  L388: def read_content(...)
+  L407: def batch_read_content(...)
+  L446: def stream_content(...)
+  L479: def stream_range(...)
+  L508: def write_stream(...)
+  L546: def delete_content(...)
+  L569: def content_exists(...)
+  L589: def get_content_size(...)
+  L609: def get_ref_count(...)
+  L631: def mkdir(...)
+  L660: def rmdir(...)
+  L680: def is_directory(...)
+  L695: def list_dir(...)
+  L727: def get_file_info(...)
+  L769: def get_object_type(...)
+  L797: def get_object_id(...)
+
+SOURCE:
+class Backend(ABC):
+    """
+    Unified backend interface for storage operations.
+
+    All storage backends (LocalFS, S3, GCS, etc.) implement this interface.
+    It combines:
+    - Content-addressable storage (CAS) for automatic deduplication
+    - Directory operations for filesystem compatibility
+
+    Content Operations:
+    - Files stored by SHA-256 hash
+    - Automatic deduplication (same content = stored once)
+    - Reference counting for safe deletion
+
+    Directory Operations:
+    - Virtual directory structure (metadata-based or backend-native)
+    - Compatible with path router and mounting
+    """
+
+    @staticmethod
+    def resolve_database_url(db_param: str) -> str:
+        """
+        Resolve database URL with TOKEN_MANAGER_DB environment variable priority.
+
+        This utility method is used by connector backends (GDrive, Gmail, X) to
+        resolve the database URL for TokenManager, giving priority to the
+        TOKEN_MANAGER_DB environment variable over the provided parameter.
+
+        Args:
+            db_param: Database URL or path provided to the connector
+
+        Returns:
+            Resolved database URL (from env var if set, otherwise db_param)
+
+        Examples:
+            >>> import os
+            >>> os.environ['TOKEN_MANAGER_DB'] = 'postgresql://localhost/nexus'
+            >>> Backend.resolve_database_url('sqlite:///local.db')
+            'postgresql://localhost/nexus'
+        """
+        import os
+
+        return os.getenv("TOKEN_MANAGER_DB") or db_param
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """
+        Backend identifier name.
+
+        Returns:
+            Backend name (e.g., "local", "gcs", "s3")
+        """
+        pass
+
+    @property
+    def user_scoped(self) -> bool:
+        """
+        Whether this backend requires per-user credentials (OAuth-based).
+
+        User-scoped backends (e.g., Google Drive, OneDrive) use different
+        credentials for each user. The backend will receive OperationContext
+        to determine which user's credentials to use.
+
+        Non-user-scoped backends (e.g., GCS, S3) use shared service account
+        credentials and ignore the context parameter.
+
+        Returns:
+            True if backend requires per-user credentials, False otherwise
+            Default: False (shared credentials)
+
+        Examples:
+            >>> # Shared credentials (GCS, S3)
+            >>> gcs_backend.user_scoped
+            False
+
+            >>> # Per-user OAuth (Google Drive, OneDrive)
+            >>> gdrive_backend.user_scoped
+            True
+        """
+        return False
+
+    @property
+    def is_connected(self) -> bool:
+        """
+        Whether the backend is currently connected.
+
+        For stateless backends (e.g., local filesystem), this always returns True.
+        For stateful backends (e.g., databases, cloud services with sessions),
+        this reflects the actual connection state.
+
+        Returns:
+            True if connected/ready, False otherwise
+            Default: True (for stateless backends)
+        """
+        return True
+
+    @property
+    def thread_safe(self) -> bool:
+        """
+        Whether this backend is safe for concurrent access from multiple threads.
+
+        Thread-safe backends can share a single instance across threads.
+        Non-thread-safe backends require per-thread instances or connection pooling.
+
+        Returns:
+            True if thread-safe, False otherwise
+            Default: True (most backends are thread-safe)
+        """
+        return True
+
+    # === Capability Flags ===
+    # These properties declare backend capabilities so that core code can use
+    # polymorphic dispatch instead of hasattr/isinstance/getattr checks.
+    # Each defaults to False; concrete backends override to return True.
+
+    @property
+    def supports_rename(self) -> bool:
+        """Whether this backend supports direct file rename/move.
+
+... <<truncated, 630 more lines>>
+
+--- IMPLEMENTER ---
+[tests/unit/backends/test_registry.py]
+METHOD INDEX:
+
+
+SOURCE:
+        class AnotherBackend(DummyBackend):
+            pass

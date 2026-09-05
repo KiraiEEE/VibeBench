@@ -1,0 +1,407 @@
+row 94   StarRocks/starrocks#70342
+============================================================================
+CONTRACT com.starrocks.sql.common.PartitionDiffer   members=5.0 implementers=2.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       34  public abstract class PartitionDiffer {
+       35      protected final MaterializedView mv;
+       36      // whether it's used for query rewrite or refresh, the difference is that query rewrite will not
+       37      // consider partition_ttl_number and mv refresh will consider it to avoid creating too much partitions
+       38      protected final MVTimelinessArbiter.QueryRewriteParams queryRewriteParams;
+       39  
+       40      public PartitionDiffer(MaterializedView mv, MVTimelinessArbiter.QueryRewriteParams queryRewriteParams) {
+       41          this.mv = mv;
+       42          this.queryRewriteParams = queryRewriteParams;
+       43      }
+       44  
+       45      /**
+       46       * Collect the ref base table's partition range map.
+       47       * @return the ref base table's partition range map: <ref base table, <partition name, partition range>>
+       48       */
+       49      public abstract Map<Table, Map<String, PCell>> syncBaseTablePartitionInfos();
+       50  
+       51      /**
+       52       * Compute the partition difference between materialized view and all ref base tables.
+       53       * @param rangeToInclude: <partition start, partition end> pair which is use for range differ.
+       54  
+       55       * @return MvPartitionDiffResult: the result of partition difference
+       56       */
+       57      public abstract PartitionDiffResult computePartitionDiff(Range<PartitionKey> rangeToInclude);
+       58  
+       59      public abstract PartitionDiffResult computePartitionDiff(Range<PartitionKey> rangeToInclude,
+       60                                                               Map<Table, Map<String, PCell>> rBTPartitionMap);
+       61      /**
+       62       * Generate the reference map between the base table and the mv.
+       63       * @param baseRangeMap src partition list map of the base table
+       64       * @param mvRangeMap mv partition name to its list partition cell
+       65       * @return base table -> <partition name, mv partition names> mapping
+       66       */
+       67      public abstract Map<Table, Map<String, Set<String>>> generateBaseRefMap(Map<Table, Map<String, PCell>> baseRangeMap,
+       68                                                                              Map<String, PCell> mvRangeMap);
+       69  
+       70      /**
+       71       * Generate the mapping from materialized view partition to base table partition.
+       72       * @param mvRangeMap : materialized view partition range map: <partitionName, partitionRange>
+       73       * @param baseRangeMap: base table partition range map, <baseTable, <partitionName, partitionRange>>
+       74       * @return mv partition name -> <base table, base partition names> mapping
+       75       */
+       76      public abstract Map<String, Map<Table, Set<String>>> generateMvRefMap(Map<String, PCell> mvRangeMap,
+       77                                                                            Map<Table, Map<String, PCell>> baseRangeMap);
+       78      /**
+       79       * To solve multi partition columns' problem of external table, record the mv partition name to all the same
+       80       * partition names map here.
+       81       * @param partitionTableAndColumns the partition table and its partition column
+       82       * @param result the result map
+       83       */
+       84      public static void collectExternalPartitionNameMapping(Map<Table, List<Column>> partitionTableAndColumns,
+       85                                                             Map<Table, Map<String, Set<String>>> result) throws AnalysisException {
+       86          for (Map.Entry<Table, List<Column>> e : partitionTableAndColumns.entrySet()) {
+       87              Table refBaseTable = e.getKey();
+       88              List<Column> refPartitionColumns = e.getValue();
+       89              collectExternalBaseTablePartitionMapping(refBaseTable, refPartitionColumns, result);
+       90          }
+       91      }
+       92  
+       93      /**
+       94       * Collect the external base table's partition name to its intersected materialized view names.
+       95       * @param refBaseTable the base table
+       96       * @param refTablePartitionColumns the partition column of the base table
+       97       * @param result the result map
+       98       * @throws AnalysisException
+       99       */
+      100      private static void collectExternalBaseTablePartitionMapping(
+      101              Table refBaseTable,
+      102              List<Column> refTablePartitionColumns,
+      103              Map<Table, Map<String, Set<String>>> result) throws AnalysisException {
+      104          if (refBaseTable.isNativeTableOrMaterializedView()) {
+      105              return;
+      106          }
+      107          Map<String, Set<String>> mvPartitionNameMap = PartitionUtil.getMVPartitionNameMapOfExternalTable(refBaseTable,
+      108                  refTablePartitionColumns, PartitionUtil.getPartitionNames(refBaseTable));
+      109          result.put(refBaseTable, mvPartitionNameMap);
+      110      }
+      111  }
+
+---------- IMPLEMENTER com.starrocks.sql.common.ListPartitionDiffer  stubs=0/5 ----------
+       42  public final class ListPartitionDiffer extends PartitionDiffer {
+       43      private static final Logger LOG = LogManager.getLogger(ListPartitionDiffer.class);
+       44  
+       45      public ListPartitionDiffer(MaterializedView mv, MVTimelinessArbiter.QueryRewriteParams queryRewriteParams) {
+       46          super(mv, queryRewriteParams);
+       47      }
+       48  
+       49      /**
+       50       * Iterate srcListMap, if the partition name is not in dstListMap or the partition value is different, add into result.
+       51       *
+       52       * Compare the partition of the base table and the partition of the mv.
+       53       * @param baseItems the partition name to its list partition cell of the base table
+       54       * @param mvItems the partition name to its list partition cell of the mv
+       55       * @return the list partition diff between the base table and the mv
+       56       */
+       57      public static PartitionDiff getListPartitionDiff(Map<String, PCell> baseItems,
+       58                                                       Map<String, PCell> mvItems,
+       59                                                       Set<String> uniqueResultNames) {
+       60          // This synchronization method has a one-to-one correspondence
+       61          // between the base table and the partition of the mv.
+       62          // for addition, we need to ensure the partition name is unique in case-insensitive
+       63          Map<String, PCell> adds = diffList(baseItems, mvItems, uniqueResultNames);
+       64          // for deletion, we don't need to ensure the partition name is unique since mvItems is used as the reference
+       65          Map<String, PCell> deletes = diffList(mvItems, baseItems, null);
+       66          return new PartitionDiff(adds, deletes);
+       67      }
+       68  
+       69      /**
+       70       * Iterate srcListMap, if the partition name is not in dstListMap or the partition value is different, add into result.
+       71       * When `uniqueResultNames` is set, use it to ensure the output partition name is unique in case-insensitive.
+       72       * NOTE: Ensure output map keys are distinct in case-insensitive which is because the key is used for partition name,
+       73       * and StarRocks partition name is case-insensitive.
+       74       */
+       75      public static Map<String, PCell> diffList(Map<String, PCell> srcListMap,
+       76                                                Map<String, PCell> dstListMap,
+       77                                                Set<String> uniqueResultNames) {
+       78          if (CollectionUtils.sizeIsEmpty(srcListMap)) {
+       79              return Maps.newHashMap();
+       80          }
+       81  
+       82          // PListCell may contain multi values, we need to ensure they are not duplicated from each other
+       83          // NOTE: dstListMap's partition items may be duplicated, we need to collect them first
+       84          Map<PListAtom, PListCell> dstAtomMaps = Maps.newHashMap();
+       85          for (PCell l : dstListMap.values()) {
+       86              Preconditions.checkArgument(l instanceof PListCell, "PListCell expected");
+       87              PListCell pListCell = (PListCell) l;
+       88              pListCell.toAtoms().stream().forEach(x -> dstAtomMaps.put(x, pListCell));
+       89          }
+       90  
+       91          Map<String, PCell> result = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
+       92          for (Map.Entry<String, PCell> srcEntry : srcListMap.entrySet()) {
+       93              String pName = srcEntry.getKey();
+       94              PListCell srcItem = (PListCell) srcEntry.getValue();
+       95  
+       96              if (srcItem.equals(dstListMap.get(pName))) {
+       97                  continue;
+       98              }
+       99  
+      100              // distinct atoms
+      101              List<PListAtom> srcDistinctAtoms = srcItem.toAtoms().stream()
+      102                      .filter(atom -> !dstAtomMaps.containsKey(atom))
+      103                      .collect(Collectors.toList());
+      104              if (!srcDistinctAtoms.isEmpty()) {
+      105                  srcDistinctAtoms.forEach(atom -> dstAtomMaps.put(atom, srcItem));
+      106                  PListCell newValue = new PListCell(
+      107                          srcDistinctAtoms.stream().map(PListAtom::getPartitionItem).collect(Collectors.toList()));
+      108  
+      109                  // ensure the partition name is unique
+      110                  if (uniqueResultNames != null) {
+      111                      if (uniqueResultNames.contains(pName)) {
+      112                          try {
+      113                              // it's fine to use result to keep it unique here, since we always
+      114                              pName = AnalyzerUtils.calculateUniquePartitionName(pName, newValue, result);
+      115                          } catch (Exception e) {
+      116                              throw new RuntimeException("Fail to calculate unique partition name: " + e.getMessage());
+      117                          }
+      118                      }
+      119                      uniqueResultNames.add(pName);
+      120                  }
+      121  
+      122                  result.put(pName, newValue);
+      123              }
+      124          }
+      125          return result;
+      126      }
+      127  
+      128      /**
+      129       * Check if the partition of the base table and the partition of the mv have changed.
+      130       *
+      131       * @param baseListMap the partition name to its list partition cell of the base table
+      132       * @param mvListMap   the partition name to its list partition cell of the mv
+      133       * @return true if the partition has changed, otherwise false
+      134       */
+      135      public static boolean hasListPartitionChanged(Map<String, PListCell> baseListMap,
+      136                                                    Map<String, PListCell> mvListMap) {
+      137          if (checkListPartitionChanged(baseListMap, mvListMap)) {
+      138              return true;
+      139          }
+      140          if (checkListPartitionChanged(mvListMap, baseListMap)) {
+      141              return true;
+      142          }
+      143          return false;
+      144      }
+      145  
+      146      /**
+      147       * Check if src list map is different from dst list map.
+      148       * @param srcListMap src partition list map
+      149       * @param dstListMap dst partition list map
+      150       * @return true if the partition has changed, otherwise false
+      151       */
+      152      public static boolean checkListPartitionChanged(Map<String, PListCell> srcListMap,
+      153                                                      Map<String, PListCell> dstListMap) {
+      154          for (Map.Entry<String, PListCell> srcEntry : srcListMap.entrySet()) {
+      155              String key = srcEntry.getKey();
+      156              PListCell srcItem = srcEntry.getValue();
+      157              if (!srcItem.equals(dstListMap.get(key))) {
+      158                  return true;
+      159              }
+      160          }
+      161          return false;
+      162      }
+      163  
+      164      private static Map<PListAtom, Set<PListCellPlus>> toAtoms(Map<String, PCell> partitionMap) {
+      165          Map<PListAtom, Set<PListCellPlus>> result = Maps.newHashMap();
+      166          for (Map.Entry<String, PCell> e : partitionMap.entrySet()) {
+      167              PListCell cell = (PListCell) e.getValue();
+      168              PListCellPlus plus = new PListCellPlus(e.getKey(), cell);
+      169              plus.toAtoms().stream().forEach(x -> {
+      170                  result.computeIfAbsent(x, k -> Sets.newHashSet())
+      171                          .add(new PListCellPlus(e.getKey(), cell));
+      172              });
+      173          }
+      174          return result;
+      175      }
+      176  
+      177      public Map<String, Set<String>> generateBaseRefMapImpl(Map<PListAtom, Set<PListCellPlus>> mvPartitionMap,
+      178                                                             Map<String, PCell> baseTablePartitionMap) {
+      179          if (mvPartitionMap.isEmpty()) {
+      180              return Maps.newHashMap();
+      181          }
+      182          // for each partition of base, find the corresponding partition of mv
+      183          Map<PListAtom, Set<PListCellPlus>> baseAtoms = toAtoms(baseTablePartitionMap);
+      184          Map<String, Set<String>> result = Maps.newHashMap();
+      185          for (Map.Entry<PListAtom, Set<PListCellPlus>> e : baseAtoms.entrySet()) {
+      186              // check query rewrite exhausted
+      187              queryRewriteParams.checkQueryRewriteExhausted();
+      188  
+      189              // once base table's singleton is found in mv, add the partition name of mv into result
+      190              PListAtom baseAtom = e.getKey();
+      191              if (mvPartitionMap.containsKey(baseAtom)) {
+      192                  Set<PListCellPlus> mvCellPluses = mvPartitionMap.get(baseAtom);
+      193                  for (PListCellPlus baseCellPlus : e.getValue()) {
+      194                      mvCellPluses.stream().forEach(x ->
+      195                              result.computeIfAbsent(baseCellPlus.getPartitionName(), k -> Sets.newHashSet())
+      196                                      .add(x.getPartitionName())
+      197                      );
+      198                  }
+      199              } else {
+      200                  // add an empty set
+      201                  Set<PListCellPlus> baseCellPluses = e.getValue();
+
+---------- IMPLEMENTER com.starrocks.sql.common.RangePartitionDiffer  stubs=0/5 ----------
+       64  public final class RangePartitionDiffer extends PartitionDiffer {
+       65      private static final Logger LOG = LogManager.getLogger(RangePartitionDiffer.class);
+       66      private static final String INTERSECTED_PARTITION_PREFIX = "_intersected_";
+       67  
+       68      private final Range<PartitionKey> rangeToInclude;
+       69      private final int partitionTTLNumber;
+       70      private final PeriodDuration partitionTTL;
+       71      private final PartitionInfo partitionInfo;
+       72      private final List<Column> partitionColumns;
+       73      private final Map<Table, List<Expr>> refBaseTablePartitionExprs;
+       74  
+       75      public RangePartitionDiffer(MaterializedView mv,
+       76                                  MVTimelinessArbiter.QueryRewriteParams queryRewriteParams,
+       77                                  Range<PartitionKey> rangeToInclude) {
+       78          super(mv, queryRewriteParams);
+       79          this.partitionInfo = mv.getPartitionInfo();
+       80          this.partitionTTLNumber = mv.getTableProperty().getPartitionTTLNumber();
+       81          this.partitionTTL = mv.getTableProperty().getPartitionTTL();
+       82          this.partitionColumns = mv.getPartitionInfo().getPartitionColumns(mv.getIdToColumn());
+       83          this.refBaseTablePartitionExprs = mv.getRefBaseTablePartitionExprs();
+       84          this.rangeToInclude = rangeToInclude;
+       85      }
+       86  
+       87      /**
+       88       * Diff considering refresh range and TTL
+       89       */
+       90      public PartitionDiff diff(Map<String, Range<PartitionKey>> srcRangeMap,
+       91                                Map<String, Range<PartitionKey>> dstRangeMap) {
+       92          Map<String, PCell> adds = null;
+       93          try {
+       94              Map<String, Range<PartitionKey>> prunedAdd = pruneAddedPartitions(srcRangeMap);
+       95              adds = diffRange(prunedAdd, dstRangeMap);
+       96          } catch (Exception e) {
+       97              LOG.warn("failed to prune partitions when creating");
+       98              throw new RuntimeException(e);
+       99          }
+      100          Map<String, PCell> deletes = diffRange(dstRangeMap, srcRangeMap);
+      101          return new PartitionDiff(adds, deletes);
+      102      }
+      103  
+      104      /**
+      105       * Prune based on TTL and refresh range
+      106       */
+      107      private Map<String, Range<PartitionKey>> pruneAddedPartitions(Map<String, Range<PartitionKey>> addPartitions)
+      108              throws AnalysisException {
+      109          Map<String, Range<PartitionKey>> res = new HashMap<>(addPartitions);
+      110          if (rangeToInclude != null) {
+      111              res.entrySet().removeIf(entry -> !isRangeIncluded(entry.getValue(), rangeToInclude));
+      112          }
+      113  
+      114          if (partitionTTL != null && !partitionTTL.isZero() && partitionInfo.isRangePartition()) {
+      115              Type partitionType = partitionColumns.get(0).getType();
+      116              LocalDateTime ttlTime = LocalDateTime.now().minus(partitionTTL);
+      117              PartitionKey ttlLowerBound;
+      118              if (partitionType.isDatetime()) {
+      119                  ttlLowerBound = PartitionKey.ofDateTime(ttlTime);
+      120              } else if (partitionType.isDate()) {
+      121                  ttlLowerBound = PartitionKey.ofDate(ttlTime.toLocalDate());
+      122              } else {
+      123                  throw new SemanticException("partition_ttl not support partition type: " + partitionType);
+      124              }
+      125              Predicate<Range<PartitionKey>> isOutdated = (p) -> p.upperEndpoint().compareTo(ttlLowerBound) <= 0;
+      126  
+      127              // filter partitions with ttl
+      128              res.values().removeIf(isOutdated);
+      129          }
+      130          if (partitionTTLNumber > 0 && partitionInfo.isRangePartition()) {
+      131              List<PRangeCellPlus> sorted =
+      132                      addPartitions.entrySet()
+      133                              .stream().map(entry -> new PRangeCellPlus(entry.getKey(), entry.getValue()))
+      134                              .sorted(Comparator.reverseOrder())
+      135                              .collect(Collectors.toList());
+      136  
+      137              Type partitionType = partitionColumns.get(0).getType();
+      138  
+      139              // For partition ttl, skip partitions that are shadow partitions or in the future
+      140              Predicate<PRangeCellPlus> isShadowKey = Predicates.alwaysFalse();
+      141              Predicate<PRangeCellPlus> isInFuture = Predicates.alwaysFalse();
+      142              // TODO: convert string type to date as predicate
+      143              if (partitionType.isDateType()) {
+      144                  PartitionKey shadowPartitionKey = PartitionKey.createShadowPartitionKey(partitionColumns);
+      145                  PartitionKey currentPartitionKey = partitionType.isDatetime() ?
+      146                          PartitionKey.ofDateTime(LocalDateTime.now()) : PartitionKey.ofDate(LocalDate.now());
+      147                  isShadowKey = (p) -> p.getCell().getRange().lowerEndpoint().compareTo(shadowPartitionKey) == 0;
+      148                  isInFuture = (p) -> p.getCell().getRange().lowerEndpoint().compareTo(currentPartitionKey) > 0;
+      149              }
+      150              // keep partition that either is shadow partition, or larger than current_time
+      151              // and keep only partition_ttl_number of partitions
+      152              Predicate<PRangeCellPlus> finalIsShadowKey = isShadowKey;
+      153              Predicate<PRangeCellPlus> finalIsInFuture = isInFuture;
+      154              List<PRangeCellPlus> ttlCandidate =
+      155                      sorted.stream()
+      156                              .filter(x -> !finalIsShadowKey.test(x) && !finalIsInFuture.test(x))
+      157                              .collect(Collectors.toList());
+      158  
+      159              // keep only ttl_number of candidates,
+      160              // since ths list already reversed sorted, grab the sublist
+      161              if (ttlCandidate.size() > partitionTTLNumber) {
+      162                  ttlCandidate = ttlCandidate.subList(partitionTTLNumber, ttlCandidate.size());
+      163              } else {
+      164                  ttlCandidate.clear();
+      165              }
+      166  
+      167              // remove partitions in ttl candidate
+      168              Set<String> prunedPartitions = ttlCandidate.stream().map(PRangeCellPlus::getPartitionName)
+      169                      .collect(Collectors.toSet());
+      170              res.keySet().removeIf(prunedPartitions::contains);
+      171          }
+      172  
+      173          return res;
+      174      }
+      175  
+      176      public static PartitionDiff simpleDiff(Map<String, Range<PartitionKey>> srcRangeMap,
+      177                                             Map<String, Range<PartitionKey>> dstRangeMap) {
+      178          Map<String, PCell> adds = diffRange(srcRangeMap, dstRangeMap);
+      179          Map<String, PCell> deletes = diffRange(dstRangeMap, srcRangeMap);
+      180          return new PartitionDiff(adds, deletes);
+      181      }
+      182  
+      183      public static Map<String, PCell> diffRange(Map<String, Range<PartitionKey>> srcRangeMap,
+      184                                                 Map<String, Range<PartitionKey>> dstRangeMap) {
+      185          Map<String, PCell> result = Maps.newHashMap();
+      186          for (Map.Entry<String, Range<PartitionKey>> srcEntry : srcRangeMap.entrySet()) {
+      187              if (!dstRangeMap.containsKey(srcEntry.getKey()) ||
+      188                      !RangeUtils.isRangeEqual(srcEntry.getValue(), dstRangeMap.get(srcEntry.getKey()))) {
+      189                  result.put(srcEntry.getKey(),
+      190                          new PRangeCell(SyncPartitionUtils.convertToDatePartitionRange(srcEntry.getValue())));
+      191              }
+      192          }
+      193          return result;
+      194      }
+      195  
+      196      /**
+      197       * Check whether `range` is included in `rangeToInclude`. Here we only want to
+      198       * create partitions which is between `start` and `end` when executing
+      199       * `refresh materialized view xxx partition start (xxx) end (xxx)`
+      200       * @param rangeToInclude range to check whether the to be checked range is in
+      201       * @return true if included, else false
+      202       */
+      203      public static boolean isRangeIncluded(Range<PartitionKey> rangeToCheck, Range<PartitionKey> rangeToInclude) {
+      204          if (rangeToInclude == null) {
+      205              return true;
+      206          }
+      207          int lowerCmp = rangeToInclude.lowerEndpoint().compareTo(rangeToCheck.upperEndpoint());
+      208          int upperCmp = rangeToInclude.upperEndpoint().compareTo(rangeToCheck.lowerEndpoint());
+      209          return !(lowerCmp >= 0 || upperCmp <= 0);
+      210      }
+      211  
+      212      /**
+      213       * Collect the ref base table's partition range map.
+      214       * @return the ref base table's partition range map: <ref base table, <partition name, partition range>>
+      215       */
+      216      @Override
+      217      public Map<Table, Map<String, PCell>> syncBaseTablePartitionInfos() {
+      218          Map<Table, List<Column>> partitionTableAndColumn = mv.getRefBaseTablePartitionColumns();
+      219          if (partitionTableAndColumn.isEmpty()) {
+      220              return Maps.newHashMap();
+      221          }
+      222  
+      223          Map<Table, Map<String, PCell>> refBaseTablePartitionMap = Maps.newHashMap();

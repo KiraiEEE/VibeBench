@@ -1,0 +1,148 @@
+row 256   apache/ozone#8572
+============================================================================
+CLASS org.apache.hadoop.ozone.om.service.CompactionService   loc=143 methods=8 wmc=15 lcom=0.4285714285714285 c3=0.1056553280219483
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       47  public class CompactionService extends BackgroundService {
+       48    private static final Logger LOG =
+       49        LoggerFactory.getLogger(CompactionService.class);
+       50  
+       51    // Use only a single thread for Compaction.
+       52    private static final int COMPACTOR_THREAD_POOL_SIZE = 1;
+       53  
+       54    private final OzoneManager ozoneManager;
+       55    private final OMMetadataManager omMetadataManager;
+       56    private final AtomicLong numCompactions;
+       57    private final AtomicBoolean suspended;
+       58    // list of tables that can be compacted
+       59    private final List<String> compactableTables;
+       60    private final int manualCompactionMaxSubCompactions;
+       61  
+       62    public CompactionService(OzoneManager ozoneManager, TimeUnit unit, long interval, long timeout,
+       63                             List<String> tables) {
+       64      super("CompactionService", interval, unit,
+       65          COMPACTOR_THREAD_POOL_SIZE, timeout,
+       66          ozoneManager.getThreadNamePrefix());
+       67      this.ozoneManager = ozoneManager;
+       68      this.omMetadataManager = this.ozoneManager.getMetadataManager();
+       69  
+       70      this.numCompactions = new AtomicLong(0);
+       71      this.suspended = new AtomicBoolean(false);
+       72      this.compactableTables = validateTables(tables);
+       73      this.manualCompactionMaxSubCompactions = ozoneManager.getConfiguration().getObject(RocksDBConfiguration.class)
+       74          .getManualCompactionMaxSubCompactions();
+       75    }
+       76  
+       77    private List<String> validateTables(List<String> tables) {
+       78      if (tables == null || tables.isEmpty()) {
+       79        return Collections.emptyList();
+       80      }
+       81      List<String> validTables = new ArrayList<>();
+       82      Set<String> allTableNames = new HashSet<>(omMetadataManager.listTableNames());
+       83      for (String table : tables) {
+       84        if (allTableNames.contains(table)) {
+       85          validTables.add(table);
+       86        } else {
+       87          LOG.warn("CompactionService: Table \"{}\" not found in OM metadata. Skipping this table.", table);
+       88        }
+       89      }
+       90      if (validTables.isEmpty()) {
+       91        LOG.error("CompactionService: No valid compaction tables found. Failing initialization.");
+       92        throw new IllegalArgumentException("CompactionService: None of the provided tables are valid.");
+       93      }
+       94      return Collections.unmodifiableList(validTables);
+       95    }
+       96  
+       97    /**
+       98     * Suspend the service (for testing).
+       99     */
+      100    @VisibleForTesting
+      101    public void suspend() {
+      102      suspended.set(true);
+      103    }
+      104  
+      105    /**
+      106     * Resume the service if suspended (for testing).
+      107     */
+      108    @VisibleForTesting
+      109    public void resume() {
+      110      suspended.set(false);
+      111    }
+      112  
+      113    @VisibleForTesting
+      114    public List<String> getCompactableTables() {
+      115      return compactableTables;
+      116    }
+      117  
+      118    /**
+      119     * Returns the number of manual compactions performed.
+      120     *
+      121     * @return long count.
+      122     */
+      123    @VisibleForTesting
+      124    public long getNumCompactions() {
+      125      return numCompactions.get();
+      126    }
+      127  
+      128    @Override
+      129    public synchronized BackgroundTaskQueue getTasks() {
+      130      BackgroundTaskQueue queue = new BackgroundTaskQueue();
+      131      for (String tableName : compactableTables) {
+      132        queue.add(new CompactTask(tableName));
+      133      }
+      134      return queue;
+      135    }
+      136  
+      137    private boolean shouldRun() {
+      138      return !suspended.get();
+      139    }
+      140  
+      141    protected void compactFully(String tableName) throws IOException {
+      142      long startTime = Time.monotonicNow();
+      143      LOG.info("Compacting column family: {}", tableName);
+      144      try (ManagedCompactRangeOptions options = new ManagedCompactRangeOptions()) {
+      145        options.setBottommostLevelCompaction(ManagedCompactRangeOptions.BottommostLevelCompaction.kForce);
+      146        options.setExclusiveManualCompaction(true);
+      147        options.setMaxSubcompactions(manualCompactionMaxSubCompactions);
+      148        RocksDatabase rocksDatabase = ((RDBStore) omMetadataManager.getStore()).getDb();
+      149  
+      150        try {
+      151          // Find CF Handler
+      152          RocksDatabase.ColumnFamily columnFamily = rocksDatabase.getColumnFamily(tableName);
+      153          rocksDatabase.compactRange(columnFamily, null, null, options);
+      154          LOG.info("Compaction of column family: {} completed in {} ms",
+      155              tableName, Time.monotonicNow() - startTime);
+      156        } catch (NullPointerException ex) {
+      157          LOG.error("Unable to trigger compaction for \"{}\". Column family not found ", tableName);
+      158          throw new IOException("Column family \"" + tableName + "\" not found.");
+      159        }
+      160      }
+      161    }
+      162  
+      163    private class CompactTask implements BackgroundTask {
+      164      private final String tableName;
+      165  
+      166      CompactTask(String tableName) {
+      167        this.tableName = tableName;
+      168      }
+      169  
+      170      @Override
+      171      public int getPriority() {
+      172        return 0;
+      173      }
+      174  
+      175      @Override
+      176      public BackgroundTaskResult call() throws Exception {
+      177        // trigger full compaction for the specified table.
+      178        if (!shouldRun()) {
+      179          return BackgroundTaskResult.EmptyTaskResult.newResult();
+      180        }
+      181        LOG.debug("Running CompactTask");
+      182  
+      183        compactFully(tableName);
+      184        numCompactions.incrementAndGet();
+      185        return () -> 1;
+      186      }
+      187    }
+      188  
+      189  }

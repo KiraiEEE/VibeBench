@@ -1,0 +1,406 @@
+row 28   lakernote/EasyPostman#113
+============================================================================
+CLASS com.laker.postman.plugin.git.GitWorkspacePluginService   loc=822 methods=28 wmc=154 lcom=0.037037037037037 c3=0.2066563251695895
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       41  @Slf4j
+       42  public class GitWorkspacePluginService implements GitPluginService {
+       43  
+       44      private static final int GIT_OPERATION_TIMEOUT = 10;
+       45  
+       46      @Override
+       47      public void prepareGitWorkspace(Workspace workspace) throws Exception {
+       48          ensureGitWorkspace(workspace);
+       49          if (workspace.getGitRepoSource() == GitRepoSource.CLONED) {
+       50              cloneRepository(workspace);
+       51          } else if (workspace.getGitRepoSource() == GitRepoSource.INITIALIZED) {
+       52              initializeGitRepository(workspace);
+       53          }
+       54      }
+       55  
+       56      @Override
+       57      public void migrateDefaultWorkspaceGit(Workspace workspace, String commitMessage) throws Exception {
+       58          try (Git git = Git.init().setDirectory(new File(workspace.getPath())).call()) {
+       59              createGitignore(workspace);
+       60              git.add().addFilepattern(".").call();
+       61              git.commit().setMessage(commitMessage).call();
+       62  
+       63              String oldBranch = workspace.getCurrentBranch();
+       64              String actualBranch = git.getRepository().getBranch();
+       65              if (oldBranch != null && !oldBranch.isBlank() && !oldBranch.equals(actualBranch)) {
+       66                  git.branchCreate().setName(oldBranch).call();
+       67                  git.checkout().setName(oldBranch).call();
+       68              } else {
+       69                  workspace.setCurrentBranch(actualBranch);
+       70              }
+       71  
+       72              String remoteUrl = workspace.getGitRemoteUrl();
+       73              if (remoteUrl != null && !remoteUrl.isBlank()) {
+       74                  git.remoteAdd().setName("origin").setUri(new URIish(remoteUrl)).call();
+       75              }
+       76  
+       77              workspace.setLastCommitId(getLastCommitId(git));
+       78              workspace.setUpdatedAt(System.currentTimeMillis());
+       79          }
+       80      }
+       81  
+       82      @Override
+       83      public GitStatusCheck checkGitStatus(Workspace workspace, GitOperation operation) {
+       84          return GitConflictDetector.checkGitStatus(
+       85                  workspace.getPath(),
+       86                  operation.name(),
+       87                  getCredentialsProvider(workspace),
+       88                  getSshCredentialsProvider(workspace)
+       89          );
+       90      }
+       91  
+       92      @Override
+       93      public void clearSshCache(String privateKeyPath) {
+       94          if (privateKeyPath != null && !privateKeyPath.isBlank()) {
+       95              SshCredentialsProvider.clearCache(privateKeyPath);
+       96          }
+       97      }
+       98  
+       99      @Override
+      100      public GitOperationResult pullUpdates(Workspace workspace) throws Exception {
+      101          ensureGitWorkspace(workspace);
+      102          GitOperationResult result = new GitOperationResult();
+      103          result.operationType = "Pull";
+      104  
+      105          try (Git git = Git.open(new File(workspace.getPath()))) {
+      106              String branch = git.getRepository().getBranch();
+      107              String tracking = git.getRepository().getConfig().getString("branch", branch, "merge");
+      108              if (tracking == null) {
+      109                  throw new IllegalStateException(
+      110                          "Local branch is not tracking a remote branch, unable to pull. Please set up tracking branch first, e.g.: git branch --set-upstream-to=origin/" + branch);
+      111              }
+      112  
+      113              var statusBefore = git.status().call();
+      114              String commitIdBefore = getLastCommitId(git);
+      115  
+      116              if (commitIdBefore == null) {
+      117                  result.details += "Detected empty local repository, attempting to pull initial content from remote\n";
+      118                  try {
+      119                      var fetchCommand = git.fetch();
+      120                      fetchCommand.setTimeout(GIT_OPERATION_TIMEOUT);
+      121                      applyAuth(fetchCommand, workspace);
+      122                      fetchCommand.call();
+      123  
+      124                      String remoteName = git.getRepository().getConfig().getString("branch", branch, "remote");
+      125                      if (remoteName == null) {
+      126                          remoteName = "origin";
+      127                      }
+      128                      String remoteBranchName = tracking.startsWith("refs/heads/")
+      129                              ? tracking.substring("refs/heads/".length())
+      130                              : tracking;
+      131                      String remoteRef = "refs/remotes/" + remoteName + "/" + remoteBranchName;
+      132                      ObjectId remoteId = git.getRepository().resolve(remoteRef);
+      133                      if (remoteId == null) {
+      134                          result.success = true;
+      135                          result.message = "Remote repository is empty, nothing to pull";
+      136                          result.details += "Remote repository is currently empty, waiting for initial push\n";
+      137                          return result;
+      138                      }
+      139                  } catch (RefNotAdvertisedException e) {
+      140                      result.success = true;
+      141                      result.message = "Remote repository is empty or remote branch does not exist, nothing to pull";
+      142                      result.details += "Remote repository is empty or branch '" + tracking + "' does not exist\n";
+      143                      return result;
+      144                  } catch (Exception e) {
+      145                      throw new RuntimeException("Unable to connect to remote repository: " + e.getMessage(), e);
+      146                  }
+      147              }
+      148  
+      149              if (!statusBefore.isClean()) {
+      150                  result.details += "Detected local uncommitted content, automatically cleaning:\n";
+      151                  if (!statusBefore.getModified().isEmpty()) {
+      152                      result.details += "  Reset modified files: " + String.join(", ", statusBefore.getModified()) + "\n";
+      153                  }
+      154                  if (!statusBefore.getUntracked().isEmpty()) {
+      155                      result.details += "  Clean untracked files: " + String.join(", ", statusBefore.getUntracked()) + "\n";
+      156                  }
+      157                  git.reset().setMode(org.eclipse.jgit.api.ResetCommand.ResetType.HARD).call();
+      158                  git.clean().setCleanDirectories(true).setForce(true).call();
+      159                  if (!git.status().call().isClean()) {
+      160                      throw new IllegalStateException("Still have uncommitted content or conflicts after automatic cleanup, please handle manually.");
+      161                  }
+      162              }
+      163  
+      164              try {
+      165                  var pullCommand = git.pull();
+      166                  pullCommand.setTimeout(GIT_OPERATION_TIMEOUT);
+      167                  pullCommand.setStrategy(MergeStrategy.RECURSIVE);
+      168                  applyAuth(pullCommand, workspace);
+      169                  var pullResult = pullCommand.call();
+      170                  if (!pullResult.isSuccessful()) {
+      171                      throw new RuntimeException("Git pull failed: " + pullResult);
+      172                  }
+      173  
+      174                  String commitIdAfter = getLastCommitId(git);
+      175                  if (commitIdBefore == null || !commitIdBefore.equals(commitIdAfter)) {
+      176                      try {
+      177                          if (commitIdBefore != null && commitIdAfter != null) {
+      178                              List<String> changedFiles = getChangedFilesBetweenCommits(workspace, commitIdBefore, commitIdAfter);
+      179                              result.affectedFiles.addAll(changedFiles);
+      180                              result.details += "Pulled new commits, affected files:\n";
+      181                              for (String file : changedFiles) {
+      182                                  result.details += "  " + file + "\n";
+      183                              }
+      184                          } else if (commitIdAfter != null) {
+      185                              result.details += "Pulled initial content from remote repository\n";
+      186                          }
+      187                      } catch (Exception e) {
+      188                          log.warn("Failed to get changed files", e);
+      189                          result.details += "Unable to get detailed file change information\n";
+      190                      }
+      191                      result.message = "Successfully pulled updates, " + result.affectedFiles.size() + " files affected";
+      192                  } else {
+      193                      result.message = "Already up to date, no updates needed";
+      194                      result.details += "Local repository is already up to date\n";
+      195                  }
+      196  
+      197                  workspace.setLastCommitId(commitIdAfter);
+      198                  workspace.setUpdatedAt(System.currentTimeMillis());
+      199                  result.success = true;
+      200              } catch (RefNotAdvertisedException e) {
+      201                  result.success = true;
+      202                  result.message = "Remote branch does not exist, nothing to pull";
+      203                  result.details += "Remote branch '" + tracking + "' does not exist or is empty\n";
+      204              }
+      205          }
+      206  
+      207          return result;
+      208      }
+      209  
+      210      @Override
+      211      public GitOperationResult pushChanges(Workspace workspace) throws Exception {
+      212          ensureGitWorkspace(workspace);
+      213          GitOperationResult result = new GitOperationResult();
+      214          result.operationType = "Push";
+      215  
+      216          try (Git git = Git.open(new File(workspace.getPath()))) {
+      217              var remotes = git.remoteList().call();
+      218              if (remotes.isEmpty()) {
+      219                  throw new IllegalStateException("No remote repository configured, unable to push");
+      220              }
+      221  
+      222              String currentBranch = git.getRepository().getBranch();
+      223              String tracking = git.getRepository().getConfig().getString("branch", currentBranch, "merge");
+      224              if (tracking == null) {
+      225                  throw new IllegalStateException("Current branch has no upstream branch set, please perform initial push or set upstream branch first");
+      226              }
+      227  
+      228              String remoteBranchName = tracking.startsWith("refs/heads/")
+      229                      ? tracking.substring("refs/heads/".length())
+      230                      : tracking;
+      231              String remoteName = git.getRepository().getConfig().getString("branch", currentBranch, "remote");
+      232              if (remoteName == null) {
+      233                  remoteName = "origin";
+      234              }
+      235  
+      236              int unpushedCommitsCount = 0;
+      237              try {
+      238                  var fetchCommand = git.fetch();
+      239                  fetchCommand.setTimeout(GIT_OPERATION_TIMEOUT);
+      240                  applyAuth(fetchCommand, workspace);
+      241                  fetchCommand.call();
+      242  
+      243                  String localRef = "refs/heads/" + currentBranch;
+      244                  String remoteRef = "refs/remotes/" + remoteName + "/" + remoteBranchName;
+      245                  ObjectId localId = git.getRepository().resolve(localRef);
+      246                  ObjectId remoteId = git.getRepository().resolve(remoteRef);
+      247                  if (localId == null) {
+      248                      throw new IllegalStateException("Unable to find local branch: " + currentBranch);
+      249                  }
+      250  
+      251                  Iterable<RevCommit> commits = remoteId != null
+      252                          ? git.log().addRange(remoteId, localId).call()
+      253                          : git.log().call();
+      254                  for (RevCommit commit : commits) {
+      255                      unpushedCommitsCount++;
+      256                      if (commit.getParentCount() > 0 && (remoteId != null || unpushedCommitsCount <= 10)) {
+      257                          try {
+      258                              var parent = commit.getParent(0);
+      259                              List<DiffEntry> diffs = git.diff()
+      260                                      .setOldTree(prepareTreeParser(git.getRepository(), parent.toObjectId()))
+      261                                      .setNewTree(prepareTreeParser(git.getRepository(), commit.toObjectId()))
+      262                                      .call();
+      263                              for (DiffEntry diff : diffs) {
+      264                                  String fileName = diff.getNewPath();
+      265                                  if (!result.affectedFiles.contains(fileName)) {
+      266                                      result.affectedFiles.add(fileName);
+      267                                  }
+      268                              }
+      269                          } catch (Exception e) {
+      270                              log.warn("Failed to get commit files for {}", commit.getName(), e);
+      271                          }
+      272                      }
+      273                  }
+      274  
+      275                  if (unpushedCommitsCount == 0) {
+      276                      result.success = true;
+      277                      result.message = "No commits to push, local branch is up to date";
+      278                      result.details = "Local branch " + currentBranch + " is in sync with remote branch "
+      279                              + remoteName + "/" + remoteBranchName + "\n";
+      280                      return result;
+      281                  }
+      282              } catch (Exception e) {
+      283                  log.warn("Failed to accurately count unpushed commits, proceeding with push", e);
+      284              }
+      285  
+      286              var pushCommand = git.push().setRemote(remoteName).add(currentBranch + ":" + remoteBranchName);
+      287              pushCommand.setTimeout(GIT_OPERATION_TIMEOUT);
+      288              applyAuth(pushCommand, workspace);
+      289              var pushResults = pushCommand.call();
+      290  
+      291              result.details += "Push details:\n";
+      292              result.details += "  Local branch: " + currentBranch + "\n";
+      293              result.details += "  Remote branch: " + remoteName + "/" + remoteBranchName + "\n";
+      294              result.details += "  Pushed commits: " + unpushedCommitsCount + "\n";
+      295  
+      296              boolean pushSuccess = false;
+      297              for (var pushResult : pushResults) {
+      298                  String msg = pushResult.getMessages();
+      299                  if (msg != null && !msg.isEmpty() && (msg.toLowerCase().contains("error") || msg.toLowerCase().contains("fail"))) {
+      300                      result.details += "  Push message: " + msg + "\n";
+      301                  }
+      302                  for (var remoteRefUpdate : pushResult.getRemoteUpdates()) {
+      303                      result.details += "  Branch update: " + remoteRefUpdate.getSrcRef() + " -> "
+      304                              + remoteRefUpdate.getRemoteName() + " (" + remoteRefUpdate.getStatus() + ")\n";
+      305                      if (remoteRefUpdate.getMessage() != null && !remoteRefUpdate.getMessage().isEmpty()) {
+      306                          result.details += "    Details: " + remoteRefUpdate.getMessage() + "\n";
+      307                      }
+      308                      if (remoteRefUpdate.getStatus() == org.eclipse.jgit.transport.RemoteRefUpdate.Status.OK
+      309                              || remoteRefUpdate.getStatus() == org.eclipse.jgit.transport.RemoteRefUpdate.Status.UP_TO_DATE) {
+      310                          pushSuccess = true;
+      311                      }
+      312                  }
+      313              }
+      314  
+      315              if (!pushSuccess) {
+      316                  throw new RuntimeException("Push failed, please check error details in push result");
+      317              }
+      318  
+      319              result.success = true;
+      320              result.message = "Successfully pushed " + unpushedCommitsCount + " commits, " + result.affectedFiles.size() + " files affected";
+      321          }
+      322  
+      323          return result;
+      324      }
+      325  
+      326      @Override
+      327      public GitOperationResult forcePushChanges(Workspace workspace) throws Exception {
+      328          ensureGitWorkspace(workspace);
+      329          GitOperationResult result = new GitOperationResult();
+      330          result.operationType = "Force Push";
+      331  
+      332          try (Git git = Git.open(new File(workspace.getPath()))) {
+      333              String currentBranch = git.getRepository().getBranch();
+      334              var pushCommand = git.push().setForce(true);
+      335              pushCommand.setTimeout(GIT_OPERATION_TIMEOUT);
+      336              applyAuth(pushCommand, workspace);
+      337              var pushResults = pushCommand.call();
+      338  
+      339              result.details += "Force push details:\n";
+      340              result.details += "  Local branch: " + currentBranch + "\n";
+      341              result.details += "  Warning: Force push has overwritten remote changes\n";
+      342  
+      343              boolean pushSuccess = false;
+      344              for (var pushResult : pushResults) {
+      345                  for (var remoteRefUpdate : pushResult.getRemoteUpdates()) {
+      346                      result.details += "  Branch update: " + remoteRefUpdate.getSrcRef() + " -> "
+      347                              + remoteRefUpdate.getRemoteName() + " (" + remoteRefUpdate.getStatus() + ")\n";
+      348                      if (remoteRefUpdate.getStatus() == org.eclipse.jgit.transport.RemoteRefUpdate.Status.OK
+      349                              || remoteRefUpdate.getStatus() == org.eclipse.jgit.transport.RemoteRefUpdate.Status.UP_TO_DATE) {
+      350                          pushSuccess = true;
+      351                      }
+      352                  }
+      353              }
+      354  
+      355              if (!pushSuccess) {
+      356                  throw new RuntimeException("Force push failed");
+      357              }
+      358  
+      359              result.success = true;
+      360              result.message = "Force push successful, remote changes have been overwritten";
+      361          }
+      362  
+      363          return result;
+      364      }
+      365  
+      366      @Override
+      367      public GitOperationResult stashChanges(Workspace workspace) throws Exception {
+      368          ensureGitWorkspace(workspace);
+      369          GitOperationResult result = new GitOperationResult();
+      370          result.operationType = "Stash";
+      371  
+      372          try (Git git = Git.open(new File(workspace.getPath()))) {
+      373              var status = git.status().call();
+      374              result.affectedFiles.addAll(status.getModified());
+      375              result.affectedFiles.addAll(status.getChanged());
+      376              result.affectedFiles.addAll(status.getAdded());
+      377              result.affectedFiles.addAll(status.getRemoved());
+      378  
+      379              var stashResult = git.stashCreate().call();
+      380              if (stashResult == null) {
+      381                  throw new RuntimeException("Stash failed, no changes to stash");
+      382              }
+      383  
+      384              result.success = true;
+      385              result.message = "Successfully stashed " + result.affectedFiles.size() + " file changes";
+      386              result.details = "Stash ID: " + stashResult.getName().substring(0, 8) + "\n";
+      387          }
+      388  
+      389          return result;
+      390      }
+      391  
+      392      @Override
+      393      public GitOperationResult popStashChanges(Workspace workspace) throws Exception {
+      394          ensureGitWorkspace(workspace);
+      395          GitOperationResult result = new GitOperationResult();
+      396          result.operationType = "Pop Stash";
+      397  
+      398          try (Git git = Git.open(new File(workspace.getPath()))) {
+      399              if (!git.stashList().call().iterator().hasNext()) {
+      400                  throw new RuntimeException("No stashed changes found");
+      401              }
+      402  
+      403              git.stashApply().call();
+      404              git.stashDrop().call();
+      405              var status = git.status().call();
+      406              result.affectedFiles.addAll(status.getModified());
+      407              result.affectedFiles.addAll(status.getChanged());
+      408              result.affectedFiles.addAll(status.getAdded());
+      409  
+      410              result.success = true;
+      411              result.message = "Successfully restored stashed changes";
+      412              result.details = "Restored files:\n";
+      413              for (String file : result.affectedFiles) {
+      414                  result.details += "  " + file + "\n";
+      415              }
+      416          }
+      417  
+      418          return result;
+      419      }
+      420  
+      421      @Override
+      422      public GitOperationResult forcePullUpdates(Workspace workspace) throws Exception {
+      423          ensureGitWorkspace(workspace);
+      424          GitOperationResult result = new GitOperationResult();
+      425          result.operationType = "Force Pull";
+      426  
+      427          try (Git git = Git.open(new File(workspace.getPath()))) {
+      428              var statusBefore = git.status().call();
+      429              result.affectedFiles.addAll(statusBefore.getModified());
+      430              result.affectedFiles.addAll(statusBefore.getChanged());
+      431              result.affectedFiles.addAll(statusBefore.getAdded());
+      432              result.affectedFiles.addAll(statusBefore.getUntracked());
+      433  
+      434              String commitIdBefore = getLastCommitId(git);
+      435              String branchName = git.getRepository().getBranch();
+      436  
+      437              var fetchCmd = git.fetch();
+      438              fetchCmd.setTimeout(GIT_OPERATION_TIMEOUT);
+      439              applyAuth(fetchCmd, workspace);
+      440              fetchCmd.call();
+       ... truncated at 400 lines ...

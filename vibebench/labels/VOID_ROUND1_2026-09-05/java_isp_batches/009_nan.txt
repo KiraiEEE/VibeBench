@@ -1,0 +1,931 @@
+row 9   chsami/Microbot#1645
+============================================================================
+CONTRACT net.runelite.client.plugins.microbot.util.cache.strategy.CacheUpdateStrategy   members=2.0 implementers=8.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       17  public interface CacheUpdateStrategy<K, V> extends AutoCloseable {
+       18      
+       19      /**
+       20       * Handles an event and potentially updates cache entries with enhanced data.
+       21       * 
+       22       * @param event The event that occurred
+       23       * @param cache The cache to potentially update
+       24       */
+       25      void handleEvent(Object event, CacheOperations<K, V> cache);
+       26      
+       27      /**
+       28       * Gets the event types this strategy handles.
+       29       * 
+       30       * @return Array of event classes this strategy processes
+       31       */
+       32      Class<?>[] getHandledEventTypes();
+       33      
+       34      /**
+       35       * Called when the strategy is attached to a cache.
+       36       * 
+       37       * @param cache The cache this strategy is attached to
+       38       */
+       39      default void onAttach(CacheOperations<K, V> cache) {
+       40          // Default: no action
+       41      }
+       42      
+       43      /**
+       44       * Called when the strategy is detached from a cache.
+       45       * 
+       46       * @param cache The cache this strategy was attached to
+       47       */
+       48      default void onDetach(CacheOperations<K, V> cache) {
+       49          // Default: no action
+       50      }
+       51      
+       52      /**
+       53       * Closes this strategy and releases any resources such as scheduled tasks,
+       54       * executor services, or other background processing.
+       55       * 
+       56       * Default implementation does nothing - strategies that use resources
+       57       * should override this method to ensure proper cleanup.
+       58       */
+       59      @Override
+       60      default void close() {
+       61          // Default: no action
+       62      }
+       63  }
+
+---------- IMPLEMENTER net.runelite.client.plugins.microbot.util.cache.strategy.entity.GroundItemUpdateStrategy  stubs=0/1 ----------
+       30  @Slf4j
+       31  public class GroundItemUpdateStrategy implements CacheUpdateStrategy<String, Rs2GroundItemModel> {
+       32      
+       33      GameState lastGameState = null;
+       34      
+       35      // ScheduledExecutorService for non-blocking operations
+       36      private final ScheduledExecutorService executorService;
+       37      private ScheduledFuture<?> periodicSceneScanTask;
+       38      private ScheduledFuture<?> sceneScanTask;
+       39      
+       40      // Scene scan tracking
+       41      private final AtomicBoolean scanActive = new AtomicBoolean(false);
+       42      private final AtomicBoolean scanRequest =  new AtomicBoolean(false);        
+       43      private static final long MIN_SCAN_INTERVAL_MS = Constants.GAME_TICK_LENGTH; // Minimum interval between scans
+       44      private volatile long lastSceneScan = 0; // Last time a scene scan was performed
+       45      
+       46      /**
+       47       * Constructor initializes the executor service for background tasks.
+       48       */
+       49      public GroundItemUpdateStrategy() {
+       50          this.executorService = Executors.newScheduledThreadPool(2, r -> {
+       51              Thread thread = new Thread(r, "GroundItemUpdateStrategy-" + System.currentTimeMillis());
+       52              thread.setDaemon(true);
+       53              return thread;
+       54          });
+       55          log.debug("GroundItemUpdateStrategy initialized with ScheduledExecutorService");
+       56      }
+       57      
+       58      @Override
+       59      public void handleEvent(Object event, CacheOperations<String, Rs2GroundItemModel> cache) {
+       60          if (executorService == null || executorService.isShutdown() || !Microbot.isLoggedIn() || Microbot.getClient() == null || Microbot.getClient().getLocalPlayer() == null) {
+       61              log.warn("GroundItemUpdateStrategy is shut down or not logged in, ignoring event: {}", event.getClass().getSimpleName());
+       62              return; // Don't process events if shut down
+       63          }
+       64          if (scanActive.get()){
+       65              log.debug("Skipping event processing - scan already active: {}", event.getClass().getSimpleName());
+       66              return; // Don't process events if a scan is already active
+       67          }
+       68          // Submit event handling to executor service for non-blocking processing
+       69          //executorService.submit(() -> {
+       70            //  try {
+       71                  processEventInternal(event, cache);
+       72              //} catch (Exception e) {
+       73                //  log.error("Error processing event: {}", event.getClass().getSimpleName(), e);
+       74              //}
+       75          //});
+       76      }
+       77      
+       78      /**
+       79       * Internal method to process events - runs on background thread.
+       80       */
+       81      private void processEventInternal(Object event, CacheOperations<String, Rs2GroundItemModel> cache) {
+       82          if (event instanceof ItemSpawned) {
+       83              handleItemSpawned((ItemSpawned) event, cache);
+       84          } else if (event instanceof ItemDespawned) {
+       85              handleItemDespawned((ItemDespawned) event, cache);
+       86          } else if (event instanceof GameStateChanged) {
+       87              handleGameStateChanged((GameStateChanged) event, cache);
+       88          }
+       89      }
+       90      
+       91      /**
+       92       * Performs an scene scan to populate the cache.
+       93       * Only scans if certain conditions are met to avoid unnecessary processing.
+       94       * This method runs asynchronously on a background thread to avoid blocking.
+       95       * 
+       96       * @param cache The cache to populate
+       97       */
+       98      public void performSceneScan(CacheOperations<String, Rs2GroundItemModel> cache,long delayMs) {
+       99          if (executorService == null || executorService.isShutdown()) {
+      100              log.debug("Skipping ground item scene scan - strategy is shut down or not logged in");
+      101              return;
+      102          }
+      103          
+      104          // Respect minimum scan interval unless forced
+      105          if ((System.currentTimeMillis() - lastSceneScan) < MIN_SCAN_INTERVAL_MS) {
+      106              log.debug("Skipping ground item scene scan due to minimum interval not reached");
+      107              scanActive.set(false);
+      108              return;
+      109          }
+      110          
+      111          if (sceneScanTask != null && !sceneScanTask.isDone()) {
+      112              log.debug("Skipping ground item scene scan - already scheduled or running");
+      113              return; // Don't perform scan if already scheduled or running
+      114          }
+      115          
+      116          if (scanActive.compareAndSet(false, true)) {
+      117              // Submit scene scan to executor service for non-blocking execution
+      118              sceneScanTask = executorService.schedule(() -> {
+      119                  try {
+      120                      performSceneScanInternal(cache);
+      121                  } catch (Exception e) {
+      122                      log.error("Error during ground item scene scan", e);
+      123                  } finally {
+      124                      scanActive.set(false);                    
+      125                  }
+      126              }, delayMs, TimeUnit.MILLISECONDS); // delay before scan
+      127          } else {
+      128              log.debug("Skipping ground item scene scan - already active");
+      129              return; // Don't perform scan if already active
+      130          }
+      131      }
+      132      
+      133      /**
+      134       * Schedules a periodic scene scan task.
+      135       * This is useful for ensuring the cache stays up-to-date even if events are missed.
+      136       * 
+      137       * @param cache The cache to scan
+      138       * @param intervalSeconds How often to scan in seconds
+      139       */
+      140      public void schedulePeriodicSceneScan(CacheOperations<String, Rs2GroundItemModel> cache, long intervalSeconds) {
+      141          if (executorService == null || executorService.isShutdown()) {
+      142              log.warn("Cannot schedule periodic scan - strategy is shut down");
+      143              return;
+      144          }
+      145          
+      146          // Cancel existing task if any
+      147          stopPeriodicSceneScan();
+      148          
+      149          periodicSceneScanTask = executorService.scheduleWithFixedDelay(() -> {
+      150              try {
+      151                  if (scanActive.compareAndSet(false, true)) {
+      152                      if (scanRequest.get() && Microbot.isLoggedIn()) {
+      153                          log.debug("Periodic ground item scene scan triggered");
+      154                          performSceneScanInternal(cache);
+      155                      }
+      156                  } else {
+      157                      log.debug("Skipping scheduled ground item scene scan - already active");
+      158                  }
+      159              } catch (Exception e) {
+      160                  log.error("Error in periodic ground item scene scan", e);
+      161              } finally {
+      162                  scanActive.set(false);                
+      163              }
+      164          }, intervalSeconds, intervalSeconds, TimeUnit.SECONDS);
+      165          
+      166          log.debug("Scheduled periodic ground item scene scan every {} seconds", intervalSeconds);
+      167      }
+      168      
+      169      /**
+      170       * Stops periodic scene scanning.
+      171       */
+      172      public void stopPeriodicSceneScan() {
+      173          if (periodicSceneScanTask != null && !periodicSceneScanTask.isDone()) {
+      174              periodicSceneScanTask.cancel(false);
+      175              periodicSceneScanTask = null;
+      176              log.debug("Stopped periodic ground item scene scanning");
+      177          }
+      178      }
+      179      
+      180      /**
+      181       * Checks if a scene scan is needed based on cache state.
+      182       * 
+      183       * @param cache The cache to check
+      184       * @return true if a scan would be beneficial
+      185       */
+      186      public boolean requestSceneScan(CacheOperations<String, Rs2GroundItemModel> cache) {
+      187          if (scanActive.get()) {
+      188              log.debug("Skipping scene scan request - already active");
+      189              return false; // Don't request scan if already active
+
+---------- IMPLEMENTER net.runelite.client.plugins.microbot.util.cache.strategy.entity.NpcUpdateStrategy  stubs=0/1 ----------
+       27  @Slf4j
+       28  public class NpcUpdateStrategy implements CacheUpdateStrategy<Integer, Rs2NpcModel> {
+       29      
+       30      GameState lastGameState = null;
+       31      
+       32      // ScheduledExecutorService for non-blocking operations
+       33      private final ScheduledExecutorService executorService;
+       34      private ScheduledFuture<?> periodicSceneScanTask;
+       35      private ScheduledFuture<?> sceneScanTask;
+       36      
+       37      // Scene scan tracking
+       38      private final AtomicBoolean scanActive = new AtomicBoolean(false);
+       39      private final AtomicBoolean scanRequest = new AtomicBoolean(false);    
+       40      private volatile long lastSceneScan = 0;
+       41      private static final long MIN_SCAN_INTERVAL_MS = Constants.GAME_TICK_LENGTH;
+       42      
+       43      /**
+       44       * Constructor initializes the executor service for background tasks.
+       45       */
+       46      public NpcUpdateStrategy() {
+       47          this.executorService = Executors.newScheduledThreadPool(2, r -> {
+       48              Thread thread = new Thread(r, "NpcUpdateStrategy-" + System.currentTimeMillis());
+       49              thread.setDaemon(true);
+       50              return thread;
+       51          });
+       52          log.debug("NpcUpdateStrategy initialized with ScheduledExecutorService");
+       53      }
+       54      
+       55      @Override
+       56      public void handleEvent(final Object event, CacheOperations<Integer, Rs2NpcModel> cache) {
+       57          if (executorService == null || executorService.isShutdown()) {
+       58              return; // Don't process events if shut down
+       59          }                
+       60          processEventInternal(event, cache);        
+       61      }
+       62      
+       63      /**
+       64       * Internal method to process events - runs on background thread.
+       65       */
+       66      private void processEventInternal(Object event, CacheOperations<Integer, Rs2NpcModel> cache) {
+       67          if (event instanceof NpcSpawned) {
+       68              handleNpcSpawned((NpcSpawned) event, cache);
+       69          } else if (event instanceof NpcDespawned) {
+       70              handleNpcDespawned((NpcDespawned) event, cache);
+       71          } else if (event instanceof GameStateChanged) {
+       72              handleGameStateChanged((GameStateChanged) event, cache);
+       73          }
+       74      }
+       75      
+       76      /**
+       77       * Performs an scene scan to populate the cache.
+       78       * Only scans if certain conditions are met to avoid unnecessary processing.
+       79       * This method runs asynchronously on a background thread to avoid blocking.
+       80       * 
+       81       * @param cache The cache to populate
+       82       */
+       83      public void performSceneScan(CacheOperations<Integer, Rs2NpcModel> cache, long delayMs) {
+       84          if (executorService == null || executorService.isShutdown() ) {
+       85              log.debug("Skipping NPC scene scan - strategy is shut down or not logged in");
+       86              return;
+       87          }
+       88          
+       89          // Respect minimum scan interval unless forced
+       90          if ((System.currentTimeMillis() - lastSceneScan) < MIN_SCAN_INTERVAL_MS) {
+       91              log.debug("Skipping NPC scene scan due to minimum interval not reached");
+       92              scanActive.set(false);
+       93              return;
+       94          }
+       95          
+       96          if (sceneScanTask != null && !sceneScanTask.isDone()) {
+       97              log.debug("Skipping NPC scene scan - already scheduled or running");
+       98              return; // Don't perform scan if already scheduled or running
+       99          }
+      100          
+      101          if (scanActive.compareAndSet(false, true)) {
+      102              // Submit scene scan to executor service for non-blocking execution
+      103              sceneScanTask = executorService.schedule(() -> {
+      104                  try {
+      105                      performSceneScanInternal(cache);
+      106                  } catch (Exception e) {
+      107                      log.error("Error during NPC scene scan", e);
+      108                  } finally {
+      109                      scanActive.set(false);
+      110                      scanRequest.set(false); // Reset request after scan
+      111                  }
+      112              }, delayMs, TimeUnit.MILLISECONDS); // delay before scan
+      113          } else {
+      114              log.debug("Skipping NPC scene scan - already active");
+      115              return; // Don't perform scan if already active
+      116          }
+      117      }
+      118      
+      119      /**
+      120       * Schedules a periodic scene scan task.
+      121       * This is useful for ensuring the cache stays up-to-date even if events are missed.
+      122       * 
+      123       * @param cache The cache to scan
+      124       * @param intervalSeconds How often to scan in seconds
+      125       */
+      126      public void schedulePeriodicSceneScan(CacheOperations<Integer, Rs2NpcModel> cache, long intervalSeconds) {
+      127          if (executorService == null || executorService.isShutdown()) {
+      128              log.warn("Cannot schedule periodic scan - strategy is shut down");
+      129              return;
+      130          }
+      131          
+      132          // Cancel existing task if any
+      133          stopPeriodicSceneScan();
+      134          
+      135          periodicSceneScanTask = executorService.scheduleWithFixedDelay(() -> {
+      136              try {
+      137                  if (scanActive.compareAndSet(false, true)) {
+      138                      if (scanRequest.get() && Microbot.isLoggedIn()) {
+      139                          log.debug("Periodic NPC scene scan triggered");
+      140                          performSceneScanInternal(cache);
+      141                      }
+      142                  } else {
+      143                      log.debug("Skipping scheduled NPC scene scan - already active");
+      144                  }
+      145              } catch (Exception e) {
+      146                  log.error("Error in periodic NPC scene scan", e);
+      147              } finally {
+      148                  scanActive.set(false);
+      149              }
+      150          }, intervalSeconds, intervalSeconds, TimeUnit.SECONDS);
+      151          
+      152          log.debug("Scheduled periodic NPC scene scan every {} seconds", intervalSeconds);
+      153      }
+      154      
+      155      /**
+      156       * Stops periodic scene scanning.
+      157       */
+      158      public void stopPeriodicSceneScan() {
+      159          if (periodicSceneScanTask != null && !periodicSceneScanTask.isDone()) {
+      160              periodicSceneScanTask.cancel(false);
+      161              periodicSceneScanTask = null;
+      162              log.debug("Stopped periodic NPC scene scanning");
+      163          }
+      164      }
+      165      
+      166      
+      167      /**
+      168       * Checks if a scene scan is needed based on cache state.
+      169       * 
+      170       * @param cache The cache to check
+      171       * @return true if a scan would be beneficial
+      172       */    
+      173      public boolean requestSceneScan(CacheOperations<Integer, Rs2NpcModel> cache) {
+      174          if (scanActive.get()) {
+      175              log.debug("Skipping scene scan request - already active");
+      176              return false; // Don't request scan if already active
+      177          }
+      178          if (scanRequest.compareAndSet(false, true)) {
+      179              log.debug("NPC scene scan requested");
+      180              performSceneScan(cache, 5); // Perform with 5ms delay for stability
+      181          }
+      182          if (!Microbot.getClient().isClientThread()){
+      183              sleepUntil(()->!scanRequest.get(), 1000); // Wait until scan is requested and reset
+      184          }        
+      185          return !scanRequest.get(); // Return true if scan was requested,reseted               
+      186      }
+
+---------- IMPLEMENTER net.runelite.client.plugins.microbot.util.cache.strategy.entity.ObjectUpdateStrategy  stubs=0/1 ----------
+       28  @Slf4j
+       29  public class ObjectUpdateStrategy implements CacheUpdateStrategy<String, Rs2ObjectModel> {
+       30      GameState lastGameState = null;
+       31      
+       32      // ScheduledExecutorService for non-blocking operations
+       33      private final ScheduledExecutorService executorService;
+       34      private ScheduledFuture<?> periodicSceneScanTask;
+       35      private ScheduledFuture<?> sceneScanTask;
+       36      AtomicBoolean scanActive = new AtomicBoolean(false);
+       37      AtomicBoolean scanRequest = new AtomicBoolean(false);
+       38      private volatile long lastSceneScan = 0;
+       39      private static final long MIN_SCAN_INTERVAL_MS = Constants.GAME_TICK_LENGTH;
+       40      
+       41      /**
+       42       * Constructor initializes the executor service for background tasks.
+       43       */
+       44      public ObjectUpdateStrategy() {
+       45          this.executorService = Executors.newScheduledThreadPool(2, r -> {
+       46              Thread thread = new Thread(r, "ObjectUpdateStrategy-" + System.currentTimeMillis());
+       47              thread.setDaemon(true);
+       48              return thread;
+       49          });
+       50      }
+       51      /**
+       52       * Generates a unique cache key for any TileObject (GameObject, WallObject, GroundObject, DecorativeObject).
+       53       * Uses canonical location logic for GameObjects, and world location for others.
+       54       *
+       55       * @param object The TileObject (GameObject, WallObject, etc.)
+       56       * @param tile The tile containing the object
+       57       * @return The cache key string
+       58       */
+       59      public static String generateCacheIdForObject(TileObject object, Tile tile) {
+       60          if (object instanceof GameObject) {
+       61              // Use canonical location logic for GameObjects            
+       62              return ObjectUpdateStrategy.generateCacheIdForGameObject((GameObject) object, tile);
+       63          } else if (object instanceof WallObject) {
+       64              WallObject wallObject = (WallObject) object;            
+       65              return ObjectUpdateStrategy.generateCacheId("WallObject", wallObject.getId(), wallObject.getWorldLocation());
+       66          } else if (object instanceof GroundObject) {
+       67              GroundObject groundObject = (GroundObject) object;
+       68              return ObjectUpdateStrategy.generateCacheId("GroundObject", groundObject.getId(), groundObject.getWorldLocation());
+       69          } else if (object instanceof DecorativeObject) {
+       70              DecorativeObject decorativeObject = (DecorativeObject) object;
+       71              return ObjectUpdateStrategy.generateCacheId("DecorativeObject", decorativeObject.getId(), decorativeObject.getWorldLocation());
+       72          }
+       73          // Fallback: use type name and world location if available
+       74          String type = object != null ? object.getClass().getSimpleName() : "Unknown";
+       75          WorldPoint location = object != null ? object.getWorldLocation() : null;
+       76          int objectId = object != null ? object.getId() : -1;
+       77          return location != null ? String.format("%s_%d_%d_%d_%d", type, objectId, location.getX(), location.getY(), location.getPlane()) : type + "_null";
+       78      }
+       79          
+       80     
+       81      @Override
+       82      public void handleEvent(final Object event, final CacheOperations<String, Rs2ObjectModel> cache) {
+       83    
+       84          if (executorService == null || executorService.isShutdown() || !Microbot.isLoggedIn() || Microbot.getClient() == null || Microbot.getClient().getLocalPlayer() == null) {
+       85              log.warn("ObjectUpdateStrategy is shut down, ignoring event: {}", event.getClass().getSimpleName());
+       86              return; // Don't process events if shut down
+       87          }
+       88          if(scanActive.get()){
+       89              log.debug("Skipping event processing - scan already active: {}", event.getClass().getSimpleName());
+       90              return; // Don't process events if a scan is already active
+       91          }                
+       92          // Submit event handling to executor service for non-blocking processing
+       93          //executorService.submit(() -> {
+       94              //try {
+       95                  processEventInternal(event, cache);
+       96              //} catch (Exception e) {
+       97                  //log.error("Error processing event: {}", event.getClass().getSimpleName(), e);
+       98              //}
+       99          //});
+      100      }
+      101      
+      102      /**
+      103       * Internal method to process events - runs on client thread after coalescing.
+      104       * This is the renamed version of the original processEvent method.
+      105       */
+      106      private void processEventInternal(final Object event, final CacheOperations<String, Rs2ObjectModel> cache) {
+      107          try {       
+      108              if (event instanceof GameObjectSpawned) {
+      109                  if(lastGameState == GameState.LOGGED_IN) handleGameObjectSpawned((GameObjectSpawned) event, cache);
+      110              } else if (event instanceof GameObjectDespawned) {
+      111                  if(lastGameState == GameState.LOGGED_IN) handleGameObjectDespawned((GameObjectDespawned) event, cache);
+      112              } else if (event instanceof GroundObjectSpawned) {
+      113                  if(lastGameState == GameState.LOGGED_IN) handleGroundObjectSpawned((GroundObjectSpawned) event, cache);
+      114              } else if (event instanceof GroundObjectDespawned) {
+      115                  if(lastGameState == GameState.LOGGED_IN) handleGroundObjectDespawned((GroundObjectDespawned) event, cache);
+      116              } else if (event instanceof WallObjectSpawned) {
+      117                  if(lastGameState == GameState.LOGGED_IN) handleWallObjectSpawned((WallObjectSpawned) event, cache);
+      118              } else if (event instanceof WallObjectDespawned) {
+      119                  if(lastGameState == GameState.LOGGED_IN) handleWallObjectDespawned((WallObjectDespawned) event, cache);
+      120              } else if (event instanceof DecorativeObjectSpawned) {
+      121                  if(lastGameState == GameState.LOGGED_IN) handleDecorativeObjectSpawned((DecorativeObjectSpawned) event, cache);
+      122              } else if (event instanceof DecorativeObjectDespawned) {
+      123                  if(lastGameState == GameState.LOGGED_IN) handleDecorativeObjectDespawned((DecorativeObjectDespawned) event, cache);
+      124              } else if (event instanceof GameStateChanged) {
+      125                  handleGameStateChanged((GameStateChanged) event, cache);
+      126              } else if (event instanceof GameTick) {
+      127                  //handleGameTick((GameTick) event, cache);
+      128              }
+      129          } catch (Exception e) {
+      130              log.error("Error handling event: {}", event.getClass().getSimpleName(), e);
+      131          }        
+      132      }
+      133      
+      134      /**
+      135       * Performs an scene scan to populate the cache.
+      136       * Only scans if certain conditions are met to avoid unnecessary processing.
+      137       * This method now runs asynchronously on a background thread to avoid blocking.
+      138       * 
+      139       * @param cache The cache to populate
+      140       * @param force Whether to force a scan regardless of conditions
+      141       */
+      142      public void performSceneScan(CacheOperations<String, Rs2ObjectModel> cache, long delayMs) {
+      143          if (executorService == null || executorService.isShutdown()) {
+      144              log.debug("Skipping scene scan - is executor service shutdown: {} or null {}, scan active: {}", 
+      145                        executorService.isShutdown() ,executorService == null  , scanActive.get());
+      146              return;
+      147          }
+      148       
+      149          // Respect minimum scan interval unless forced
+      150          if ((System.currentTimeMillis() - lastSceneScan) < MIN_SCAN_INTERVAL_MS) {
+      151              log.debug("Skipping scene scan due to minimum interval not reached");
+      152              scanActive.set(false);
+      153              return;
+      154          }      
+      155          if (sceneScanTask != null && !sceneScanTask.isDone()) {
+      156              log.debug("Skipping scene scan - already scheduled or running");
+      157              return; // Don't perform scan if already scheduled or running
+      158          }
+      159          if (scanActive.compareAndSet(false,true)){  
+      160              // Submit scene scan to executor service for non-blocking execution
+      161              sceneScanTask = executorService.schedule(() -> {
+      162                  try {
+      163                      performSceneScanInternal(cache);
+      164                  } catch (Exception e) {
+      165                      log.error("Error during scene scan", e);
+      166                  }finally {
+      167                      
+      168                  }
+      169              }, delayMs, TimeUnit.MILLISECONDS); // 100ms delay before scan
+      170          }else{
+      171              log.debug("Skipping scene scan - already active");
+      172              return; // Don't perform scan if already active
+      173          }
+      174      }
+      175      
+      176      /**
+      177       * Schedules a periodic scene scan task.
+      178       * This is useful for ensuring the cache stays up-to-date even if events are missed.
+      179       * 
+      180       * @param cache The cache to scan
+      181       * @param intervalSeconds The interval between scans in seconds
+      182       */
+      183      public void schedulePeriodicSceneScan(CacheOperations<String, Rs2ObjectModel> cache, long intervalSeconds) {
+      184          if (executorService == null || executorService.isShutdown()) {
+      185              log.debug("Cannot schedule periodic scan - strategy is shut down");
+      186              return;
+      187          }
+
+---------- IMPLEMENTER net.runelite.client.plugins.microbot.util.cache.strategy.farming.SpiritTreeUpdateStrategy  stubs=0/1 ----------
+       33  @Slf4j
+       34  public class SpiritTreeUpdateStrategy implements CacheUpdateStrategy<SpiritTree, SpiritTreeData> {
+       35      
+       36      // Widget constants for spirit tree detection
+       37      private static final int ADVENTURE_LOG_GROUP_ID = 187;
+       38      private static final int ADVENTURE_LOG_CONTAINER_CHILD = 0;
+       39      private static final String SPIRIT_TREE_WIDGET_TITLE = SpiritTree.SPIRIT_TREE_WIDGET_TITLE;
+       40      
+       41      // Spirit tree object IDs for game object detection
+       42      private static final List<Integer> SPIRIT_TREE_OBJECT_IDS = Arrays.asList(
+       43  		ObjectID.FARMING_SPIRIT_TREE_PATCH_5, // Object ID found in farming guild fully grown spirit tree patch
+       44          ObjectID.SPIRIT_TREE_FULLYGROWN,  // Standard spirit spiritTree id when fully grown  and available for travel -> healty )         
+       45          ObjectID.SPIRITTREE_PRIF, // Prifddinas spirit tree  
+       46          ObjectID.POG_SPIRIT_TREE_ALIVE_STATIC,  // Poison Waste spirit tree
+       47          ObjectID.SPIRITTREE_SMALL, // Small spirit tree in  grand Exchange 1295
+       48          ObjectID.ENT, // for the "great" trees in tree gnome village 1293
+       49          ObjectID.STRONGHOLD_ENT, // nd tree gnome stronghold 1294
+       50          ObjectID.POH_SPIRIT_TREE // Player-owned house spirit tree object ID
+       51      );
+       52      
+       53      // Spirit tree specific farming transmit varbits
+       54      private static final List<Integer> SPIRIT_TREE_VARBIT_IDS = Arrays.asList(
+       55          VarbitID.FARMING_TRANSMIT_A, // 4771 - Port Sarim and Farming Guild 
+       56          VarbitID.FARMING_TRANSMIT_B, // 4772 - Etceteria and Brimhaven patches
+       57          VarbitID.FARMING_TRANSMIT_F  // 7904 - Hosidius
+       58      );
+       59  
+       60      /**
+       61       * Handle an event from the client and update the cache accordingly.
+       62       * @param event The event that occurred
+       63       * @param cache The cache to potentially update
+       64       */
+       65      @Override
+       66      public void handleEvent(Object event, CacheOperations<SpiritTree, SpiritTreeData> cache) {
+       67          try {
+       68              if (event instanceof WidgetLoaded) {
+       69                  handleWidgetLoaded((WidgetLoaded) event, cache);
+       70              } else if (event instanceof VarbitChanged) {
+       71                  handleVarbitChanged((VarbitChanged) event, cache);
+       72              } else if (event instanceof GameStateChanged) {
+       73                  handleGameStateChanged((GameStateChanged) event, cache);
+       74              } else if (event instanceof GameObjectSpawned) {
+       75                  GameObject go = ((GameObjectSpawned) event).getGameObject();
+       76                  handleGameObjectChange(go, true, cache);
+       77              } else if (event instanceof GameObjectDespawned) {
+       78                  GameObject go = ((GameObjectDespawned) event).getGameObject();
+       79                  handleGameObjectChange(go, false, cache);
+       80              }
+       81          } catch (Exception e) {
+       82              log.error("Error handling event in SpiritTreeUpdateStrategy: {}", e.getMessage(), e);
+       83          }
+       84      }
+       85  
+       86      /**
+       87       * Get the event types that are handled by this strategy
+       88       */
+       89      @Override
+       90      public Class<?>[] getHandledEventTypes() {
+       91          return new Class<?>[]{WidgetLoaded.class, VarbitChanged.class, GameStateChanged.class, GameObjectSpawned.class, GameObjectDespawned.class};
+       92      }
+       93  
+       94      /**
+       95       * Handle widget loaded events to detect spirit tree widget opening
+       96       */
+       97      private void handleWidgetLoaded(WidgetLoaded event, CacheOperations<SpiritTree, SpiritTreeData> cache) {        
+       98          // Check if this is the adventure log widget with spirit tree locations
+       99          if (event.getGroupId() == ADVENTURE_LOG_GROUP_ID) {            
+      100              // Small delay to ensure widget is fully loaded
+      101              Microbot.getClientThread().invokeLater(() -> {
+      102                  try {                    
+      103                      if(Rs2Widget.isHidden(ADVENTURE_LOG_GROUP_ID, ADVENTURE_LOG_CONTAINER_CHILD)) {
+      104                          log.debug("Adventure log widget not found, skipping spirit tree update");
+      105                          return;
+      106                      }
+      107                      Widget titleWidget = Rs2Widget.getWidget(ADVENTURE_LOG_GROUP_ID, ADVENTURE_LOG_CONTAINER_CHILD);
+      108                      if (titleWidget == null || titleWidget.isHidden()) {
+      109                          log.debug("Adventure log widget not found, skipping spirit tree update");
+      110                          return;
+      111                      }
+      112                      log.debug("Adventure log widget loaded (group {}), checking for spirit tree locations", event.getGroupId());
+      113                      boolean hasRightTitle = Rs2Widget.hasWidgetText(SPIRIT_TREE_WIDGET_TITLE, ADVENTURE_LOG_GROUP_ID, ADVENTURE_LOG_CONTAINER_CHILD, false);
+      114                              
+      115                      if (hasRightTitle) {
+      116                          log.debug("Spirit tree locations widget detected, updating cache from widget data");
+      117                          updateCacheFromWidget(cache);
+      118                          
+      119                      }
+      120                  } catch (Exception e) {
+      121                      log.debug("Error checking spirit tree widget: {}", e.getMessage());
+      122                  }
+      123              });
+      124          }
+      125      }
+      126      
+      127      /**
+      128       * Handle varbit changed events for spirit tree farming transmit varbits
+      129       */
+      130      private void handleVarbitChanged(VarbitChanged event, CacheOperations<SpiritTree, SpiritTreeData> cache) {
+      131          int varbitId = event.getVarbitId();        
+      132          // Check if this is a spirit tree farming transmit varbit
+      133          if (SPIRIT_TREE_VARBIT_IDS.contains(varbitId)) {
+      134              log.debug("Spirit tree farming varbit {} changed to value {}, updating spirit tree farming states", varbitId, event.getValue());                        
+      135              // Update farming states for all farmable spirit tree patches
+      136              updateFarmingStatesFromVarbits(cache);
+      137          }
+      138          if(varbitId == VarbitID.POH_SPIRIT_TREE_UPROOTED){
+      139              log.debug("TODO update cache for POH spirit tree uprooted varbit change,currently in POH? {} ",PohTeleports.isInHouse());
+      140          }
+      141      }
+      142  
+      143      /**
+      144       * Handles changes to game objects related to spirit trees and updates the cache accordingly.
+      145       * If the provided game object matches known spirit tree objects, it logs the detection
+      146       * and updates the cache with the relevant state.
+      147       *
+      148       * @param gameObject The game object that has changed. May be null, in which case this method does nothing.
+      149       * @param spawned    Indicates whether the game object was spawned (true) or despawned (false).
+      150       * @param cache      The cache instance used for storing and updating {@link SpiritTreeData} for detected spirit trees.
+      151       */
+      152      private void handleGameObjectChange(GameObject gameObject, boolean spawned, CacheOperations<SpiritTree, SpiritTreeData> cache) {
+      153          if(gameObject == null){
+      154              return;
+      155          }
+      156          Arrays.stream(SpiritTree.values()).filter(tree -> tree.getType() == SpiritTree.SpiritTreeType.POH).forEach(tree -> {
+      157              if (tree.getObjectId().contains(gameObject.getId())) {
+      158                  log.info("Found spirit tree object {} for POH spirit tree {}, {} to cache", gameObject.getId(), tree.name(), spawned ? "added" : "removed");
+      159                  SpiritTreeData newData = new SpiritTreeData(
+      160                          tree,
+      161                          spawned ? CropState.HARVESTABLE: CropState.DEAD,
+      162                          spawned,
+      163                          gameObject.getWorldLocation(),
+      164                          false, // Not detected via widget
+      165                          true // Detected via nearby tree if present
+      166                  );
+      167                  cache.put(tree, newData);
+      168              }
+      169          });
+      170  
+      171      }
+      172  
+      173      /**
+      174       * Handle GameStateChanged events to detect POH region changes and validate spirit tree presence
+      175       */
+      176      private void handleGameStateChanged(GameStateChanged event, CacheOperations<SpiritTree, SpiritTreeData> cache) {
+      177          GameState gameState = event.getGameState();
+      178          
+      179          // Only process when entering game or loading regions
+      180          if (gameState != GameState.LOGGED_IN && gameState != GameState.LOADING) {
+      181              return;
+      182          }
+      183          
+      184          try {
+      185              // Use unified region detection from Rs2Cache
+      186              Rs2Cache.checkAndHandleRegionChange(cache);
+      187          } catch (Exception e) {
+      188              log.error("Error handling GameStateChanged in SpiritTreeUpdateStrategy: {}", e.getMessage(), e);
+      189          }
+      190      }
+      191      
+      192      /**
+
+---------- IMPLEMENTER net.runelite.client.plugins.microbot.util.cache.strategy.simple.QuestUpdateStrategy  stubs=0/1 ----------
+       25  @Slf4j
+       26  public class QuestUpdateStrategy implements CacheUpdateStrategy<Quest, QuestState> {
+       27      
+       28      // Quest tracking variables moved from Rs2QuestCache
+       29      private static Quest trackedQuest = null;
+       30      
+       31      // Map from varbit/varplayer IDs to corresponding RuneLite Quest objects
+       32      private static final Map<Integer, Quest> varbitToQuestMap = new ConcurrentHashMap<>();
+       33      private static final Map<Integer, Quest> varPlayerToQuestMap = new ConcurrentHashMap<>();
+       34      
+       35      // Flag to track if quest maps have been initialized
+       36      private static volatile boolean mapsInitialized = false;
+       37      
+       38      /**
+       39       * Gets the currently tracked quest.
+       40       * 
+       41       * @return The currently tracked quest, or null if none
+       42       */
+       43      public static Quest getTrackedQuest() {
+       44          return trackedQuest;
+       45      }
+       46      
+       47      /**
+       48       * Sets the quest to track for changes.
+       49       * 
+       50       * @param quest The quest to track, or null to stop tracking
+       51       */
+       52      public static void setTrackedQuest(Quest quest) {
+       53          if (trackedQuest != quest) {
+       54              Quest oldQuest = trackedQuest;
+       55              trackedQuest = quest;
+       56              log.debug("Tracked quest changed from {} to {}", 
+       57                      oldQuest != null ? oldQuest.getName() : "none",
+       58                      quest != null ? quest.getName() : "none");
+       59          }
+       60      }
+       61      
+       62      /**
+       63       * Initializes the varbit/varPlayer to Quest mapping from QuestHelperQuest enum.
+       64       * This is done lazily on first access to avoid initialization order issues.
+       65       */
+       66      private static void initializeQuestMaps() {
+       67          if (mapsInitialized) {
+       68              return;
+       69          }
+       70          
+       71          synchronized (QuestUpdateStrategy.class) {
+       72              if (mapsInitialized) {
+       73                  return;
+       74              }
+       75              
+       76              try {
+       77                  log.debug("Initializing quest variable maps from QuestHelperQuest enum...");
+       78                  
+       79                  for (QuestHelperQuest questHelperQuest : QuestHelperQuest.values()) {
+       80                      // Get RuneLite Quest by ID
+       81                      Quest runeliteQuest = getQuestById(questHelperQuest.getId());
+       82                      if (runeliteQuest == null) {
+       83                          continue; // Skip quests without RuneLite Quest mapping
+       84                      }
+       85                      
+       86                      // Use reflection to access private varbit and varPlayer fields
+       87                      try {
+       88                          Field varbitField = QuestHelperQuest.class.getDeclaredField("varbit");
+       89                          varbitField.setAccessible(true);
+       90                          Object varbitValue = varbitField.get(questHelperQuest);
+       91                          
+       92                          if (varbitValue != null) {
+       93                              // Get the ID from the QuestVarbits enum
+       94                              Field idField = varbitValue.getClass().getDeclaredField("id");
+       95                              idField.setAccessible(true);
+       96                              int varbitId = (Integer) idField.get(varbitValue);
+       97                              varbitToQuestMap.put(varbitId, runeliteQuest);
+       98                              log.trace("Mapped varbit {} to quest {}", varbitId, runeliteQuest.getName());
+       99                          }
+      100                          
+      101                          Field varPlayerField = QuestHelperQuest.class.getDeclaredField("varPlayer");
+      102                          varPlayerField.setAccessible(true);
+      103                          Object varPlayerValue = varPlayerField.get(questHelperQuest);
+      104                          
+      105                          if (varPlayerValue != null) {
+      106                              // Get the ID from the QuestVarPlayer enum
+      107                              Field idField = varPlayerValue.getClass().getDeclaredField("id");
+      108                              idField.setAccessible(true);
+      109                              int varPlayerId = (Integer) idField.get(varPlayerValue);
+      110                              varPlayerToQuestMap.put(varPlayerId, runeliteQuest);
+      111                              log.trace("Mapped varPlayer {} to quest {}", varPlayerId, runeliteQuest.getName());
+      112                          }
+      113                          
+      114                      } catch (Exception reflectionException) {
+      115                          log.trace("Reflection failed for quest {}: {}", questHelperQuest.getName(), reflectionException.getMessage());
+      116                      }
+      117                  }
+      118                  
+      119                  mapsInitialized = true;
+      120                  log.info("Initialized quest maps: {} varbits, {} varPlayers", 
+      121                          varbitToQuestMap.size(), varPlayerToQuestMap.size());
+      122                  
+      123              } catch (Exception e) {
+      124                  log.error("Error initializing quest variable maps: {}", e.getMessage(), e);
+      125              }
+      126          }
+      127      }
+      128      
+      129      /**
+      130       * Gets a RuneLite Quest by its ID.
+      131       * 
+      132       * @param questId The quest ID
+      133       * @return The Quest object, or null if not found
+      134       */
+      135      private static Quest getQuestById(int questId) {
+      136          try {
+      137              for (Quest quest : Quest.values()) {
+      138                  if (quest.getId() == questId) {
+      139                      return quest;
+      140                  }
+      141              }
+      142          } catch (Exception e) {
+      143              log.trace("Error finding quest by ID {}: {}", questId, e.getMessage());
+      144          }
+      145          return null;
+      146      }
+      147      
+      148      /**
+      149       * Gets the Quest associated with a varbit ID.
+      150       * 
+      151       * @param varbitId The varbit ID
+      152       * @return The associated Quest, or null if none found
+      153       */
+      154      public static Quest getQuestByVarbit(int varbitId) {
+      155          initializeQuestMaps();
+      156          return varbitToQuestMap.get(varbitId);
+      157      }
+      158      
+      159      /**
+      160       * Gets the Quest associated with a varPlayer ID.
+      161       * 
+      162       * @param varPlayerId The varPlayer ID
+      163       * @return The associated Quest, or null if none found
+      164       */
+      165      public static Quest getQuestByVarPlayer(int varPlayerId) {
+      166          initializeQuestMaps();
+      167          return varPlayerToQuestMap.get(varPlayerId);
+      168      }
+      169      
+      170      /**
+      171       * Gets the varbit ID associated with a quest.
+      172       * 
+      173       * @param quest The quest to look up
+      174       * @return The varbit ID, or null if none found
+      175       */
+      176      public static Integer getVarbitIdByQuest(Quest quest) {
+      177          initializeQuestMaps();
+      178          return varbitToQuestMap.entrySet().stream()
+      179              .filter(entry -> entry.getValue().equals(quest))
+      180              .map(Map.Entry::getKey)
+      181              .findFirst()
+      182              .orElse(null);
+      183      }
+      184      
+
+---------- IMPLEMENTER net.runelite.client.plugins.microbot.util.cache.strategy.simple.SkillUpdateStrategy  stubs=0/1 ----------
+       16  @Slf4j
+       17  public class SkillUpdateStrategy implements CacheUpdateStrategy<Skill, SkillData> {
+       18      
+       19      @Override
+       20      public void handleEvent(Object event, CacheOperations<Skill, SkillData> cache) {
+       21          if (event instanceof StatChanged) {
+       22              handleStatChanged((StatChanged) event, cache);
+       23          }
+       24      }
+       25      
+       26      private void handleStatChanged(StatChanged event, CacheOperations<Skill, SkillData> cache) {
+       27          try {
+       28              Skill skill = event.getSkill();
+       29              if (skill != null && Microbot.getClient() != null) {
+       30                  
+       31                  // Get current skill data from client
+       32                  int level = Microbot.getClient().getRealSkillLevel(skill);
+       33                  int boostedLevel = Microbot.getClient().getBoostedSkillLevel(skill);
+       34                  int experience = Microbot.getClient().getSkillExperience(skill);
+       35                  
+       36                  // Get existing data to preserve previous values
+       37                  SkillData existingData = cache.get(skill);
+       38                  
+       39                  // Create new skill data with temporal and change tracking
+       40                  SkillData skillData;
+       41                  if (existingData != null) {
+       42                      // Use withUpdate to preserve previous values
+       43                      skillData = existingData.withUpdate(level, boostedLevel, experience);
+       44                  } else {
+       45                      // No previous data available
+       46                      skillData = new SkillData(level, boostedLevel, experience);
+       47                  }
+       48                  
+       49                  cache.put(skill, skillData);
+       50                  
+       51                  // Log level ups and significant experience gains
+       52                  if (skillData.isLevelUp()) {
+       53                      log.debug("Level up detected: {} leveled from {} to {}", skill, skillData.getPreviousLevel(), level);
+       54                  }
+       55                  if (skillData.getExperienceGained() > 0) {
+       56                      log.debug("\n\tUpdated skill cache: {} (level: {}, boosted: {}, exp: {}, gained: {} exp)", 
+       57                               skill, level, boostedLevel, experience, skillData.getExperienceGained());
+       58                  } else {
+       59                      log.trace("Updated skill cache: {} (level: {}, boosted: {}, exp: {})", 
+       60                               skill, level, boostedLevel, experience);
+       61                  }
+       62              }
+       63          } catch (Exception e) {
+       64              log.error("Error handling StatChanged event: {}", e.getMessage(), e);
+       65          }
+       66      }
+       67      
+       68      @Override
+       69      public Class<?>[] getHandledEventTypes() {
+       70          return new Class<?>[]{StatChanged.class};
+       71      }
+       72      
+       73      @Override
+       74      public void onAttach(CacheOperations<Skill, SkillData> cache) {
+       75          log.debug("SkillUpdateStrategy attached to cache");
+       76      }
+       77      
+       78      @Override
+       79      public void onDetach(CacheOperations<Skill, SkillData> cache) {
+       80          log.debug("SkillUpdateStrategy detached from cache");
+       81      }
+       82  }

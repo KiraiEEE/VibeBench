@@ -1,0 +1,726 @@
+row 4   datahub-project/datahub#14565
+============================================================================
+CONTRACT com.linkedin.metadata.recommendation.candidatesource.RecommendationSource   members=5.0 implementers=11.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       17  public interface RecommendationSource {
+       18  
+       19    /** Returns the title of the module that is sourced (used in rendering) */
+       20    String getTitle();
+       21  
+       22    /** Returns a unique module id associated with the module */
+       23    String getModuleId();
+       24  
+       25    /** Returns the template type used for rendering recommendations from this module */
+       26    RecommendationRenderType getRenderType();
+       27  
+       28    /**
+       29     * Whether or not this module is eligible for resolution given the context
+       30     *
+       31     * @param opContext User's context requesting recommendations
+       32     * @param requestContext Context of where the recommendations are being requested
+       33     * @return whether this source is eligible
+       34     */
+       35    boolean isEligible(
+       36        @Nonnull OperationContext opContext, @Nonnull RecommendationRequestContext requestContext);
+       37  
+       38    /**
+       39     * Get recommended items (candidates / content) provided the context
+       40     *
+       41     * @param opContext User's context requesting recommendations
+       42     * @param requestContext Context of where the recommendations are being requested
+       43     * @return list of recommendation candidates
+       44     */
+       45    @WithSpan
+       46    List<RecommendationContent> getRecommendations(
+       47        @Nonnull OperationContext opContext,
+       48        @Nonnull RecommendationRequestContext requestContext,
+       49        @Nullable Filter filter);
+       50  
+       51    // retaining this for backward compatibility
+       52    default List<RecommendationContent> getRecommendations(
+       53        @Nonnull OperationContext opContext, @Nonnull RecommendationRequestContext requestContext) {
+       54      return getRecommendations(opContext, requestContext, null);
+       55    }
+       56  
+       57    /**
+       58     * Get the full recommendations module itself provided the request context.
+       59     *
+       60     * @param opContext User's context requesting recommendations
+       61     * @param requestContext Context of where the recommendations are being requested
+       62     * @return list of recommendation candidates
+       63     */
+       64    default Optional<RecommendationModule> getRecommendationModule(
+       65        @Nonnull OperationContext opContext,
+       66        @Nonnull RecommendationRequestContext requestContext,
+       67        @Nullable Filter filter) {
+       68      if (!isEligible(opContext, requestContext)) {
+       69        return Optional.empty();
+       70      }
+       71  
+       72      List<RecommendationContent> recommendations =
+       73          getRecommendations(opContext, requestContext, filter);
+       74      if (recommendations.isEmpty()) {
+       75        return Optional.empty();
+       76      }
+       77  
+       78      return Optional.of(
+       79          new RecommendationModule()
+       80              .setTitle(getTitle())
+       81              .setModuleId(getModuleId())
+       82              .setRenderType(getRenderType())
+       83              .setContent(new RecommendationContentArray(recommendations)));
+       84    }
+       85  }
+
+---------- IMPLEMENTER com.linkedin.metadata.recommendation.candidatesource.MostPopularSource  stubs=0/5 ----------
+       43  @Slf4j
+       44  @RequiredArgsConstructor
+       45  public class MostPopularSource implements EntityRecommendationSource {
+       46    /** Entity Types that should be in scope for this type of recommendation. */
+       47    private static final Set<String> SUPPORTED_ENTITY_TYPES =
+       48        ImmutableSet.of(
+       49            Constants.DATASET_ENTITY_NAME,
+       50            Constants.DATA_FLOW_ENTITY_NAME,
+       51            Constants.DATA_JOB_ENTITY_NAME,
+       52            Constants.CONTAINER_ENTITY_NAME,
+       53            Constants.DASHBOARD_ENTITY_NAME,
+       54            Constants.CHART_ENTITY_NAME,
+       55            Constants.ML_MODEL_ENTITY_NAME,
+       56            Constants.ML_FEATURE_ENTITY_NAME,
+       57            Constants.ML_MODEL_GROUP_ENTITY_NAME,
+       58            Constants.ML_FEATURE_TABLE_ENTITY_NAME);
+       59  
+       60    private final RestHighLevelClient _searchClient;
+       61    private final IndexConvention _indexConvention;
+       62    private final EntityService<?> _entityService;
+       63  
+       64    private static final String DATAHUB_USAGE_INDEX = "datahub_usage_event";
+       65    private static final String ENTITY_AGG_NAME = "entity";
+       66    private static final int MAX_CONTENT = 5;
+       67  
+       68    @Override
+       69    public String getTitle() {
+       70      return "Most Popular";
+       71    }
+       72  
+       73    @Override
+       74    public String getModuleId() {
+       75      return "HighUsageEntities";
+       76    }
+       77  
+       78    @Override
+       79    public RecommendationRenderType getRenderType() {
+       80      return RecommendationRenderType.ENTITY_NAME_LIST;
+       81    }
+       82  
+       83    @Override
+       84    public boolean isEligible(
+       85        @Nonnull OperationContext opContext, @Nonnull RecommendationRequestContext requestContext) {
+       86      boolean analyticsEnabled = false;
+       87      try {
+       88        analyticsEnabled =
+       89            _searchClient
+       90                .indices()
+       91                .exists(
+       92                    new GetIndexRequest(_indexConvention.getIndexName(DATAHUB_USAGE_INDEX)),
+       93                    RequestOptions.DEFAULT);
+       94      } catch (IOException e) {
+       95        log.error("Failed to determine whether DataHub usage index exists");
+       96      }
+       97      return requestContext.getScenario() == ScenarioType.HOME && analyticsEnabled;
+       98    }
+       99  
+      100    @Override
+      101    @WithSpan
+      102    public List<RecommendationContent> getRecommendations(
+      103        @Nonnull OperationContext opContext,
+      104        @Nonnull RecommendationRequestContext requestContext,
+      105        @Nullable Filter filter) {
+      106      SearchRequest searchRequest = buildSearchRequest(opContext);
+      107  
+      108      return opContext.withSpan(
+      109          "getMostPopular",
+      110          () -> {
+      111            try {
+      112              final SearchResponse searchResponse =
+      113                  _searchClient.search(searchRequest, RequestOptions.DEFAULT);
+      114              // extract results
+      115              ParsedTerms parsedTerms = searchResponse.getAggregations().get(ENTITY_AGG_NAME);
+      116              List<String> bucketUrns =
+      117                  parsedTerms.getBuckets().stream()
+      118                      .map(MultiBucketsAggregation.Bucket::getKeyAsString)
+      119                      .collect(Collectors.toList());
+      120              return buildContent(opContext, bucketUrns, _entityService)
+      121                  .limit(MAX_CONTENT)
+      122                  .collect(Collectors.toList());
+      123            } catch (Exception e) {
+      124              log.error("Search query to get most popular entities failed", e);
+      125              throw new ESQueryException("Search query failed:", e);
+      126            }
+      127          },
+      128          MetricUtils.DROPWIZARD_NAME,
+      129          MetricUtils.name(this.getClass(), "getMostPopular"));
+      130    }
+      131  
+      132    @Override
+      133    public Set<String> getSupportedEntityTypes() {
+      134      return SUPPORTED_ENTITY_TYPES;
+      135    }
+      136  
+      137    private SearchRequest buildSearchRequest(@Nonnull OperationContext opContext) {
+      138      // TODO: Proactively filter for entity types in the supported set.
+      139      SearchRequest request = new SearchRequest();
+      140      SearchSourceBuilder source = new SearchSourceBuilder();
+      141      BoolQueryBuilder query = QueryBuilders.boolQuery();
+      142  
+      143      // Potentially limit actors
+      144      restrictPeers(opContext).ifPresent(query::must);
+      145  
+      146      // Filter for all entity view events
+      147      query.must(
+      148          QueryBuilders.termQuery(
+      149              DataHubUsageEventConstants.TYPE, DataHubUsageEventType.ENTITY_VIEW_EVENT.getType()));
+      150      source.query(query);
+      151  
+      152      // Find the entities with the most views
+      153      AggregationBuilder aggregation =
+      154          AggregationBuilders.terms(ENTITY_AGG_NAME)
+      155              .field(
+      156                  ESUtils.toKeywordField(
+      157                      DataHubUsageEventConstants.ENTITY_URN, false, opContext.getAspectRetriever()))
+      158              .size(MAX_CONTENT * 2);
+      159      source.aggregation(aggregation);
+      160      source.size(0);
+      161  
+      162      request.source(source);
+      163      request.indices(_indexConvention.getIndexName(DATAHUB_USAGE_INDEX));
+      164      return request;
+      165    }
+      166  
+      167    // If search access controls enabled, restrict user activity to peers
+      168    private static Optional<QueryBuilder> restrictPeers(@Nonnull OperationContext opContext) {
+      169      ViewAuthorizationConfiguration config =
+      170          opContext.getOperationContextConfig().getViewAuthorizationConfiguration();
+      171  
+      172      if (config.isEnabled()
+      173          && config.getRecommendations().isPeerGroupEnabled()
+      174          && !opContext.isSystemAuth()) {
+      175        return Optional.of(
+      176            QueryBuilders.termsQuery(
+      177                DataHubUsageEventConstants.ACTOR_URN + ".keyword",
+      178                opContext.getActorPeers().stream()
+      179                    .map(Object::toString)
+      180                    .collect(Collectors.toList())));
+      181      }
+      182  
+      183      return Optional.empty();
+      184    }
+      185  }
+
+---------- IMPLEMENTER com.linkedin.metadata.recommendation.candidatesource.RecentlyEditedSource  stubs=0/5 ----------
+       43  @Slf4j
+       44  @RequiredArgsConstructor
+       45  public class RecentlyEditedSource implements EntityRecommendationSource {
+       46    /** Entity Types that should be in scope for this type of recommendation. */
+       47    private static final Set<String> SUPPORTED_ENTITY_TYPES =
+       48        ImmutableSet.of(
+       49            Constants.DATASET_ENTITY_NAME,
+       50            Constants.DATA_FLOW_ENTITY_NAME,
+       51            Constants.DATA_JOB_ENTITY_NAME,
+       52            Constants.CONTAINER_ENTITY_NAME,
+       53            Constants.DASHBOARD_ENTITY_NAME,
+       54            Constants.CHART_ENTITY_NAME,
+       55            Constants.ML_MODEL_ENTITY_NAME,
+       56            Constants.ML_FEATURE_ENTITY_NAME,
+       57            Constants.ML_MODEL_GROUP_ENTITY_NAME,
+       58            Constants.ML_FEATURE_TABLE_ENTITY_NAME);
+       59  
+       60    private final RestHighLevelClient _searchClient;
+       61    private final IndexConvention _indexConvention;
+       62    private final EntityService<?> _entityService;
+       63  
+       64    private static final String DATAHUB_USAGE_INDEX = "datahub_usage_event";
+       65    private static final String ENTITY_AGG_NAME = "entity";
+       66    private static final int MAX_CONTENT = 5;
+       67  
+       68    @Override
+       69    public String getTitle() {
+       70      return "Recently Edited";
+       71    }
+       72  
+       73    @Override
+       74    public String getModuleId() {
+       75      return "RecentlyEditedEntities";
+       76    }
+       77  
+       78    @Override
+       79    public RecommendationRenderType getRenderType() {
+       80      return RecommendationRenderType.ENTITY_NAME_LIST;
+       81    }
+       82  
+       83    @Override
+       84    public boolean isEligible(
+       85        @Nonnull OperationContext opContext, @Nonnull RecommendationRequestContext requestContext) {
+       86      boolean analyticsEnabled = false;
+       87      try {
+       88        analyticsEnabled =
+       89            _searchClient
+       90                .indices()
+       91                .exists(
+       92                    new GetIndexRequest(_indexConvention.getIndexName(DATAHUB_USAGE_INDEX)),
+       93                    RequestOptions.DEFAULT);
+       94      } catch (IOException e) {
+       95        log.error("Failed to check whether DataHub usage index exists");
+       96      }
+       97      return requestContext.getScenario() == ScenarioType.HOME && analyticsEnabled;
+       98    }
+       99  
+      100    @Override
+      101    @WithSpan
+      102    public List<RecommendationContent> getRecommendations(
+      103        @Nonnull OperationContext opContext,
+      104        @Nonnull RecommendationRequestContext requestContext,
+      105        @Nullable Filter filter) {
+      106      SearchRequest searchRequest =
+      107          buildSearchRequest(
+      108              opContext.getSessionActorContext().getActorUrn(), opContext.getAspectRetriever());
+      109  
+      110      return opContext.withSpan(
+      111          "getRecentlyEdited",
+      112          () -> {
+      113            try {
+      114              final SearchResponse searchResponse =
+      115                  _searchClient.search(searchRequest, RequestOptions.DEFAULT);
+      116              // extract results
+      117              ParsedTerms parsedTerms = searchResponse.getAggregations().get(ENTITY_AGG_NAME);
+      118              List<String> bucketUrns =
+      119                  parsedTerms.getBuckets().stream()
+      120                      .map(MultiBucketsAggregation.Bucket::getKeyAsString)
+      121                      .collect(Collectors.toList());
+      122              return buildContent(opContext, bucketUrns, _entityService)
+      123                  .limit(MAX_CONTENT)
+      124                  .collect(Collectors.toList());
+      125            } catch (Exception e) {
+      126              log.error("Search query to get most recently edited entities failed", e);
+      127              throw new ESQueryException("Search query failed:", e);
+      128            }
+      129          },
+      130          MetricUtils.DROPWIZARD_NAME,
+      131          MetricUtils.name(this.getClass(), "getRecentlyEdited"));
+      132    }
+      133  
+      134    @Override
+      135    public Set<String> getSupportedEntityTypes() {
+      136      return SUPPORTED_ENTITY_TYPES;
+      137    }
+      138  
+      139    private SearchRequest buildSearchRequest(
+      140        @Nonnull Urn userUrn, @Nullable AspectRetriever aspectRetriever) {
+      141      // TODO: Proactively filter for entity types in the supported set.
+      142      SearchRequest request = new SearchRequest();
+      143      SearchSourceBuilder source = new SearchSourceBuilder();
+      144      BoolQueryBuilder query = QueryBuilders.boolQuery();
+      145      // Filter for the entity edit events of the user requesting recommendation
+      146      query.must(
+      147          QueryBuilders.termQuery(
+      148              ESUtils.toKeywordField(DataHubUsageEventConstants.ACTOR_URN, false, aspectRetriever),
+      149              userUrn.toString()));
+      150      // Filter for the entity action events
+      151      query.must(
+      152          QueryBuilders.termQuery(
+      153              DataHubUsageEventConstants.TYPE, DataHubUsageEventType.ENTITY_ACTION_EVENT.getType()));
+      154      source.query(query);
+      155  
+      156      // Find the entity with the largest last viewed timestamp
+      157      String lastViewed = "last_viewed";
+      158      AggregationBuilder aggregation =
+      159          AggregationBuilders.terms(ENTITY_AGG_NAME)
+      160              .field(
+      161                  ESUtils.toKeywordField(
+      162                      DataHubUsageEventConstants.ENTITY_URN, false, aspectRetriever))
+      163              .size(MAX_CONTENT)
+      164              .order(BucketOrder.aggregation(lastViewed, false))
+      165              .subAggregation(
+      166                  AggregationBuilders.max(lastViewed).field(DataHubUsageEventConstants.TIMESTAMP));
+      167      source.aggregation(aggregation);
+      168      source.size(0);
+      169  
+      170      request.source(source);
+      171      request.indices(_indexConvention.getIndexName(DATAHUB_USAGE_INDEX));
+      172      return request;
+      173    }
+      174  }
+
+---------- IMPLEMENTER com.linkedin.metadata.recommendation.candidatesource.RecentlyViewedSource  stubs=0/5 ----------
+       43  @Slf4j
+       44  @RequiredArgsConstructor
+       45  public class RecentlyViewedSource implements EntityRecommendationSource {
+       46    /** Entity Types that should be in scope for this type of recommendation. */
+       47    private static final Set<String> SUPPORTED_ENTITY_TYPES =
+       48        ImmutableSet.of(
+       49            Constants.DATASET_ENTITY_NAME,
+       50            Constants.DATA_FLOW_ENTITY_NAME,
+       51            Constants.DATA_JOB_ENTITY_NAME,
+       52            Constants.CONTAINER_ENTITY_NAME,
+       53            Constants.DASHBOARD_ENTITY_NAME,
+       54            Constants.CHART_ENTITY_NAME,
+       55            Constants.ML_MODEL_ENTITY_NAME,
+       56            Constants.ML_FEATURE_ENTITY_NAME,
+       57            Constants.ML_MODEL_GROUP_ENTITY_NAME,
+       58            Constants.ML_FEATURE_TABLE_ENTITY_NAME);
+       59  
+       60    private final RestHighLevelClient _searchClient;
+       61    private final IndexConvention _indexConvention;
+       62    private final EntityService<?> _entityService;
+       63  
+       64    private static final String DATAHUB_USAGE_INDEX = "datahub_usage_event";
+       65    private static final String ENTITY_AGG_NAME = "entity";
+       66    private static final int MAX_CONTENT = 5;
+       67  
+       68    @Override
+       69    public String getTitle() {
+       70      return "Recently Viewed";
+       71    }
+       72  
+       73    @Override
+       74    public String getModuleId() {
+       75      return "RecentlyViewedEntities";
+       76    }
+       77  
+       78    @Override
+       79    public RecommendationRenderType getRenderType() {
+       80      return RecommendationRenderType.ENTITY_NAME_LIST;
+       81    }
+       82  
+       83    @Override
+       84    public boolean isEligible(
+       85        @Nonnull OperationContext opContext, @Nonnull RecommendationRequestContext requestContext) {
+       86      boolean analyticsEnabled = false;
+       87      try {
+       88        analyticsEnabled =
+       89            _searchClient
+       90                .indices()
+       91                .exists(
+       92                    new GetIndexRequest(_indexConvention.getIndexName(DATAHUB_USAGE_INDEX)),
+       93                    RequestOptions.DEFAULT);
+       94      } catch (IOException e) {
+       95        log.error("Failed to check whether DataHub usage index exists");
+       96      }
+       97      return requestContext.getScenario() == ScenarioType.HOME && analyticsEnabled;
+       98    }
+       99  
+      100    @Override
+      101    @WithSpan
+      102    public List<RecommendationContent> getRecommendations(
+      103        @Nonnull OperationContext opContext,
+      104        @Nonnull RecommendationRequestContext requestContext,
+      105        @Nullable Filter filter) {
+      106      SearchRequest searchRequest =
+      107          buildSearchRequest(
+      108              opContext.getSessionActorContext().getActorUrn(), opContext.getAspectRetriever());
+      109  
+      110      return opContext.withSpan(
+      111          "getRecentlyViewed",
+      112          () -> {
+      113            try {
+      114              final SearchResponse searchResponse =
+      115                  _searchClient.search(searchRequest, RequestOptions.DEFAULT);
+      116              // extract results
+      117              ParsedTerms parsedTerms = searchResponse.getAggregations().get(ENTITY_AGG_NAME);
+      118              List<String> bucketUrns =
+      119                  parsedTerms.getBuckets().stream()
+      120                      .map(MultiBucketsAggregation.Bucket::getKeyAsString)
+      121                      .collect(Collectors.toList());
+      122              return buildContent(opContext, bucketUrns, _entityService)
+      123                  .limit(MAX_CONTENT)
+      124                  .collect(Collectors.toList());
+      125            } catch (Exception e) {
+      126              log.error("Search query to get most recently viewed entities failed", e);
+      127              throw new ESQueryException("Search query failed:", e);
+      128            }
+      129          },
+      130          MetricUtils.DROPWIZARD_NAME,
+      131          MetricUtils.name(this.getClass(), "getRecentlyViewed"));
+      132    }
+      133  
+      134    @Override
+      135    public Set<String> getSupportedEntityTypes() {
+      136      return SUPPORTED_ENTITY_TYPES;
+      137    }
+      138  
+      139    private SearchRequest buildSearchRequest(
+      140        @Nonnull Urn userUrn, @Nullable AspectRetriever aspectRetriever) {
+      141      // TODO: Proactively filter for entity types in the supported set.
+      142      SearchRequest request = new SearchRequest();
+      143      SearchSourceBuilder source = new SearchSourceBuilder();
+      144      BoolQueryBuilder query = QueryBuilders.boolQuery();
+      145      // Filter for the entity view events of the user requesting recommendation
+      146      query.must(
+      147          QueryBuilders.termQuery(
+      148              ESUtils.toKeywordField(DataHubUsageEventConstants.ACTOR_URN, false, aspectRetriever),
+      149              userUrn.toString()));
+      150      query.must(
+      151          QueryBuilders.termQuery(
+      152              DataHubUsageEventConstants.TYPE, DataHubUsageEventType.ENTITY_VIEW_EVENT.getType()));
+      153      source.query(query);
+      154  
+      155      // Find the entity with the largest last viewed timestamp
+      156      String lastViewed = "last_viewed";
+      157      AggregationBuilder aggregation =
+      158          AggregationBuilders.terms(ENTITY_AGG_NAME)
+      159              .field(
+      160                  ESUtils.toKeywordField(
+      161                      DataHubUsageEventConstants.ENTITY_URN, false, aspectRetriever))
+      162              .size(MAX_CONTENT)
+      163              .order(BucketOrder.aggregation(lastViewed, false))
+      164              .subAggregation(
+      165                  AggregationBuilders.max(lastViewed).field(DataHubUsageEventConstants.TIMESTAMP));
+      166      source.aggregation(aggregation);
+      167      source.size(0);
+      168  
+      169      request.source(source);
+      170      request.indices(_indexConvention.getIndexName(DATAHUB_USAGE_INDEX));
+      171      return request;
+      172    }
+      173  }
+
+---------- IMPLEMENTER com.linkedin.metadata.recommendation.candidatesource.TestSource  stubs=0/5 ----------
+       14  @Getter
+       15  @RequiredArgsConstructor
+       16  public class TestSource implements RecommendationSource {
+       17  
+       18    private final String title;
+       19    private final String moduleId;
+       20    private final RecommendationRenderType renderType;
+       21    private final boolean eligible;
+       22    private final List<RecommendationContent> contents;
+       23  
+       24    @Override
+       25    public String getTitle() {
+       26      return title;
+       27    }
+       28  
+       29    @Override
+       30    public String getModuleId() {
+       31      return moduleId;
+       32    }
+       33  
+       34    @Override
+       35    public RecommendationRenderType getRenderType() {
+       36      return renderType;
+       37    }
+       38  
+       39    @Override
+       40    public boolean isEligible(
+       41        @Nonnull OperationContext opContext, @Nonnull RecommendationRequestContext requestContext) {
+       42      return eligible;
+       43    }
+       44  
+       45    @Override
+       46    public List<RecommendationContent> getRecommendations(
+       47        @Nonnull OperationContext opContext,
+       48        @Nonnull RecommendationRequestContext requestContext,
+       49        @Nullable Filter filter) {
+       50      return contents;
+       51    }
+       52  }
+
+---------- IMPLEMENTER com.linkedin.metadata.recommendation.candidatesource.DomainsCandidateSource  stubs=0/4 ----------
+       13  @Slf4j
+       14  public class DomainsCandidateSource extends EntitySearchAggregationSource {
+       15  
+       16    private static final String DOMAINS = "domains";
+       17  
+       18    public DomainsCandidateSource(
+       19        EntityService<?> entityService,
+       20        EntitySearchService entitySearchService,
+       21        EntityRegistry entityRegistry) {
+       22      super(entityService, entitySearchService, entityRegistry);
+       23    }
+       24  
+       25    @Override
+       26    public String getTitle() {
+       27      return "Domains";
+       28    }
+       29  
+       30    @Override
+       31    public String getModuleId() {
+       32      return "Domains";
+       33    }
+       34  
+       35    @Override
+       36    public RecommendationRenderType getRenderType() {
+       37      return RecommendationRenderType.DOMAIN_SEARCH_LIST;
+       38    }
+       39  
+       40    @Override
+       41    public boolean isEligible(
+       42        @Nonnull OperationContext opContext, @Nonnull RecommendationRequestContext requestContext) {
+       43      return requestContext.getScenario() == ScenarioType.HOME;
+       44    }
+       45  
+       46    @Override
+       47    protected String getSearchFieldName() {
+       48      return DOMAINS;
+       49    }
+       50  
+       51    @Override
+       52    protected int getMaxContent() {
+       53      return 10;
+       54    }
+       55  
+       56    @Override
+       57    protected boolean isValueUrn() {
+       58      return true;
+       59    }
+       60  }
+
+---------- IMPLEMENTER com.linkedin.metadata.recommendation.candidatesource.EntitySearchAggregationSource  stubs=0/1 ----------
+       43  @Slf4j
+       44  @RequiredArgsConstructor
+       45  public abstract class EntitySearchAggregationSource implements RecommendationSource {
+       46  
+       47    private final EntityService entityService;
+       48    private final EntitySearchService entitySearchService;
+       49    private final EntityRegistry entityRegistry;
+       50  
+       51    /** Field to aggregate on */
+       52    protected abstract String getSearchFieldName();
+       53  
+       54    /** Max number of contents in module */
+       55    protected abstract int getMaxContent();
+       56  
+       57    /** Whether the aggregate value is an urn */
+       58    protected abstract boolean isValueUrn();
+       59  
+       60    /** Whether the urn candidate is valid */
+       61    protected boolean isValidCandidateUrn(@Nonnull OperationContext opContext, Urn urn) {
+       62      return entityService.exists(opContext, urn, false);
+       63    }
+       64  
+       65    /** Whether the string candidate is valid */
+       66    protected boolean isValidCandidateValue(String candidateValue) {
+       67      return true;
+       68    }
+       69  
+       70    /** Whether the candidate is valid Calls different functions if candidate is an Urn */
+       71    protected <T> boolean isValidCandidate(@Nonnull OperationContext opContext, T candidate) {
+       72      if (candidate instanceof Urn) {
+       73        return isValidCandidateUrn(opContext, (Urn) candidate);
+       74      }
+       75      return isValidCandidateValue(candidate.toString());
+       76    }
+       77  
+       78    @Override
+       79    @WithSpan
+       80    public List<RecommendationContent> getRecommendations(
+       81        @Nonnull OperationContext opContext,
+       82        @Nullable RecommendationRequestContext requestContext,
+       83        @Nullable Filter filter) {
+       84      Map<String, Long> aggregationResult =
+       85          entitySearchService.aggregateByValue(
+       86              opContext,
+       87              getEntityNames(entityRegistry),
+       88              getSearchFieldName(),
+       89              filter,
+       90              getMaxContent());
+       91  
+       92      if (aggregationResult.isEmpty()) {
+       93        return Collections.emptyList();
+       94      }
+       95  
+       96      // If the aggregated values are not urn, simply get top k values with the most counts
+       97      if (!isValueUrn()) {
+       98        return getTopKValues(opContext, aggregationResult).stream()
+       99            .map(entry -> buildRecommendationContent(entry.getKey(), entry.getValue()))
+      100            .collect(Collectors.toList());
+      101      }
+      102  
+      103      // If the aggregated values are urns, convert key into urns
+      104      Map<Urn, Long> urnCounts =
+      105          aggregationResult.entrySet().stream()
+      106              .map(
+      107                  entry -> {
+      108                    try {
+      109                      Urn entityUrn = Urn.createFromString(entry.getKey());
+      110                      return Optional.of(Pair.of(entityUrn, entry.getValue()));
+      111                    } catch (URISyntaxException e) {
+      112                      log.error("Invalid entity urn {}", entry.getKey(), e);
+      113                      return Optional.<Pair<Urn, Long>>empty();
+      114                    }
+      115                  })
+      116              .filter(Optional::isPresent)
+      117              .map(Optional::get)
+      118              .collect(Collectors.toMap(Pair::getKey, Pair::getValue));
+      119  
+      120      if (urnCounts.isEmpty()) {
+      121        return Collections.emptyList();
+      122      }
+      123  
+      124      // Get the top X valid platforms (ones with logo) with the most number of documents
+      125      return getTopKValues(opContext, urnCounts).stream()
+      126          .map(entry -> buildRecommendationContent(entry.getKey(), entry.getValue()))
+      127          .collect(Collectors.toList());
+      128    }
+      129  
+      130    protected List<String> getEntityNames(EntityRegistry entityRegistry) {
+      131      // By default, no list is applied which means searching across entities.
+      132      return QueryUtils.getQueryByDefaultEntitySpecs(entityRegistry).stream()
+      133          .map(EntitySpec::getName)
+      134          .collect(Collectors.toList());
+      135    }
+      136  
+      137    // Get top K entries with the most count
+      138    private <T> List<Map.Entry<T, Long>> getTopKValues(
+      139        @Nonnull OperationContext opContext, Map<T, Long> countMap) {
+      140      final PriorityQueue<Map.Entry<T, Long>> queue =
+      141          new PriorityQueue<>(getMaxContent(), Map.Entry.comparingByValue(Comparator.naturalOrder()));
+      142      for (Map.Entry<T, Long> entry : countMap.entrySet()) {
+      143        if (queue.size() < getMaxContent() && isValidCandidate(opContext, entry.getKey())) {
+      144          queue.add(entry);
+      145        } else if (queue.size() > 0
+      146            && queue.peek().getValue() < entry.getValue()
+      147            && isValidCandidate(opContext, entry.getKey())) {
+      148          queue.poll();
+      149          queue.add(entry);
+      150        }
+      151      }
+      152  
+      153      // Since priority queue polls in reverse order (nature of heaps), need to reverse order before
+      154      // returning
+      155      final LinkedList<Map.Entry<T, Long>> topK = new LinkedList<>();
+      156      while (!queue.isEmpty()) {
+      157        topK.addFirst(queue.poll());
+      158      }
+      159      return topK;
+      160    }
+      161  
+      162    private Map<String, Long> mergeAggregation(Map<String, Long> first, Map<String, Long> second) {
+      163      return Stream.concat(first.entrySet().stream(), second.entrySet().stream())
+      164          .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue, Long::sum));
+      165    }
+      166  
+      167    private <T> RecommendationContent buildRecommendationContent(T candidate, long count) {
+      168      // Set filters for platform
+      169      SearchParams searchParams =
+      170          new SearchParams()
+      171              .setQuery("")
+      172              .setFilters(
+      173                  new CriterionArray(
+      174                      ImmutableList.of(
+      175                          buildCriterion(
+      176                              getSearchFieldName(), Condition.EQUAL, candidate.toString()))));
+      177      ContentParams contentParams = new ContentParams().setCount(count);
+      178      RecommendationContent content = new RecommendationContent();
+      179      if (candidate instanceof Urn) {
+      180        content.setEntity((Urn) candidate);
+      181      }
+      182      return content
+      183          .setValue(candidate.toString())
+      184          .setParams(
+      185              new RecommendationParams()
+      186                  .setSearchParams(searchParams)
+      187                  .setContentParams(contentParams));
+      188    }
+      189  }

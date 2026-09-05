@@ -1,0 +1,406 @@
+row 359   open-metadata/OpenMetadata#26572
+============================================================================
+CLASS org.openmetadata.service.apps.bundles.rdf.RdfIndexApp   loc=786 methods=29 wmc=131 lcom=0.0357142857142857 c3=0.1370014823986137
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       59  @Slf4j
+       60  public class RdfIndexApp extends AbstractNativeApplication {
+       61    private static final String ALL = "all";
+       62    private static final String POISON_PILL = "__POISON_PILL__";
+       63    private static final int DEFAULT_BATCH_SIZE = 100;
+       64    private static final int DEFAULT_QUEUE_SIZE = 5000;
+       65    private static final int MAX_PRODUCER_THREADS = 10;
+       66    private static final int MAX_CONSUMER_THREADS = 5;
+       67    private static final long WEBSOCKET_UPDATE_INTERVAL_MS = 2000;
+       68  
+       69    private static final List<Integer> ALL_RELATIONSHIPS =
+       70        java.util.Arrays.stream(Relationship.values())
+       71            .map(Relationship::ordinal)
+       72            .collect(Collectors.toList());
+       73  
+       74    // Entity types that should be excluded from RDF relationships as they don't provide
+       75    // meaningful semantic value (operational/audit entities)
+       76    private static final Set<String> EXCLUDED_RELATIONSHIP_ENTITY_TYPES =
+       77        Set.of(
+       78            "changeEvent",
+       79            "auditLog",
+       80            "webAnalyticEvent",
+       81            "entityUsage",
+       82            "eventSubscription",
+       83            "vote",
+       84            "THREAD");
+       85  
+       86    // Relationship types that should be excluded from RDF as they don't provide
+       87    // meaningful semantic relationships (user interactions, not data relationships)
+       88    private static final Set<Integer> EXCLUDED_RELATIONSHIP_TYPES =
+       89        Set.of(Relationship.VOTED.ordinal(), Relationship.FOLLOWS.ordinal());
+       90  
+       91    private final RdfRepository rdfRepository;
+       92    private volatile boolean stopped = false;
+       93    private volatile long lastWebSocketUpdate = 0;
+       94  
+       95    @Getter private EventPublisherJob jobData;
+       96    private ExecutorService producerExecutor;
+       97    private ExecutorService consumerExecutor;
+       98    private ExecutorService jobExecutor;
+       99    private JobExecutionContext jobExecutionContext;
+      100    private final AtomicReference<Stats> rdfIndexStats = new AtomicReference<>();
+      101    private final AtomicBoolean producersDone = new AtomicBoolean(false);
+      102    private BlockingQueue<IndexingTask> taskQueue;
+      103  
+      104    record IndexingTask(
+      105        String entityType, List<? extends EntityInterface> entities, int offset, int retryCount) {
+      106      IndexingTask(String entityType, List<? extends EntityInterface> entities, int offset) {
+      107        this(entityType, entities, offset, 0);
+      108      }
+      109  
+      110      boolean isPoisonPill() {
+      111        return POISON_PILL.equals(entityType);
+      112      }
+      113    }
+      114  
+      115    public RdfIndexApp(CollectionDAO collectionDAO, SearchRepository searchRepository) {
+      116      super(collectionDAO, searchRepository);
+      117      this.rdfRepository = RdfRepository.getInstance();
+      118    }
+      119  
+      120    @Override
+      121    public void init(App app) {
+      122      super.init(app);
+      123      jobData = JsonUtils.convertValue(app.getAppConfiguration(), EventPublisherJob.class);
+      124    }
+      125  
+      126    @Override
+      127    public void execute(JobExecutionContext jobExecutionContext) {
+      128      this.jobExecutionContext = jobExecutionContext;
+      129      stopped = false;
+      130      producersDone.set(false);
+      131  
+      132      if (jobData == null) {
+      133        String appConfigJson =
+      134            (String) jobExecutionContext.getJobDetail().getJobDataMap().get(APP_CONFIG);
+      135        if (appConfigJson != null) {
+      136          jobData = JsonUtils.readValue(appConfigJson, EventPublisherJob.class);
+      137        } else if (getApp() != null && getApp().getAppConfiguration() != null) {
+      138          jobData = JsonUtils.convertValue(getApp().getAppConfiguration(), EventPublisherJob.class);
+      139        } else {
+      140          LOG.error("Unable to initialize jobData from JobDataMap or App configuration");
+      141          throw new IllegalStateException("JobData is not initialized");
+      142        }
+      143      }
+      144  
+      145      if (!rdfRepository.isEnabled()) {
+      146        LOG.error("RDF Repository is not enabled. Please enable RDF in configuration.");
+      147        updateJobStatus(EventPublisherJob.Status.FAILED);
+      148        jobData.setFailure(
+      149            new IndexingError()
+      150                .withErrorSource(IndexingError.ErrorSource.JOB)
+      151                .withMessage("RDF Repository is not enabled"));
+      152        sendUpdates(jobExecutionContext, true);
+      153        return;
+      154      }
+      155  
+      156      String jobName = jobExecutionContext.getJobDetail().getKey().getName();
+      157      if (jobName.equals(ON_DEMAND_JOB)) {
+      158        Map<String, Object> jsonAppConfig = JsonUtils.convertValue(jobData, Map.class);
+      159        getApp().setAppConfiguration(jsonAppConfig);
+      160      }
+      161  
+      162      try {
+      163        boolean containsAll = jobData.getEntities().contains(ALL);
+      164        if (containsAll) {
+      165          jobData.setEntities(getAll());
+      166        }
+      167  
+      168        LOG.info(
+      169            "RDF Index Job Started for Entities: {}, RecreateIndex: {}",
+      170            jobData.getEntities(),
+      171            jobData.getRecreateIndex());
+      172  
+      173        initializeJob(jobExecutionContext);
+      174  
+      175        if (Boolean.TRUE.equals(jobData.getRecreateIndex())) {
+      176          LOG.info("Clearing existing RDF data");
+      177          clearRdfData();
+      178        }
+      179  
+      180        updateJobStatus(EventPublisherJob.Status.RUNNING);
+      181        reIndexFromStartToEnd();
+      182  
+      183        if (stopped) {
+      184          updateJobStatus(EventPublisherJob.Status.STOPPED);
+      185        } else {
+      186          updateJobStatus(EventPublisherJob.Status.COMPLETED);
+      187        }
+      188  
+      189        LOG.info("RDF Index Job Completed for Entities: {}", jobData.getEntities());
+      190      } catch (Exception ex) {
+      191        if (stopped) {
+      192          LOG.info("RDF Index Job Stopped for Entities: {}", jobData.getEntities());
+      193          jobData.setStatus(EventPublisherJob.Status.STOPPED);
+      194        } else {
+      195          handleJobFailure(ex);
+      196        }
+      197      } finally {
+      198        sendUpdates(jobExecutionContext, true);
+      199        cleanupExecutors();
+      200      }
+      201    }
+      202  
+      203    private void initializeJob(JobExecutionContext jobExecutionContext) {
+      204      LOG.debug("Executing RDF Indexing Job with JobData: {}", jobData);
+      205      updateJobStatus(EventPublisherJob.Status.RUNNING);
+      206  
+      207      LOG.debug("Initializing job statistics.");
+      208      rdfIndexStats.set(initializeTotalRecords(jobData.getEntities()));
+      209      jobData.setStats(rdfIndexStats.get());
+      210  
+      211      int queueSize = jobData.getQueueSize() != null ? jobData.getQueueSize() : DEFAULT_QUEUE_SIZE;
+      212      int effectiveQueueSize = calculateMemoryAwareQueueSize(queueSize);
+      213      taskQueue = new LinkedBlockingQueue<>(effectiveQueueSize);
+      214      LOG.info("Initialized task queue with size: {}", effectiveQueueSize);
+      215  
+      216      sendUpdates(jobExecutionContext, true);
+      217    }
+      218  
+      219    private int calculateMemoryAwareQueueSize(int requestedSize) {
+      220      Runtime runtime = Runtime.getRuntime();
+      221      long maxMemory = runtime.maxMemory();
+      222      long estimatedEntitySize = 10 * 1024L;
+      223      int batchSize = jobData.getBatchSize() != null ? jobData.getBatchSize() : DEFAULT_BATCH_SIZE;
+      224      long maxQueueMemory = (long) (maxMemory * 0.15);
+      225      int memoryBasedLimit = (int) (maxQueueMemory / (estimatedEntitySize * batchSize));
+      226      return Math.min(requestedSize, Math.max(100, memoryBasedLimit));
+      227    }
+      228  
+      229    private void clearRdfData() {
+      230      try {
+      231        rdfRepository.clearAll();
+      232        LOG.info("Cleared all RDF data");
+      233      } catch (Exception e) {
+      234        LOG.error("Failed to clear RDF data", e);
+      235        throw new RuntimeException("Failed to clear RDF data", e);
+      236      }
+      237    }
+      238  
+      239    private void reIndexFromStartToEnd() throws InterruptedException {
+      240      long totalEntities = rdfIndexStats.get().getJobStats().getTotalRecords();
+      241      int numProducers = Math.clamp((int) (totalEntities / 5000), 2, MAX_PRODUCER_THREADS);
+      242      int numConsumers =
+      243          jobData.getConsumerThreads() != null
+      244              ? Math.min(jobData.getConsumerThreads(), MAX_CONSUMER_THREADS)
+      245              : Math.min(3, MAX_CONSUMER_THREADS);
+      246  
+      247      LOG.info(
+      248          "Starting RDF indexing with {} producer threads, {} consumer threads",
+      249          numProducers,
+      250          numConsumers);
+      251  
+      252      jobExecutor =
+      253          Executors.newFixedThreadPool(
+      254              jobData.getEntities().size(), Thread.ofPlatform().name("rdf-job-", 0).factory());
+      255      producerExecutor =
+      256          Executors.newFixedThreadPool(
+      257              numProducers, Thread.ofPlatform().name("rdf-producer-", 0).factory());
+      258      consumerExecutor =
+      259          Executors.newFixedThreadPool(
+      260              numConsumers, Thread.ofPlatform().name("rdf-consumer-", 0).factory());
+      261  
+      262      CountDownLatch consumerLatch = new CountDownLatch(numConsumers);
+      263      for (int i = 0; i < numConsumers; i++) {
+      264        final int consumerId = i;
+      265        consumerExecutor.submit(() -> runConsumer(consumerId, consumerLatch));
+      266      }
+      267  
+      268      try {
+      269        // Clear entire RDF store before re-indexing to remove stale data
+      270        LOG.info("Clearing RDF store before re-indexing");
+      271        rdfRepository.clearAll();
+      272  
+      273        processEntityTypes();
+      274        signalConsumersToStop(numConsumers);
+      275        consumerLatch.await();
+      276        LOG.info("All consumers have finished processing tasks");
+      277      } catch (InterruptedException e) {
+      278        LOG.info("Reindexing interrupted - stopping immediately");
+      279        stopped = true;
+      280        Thread.currentThread().interrupt();
+      281        throw e;
+      282      }
+      283    }
+      284  
+      285    private void runConsumer(int consumerId, CountDownLatch consumerLatch) {
+      286      LOG.info("Consumer {} started", consumerId);
+      287      try {
+      288        while (!stopped && (!producersDone.get() || !taskQueue.isEmpty())) {
+      289          try {
+      290            IndexingTask task = taskQueue.poll(100, TimeUnit.MILLISECONDS);
+      291            if (task != null && !task.isPoisonPill()) {
+      292              processTask(task);
+      293            }
+      294          } catch (InterruptedException e) {
+      295            Thread.currentThread().interrupt();
+      296            break;
+      297          }
+      298        }
+      299      } finally {
+      300        LOG.info("Consumer {} stopped", consumerId);
+      301        consumerLatch.countDown();
+      302      }
+      303    }
+      304  
+      305    private void processTask(IndexingTask task) {
+      306      String entityType = task.entityType();
+      307      List<? extends EntityInterface> entities = task.entities();
+      308  
+      309      if (entities == null || entities.isEmpty()) {
+      310        return;
+      311      }
+      312  
+      313      int successCount = 0;
+      314      int failedCount = 0;
+      315  
+      316      try {
+      317        for (EntityInterface entity : entities) {
+      318          if (stopped) {
+      319            break;
+      320          }
+      321          try {
+      322            rdfRepository.createOrUpdate(entity);
+      323            successCount++;
+      324          } catch (Exception e) {
+      325            LOG.error("Failed to index entity {} to RDF", entity.getId(), e);
+      326            failedCount++;
+      327          }
+      328        }
+      329  
+      330        processBatchRelationships(entityType, entities);
+      331  
+      332        // Process glossary term relations if this is a glossaryTerm batch
+      333        if ("glossaryTerm".equals(entityType)) {
+      334          processGlossaryTermRelations(entities);
+      335        }
+      336  
+      337        StepStats currentStats =
+      338            new StepStats().withSuccessRecords(successCount).withFailedRecords(failedCount);
+      339        updateEntityStats(entityType, currentStats);
+      340        sendUpdates(jobExecutionContext, false);
+      341  
+      342      } catch (Exception e) {
+      343        LOG.error("Error processing batch for entity type {}", entityType, e);
+      344        updateEntityStats(
+      345            entityType,
+      346            new StepStats()
+      347                .withSuccessRecords(successCount)
+      348                .withFailedRecords(entities.size() - successCount));
+      349      }
+      350    }
+      351  
+      352    private void processBatchRelationships(
+      353        String entityType, List<? extends EntityInterface> entities) {
+      354      if (entities.isEmpty()) {
+      355        return;
+      356      }
+      357  
+      358      List<String> entityIds =
+      359          entities.stream().map(e -> e.getId().toString()).collect(Collectors.toList());
+      360  
+      361      try {
+      362        List<EntityRelationshipObject> outgoingRelationships =
+      363            collectionDAO
+      364                .relationshipDAO()
+      365                .findToBatchWithRelations(entityIds, entityType, ALL_RELATIONSHIPS);
+      366  
+      367        List<EntityRelationshipObject> incomingLineage =
+      368            collectionDAO
+      369                .relationshipDAO()
+      370                .findFromBatch(entityIds, Relationship.UPSTREAM.ordinal(), Include.ALL);
+      371  
+      372        List<org.openmetadata.schema.type.EntityRelationship> allRelationships = new ArrayList<>();
+      373  
+      374        for (EntityRelationshipObject rel : outgoingRelationships) {
+      375          // Skip relationships to/from excluded entity types (changeEvent, auditLog, vote, etc.)
+      376          // These don't provide meaningful semantic value in the knowledge graph
+      377          if (EXCLUDED_RELATIONSHIP_ENTITY_TYPES.contains(rel.getToEntity())
+      378              || EXCLUDED_RELATIONSHIP_ENTITY_TYPES.contains(rel.getFromEntity())) {
+      379            LOG.debug(
+      380                "Skipping relationship {} -> {} (excluded entity type: {} or {})",
+      381                rel.getFromId(),
+      382                rel.getToId(),
+      383                rel.getFromEntity(),
+      384                rel.getToEntity());
+      385            continue;
+      386          }
+      387  
+      388          // Skip excluded relationship types (VOTED, FOLLOWS, etc.)
+      389          if (EXCLUDED_RELATIONSHIP_TYPES.contains(rel.getRelation())) {
+      390            LOG.debug(
+      391                "Skipping relationship {} -> {} (excluded relationship type: {})",
+      392                rel.getFromId(),
+      393                rel.getToId(),
+      394                rel.getRelation());
+      395            continue;
+      396          }
+      397  
+      398          if (rel.getRelation() == Relationship.UPSTREAM.ordinal() && rel.getJson() != null) {
+      399            processLineageRelationship(rel);
+      400          } else {
+      401            // Skip glossary term RELATED_TO relationships - they're handled separately
+      402            // by processGlossaryTermRelations() with typed predicates
+      403            if ("glossaryTerm".equals(entityType)
+      404                && rel.getRelation() == Relationship.RELATED_TO.ordinal()
+      405                && "glossaryTerm".equals(rel.getToEntity())) {
+      406              LOG.debug(
+      407                  "Skipping glossary term relation {} -> {} (handled by processGlossaryTermRelations)",
+      408                  rel.getFromId(),
+      409                  rel.getToId());
+      410              continue;
+      411            }
+      412            allRelationships.add(convertToEntityRelationship(rel));
+      413          }
+      414        }
+      415  
+      416        for (EntityRelationshipObject rel : incomingLineage) {
+      417          // Skip relationships to/from excluded entity types
+      418          if (EXCLUDED_RELATIONSHIP_ENTITY_TYPES.contains(rel.getToEntity())
+      419              || EXCLUDED_RELATIONSHIP_ENTITY_TYPES.contains(rel.getFromEntity())) {
+      420            continue;
+      421          }
+      422  
+      423          // Skip excluded relationship types
+      424          if (EXCLUDED_RELATIONSHIP_TYPES.contains(rel.getRelation())) {
+      425            continue;
+      426          }
+      427  
+      428          if (rel.getJson() != null) {
+      429            processLineageRelationship(rel);
+      430          } else {
+      431            allRelationships.add(convertToEntityRelationship(rel));
+      432          }
+      433        }
+      434  
+      435        if (!allRelationships.isEmpty()) {
+      436          rdfRepository.bulkAddRelationships(allRelationships);
+      437          LOG.debug(
+      438              "Bulk added {} relationships for {} entities",
+      439              allRelationships.size(),
+      440              entities.size());
+      441        }
+      442  
+      443      } catch (Exception e) {
+      444        LOG.error("Failed to process batch relationships for entity type {}", entityType, e);
+      445      }
+      446    }
+      447  
+      448    private void processLineageRelationship(EntityRelationshipObject rel) {
+      449      try {
+      450        UUID fromId = UUID.fromString(rel.getFromId());
+      451        UUID toId = UUID.fromString(rel.getToId());
+      452        LineageDetails lineageDetails = JsonUtils.readValue(rel.getJson(), LineageDetails.class);
+      453        rdfRepository.addLineageWithDetails(
+      454            rel.getFromEntity(), fromId, rel.getToEntity(), toId, lineageDetails);
+      455        LOG.debug(
+      456            "Added lineage with details from {}/{} to {}/{}",
+      457            rel.getFromEntity(),
+      458            fromId,
+       ... truncated at 400 lines ...

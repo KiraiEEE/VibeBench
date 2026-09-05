@@ -1,0 +1,375 @@
+row 1   mr3project/hive-mr3#78
+============================================================================
+CONTRACT org.apache.hadoop.hive.ql.IDriver   members=18.0 implementers=2.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       36  @InterfaceAudience.Private
+       37  @InterfaceStability.Unstable
+       38  public interface IDriver extends CommandProcessor {
+       39  
+       40    CommandProcessorResponse compileAndRespond(String statement) throws CommandProcessorException;
+       41  
+       42    QueryPlan getPlan();
+       43  
+       44    QueryState getQueryState();
+       45  
+       46    QueryDisplay getQueryDisplay();
+       47  
+       48    void setOperationId(String operationId);
+       49  
+       50    CommandProcessorResponse run() throws CommandProcessorException;
+       51  
+       52    @Override
+       53    CommandProcessorResponse run(String command) throws CommandProcessorException;
+       54  
+       55    // create some "cover" to the result?
+       56    @SuppressWarnings("rawtypes")
+       57    boolean getResults(List res) throws IOException;
+       58  
+       59    void setMaxRows(int maxRows);
+       60  
+       61    FetchTask getFetchTask();
+       62  
+       63    Schema getSchema();
+       64  
+       65    boolean isFetchingTable();
+       66  
+       67    void resetFetch() throws IOException;
+       68  
+       69    // close&destroy is used in seq coupling most of the time - the difference is either not clear; or not relevant
+       70    // remove?
+       71    @Override
+       72    void close();
+       73    void destroy();
+       74  
+       75    HiveConf getConf();
+       76  
+       77    Context getContext();
+       78  
+       79    boolean hasResultSet();
+       80  
+       81  }
+
+---------- IMPLEMENTER org.apache.hadoop.hive.ql.Driver  stubs=0/18 ----------
+       74  public class Driver implements IDriver {
+       75    private static final String CLASS_NAME = Driver.class.getName();
+       76    private static final Logger LOG = LoggerFactory.getLogger(CLASS_NAME);
+       77    private static final LogHelper CONSOLE = new LogHelper(LOG);
+       78  
+       79    private static final String SNAPSHOT_WAS_OUTDATED_WHEN_LOCKS_WERE_ACQUIRED =
+       80        "snapshot was outdated when locks were acquired";
+       81  
+       82    private int maxRows = 100;
+       83    @VisibleForTesting
+       84    final DriverContext driverContext;
+       85    private final DriverState driverState = new DriverState();
+       86    private final DriverTxnHandler driverTxnHandler;
+       87  
+       88    private Context context;
+       89    private TaskQueue taskQueue;
+       90  
+       91    @VisibleForTesting
+       92    public Driver(HiveConf conf) {
+       93      this(new QueryState.Builder().withGenerateNewQueryId(true).withHiveConf(conf).build());
+       94    }
+       95  
+       96    // Pass lineageState when a driver instantiates another Driver to run or compile another query
+       97    public Driver(HiveConf conf, Context ctx, LineageState lineageState) {
+       98      this(QueryState.getNewQueryState(conf, lineageState), QueryInfo.getFromConf(conf));
+       99      context = ctx;
+      100    }
+      101  
+      102    public Driver(QueryState queryState) {
+      103      this(queryState, null, null);
+      104    }
+      105  
+      106    public Driver(QueryState queryState, QueryInfo queryInfo) {
+      107      this(queryState, queryInfo, null);
+      108    }
+      109  
+      110    public Driver(QueryState queryState, QueryInfo queryInfo, HiveTxnManager txnManager) {
+      111      driverContext = new DriverContext(queryState, queryInfo, new HookRunner(queryState.getConf(), CONSOLE),
+      112          txnManager);
+      113      driverTxnHandler = new DriverTxnHandler(driverContext, driverState);
+      114    }
+      115  
+      116    @Override
+      117    public Context getContext() {
+      118      return context;
+      119    }
+      120  
+      121    @Override
+      122    public HiveConf getConf() {
+      123      return driverContext.getConf();
+      124    }
+      125  
+      126    /**
+      127     * Compiles and executes an HQL command.
+      128     */
+      129    @Override
+      130    public CommandProcessorResponse run(String command) throws CommandProcessorException {
+      131      return run(command, false);
+      132    }
+      133  
+      134    /**
+      135     * Executes a previously compiled HQL command.
+      136     */
+      137    @Override
+      138    public CommandProcessorResponse run() throws CommandProcessorException {
+      139      return run(null, true);
+      140    }
+      141  
+      142    private CommandProcessorResponse run(String command, boolean alreadyCompiled) throws CommandProcessorException {
+      143      try {
+      144        runInternal(command, alreadyCompiled);
+      145        return new CommandProcessorResponse(getSchema(), null);
+      146      } catch (CommandProcessorException cpe) {
+      147        processRunException(cpe);
+      148        saveErrorMessageAndRethrow(cpe);
+      149        return null;
+      150      }
+      151    }
+      152  
+      153    private void runInternal(String command, boolean alreadyCompiled) throws CommandProcessorException {
+      154      DriverState.setDriverState(driverState);
+      155  
+      156      QueryPlan plan = driverContext.getPlan();
+      157      if (plan != null && plan.isPrepareQuery() && !plan.isExplain()) {
+      158        LOG.info("Skip running tasks for prepare plan");
+      159        return;
+      160      }
+      161  
+      162      setInitialStateForRun(alreadyCompiled);
+      163  
+      164      // a flag that helps to set the correct driver state in finally block by tracking if
+      165      // the method has been returned by an error or not.
+      166      boolean isFinishedWithError = true;
+      167      try {
+      168        HiveDriverRunHookContext hookContext = new HiveDriverRunHookContextImpl(driverContext.getConf(),
+      169            alreadyCompiled ? context.getCmd() : command);
+      170        runPreDriverHooks(hookContext);
+      171  
+      172        if (!alreadyCompiled) {
+      173          compileInternal(command, true);
+      174        } else {
+      175          driverContext.getPlan().setQueryStartTime(driverContext.getQueryDisplay().getQueryStartTime());
+      176        }
+      177  
+      178        DriverUtils.checkInterrupted(driverState, driverContext, "at acquiring the lock.", null, null);
+      179  
+      180        lockAndRespond();
+      181        validateCurrentSnapshot();
+      182  
+      183        // Reset the PerfLogger so that it doesn't retain any previous values.
+      184        // Any value from compilation phase can be obtained through the map set in queryDisplay during compilation.
+      185        PerfLogger perfLogger = SessionState.getPerfLogger(true);
+      186  
+      187        // the reason that we set the txn manager for the cxt here is because each query has its own ctx object.
+      188        // The txn mgr is shared across the same instance of Driver, which can run multiple queries.
+      189        context.setHiveTxnManager(driverContext.getTxnManager());
+      190        
+      191        execute();
+      192  
+      193        FetchTask fetchTask = driverContext.getPlan().getFetchTask();
+      194        if (fetchTask != null) {
+      195          fetchTask.setTaskQueue(null);
+      196          fetchTask.setQueryPlan(null);
+      197          try {
+      198            fetchTask.execute();
+      199            driverContext.setFetchTask(fetchTask);
+      200          } catch (Throwable e) {
+      201            throw new CommandProcessorException(e);
+      202          }
+      203        }
+      204        driverTxnHandler.handleTransactionAfterExecution();
+      205  
+      206        driverContext.getQueryDisplay().setPerfLogStarts(QueryDisplay.Phase.EXECUTION, perfLogger.getStartTimes());
+      207        driverContext.getQueryDisplay().setPerfLogEnds(QueryDisplay.Phase.EXECUTION, perfLogger.getEndTimes());
+      208  
+      209        runPostDriverHooks(hookContext);
+      210        isFinishedWithError = false;
+      211      } finally {
+      212        if (driverState.isAborted()) {
+      213          closeInProcess(true);
+      214        } else {
+      215          releaseResources();
+      216        }
+      217        driverState.executionFinishedWithLocking(isFinishedWithError);
+      218      }
+      219  
+      220      SessionState.getPerfLogger().cleanupPerfLogMetrics();
+      221    }
+      222  
+      223    /**
+      224     * Checks if the recorded snapshot is up-to-date
+      225     */
+      226    private void validateCurrentSnapshot() throws CommandProcessorException {
+      227      int retryShapshotCount = 0;
+      228      
+      229      int maxRetrySnapshotCount = HiveConf.getIntVar(driverContext.getConf(),
+      230          HiveConf.ConfVars.HIVE_TXN_MAX_RETRYSNAPSHOT_COUNT);
+      231      try {
+      232        do {
+      233          driverContext.setOutdatedTxn(false);
+
+---------- IMPLEMENTER org.apache.hadoop.hive.ql.reexec.ReExecDriver  stubs=0/18 ----------
+       60  public class ReExecDriver implements IDriver {
+       61    private static final Logger LOG = LoggerFactory.getLogger(ReExecDriver.class);
+       62    private static final SessionState.LogHelper CONSOLE = new SessionState.LogHelper(LOG);
+       63  
+       64    private final Driver coreDriver;
+       65    private final QueryState queryState;
+       66    private final List<IReExecutionPlugin> plugins;
+       67  
+       68    private boolean explainReOptimization;
+       69    private String currentQuery;
+       70    private int executionIndex;
+       71  
+       72    public ReExecDriver(QueryState queryState, QueryInfo queryInfo, List<IReExecutionPlugin> plugins) {
+       73      this.queryState = queryState;
+       74      this.coreDriver = new Driver(queryState, queryInfo, null);
+       75      this.plugins = plugins;
+       76  
+       77      coreDriver.getHookRunner().addSemanticAnalyzerHook(new HandleReOptimizationExplain());
+       78      plugins.forEach(p -> p.initialize(coreDriver));
+       79    }
+       80  
+       81    @VisibleForTesting
+       82    public int compile(String command, boolean resetTaskIds) {
+       83      return coreDriver.compile(command, resetTaskIds);
+       84    }
+       85  
+       86    @VisibleForTesting
+       87    public List<IReExecutionPlugin> getPlugins() {
+       88      return plugins;
+       89    }
+       90  
+       91    private boolean firstExecution() {
+       92      return executionIndex == 0;
+       93    }
+       94  
+       95    private void checkHookConfig() throws CommandProcessorException {
+       96      String strategies = coreDriver.getConf().getVar(ConfVars.HIVE_QUERY_REEXECUTION_STRATEGIES);
+       97      CBOFallbackStrategy fallbackStrategy =
+       98          CBOFallbackStrategy.valueOf(coreDriver.getConf().getVar(ConfVars.HIVE_CBO_FALLBACK_STRATEGY));
+       99      if (fallbackStrategy.allowsRetry() &&
+      100          (strategies == null || !Arrays.stream(strategies.split(",")).anyMatch("recompile_without_cbo"::equals))) {
+      101        String errorMsg = "Invalid configuration. If fallbackStrategy is set to " + fallbackStrategy.name() + " then " +
+      102            ConfVars.HIVE_QUERY_REEXECUTION_STRATEGIES.varname + " should contain 'recompile_without_cbo'";
+      103        CONSOLE.printError(errorMsg);
+      104        throw new CommandProcessorException(errorMsg);
+      105      }
+      106    }
+      107  
+      108    @Override
+      109    public CommandProcessorResponse compileAndRespond(String statement) throws CommandProcessorException {
+      110      currentQuery = statement;
+      111  
+      112      checkHookConfig();
+      113  
+      114      int compileIndex = 0;
+      115      int maxCompilations = 1 + coreDriver.getConf().getIntVar(ConfVars.HIVE_QUERY_MAX_RECOMPILATION_COUNT);
+      116      while (true) {
+      117        compileIndex++;
+      118  
+      119        final int currentIndex = compileIndex;
+      120        plugins.forEach(p -> p.beforeCompile(currentIndex));
+      121  
+      122        LOG.info("Compile #{} of query", compileIndex);
+      123        CommandProcessorResponse cpr = null;
+      124        CommandProcessorException cpe = null;
+      125        try {
+      126          cpr = coreDriver.compileAndRespond(statement);
+      127        } catch (CommandProcessorException e) {
+      128          cpe = e;
+      129        }
+      130  
+      131        final boolean success = cpe == null;
+      132        plugins.forEach(p -> p.afterCompile(success));
+      133  
+      134        // If the compilation was successful return the result
+      135        if (success) {
+      136          return cpr;
+      137        }
+      138  
+      139        if (compileIndex >= maxCompilations || !plugins.stream().anyMatch(p -> p.shouldReCompile(currentIndex))) {
+      140          // If we do not have to recompile, return the last error
+      141          throw cpe;
+      142        }
+      143  
+      144        // Prepare for the recompile and start the next loop
+      145        plugins.forEach(IReExecutionPlugin::prepareToReCompile);
+      146      }
+      147    }
+      148  
+      149    @Override
+      150    public HiveConf getConf() {
+      151      return queryState.getConf();
+      152    }
+      153  
+      154    @Override
+      155    public QueryPlan getPlan() {
+      156      return coreDriver.getPlan();
+      157    }
+      158  
+      159    @Override
+      160    public QueryState getQueryState() {
+      161      return queryState;
+      162    }
+      163  
+      164    @Override
+      165    public QueryDisplay getQueryDisplay() {
+      166      return coreDriver.getQueryDisplay();
+      167    }
+      168  
+      169    @Override
+      170    public void setOperationId(String operationId) {
+      171      coreDriver.setOperationId(operationId);
+      172    }
+      173  
+      174    @Override
+      175    public CommandProcessorResponse run() throws CommandProcessorException {
+      176      executionIndex = 0;
+      177      int maxExecutions = 1 + coreDriver.getConf().getIntVar(ConfVars.HIVE_QUERY_MAX_REEXECUTION_COUNT);
+      178  
+      179      while (true) {
+      180        executionIndex++;
+      181  
+      182        for (IReExecutionPlugin p : plugins) {
+      183          p.beforeExecute(executionIndex, explainReOptimization);
+      184        }
+      185        coreDriver.getContext().setExecutionIndex(executionIndex);
+      186        LOG.info("Execution #{} of query", executionIndex);
+      187        CommandProcessorResponse cpr = null;
+      188        CommandProcessorException cpe = null;
+      189        try {
+      190          cpr = coreDriver.run();
+      191        } catch (CommandProcessorException e) {
+      192          cpe = e;
+      193        }
+      194  
+      195        PlanMapper oldPlanMapper = coreDriver.getPlanMapper();
+      196        boolean success = cpr != null;
+      197        plugins.forEach(p -> p.afterExecute(oldPlanMapper, success));
+      198  
+      199        boolean shouldReExecute = explainReOptimization && executionIndex==1;
+      200        shouldReExecute |= cpr == null && plugins.stream().anyMatch(p -> p.shouldReExecute(executionIndex));
+      201  
+      202        LOG.info("Re-execution decision is made according to: executionIndex: {}, maxExecutions: {}, shouldReExecute: {}",
+      203            executionIndex, maxExecutions, shouldReExecute);
+      204        if (executionIndex >= maxExecutions || !shouldReExecute) {
+      205          if (cpr != null) {
+      206            return cpr;
+      207          } else {
+      208            throw cpe;
+      209          }
+      210        }
+      211        LOG.info("Preparing to re-execute query");
+      212        plugins.forEach(IReExecutionPlugin::prepareToReExecute);
+      213  
+      214        try {
+      215          coreDriver.compileAndRespond(currentQuery);
+      216        } catch (CommandProcessorException e) {
+      217          LOG.error("Recompilation of the query failed; this is unexpected.");
+      218          // FIXME: somehow place pointers that re-execution compilation have failed; the query have been successfully compiled before?
+      219          throw e;

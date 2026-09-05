@@ -1,0 +1,1160 @@
+======================================================================
+ROW 48 | implementer | Claude_Code | TianGzlab/OmicsClaw#10
+implementer bot.memory.backends.sqlite:SQLiteBackend of bot.memory.store:MemoryStore (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[bot/memory/store.py]
+METHOD INDEX:
+  L11: def initialize(...)
+  L16: def create_session(...)
+  L21: def get_session(...)
+  L26: def update_session(...)
+  L31: def save_memory(...)
+  L36: def get_memories(...)
+  L43: def update_memory(...)
+  L48: def delete_session(...)
+  L53: def search_memories(...)
+  L59: def close(...)
+  L63: def cleanup_expired(...)
+
+SOURCE:
+class MemoryStore(ABC):
+    """Abstract interface for memory persistence."""
+
+    @abstractmethod
+    async def initialize(self) -> None:
+        """Initialize storage backend."""
+        pass
+
+    @abstractmethod
+    async def create_session(self, user_id: str, platform: str, chat_id: str) -> Session:
+        """Create new session."""
+        pass
+
+    @abstractmethod
+    async def get_session(self, session_id: str) -> Session | None:
+        """Retrieve session by ID."""
+        pass
+
+    @abstractmethod
+    async def update_session(self, session_id: str, updates: dict) -> None:
+        """Update session fields."""
+        pass
+
+    @abstractmethod
+    async def save_memory(self, session_id: str, memory: BaseMemory) -> str:
+        """Save memory node, return memory_id."""
+        pass
+
+    @abstractmethod
+    async def get_memories(
+        self, session_id: str, memory_type: str | None = None, limit: int = 100
+    ) -> list[BaseMemory]:
+        """Retrieve memories for session."""
+        pass
+
+    @abstractmethod
+    async def update_memory(self, memory_id: str, updates: dict) -> None:
+        """Update memory fields."""
+        pass
+
+    @abstractmethod
+    async def delete_session(self, session_id: str) -> None:
+        """Delete session and all memories."""
+        pass
+
+    @abstractmethod
+    async def search_memories(
+        self, session_id: str, query: str, memory_type: str | None = None
+    ) -> list[BaseMemory]:
+        """Search memories by content."""
+        pass
+
+    async def close(self) -> None:
+        """Close backend resources (optional)."""
+        pass
+
+    async def cleanup_expired(self, ttl_days: int | None = None) -> int:
+        """Remove expired sessions/memories. Returns count deleted."""
+        return 0
+
+--- IMPLEMENTER ---
+[bot/memory/backends/sqlite.py]
+METHOD INDEX:
+  L41: def __init__(...)
+  L49: def _ensure_connection(...)
+  L58: def _ensure_initialized(...)
+  L64: def initialize(...)
+  L99: def close(...)
+  L105: def cleanup_expired(...)
+  L125: def _maybe_cleanup(...)
+  L131: def create_session(...)
+  L160: def get_session(...)
+  L182: def update_session(...)
+  L200: def save_memory(...)
+  L242: def _find_duplicate(...)
+  L278: def get_memories(...)
+  L309: def update_memory(...)
+  L354: def delete_session(...)
+  L363: def search_memories(...)
+
+SOURCE:
+class SQLiteBackend(MemoryStore):
+    """Async SQLite storage with encryption and connection pooling."""
+
+    def __init__(self, db_path: str, encryptor: SecureFieldEncryptor):
+        self.db_path = db_path
+        self.encryptor = encryptor
+        self._write_lock = asyncio.Lock()
+        self._conn: aiosqlite.Connection | None = None
+        self._initialized = False
+        self._op_count = 0
+
+    async def _ensure_connection(self) -> aiosqlite.Connection:
+        """Get or create persistent connection with PRAGMAs set once."""
+        if self._conn is None:
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+            self._conn = await aiosqlite.connect(self.db_path)
+            await self._conn.execute("PRAGMA journal_mode=WAL")
+            await self._conn.execute("PRAGMA foreign_keys=ON")
+        return self._conn
+
+    async def _ensure_initialized(self):
+        """Lazy initialization: create tables on first use."""
+        if self._initialized:
+            return
+        await self.initialize()
+
+    async def initialize(self) -> None:
+        """Create tables if not exist."""
+        db = await self._ensure_connection()
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_activity TEXT NOT NULL,
+                preferences TEXT,
+                active INTEGER DEFAULT 1
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                memory_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                memory_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+            )
+        """)
+
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_session_memories ON memories(session_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_memory_type ON memories(memory_type)")
+        await db.commit()
+        self._initialized = True
+
+        # Run TTL cleanup on startup
+        await self.cleanup_expired()
+
+    async def close(self) -> None:
+        """Close the persistent connection."""
+        if self._conn is not None:
+            await self._conn.close()
+            self._conn = None
+
+    async def cleanup_expired(self, ttl_days: int | None = None) -> int:
+        """Remove sessions (and their memories via CASCADE) older than ttl_days."""
+        ttl = ttl_days if ttl_days is not None else DEFAULT_TTL_DAYS
+        if ttl <= 0:
+            return 0
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=ttl)).isoformat()
+        db = await self._ensure_connection()
+
+        async with self._write_lock:
+            cursor = await db.execute(
+                "DELETE FROM sessions WHERE last_activity < ?", (cutoff,)
+            )
+            count = cursor.rowcount
+            await db.commit()
+
+        if count > 0:
+            logger.info(f"TTL cleanup: removed {count} expired session(s) (>{ttl} days)")
+        return count
+
+    async def _maybe_cleanup(self):
+        """Periodically trigger TTL cleanup (every 100 operations)."""
+        self._op_count += 1
+        if self._op_count % 100 == 0:
+            await self.cleanup_expired()
+
+    async def create_session(self, user_id: str, platform: str, chat_id: str) -> Session:
+        """Create new session."""
+        await self._ensure_initialized()
+        session_id = f"{platform}:{user_id}:{chat_id}"
+        session = Session(
+            session_id=session_id,
+            user_id=user_id,
+            platform=platform,
+        )
+
+        db = await self._ensure_connection()
+        async with self._write_lock:
+            await db.execute(
+                """INSERT INTO sessions (session_id, user_id, platform, created_at, last_activity, preferences)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    session.session_id,
+                    session.user_id,
+                    session.platform,
+                    session.created_at.isoformat(),
+                    session.last_activity.isoformat(),
+                    json.dumps(session.preferences),
+                ),
+            )
+            await db.commit()
+
+        await self._maybe_cleanup()
+... <<truncated, 245 more lines>>
+
+======================================================================
+ROW 49 | interface | Claude_Code | pyathena-dev/PyAthena#601
+interface pyathena.common:CursorIterator kind=abc
+======================================================================
+[pyathena/common.py]
+METHOD INDEX:
+  L55: def __init__(...)
+  L62: def arraysize(...)
+  L66: def arraysize(...)
+  L74: def rownumber(...)
+  L78: def rowcount(...)
+  L82: def fetchone(...)
+  L86: def fetchmany(...)
+  L90: def fetchall(...)
+  L93: def __next__(...)
+  L99: def __iter__(...)
+
+SOURCE:
+class CursorIterator(metaclass=ABCMeta):
+    """Abstract base class providing iteration and result fetching capabilities for cursors.
+
+    This mixin class provides common functionality for iterating through query results
+    and managing cursor state. It implements the iterator protocol and provides
+    standard fetch methods that conform to the DB API 2.0 specification.
+
+    Attributes:
+        DEFAULT_FETCH_SIZE: Default number of rows to fetch per request (1000).
+        DEFAULT_RESULT_REUSE_MINUTES: Default minutes for Athena result reuse (60).
+        arraysize: Number of rows to fetch with fetchmany() if size not specified.
+
+    Note:
+        This is an abstract base class used by concrete cursor implementations.
+        It should not be instantiated directly.
+    """
+
+    # https://docs.aws.amazon.com/athena/latest/APIReference/API_GetQueryResults.html
+    # Valid Range: Minimum value of 1. Maximum value of 1000.
+    DEFAULT_FETCH_SIZE: int = 1000
+    # https://docs.aws.amazon.com/athena/latest/APIReference/API_ResultReuseByAgeConfiguration.html
+    # Specifies, in minutes, the maximum age of a previous query result
+    # that Athena should consider for reuse. The default is 60.
+    DEFAULT_RESULT_REUSE_MINUTES = 60
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__()
+        self.arraysize: int = kwargs.get("arraysize", self.DEFAULT_FETCH_SIZE)
+        self._rownumber: Optional[int] = None
+        self._rowcount: int = -1  # By default, return -1 to indicate that this is not supported.
+
+    @property
+    def arraysize(self) -> int:
+        return self._arraysize
+
+    @arraysize.setter
+    def arraysize(self, value: int) -> None:
+        if value <= 0 or value > self.DEFAULT_FETCH_SIZE:
+            raise ProgrammingError(
+                f"MaxResults is more than maximum allowed length {self.DEFAULT_FETCH_SIZE}."
+            )
+        self._arraysize = value
+
+    @property
+    def rownumber(self) -> Optional[int]:
+        return self._rownumber
+
+    @property
+    def rowcount(self) -> int:
+        return self._rowcount
+
+    @abstractmethod
+    def fetchone(self):
+        raise NotImplementedError  # pragma: no cover
+
+    @abstractmethod
+    def fetchmany(self):
+        raise NotImplementedError  # pragma: no cover
+
+    @abstractmethod
+    def fetchall(self):
+        raise NotImplementedError  # pragma: no cover
+
+    def __next__(self):
+        row = self.fetchone()
+        if row is None:
+            raise StopIteration
+        return row
+
+    def __iter__(self):
+        return self
+
+======================================================================
+ROW 50 | interface | Claude_Code | blarApp/blarify#266
+interface blarify.repositories.version_control.abstract_version_controller:AbstractVersionController kind=abc
+======================================================================
+[blarify/repositories/version_control/abstract_version_controller.py]
+METHOD INDEX:
+  L16: def fetch_pull_requests(...)
+  L45: def fetch_commits(...)
+  L74: def fetch_commit_changes(...)
+  L95: def fetch_file_at_commit(...)
+  L112: def get_repository_info(...)
+  L128: def test_connection(...)
+  L136: def parse_patch_header(...)
+  L166: def extract_change_ranges(...)
+
+SOURCE:
+class AbstractVersionController(ABC):
+    """Abstract base class defining interface for version control systems.
+    
+    This class provides the contract for implementing integrations with various
+    version control systems like GitHub, GitLab, Bitbucket, etc.
+    """
+    
+    @abstractmethod
+    def fetch_pull_requests(
+        self,
+        limit: int = 50,
+        since_date: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """Fetch merged pull requests from the version control system.
+        
+        Only returns PRs that have been merged into the codebase.
+        
+        Args:
+            limit: Maximum number of merged PRs to fetch
+            since_date: Fetch PRs created after this date
+            
+        Returns:
+            List of PR dictionaries with standardized fields (only merged PRs):
+                - number: PR number/ID
+                - title: PR title
+                - description: PR description/body
+                - author: Author username
+                - created_at: Creation timestamp
+                - updated_at: Last update timestamp
+                - merged_at: Merge timestamp (always present)
+                - state: Current state (always 'closed' for merged PRs)
+                - url: Web URL to the PR
+                - metadata: Additional system-specific data
+        """
+        pass
+    
+    @abstractmethod
+    def fetch_commits(
+        self,
+        pr_number: Optional[int] = None,
+        branch: Optional[str] = None,
+        since_date: Optional[datetime] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Fetch commits from the version control system.
+        
+        Args:
+            pr_number: Fetch commits for a specific PR
+            branch: Fetch commits for a specific branch
+            since_date: Fetch commits after this date
+            limit: Maximum number of commits to fetch
+            
+        Returns:
+            List of commit dictionaries with standardized fields:
+                - sha: Commit SHA/hash
+                - message: Commit message
+                - author: Author name
+                - author_email: Author email
+                - timestamp: Commit timestamp
+                - url: Web URL to the commit
+                - pr_number: Associated PR number (if applicable)
+                - metadata: Additional system-specific data
+        """
+        pass
+    
+    @abstractmethod
+    def fetch_commit_changes(
+        self,
+        commit_sha: str
+    ) -> List[Dict[str, Any]]:
+        """Fetch file changes for a specific commit.
+        
+        Args:
+            commit_sha: The commit SHA/hash to get changes for
+            
+        Returns:
+            List of file change dictionaries:
+                - filename: Path to the file
+                - status: Change status (added, modified, removed)
+                - additions: Number of lines added
+                - deletions: Number of lines deleted
+                - patch: Diff patch showing the changes
+                - previous_filename: Previous name if renamed
+        """
+        pass
+    
+    @abstractmethod
+    def fetch_file_at_commit(
+        self,
+        file_path: str,
+        commit_sha: str
+    ) -> Optional[str]:
+        """Fetch the contents of a file at a specific commit.
+        
+        Args:
+            file_path: Path to the file in the repository
+            commit_sha: The commit SHA/hash
+            
+        Returns:
+            File contents as string, or None if file doesn't exist
+        """
+        pass
+    
+    @abstractmethod
+    def get_repository_info(self) -> Dict[str, Any]:
+        """Get information about the repository.
+        
+        Returns:
+            Repository information dictionary:
+                - name: Repository name
+                - owner: Repository owner/organization
+                - url: Repository URL
+                - default_branch: Default branch name
+                - created_at: Creation timestamp
+                - updated_at: Last update timestamp
+                - metadata: Additional system-specific data
+        """
+        pass
+    
+    @abstractmethod
+... <<truncated, 119 more lines>>
+
+======================================================================
+ROW 51 | interface | Copilot | onnx/onnx#7522
+interface onnx.reference.op_run:OpRun kind=abc
+======================================================================
+[onnx/reference/op_run.py]
+METHOD INDEX:
+  L157: def __init__(...)
+  L186: def _log(...)
+  L189: def _extract_attribute_value(...)
+  L229: def _evaluate_subgraph(...)
+  L232: def _load_attributes(...)
+  L280: def implicit_inputs(...)
+  L304: def input(...)
+  L309: def output(...)
+  L314: def op_type(...)
+  L319: def domain(...)
+  L323: def need_context(...)
+  L331: def __str__(...)
+  L342: def _run(...)
+  L359: def _check_and_fix_outputs(...)
+  L391: def run(...)
+  L477: def infer_name(...)
+  L489: def make_node(...)
+  L536: def create(...)
+  L571: def eval(...)
+  L557: def log_function(...)
+
+SOURCE:
+class OpRun(abc.ABC):
+    """Ancestor to all operators in this subfolder.
+
+    Args:
+        onnx_node: `onnx` node
+        run_params: additional parameters such as `verbose`, `opsets`
+            (it can be more than one if the operator has a subgraph),
+            `log` for a logging function
+        schema: operator schema
+    """
+
+    op_domain = ""
+
+    def __init__(
+        self, onnx_node: onnx.NodeProto, run_params: dict[str, Any], schema: Any = None
+    ):
+        if not isinstance(run_params, dict):
+            raise TypeError(f"run_params must be a dictionary not {type(run_params)}.")
+        for att in ["opsets", "new_ops"]:
+            if att not in run_params:
+                raise RuntimeError(
+                    f"Attribute {att!r} must be in run_params, only "
+                    f"{sorted(run_params)} was found."
+                )
+        if "log" not in run_params:
+            raise KeyError("run_params must contains key 'log'.")
+        self.onnx_node = onnx_node
+        self.run_params = run_params
+        if schema is None:
+            if hasattr(self.__class__, "op_schema"):
+                self._schema = self.__class__.op_schema
+            elif self.__class__.__name__ in _schemas:
+                self._schema = _schemas[self.__class__.__name__]
+            elif onnx_node.op_type in _schemas:
+                self._schema = _schemas[onnx_node.op_type]
+            else:
+                self._schema = None
+        else:
+            self._schema = schema
+        self.has_subgraph = False
+        self._load_attributes()
+
+    def _log(self, pattern, *args):
+        self.run_params["log"](pattern, *args)
+
+    def _extract_attribute_value(
+        self, att: onnx.AttributeProto, ref_att: onnx.AttributeProto | None = None
+    ) -> Any:
+        """Converts an attribute value into a python value."""
+        if att.type == onnx.AttributeProto.GRAPH:
+            new_ops = self.run_params.get("new_ops", None)
+            if "existing_functions" in self.run_params:
+                functions = list(self.run_params["existing_functions"].values())
+            else:
+                functions = None
+            evaluator_cls = self.run_params.get("evaluator_cls", None)
+            assert evaluator_cls is not None, (
+                f"evaluator_cls must be specified to evaluate att={att}"
+            )
+            return evaluator_cls(
+                att.g,
+                opsets=self.run_params["opsets"],
+                verbose=max(0, self.run_params.get("verbose", 0) - 2),
+                new_ops=None if new_ops is None else list(new_ops.values()),
+                functions=functions,
+            )
+
+        conversion_function = _attribute_conversion_function(att.type)
+        if conversion_function is not None:
+            return conversion_function(att)
+
+        if ref_att is None:
+            raise AttributeError(
+                f"Unable to convert attribute {att.name!r} type {att.type!r} "
+                f"from node type {self.onnx_node.op_type!r}, "
+                f"domain {self.onnx_node.domain!r}\n{att}."
+            )
+
+        raise AttributeError(
+            f"Unable to convert default value for {ref_att.name!r} type {att.type!r} "
+            f"from node type {self.onnx_node.op_type!r}, "
+            f"domain {self.onnx_node.domain!r}\n{att}\n{ref_att}."
+        )
+
+    @staticmethod
+    def _evaluate_subgraph(context, value, attributes):
+        return value.run(None, context or {}, attributes=attributes)
+
+    def _load_attributes(self) -> None:
+        """Checks and loads attributes."""
+        self.has_linked_attribute = False
+        added_attributes = []
+        for att in self.onnx_node.attribute:
+            name = att.name
+            if att.ref_attr_name:
+                value = RefAttrName(att.ref_attr_name)
+                self.has_linked_attribute = True
+            else:
+                value = self._extract_attribute_value(att)
+            setattr(self, name, value)
+            added_attributes.append(name)
+            if att.type == onnx.AttributeProto.GRAPH:
+                self.has_subgraph = True
+                self.has_linked_attribute |= value.has_linked_attribute  # type: ignore[attr-defined]
+                setattr(
+                    self,
+                    f"_run_{att.name}",
+                    lambda context,
+                    value=value,
+                    attributes=None: OpRun._evaluate_subgraph(
+                        context, value, attributes
+                    ),
+                )
+
+        if self._schema and self.onnx_node.op_type not in {"Constant"}:
+            for k, v in self._schema.attributes.items():
+                if not hasattr(self, k):
+                    if getattr(v, "required", True):
+                        raise RuntimeError(
+                            f"Attribute {k!r} is expected based on ONNX specifications "
+... <<truncated, 331 more lines>>
+
+======================================================================
+ROW 52 | implementer | OpenAI_Codex | NVIDIA/NVFlare#4368
+implementer tests.unit_test.app_common.widgets.metric_relay_test:_SingleMessagePipe of nvflare.fuel.utils.pipe.pipe:Pipe (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[nvflare/fuel/utils/pipe/pipe.py]
+METHOD INDEX:
+  L113: def __init__(...)
+  L125: def open(...)
+  L134: def clear(...)
+  L139: def send(...)
+  L154: def receive(...)
+  L168: def close(...)
+  L177: def can_resend(...)
+  L181: def release_send_cache(...)
+  L195: def get_last_peer_active_time(...)
+  L203: def export(...)
+
+SOURCE:
+class Pipe(AttributesExportable, ABC):
+    def __init__(self, mode: Mode):
+        """Creates the pipe.
+
+        Args:
+            mode (Mode): Mode of the endpoint. A pipe has two endpoints.
+                An endpoint can be either the one that initiates communication or the one listening.
+        """
+        if mode != Mode.ACTIVE and mode != Mode.PASSIVE:
+            raise ValueError(f"mode must be '{Mode.ACTIVE}' or '{Mode.PASSIVE}' but got {mode}")
+        self.mode = mode
+
+    @abstractmethod
+    def open(self, name: str):
+        """Open the pipe
+
+        Args:
+            name: name of the pipe
+        """
+        pass
+
+    @abstractmethod
+    def clear(self):
+        """Clear the pipe"""
+        pass
+
+    @abstractmethod
+    def send(self, msg: Message, timeout=None) -> bool:
+        """Sends the specified message to the peer.
+
+        Args:
+            msg: the message to be sent
+            timeout: if specified, number of secs to wait for the peer to read the message.
+                If not specified, wait indefinitely.
+
+        Returns:
+            Whether the message is read by the peer.
+
+        """
+        pass
+
+    @abstractmethod
+    def receive(self, timeout=None) -> Union[None, Message]:
+        """Try to receive message from peer.
+
+        Args:
+            timeout: how long (number of seconds) to try
+                If not specified, return right away.
+
+        Returns:
+            the message received; or None if no message
+
+        """
+        pass
+
+    @abstractmethod
+    def close(self):
+        """Close the pipe
+
+        Returns: None
+
+        """
+        pass
+
+    @abstractmethod
+    def can_resend(self) -> bool:
+        """Whether the pipe is able to resend a message."""
+        pass
+
+    def release_send_cache(self, msg: Message):
+        """Release any per-message state cached by send().
+
+        Called by PipeHandler after the retry loop exits (success, max retries,
+        or stop) to allow pipe implementations to free resources that were
+        attached to the message during send().  The default is a no-op; pipes
+        that cache state (e.g. CellPipe caches the serialized CellMessage) must
+        override this method.
+
+        Args:
+            msg: the message that was being sent.
+        """
+        pass
+
+    def get_last_peer_active_time(self):
+        """Get the last time that the peer is known to be active
+
+        Returns: the last time that the peer is known to be active; or 0 if this info is not available
+
+        """
+        return 0
+
+    def export(self, export_mode: str) -> Tuple[str, dict]:
+        if export_mode == ExportMode.SELF:
+            mode = self.mode
+        else:
+            mode = Mode.ACTIVE if self.mode == Mode.PASSIVE else Mode.PASSIVE
+
+        return f"{self.__module__}.{self.__class__.__name__}", {"mode": mode}
+
+--- IMPLEMENTER ---
+[tests/unit_test/app_common/widgets/metric_relay_test.py]
+METHOD INDEX:
+  L266: def __init__(...)
+  L272: def receive(...)
+
+SOURCE:
+class _SingleMessagePipe(_FakePipe):
+    """Pipe that delivers one caller-supplied message then idles."""
+
+    def __init__(self, message):
+        super().__init__()
+        self._message = message
+        self._delivered = False
+        self.delivered_event = threading.Event()
+
+    def receive(self, timeout=None):
+        if not self._delivered:
+            self._delivered = True
+            self.delivered_event.set()
+            return self._message
+        time.sleep(0.01)
+        return None
+
+======================================================================
+ROW 53 | implementer | Claude_Code | PrefectHQ/prefect#18864
+implementer prefect.server.concurrency.lease_storage:ConcurrencyLeaseStorage of prefect.server.utilities.leasing:LeaseStorage (kind=protocol)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/prefect/server/utilities/leasing.py]
+METHOD INDEX:
+  L22: def create_lease(...)
+  L38: def read_lease(...)
+  L50: def renew_lease(...)
+  L60: def revoke_lease(...)
+  L69: def read_expired_lease_ids(...)
+
+SOURCE:
+class LeaseStorage(Protocol[T]):
+    async def create_lease(
+        self, resource_ids: list[UUID], ttl: timedelta, metadata: T | None = None
+    ) -> ResourceLease[T]:
+        """
+        Create a new resource lease.
+
+        Args:
+            resource_ids: The IDs of the resources that the lease is associated with.
+            ttl: How long the lease should initially be held for.
+            metadata: Additional metadata associated with the lease.
+
+        Returns:
+            A ResourceLease object representing the lease.
+        """
+        ...
+
+    async def read_lease(self, lease_id: UUID) -> ResourceLease[T] | None:
+        """
+        Read a resource lease.
+
+        Args:
+            lease_id: The ID of the lease to read.
+
+        Returns:
+            A ResourceLease object representing the lease, or None if not found.
+        """
+        ...
+
+    async def renew_lease(self, lease_id: UUID, ttl: timedelta) -> None:
+        """
+        Renew a resource lease.
+
+        Args:
+            lease_id: The ID of the lease to renew.
+            ttl: The new amount of time the lease should be held for.
+        """
+        ...
+
+    async def revoke_lease(self, lease_id: UUID) -> None:
+        """
+        Release a resource lease by removing it from list of active leases.
+
+        Args:
+            lease_id: The ID of the lease to release.
+        """
+        ...
+
+    async def read_expired_lease_ids(self, limit: int = 100) -> list[UUID]:
+        """
+        Read the IDs of expired leases.
+
+        Args:
+            limit: The maximum number of expired leases to read.
+
+        Returns:
+            A list of UUIDs representing the expired leases.
+        """
+        ...
+
+--- IMPLEMENTER ---
+[src/prefect/server/concurrency/lease_storage/__init__.py]
+METHOD INDEX:
+  L31: def create_lease(...)
+  L38: def read_lease(...)
+  L42: def renew_lease(...)
+  L44: def revoke_lease(...)
+  L46: def read_active_lease_ids(...)
+  L48: def read_expired_lease_ids(...)
+
+SOURCE:
+class ConcurrencyLeaseStorage(LeaseStorage[ConcurrencyLimitLeaseMetadata]):
+    async def create_lease(
+        self,
+        resource_ids: list[UUID],
+        ttl: timedelta,
+        metadata: ConcurrencyLimitLeaseMetadata | None = None,
+    ) -> ResourceLease[ConcurrencyLimitLeaseMetadata]: ...
+
+    async def read_lease(
+        self, lease_id: UUID
+    ) -> ResourceLease[ConcurrencyLimitLeaseMetadata] | None: ...
+
+    async def renew_lease(self, lease_id: UUID, ttl: timedelta) -> None: ...
+
+    async def revoke_lease(self, lease_id: UUID) -> None: ...
+
+    async def read_active_lease_ids(self) -> list[UUID]: ...
+
+    async def read_expired_lease_ids(self, limit: int = 100) -> list[UUID]: ...
+
+======================================================================
+ROW 54 | interface | OpenAI_Codex | redis/redis-py#3990
+interface redis.asyncio.cluster:ExecutionStrategy kind=abc
+======================================================================
+[redis/asyncio/cluster.py]
+METHOD INDEX:
+  L2126: def initialize(...)
+  L2135: def execute_command(...)
+  L2146: def execute(...)
+  L2160: def mset_nonatomic(...)
+  L2171: def reset(...)
+  L2180: def multi(...)
+  L2189: def watch(...)
+  L2198: def unwatch(...)
+  L2207: def discard(...)
+  L2211: def unlink(...)
+  L2220: def __len__(...)
+
+SOURCE:
+class ExecutionStrategy(ABC):
+    @abstractmethod
+    async def initialize(self) -> "ClusterPipeline":
+        """
+        Initialize the execution strategy.
+
+        See ClusterPipeline.initialize()
+        """
+        pass
+
+    @abstractmethod
+    def execute_command(
+        self, *args: Union[KeyT, EncodableT], **kwargs: Any
+    ) -> "ClusterPipeline":
+        """
+        Append a raw command to the pipeline.
+
+        See ClusterPipeline.execute_command()
+        """
+        pass
+
+    @abstractmethod
+    async def execute(
+        self, raise_on_error: bool = True, allow_redirections: bool = True
+    ) -> List[Any]:
+        """
+        Execute the pipeline.
+
+        It will retry the commands as specified by retries specified in :attr:`retry`
+        & then raise an exception.
+
+        See ClusterPipeline.execute()
+        """
+        pass
+
+    @abstractmethod
+    def mset_nonatomic(
+        self, mapping: Mapping[AnyKeyT, EncodableT]
+    ) -> "ClusterPipeline":
+        """
+        Executes multiple MSET commands according to the provided slot/pairs mapping.
+
+        See ClusterPipeline.mset_nonatomic()
+        """
+        pass
+
+    @abstractmethod
+    async def reset(self):
+        """
+        Resets current execution strategy.
+
+        See: ClusterPipeline.reset()
+        """
+        pass
+
+    @abstractmethod
+    def multi(self):
+        """
+        Starts transactional context.
+
+        See: ClusterPipeline.multi()
+        """
+        pass
+
+    @abstractmethod
+    async def watch(self, *names):
+        """
+        Watch given keys.
+
+        See: ClusterPipeline.watch()
+        """
+        pass
+
+    @abstractmethod
+    async def unwatch(self):
+        """
+        Unwatches all previously specified keys
+
+        See: ClusterPipeline.unwatch()
+        """
+        pass
+
+    @abstractmethod
+    async def discard(self):
+        pass
+
+    @abstractmethod
+    async def unlink(self, *names):
+        """
+        "Unlink a key specified by ``names``"
+
+        See: ClusterPipeline.unlink()
+        """
+        pass
+
+    @abstractmethod
+    def __len__(self) -> int:
+        pass
+
+======================================================================
+ROW 55 | implementer | Claude_Code | jd/tenacity#588
+implementer tenacity.tornadoweb:TornadoRetrying of tenacity:BaseRetrying (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[tenacity/__init__.py]
+METHOD INDEX:
+  L219: def __init__(...)
+  L244: def copy(...)
+  L275: def __repr__(...)
+  L287: def statistics(...)
+  L313: def iter_state(...)
+  L318: def wraps(...)
+  L344: def begin(...)
+  L350: def _add_action_func(...)
+  L353: def _run_retry(...)
+  L356: def _run_wait(...)
+  L364: def _run_stop(...)
+  L368: def iter(...)
+  L375: def _begin_iter(...)
+  L392: def _post_retry_check_actions(...)
+  L404: def _post_stop_check_actions(...)
+  L434: def __iter__(...)
+  L449: def __call__(...)
+  L327: def wrapped_f(...)
+  L334: def retry_with(...)
+  L420: def next_action(...)
+  L410: def exc_check(...)
+
+SOURCE:
+class BaseRetrying(ABC):
+    def __init__(
+        self,
+        sleep: t.Callable[[int | float], None] = sleep,
+        stop: "StopBaseT" = stop_never,
+        wait: "WaitBaseT" = wait_none(),
+        retry: "RetryBaseT" = retry_if_exception_type(),
+        before: t.Callable[["RetryCallState"], None] = before_nothing,
+        after: t.Callable[["RetryCallState"], None] = after_nothing,
+        before_sleep: t.Callable[["RetryCallState"], None] | None = None,
+        reraise: bool = False,
+        retry_error_cls: type[RetryError] = RetryError,
+        retry_error_callback: t.Callable[["RetryCallState"], t.Any] | None = None,
+    ):
+        self.sleep = sleep
+        self.stop = stop
+        self.wait = wait
+        self.retry = retry
+        self.before = before
+        self.after = after
+        self.before_sleep = before_sleep
+        self.reraise = reraise
+        self._local = threading.local()
+        self.retry_error_cls = retry_error_cls
+        self.retry_error_callback = retry_error_callback
+
+    def copy(
+        self,
+        sleep: t.Callable[[int | float], None] | object = _unset,
+        stop: t.Union["StopBaseT", object] = _unset,
+        wait: t.Union["WaitBaseT", object] = _unset,
+        retry: retry_base | object = _unset,
+        before: t.Callable[["RetryCallState"], None] | object = _unset,
+        after: t.Callable[["RetryCallState"], None] | object = _unset,
+        before_sleep: t.Callable[["RetryCallState"], None] | None | object = _unset,
+        reraise: bool | object = _unset,
+        retry_error_cls: type[RetryError] | object = _unset,
+        retry_error_callback: t.Callable[["RetryCallState"], t.Any]
+        | None
+        | object = _unset,
+    ) -> "Self":
+        """Copy this object with some parameters changed if needed."""
+        return self.__class__(
+            sleep=_first_set(sleep, self.sleep),
+            stop=_first_set(stop, self.stop),
+            wait=_first_set(wait, self.wait),
+            retry=_first_set(retry, self.retry),
+            before=_first_set(before, self.before),
+            after=_first_set(after, self.after),
+            before_sleep=_first_set(before_sleep, self.before_sleep),
+            reraise=_first_set(reraise, self.reraise),
+            retry_error_cls=_first_set(retry_error_cls, self.retry_error_cls),
+            retry_error_callback=_first_set(
+                retry_error_callback, self.retry_error_callback
+            ),
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"<{self.__class__.__name__} object at 0x{id(self):x} ("
+            f"stop={self.stop}, "
+            f"wait={self.wait}, "
+            f"sleep={self.sleep}, "
+            f"retry={self.retry}, "
+            f"before={self.before}, "
+            f"after={self.after})>"
+        )
+
+    @property
+    def statistics(self) -> dict[str, t.Any]:
+        """Return a dictionary of runtime statistics.
+
+        This dictionary will be empty when the controller has never been
+        ran. When it is running or has ran previously it should have (but
+        may not) have useful and/or informational keys and values when
+        running is underway and/or completed.
+
+        .. warning:: The keys in this dictionary **should** be some what
+                     stable (not changing), but there existence **may**
+                     change between major releases as new statistics are
+                     gathered or removed so before accessing keys ensure that
+                     they actually exist and handle when they do not.
+
+        .. note:: The values in this dictionary are local to the thread
+                  running call (so if multiple threads share the same retrying
+                  object - either directly or indirectly) they will each have
+                  there own view of statistics they have collected (in the
+                  future we may provide a way to aggregate the various
+                  statistics from each thread).
+        """
+        if not hasattr(self._local, "statistics"):
+            self._local.statistics = t.cast("dict[str, t.Any]", {})
+        return self._local.statistics  # type: ignore[no-any-return]
+
+    @property
+    def iter_state(self) -> IterState:
+        if not hasattr(self._local, "iter_state"):
+            self._local.iter_state = IterState()
+        return self._local.iter_state  # type: ignore[no-any-return]
+
+    def wraps(self, f: WrappedFn) -> WrappedFn:
+        """Wrap a function for retrying.
+
+        :param f: A function to wraps for retrying.
+        """
+
+        @functools.wraps(
+            f, functools.WRAPPER_ASSIGNMENTS + ("__defaults__", "__kwdefaults__")
+        )
+        def wrapped_f(*args: t.Any, **kw: t.Any) -> t.Any:
+            # Always create a copy to prevent overwriting the local contexts when
+            # calling the same wrapped functions multiple times in the same stack
+            copy = self.copy()
+            wrapped_f.statistics = copy.statistics  # type: ignore[attr-defined]
+            return copy(f, *args, **kw)
+
+        def retry_with(*args: t.Any, **kwargs: t.Any) -> WrappedFn:
+            return self.copy(*args, **kwargs).wraps(f)
+
+        # Preserve attributes
+... <<truncated, 118 more lines>>
+
+--- IMPLEMENTER ---
+[tenacity/tornadoweb.py]
+METHOD INDEX:
+  L31: def __init__(...)
+  L40: def __call__(...)
+
+SOURCE:
+class TornadoRetrying(BaseRetrying):
+    sleep: typing.Callable[..., "Future[None]"]
+
+    def __init__(
+        self,
+        sleep: "typing.Callable[[float], Future[None]]" = gen.sleep,
+        **kwargs: typing.Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.sleep = sleep
+
+    @gen.coroutine
+    def __call__(  # type: ignore[override]
+        self,
+        fn: "typing.Callable[..., typing.Generator[typing.Any, typing.Any, _RetValT] | Future[_RetValT]]",
+        *args: typing.Any,
+        **kwargs: typing.Any,
+    ) -> "typing.Generator[typing.Any, typing.Any, _RetValT]":
+        self.begin()
+
+        retry_state = RetryCallState(retry_object=self, fn=fn, args=args, kwargs=kwargs)
+        while True:
+            do = self.iter(retry_state=retry_state)
+            if isinstance(do, DoAttempt):
+                try:
+                    result = yield fn(*args, **kwargs)
+                except BaseException:
+                    retry_state.set_exception(sys.exc_info())  # type: ignore[arg-type]
+                else:
+                    retry_state.set_result(result)
+            elif isinstance(do, DoSleep):
+                retry_state.prepare_for_next_attempt()
+                yield self.sleep(do)
+            else:
+                raise gen.Return(do)

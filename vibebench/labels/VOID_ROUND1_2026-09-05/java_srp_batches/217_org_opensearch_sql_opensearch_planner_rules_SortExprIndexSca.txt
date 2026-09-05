@@ -1,0 +1,240 @@
+row 217   opensearch-project/sql#5127
+============================================================================
+CLASS org.opensearch.sql.opensearch.planner.rules.SortExprIndexScanRule   loc=235 methods=5 wmc=37 lcom=0.0 c3=0.3494702866207647
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       40  @Value.Enclosing
+       41  public class SortExprIndexScanRule extends InterruptibleRelRule<SortExprIndexScanRule.Config> {
+       42  
+       43    protected SortExprIndexScanRule(SortExprIndexScanRule.Config config) {
+       44      super(config);
+       45    }
+       46  
+       47    @Override
+       48    protected void onMatchImpl(RelOptRuleCall call) {
+       49      final Sort sort = call.rel(0);
+       50      final Project project = call.rel(1);
+       51      final AbstractCalciteIndexScan scan = call.rel(2);
+       52  
+       53      if (sort.getConvention() != project.getConvention()
+       54          || project.getConvention() != scan.getConvention()) {
+       55        return;
+       56      }
+       57  
+       58      // Only match sort - project - scan when any sort key references an expression
+       59      if (!PlanUtils.sortReferencesExpr(sort, project)) {
+       60        return;
+       61      }
+       62  
+       63      boolean allSimpleExprs = true;
+       64      Map<Integer, Optional<Pair<Integer, Boolean>>> orderEquivInfoMap = new HashMap<>();
+       65  
+       66      for (RelFieldCollation relFieldCollation : sort.getCollation().getFieldCollations()) {
+       67        Optional<Pair<Integer, Boolean>> orderEquivInfo =
+       68            OpenSearchRelOptUtil.getOrderEquivalentInputInfo(
+       69                project.getProjects().get(relFieldCollation.getFieldIndex()));
+       70        orderEquivInfoMap.put(relFieldCollation.getFieldIndex(), orderEquivInfo);
+       71        if (allSimpleExprs && orderEquivInfo.isEmpty()) {
+       72          allSimpleExprs = false;
+       73        }
+       74      }
+       75  
+       76      if (allSimpleExprs) {
+       77        return;
+       78      }
+       79  
+       80      boolean scanProvidesRequiredCollation =
+       81          OpenSearchRelOptUtil.canScanProvideSortCollation(
+       82              scan, project, sort.collation, orderEquivInfoMap);
+       83      if (scan.isTopKPushed() && !scanProvidesRequiredCollation) {
+       84        return;
+       85      }
+       86  
+       87      // Extract sort expressions with collation information from the sort node
+       88      List<SortExprDigest> sortExprDigests =
+       89          extractSortExpressionInfos(sort, project, scan, orderEquivInfoMap);
+       90  
+       91      // Check if any sort expressions can be pushed down
+       92      if (sortExprDigests.isEmpty() || !canPushDownSortExpressionInfos(sortExprDigests)) {
+       93        return;
+       94      }
+       95  
+       96      AbstractCalciteIndexScan newScan;
+       97      // If the scan's sort info already satisfies new sort, just pushdown limit if there is
+       98      if (scan.isTopKPushed() && scanProvidesRequiredCollation) {
+       99        newScan = scan.copy();
+      100      } else {
+      101        // Attempt to push down sort expressions
+      102        newScan = scan.pushdownSortExpr(sortExprDigests);
+      103      }
+      104  
+      105      // EnumerableSort won't have limit or offset
+      106      Integer limitValue = LimitIndexScanRule.extractLimitValue(sort.fetch);
+      107      Integer offsetValue = LimitIndexScanRule.extractOffsetValue(sort.offset);
+      108      if (newScan instanceof CalciteLogicalIndexScan
+      109          && sort instanceof LogicalSort
+      110          && limitValue != null
+      111          && offsetValue != null) {
+      112        newScan =
+      113            (CalciteLogicalIndexScan)
+      114                ((CalciteLogicalIndexScan) newScan)
+      115                    .pushDownLimit((LogicalSort) sort, limitValue, offsetValue);
+      116      }
+      117  
+      118      if (newScan != null) {
+      119        Project newProject =
+      120            project.copy(sort.getTraitSet(), newScan, project.getProjects(), project.getRowType());
+      121        call.transformTo(newProject);
+      122        PlanUtils.tryPruneRelNodes(call);
+      123      }
+      124    }
+      125  
+      126    /**
+      127     * Extract sort expressions with collation information from the sort node, mapping them through
+      128     * the project if necessary.
+      129     *
+      130     * @param sort The sort node
+      131     * @param project The project node
+      132     * @param scan The scan node to get stable field references
+      133     * @param orderEquivInfoMap Order equivalence info to determine if output expression collation can
+      134     *     be optimized to field collation
+      135     * @return List of SortExprDigest with stable field references or complex expressions
+      136     */
+      137    private List<SortExprDigest> extractSortExpressionInfos(
+      138        Sort sort,
+      139        Project project,
+      140        AbstractCalciteIndexScan scan,
+      141        Map<Integer, Optional<Pair<Integer, Boolean>>> orderEquivInfoMap) {
+      142      List<SortExprDigest> sortExprDigests = new ArrayList<>();
+      143  
+      144      List<RexNode> sortKeys = sort.getSortExps();
+      145      List<RelFieldCollation> collations = sort.getCollation().getFieldCollations();
+      146  
+      147      for (int i = 0; i < sortKeys.size(); i++) {
+      148        RexNode sortKey = sortKeys.get(i);
+      149        RelFieldCollation collation = collations.get(i);
+      150  
+      151        SortExprDigest info = mapThroughProject(sortKey, project, scan, collation, orderEquivInfoMap);
+      152  
+      153        if (info != null) {
+      154          sortExprDigests.add(info);
+      155        }
+      156      }
+      157  
+      158      return sortExprDigests;
+      159    }
+      160  
+      161    /**
+      162     * Map a sort key through the project to create a SortExprDigest. For simple field references,
+      163     * stores the field name for stability. For complex expressions, stores the RexNode.
+      164     *
+      165     * @param sortKey The sort key (usually a RexInputRef)
+      166     * @param project The project node
+      167     * @param scan The scan node to get field names from
+      168     * @param collation The collation information
+      169     * @param orderEquivInfoMap Order equivalence info to determine if output expression collation can
+      170     *     be optimized to field collation
+      171     * @return SortExprDigest with stable field reference or complex expression
+      172     */
+      173    private SortExprDigest mapThroughProject(
+      174        RexNode sortKey,
+      175        Project project,
+      176        AbstractCalciteIndexScan scan,
+      177        RelFieldCollation collation,
+      178        Map<Integer, Optional<Pair<Integer, Boolean>>> orderEquivInfoMap) {
+      179      assert sortKey instanceof RexInputRef : "sort key should be always RexInputRef";
+      180  
+      181      RexInputRef inputRef = (RexInputRef) sortKey;
+      182      RexNode projectExpression = project.getProjects().get(inputRef.getIndex());
+      183      // Get the field name from the scan's row type
+      184      List<String> scanFieldNames = scan.getRowType().getFieldNames();
+      185  
+      186      // If the project expression is a simple RexInputRef pointing to a scan field,
+      187      // or it can be optimized to sort by field,
+      188      // store the field name for stability
+      189      Optional<Pair<Integer, Boolean>> orderEquivalentInfo =
+      190          orderEquivInfoMap.get(collation.getFieldIndex());
+      191      if (orderEquivalentInfo.isPresent()) {
+      192        Direction equivalentDirection =
+      193            orderEquivalentInfo.get().getRight()
+      194                ? collation.getDirection().reverse()
+      195                : collation.getDirection();
+      196        // Create SortExprDigest with field name (stable reference)
+      197        return new SortExprDigest(
+      198            scanFieldNames.get(orderEquivalentInfo.get().getLeft()),
+      199            equivalentDirection,
+      200            collation.nullDirection);
+      201      }
+      202  
+      203      // For complex expressions, store the RexNode
+      204      return new SortExprDigest(projectExpression, collation.getDirection(), collation.nullDirection);
+      205    }
+      206  
+      207    /**
+      208     * Check if sort expressions can be pushed down to OpenSearch. Rejects literals and expressions
+      209     * that only contain literals. Only supports number and string types for sort scripts.
+      210     *
+      211     * @param sortExprDigests List of sort expression infos to check
+      212     * @return true if expressions can be pushed down, false otherwise
+      213     */
+      214    private boolean canPushDownSortExpressionInfos(List<SortExprDigest> sortExprDigests) {
+      215      for (SortExprDigest info : sortExprDigests) {
+      216        RexNode expr = info.getExpression();
+      217        if (expr == null && StringUtils.isEmpty(info.getFieldName())) {
+      218          return false;
+      219        } else if (info.isSimpleFieldReference()) {
+      220          continue;
+      221        }
+      222        // Reject literals or constant expression - they don't provide meaningful sorting
+      223        if (expr instanceof RexLiteral
+      224            || RexUtil.isConstant(expr)
+      225            || !RexUtil.isDeterministic(expr)
+      226            || !isSupportedSortScriptType(expr.getType().getSqlTypeName())) {
+      227          return false;
+      228        }
+      229      }
+      230      return true;
+      231    }
+      232  
+      233    /**
+      234     * Check if the SQL type is supported for OpenSearch sort scripts. Only number and string types
+      235     * are supported for sort script.
+      236     *
+      237     * @param sqlTypeName The SQL type name to check
+      238     * @return true if the type is supported for sort scripts, false otherwise
+      239     */
+      240    private boolean isSupportedSortScriptType(SqlTypeName sqlTypeName) {
+      241      return SqlTypeName.CHAR_TYPES.contains(sqlTypeName)
+      242          || SqlTypeName.APPROX_TYPES.contains(sqlTypeName)
+      243          || SqlTypeName.INT_TYPES.contains(sqlTypeName);
+      244    }
+      245  
+      246    /** Rule configuration. */
+      247    @Value.Immutable
+      248    public interface Config extends OpenSearchRuleConfig {
+      249      SortExprIndexScanRule.Config DEFAULT =
+      250          ImmutableSortExprIndexScanRule.Config.builder()
+      251              .build()
+      252              .withOperandSupplier(
+      253                  b0 ->
+      254                      b0.operand(Sort.class)
+      255                          // Pure limit pushdown should be covered by SortProjectTransposeRule and
+      256                          // OpenSearchLimitIndexScanRule
+      257                          .predicate(sort -> !sort.collation.getFieldCollations().isEmpty())
+      258                          .oneInput(
+      259                              b1 ->
+      260                                  b1.operand(Project.class)
+      261                                      .predicate(Predicate.not(Project::containsOver))
+      262                                      .oneInput(
+      263                                          b2 ->
+      264                                              b2.operand(AbstractCalciteIndexScan.class)
+      265                                                  .predicate(
+      266                                                      AbstractCalciteIndexScan::noAggregatePushed)
+      267                                                  .noInputs())));
+      268  
+      269      @Override
+      270      default SortExprIndexScanRule toRule() {
+      271        return new SortExprIndexScanRule(this);
+      272      }
+      273    }
+      274  }

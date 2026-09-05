@@ -1,0 +1,406 @@
+row 161   ArcadeData/arcadedb#3731
+============================================================================
+CLASS com.arcadedb.schema.LocalDocumentType   loc=1153 methods=77 wmc=228 lcom=0.0131578947368421 c3=0.1433523774353324
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       49  public class LocalDocumentType implements DocumentType {
+       50    protected       String                            name;
+       51    protected final LocalSchema                       schema;
+       52    protected final List<LocalDocumentType>           superTypes                   = new ArrayList<>();
+       53    protected final List<LocalDocumentType>           subTypes                     = new ArrayList<>();
+       54    private         Set<String>                       aliases                      = Collections.emptySet();
+       55    protected final Map<String, Property>             properties                   = new HashMap<>();
+       56    protected final Map<Integer, List<IndexInternal>> bucketIndexesByBucket        = new HashMap<>();
+       57    protected final Map<List<String>, TypeIndex>      indexesByProperties          = new HashMap<>();
+       58    protected final RecordEventsRegistry              events                       = new RecordEventsRegistry();
+       59    protected final Map<String, Object>               custom                       = new HashMap<>();
+       60    protected       List<Bucket>                      buckets                      = new ArrayList<>();
+       61    protected       List<Bucket>                      cachedPolymorphicBuckets     = new ArrayList<>(); // PRE COMPILED LIST TO SPEED UP RUN-TIME OPERATIONS
+       62    protected       List<Integer>                     bucketIds                    = new ArrayList<>();
+       63    protected       List<Integer>                     cachedPolymorphicBucketIds   = new ArrayList<>(); // PRE COMPILED LIST TO SPEED UP RUN-TIME OPERATIONS
+       64    protected       BucketSelectionStrategy           bucketSelectionStrategy      = new RoundRobinBucketSelectionStrategy();
+       65    protected       Set<String>                       propertiesWithDefaultDefined = Collections.emptySet();
+       66  
+       67    public LocalDocumentType(final LocalSchema schema, final String name) {
+       68      this.schema = schema;
+       69      this.name = name;
+       70    }
+       71  
+       72    @Override
+       73    public String getName() {
+       74      return name;
+       75    }
+       76  
+       77    @Override
+       78    public MutableDocument newRecord() {
+       79      return schema.getDatabase().newDocument(name);
+       80    }
+       81  
+       82    @Override
+       83    public RecordEvents getEvents() {
+       84      return events;
+       85    }
+       86  
+       87    @Override
+       88    public Set<String> getPolymorphicPropertiesWithDefaultDefined() {
+       89      if (superTypes.isEmpty())
+       90        return propertiesWithDefaultDefined;
+       91  
+       92      final HashSet<String> set = new HashSet<>(propertiesWithDefaultDefined);
+       93      for (final LocalDocumentType superType : superTypes)
+       94        set.addAll(superType.getPolymorphicPropertiesWithDefaultDefined());
+       95      return set;
+       96    }
+       97  
+       98    @Override
+       99    public DocumentType addSuperType(final String superName) {
+      100      return addSuperType(schema.getType(superName));
+      101    }
+      102  
+      103    @Override
+      104    public DocumentType addSuperType(final DocumentType superType) {
+      105      return addSuperType(superType, true);
+      106    }
+      107  
+      108    /**
+      109     * Removes a super type (by its name) from the current type.
+      110     *
+      111     * @see #removeSuperType(DocumentType)
+      112     * @see #addSuperType(DocumentType)
+      113     * @see #addSuperType(String)
+      114     * @see #addSuperType(DocumentType, boolean)
+      115     */
+      116    @Override
+      117    public DocumentType removeSuperType(final String superTypeName) {
+      118      removeSuperType(schema.getType(superTypeName));
+      119      return this;
+      120    }
+      121  
+      122    /**
+      123     * Removes a super type from the current type.
+      124     *
+      125     * @see #removeSuperType(String)
+      126     * @see #addSuperType(DocumentType)
+      127     * @see #addSuperType(String)
+      128     * @see #addSuperType(DocumentType, boolean)
+      129     */
+      130    @Override
+      131    public DocumentType removeSuperType(final DocumentType superType) {
+      132      recordFileChanges(() -> {
+      133        if (!superTypes.remove(superType))
+      134          // ALREADY REMOVED SUPER TYPE
+      135          return null;
+      136  
+      137        ((LocalDocumentType) superType).subTypes.remove(this);
+      138  
+      139        // TODO: CHECK THE EDGE CASE WHERE THE SAME TYPE IS INHERITED ON MULTIPLE LEVEL AND YOU DON'T NEED TO REMOVE THE BUCKETS
+      140        // UPDATE THE LIST OF POLYMORPHIC BUCKETS TREE
+      141        ((LocalDocumentType) superType).updatePolymorphicBucketsCache(false, buckets, bucketIds);
+      142  
+      143        return null;
+      144      });
+      145      return this;
+      146    }
+      147  
+      148    public void rename(final String newName) {
+      149      if (schema.existsType(newName))
+      150        throw new IllegalArgumentException("Type with name '" + newName + "' already exists");
+      151  
+      152      final String oldName = name;
+      153  
+      154      final List<Bucket> removedBuckets = new ArrayList<>();
+      155  
+      156      try {
+      157        for (Bucket bucket : buckets) {
+      158          final String oldBucketName = bucket.getName();
+      159  
+      160          ((LocalBucket) bucket).rename(newName);
+      161  
+      162          removedBuckets.add(bucket);
+      163  
+      164          schema.bucketMap.remove(oldBucketName);
+      165          schema.bucketMap.put(bucket.getName(), (LocalBucket) bucket);
+      166        }
+      167  
+      168        name = newName;
+      169  
+      170        schema.types.remove(oldName);
+      171        schema.types.put(newName, this);
+      172  
+      173        for (TypeIndex idx : getAllIndexes(false))
+      174          idx.updateTypeName(newName);
+      175  
+      176        schema.saveConfiguration();
+      177  
+      178      } catch (IOException e) {
+      179        name = oldName;
+      180        schema.types.put(oldName, this);
+      181        schema.types.remove(newName);
+      182  
+      183        boolean corrupted = false;
+      184        for (Bucket bucket : removedBuckets) {
+      185          try {
+      186            final String newBucketName = bucket.getName();
+      187            final String oldBucketName = oldName + newBucketName.substring(newBucketName.lastIndexOf("_"));
+      188            ((LocalBucket) bucket).rename(oldBucketName);
+      189          } catch (IOException ex) {
+      190            corrupted = true;
+      191          }
+      192        }
+      193  
+      194        if (corrupted)
+      195          throw new SchemaException("Error on renaming type '" + oldName + "' in '" + newName
+      196              + "'. The database schema is corrupted, check single file names for buckets " + removedBuckets, e);
+      197  
+      198        throw new SchemaException("Error on renaming type '" + oldName + "' in '" + newName + "'", e);
+      199      }
+      200    }
+      201  
+      202    /**
+      203     * Returns true if the current type is the same or a subtype of `type` parameter.
+      204     *
+      205     * @param type the type name to check
+      206     *
+      207     * @see #addSuperType(DocumentType)
+      208     * @see #addSuperType(String)
+      209     * @see #addSuperType(DocumentType, boolean)
+      210     */
+      211    @Override
+      212    public boolean instanceOf(final String type) {
+      213      if (name.equals(type))
+      214        return true;
+      215  
+      216      if (aliases.contains(type))
+      217        return true;
+      218  
+      219      for (final DocumentType t : superTypes) {
+      220        if (t.instanceOf(type))
+      221          return true;
+      222      }
+      223  
+      224      return false;
+      225    }
+      226  
+      227    /**
+      228     * Returns the list of super types if any, otherwise an empty collection.
+      229     *
+      230     * @see #addSuperType(DocumentType)
+      231     * @see #addSuperType(String)
+      232     * @see #addSuperType(DocumentType, boolean)
+      233     */
+      234    @Override
+      235    public List<DocumentType> getSuperTypes() {
+      236      return new ArrayList<>(superTypes);
+      237    }
+      238  
+      239    /**
+      240     * Set the type super types. Any previous configuration about supertypes will be replaced with this new list.
+      241     *
+      242     * @param newSuperTypes List of super types to assign
+      243     *
+      244     * @see #addSuperType(DocumentType)
+      245     * @see #addSuperType(String)
+      246     * @see #addSuperType(DocumentType, boolean)
+      247     */
+      248    @Override
+      249    public DocumentType setSuperTypes(List<DocumentType> newSuperTypes) {
+      250      if (newSuperTypes == null)
+      251        newSuperTypes = Collections.emptyList();
+      252  
+      253      final List<DocumentType> commonSuperTypes = new ArrayList<>(superTypes);
+      254      commonSuperTypes.retainAll(newSuperTypes);
+      255  
+      256      final List<DocumentType> toRemove = new ArrayList<>(superTypes);
+      257      toRemove.removeAll(commonSuperTypes);
+      258      toRemove.forEach(this::removeSuperType);
+      259  
+      260      final List<DocumentType> toAdd = new ArrayList<>(newSuperTypes);
+      261      toAdd.removeAll(commonSuperTypes);
+      262      toAdd.forEach(this::addSuperType);
+      263  
+      264      return this;
+      265    }
+      266  
+      267    /**
+      268     * Returns the list of subtypes, in any, or an empty list in case the type has not subtypes defined.
+      269     *
+      270     * @see #addSuperType(DocumentType)
+      271     * @see #addSuperType(String)
+      272     * @see #addSuperType(DocumentType, boolean)
+      273     */
+      274    @Override
+      275    public List<DocumentType> getSubTypes() {
+      276      return new ArrayList<>(subTypes);
+      277    }
+      278  
+      279    /**
+      280     * Returns the list of aliases defined for the type.
+      281     */
+      282    public Set<String> getAliases() {
+      283      return this.aliases;
+      284    }
+      285  
+      286    /**
+      287     * Sets the list of aliases for the type. Any previous configuration will be lost.
+      288     */
+      289    public LocalDocumentType setAliases(final Set<String> aliases) {
+      290      final Set<String> newAliases = new HashSet<>(aliases);
+      291      newAliases.removeAll(this.aliases);
+      292      for (String alias : newAliases) {
+      293        if (schema.existsType(alias))
+      294          throw new SchemaException("Cannot set alias '" + alias + "' for type '" + name + "' because it is already used by type '"
+      295              + schema.getType(alias).getName() + "'");
+      296      }
+      297  
+      298      // DEREGISTER ALL PREVIOUS ALIASES
+      299      for (String alias : this.aliases)
+      300        schema.types.remove(alias);
+      301  
+      302      for (String alias : aliases)
+      303        schema.types.put(alias, this);
+      304  
+      305      this.aliases = aliases;
+      306      schema.saveConfiguration();
+      307      return this;
+      308    }
+      309  
+      310    /**
+      311     * Returns all the properties defined in the type, not considering the ones inherited from subtypes.
+      312     *
+      313     * @return Set containing all the names
+      314     *
+      315     * @see #getPolymorphicPropertyNames()
+      316     */
+      317    @Override
+      318    public Set<String> getPropertyNames() {
+      319      return properties.keySet();
+      320    }
+      321  
+      322    @Override
+      323    public Collection<? extends Property> getProperties() {
+      324      return properties.values();
+      325    }
+      326  
+      327    /**
+      328     * Returns all the properties defined in the type and subtypes.
+      329     *
+      330     * @see {@link #getPolymorphicPropertyNames()}, {@link #getProperties()}
+      331     */
+      332    @Override
+      333    public Collection<? extends Property> getPolymorphicProperties() {
+      334      if (superTypes.isEmpty())
+      335        return getProperties();
+      336  
+      337      final Set<Property> allProperties = new HashSet<>(getProperties());
+      338      for (final DocumentType p : superTypes)
+      339        allProperties.addAll(p.getPolymorphicProperties());
+      340      return allProperties;
+      341    }
+      342  
+      343    /**
+      344     * Returns all the properties defined in the type and subtypes.
+      345     *
+      346     * @return Set containing all the names
+      347     *
+      348     * @see #getPropertyNames()
+      349     */
+      350    @Override
+      351    public Set<String> getPolymorphicPropertyNames() {
+      352      if (superTypes.isEmpty())
+      353        return getPropertyNames();
+      354  
+      355      final Set<String> allProperties = new HashSet<>(getPropertyNames());
+      356      for (final DocumentType p : superTypes)
+      357        allProperties.addAll(p.getPolymorphicPropertyNames());
+      358      return allProperties;
+      359    }
+      360  
+      361    /**
+      362     * Creates a new property with type `propertyType`.
+      363     *
+      364     * @param propertyName Property name to remove
+      365     * @param propertyType Property type by type name @{@link String}
+      366     */
+      367    @Override
+      368    public LocalProperty createProperty(final String propertyName, final String propertyType) {
+      369      return createProperty(propertyName, Type.getTypeByName(propertyType));
+      370    }
+      371  
+      372    /**
+      373     * Creates a new property with type `propertyType`.
+      374     *
+      375     * @param propertyName Property name to remove
+      376     * @param propertyType Property type as Java @{@link Class}
+      377     */
+      378    @Override
+      379    public Property createProperty(final String propertyName, final Class<?> propertyType) {
+      380      return createProperty(propertyName, Type.getTypeByClass(propertyType));
+      381    }
+      382  
+      383    /**
+      384     * Creates a new property with type `propertyType`.
+      385     *
+      386     * @param propertyName Property name to remove
+      387     * @param propertyType Property type as @{@link Type}
+      388     */
+      389    @Override
+      390    public LocalProperty createProperty(final String propertyName, final Type propertyType) {
+      391      return createProperty(propertyName, propertyType, null);
+      392    }
+      393  
+      394    /**
+      395     * Creates a new property with type `propertyType`.
+      396     *
+      397     * @param propertyName Property name to remove
+      398     * @param propertyType Property type as @{@link Type}
+      399     * @param ofType       Linked type. For List the type contained in the list. For RID the schema type name.
+      400     */
+      401    @Override
+      402    public LocalProperty createProperty(final String propertyName, final Type propertyType, final String ofType) {
+      403      ((DatabaseInternal) schema.getDatabase()).checkPermissionsOnDatabase(SecurityDatabaseUser.DATABASE_ACCESS.UPDATE_SCHEMA);
+      404  
+      405      if (properties.containsKey(propertyName))
+      406        throw new SchemaException(
+      407            "Cannot create the property '" + propertyName + "' in type '" + name + "' because it already exists");
+      408  
+      409      if (getPolymorphicPropertyNames().contains(propertyName))
+      410        throw new SchemaException("Cannot create the property '" + propertyName + "' in type '" + name
+      411            + "' because it was already defined in a super type");
+      412  
+      413      final LocalProperty property = new LocalProperty(this, propertyName, propertyType);
+      414  
+      415      if (ofType != null)
+      416        property.setOfType(ofType);
+      417  
+      418      recordFileChanges(() -> {
+      419        properties.put(propertyName, property);
+      420        return null;
+      421      });
+      422      return property;
+      423    }
+      424  
+      425    /**
+      426     * Returns a property by its name. If the property does not exist, it is created with type `propertyType`.
+      427     *
+      428     * @param propertyName Property name to remove
+      429     * @param propertyType Property type, by type name @{@link String}, to use in case the property does not exist and will be created
+      430     */
+      431    @Override
+      432    public Property getOrCreateProperty(final String propertyName, final String propertyType) {
+      433      return getOrCreateProperty(propertyName, Type.getTypeByName(propertyType), null);
+      434    }
+      435  
+      436    /**
+      437     * Returns a property by its name. If the property does not exist, it is created with type `propertyType`.
+      438     *
+      439     * @param propertyName Property name to remove
+      440     * @param propertyType Property type, by type name @{@link String}, to use in case the property does not exist and will be created
+      441     * @param ofType       Linked type. For List the type contained in the list. For RID the schema type name.
+      442     */
+      443    @Override
+      444    public Property getOrCreateProperty(final String propertyName, final String propertyType, final String ofType) {
+      445      return getOrCreateProperty(propertyName, Type.getTypeByName(propertyType), ofType);
+      446    }
+      447  
+      448    /**
+       ... truncated at 400 lines ...

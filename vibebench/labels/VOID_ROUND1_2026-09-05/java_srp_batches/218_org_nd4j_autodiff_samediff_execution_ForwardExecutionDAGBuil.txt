@@ -1,0 +1,406 @@
+row 218   deeplearning4j/deeplearning4j#10341
+============================================================================
+CLASS org.nd4j.autodiff.samediff.execution.ForwardExecutionDAGBuilder   loc=555 methods=21 wmc=112 lcom=0.0 c3=0.2399413769519115
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       49  @Slf4j
+       50  public class ForwardExecutionDAGBuilder {
+       51      
+       52      private final SameDiff sameDiff;
+       53      
+       54      public ForwardExecutionDAGBuilder(SameDiff sameDiff) {
+       55          this.sameDiff = sameDiff;
+       56      }
+       57      
+       58      /**
+       59       * Build the corrected forward execution DAG.
+       60       * This is the main entry point that fixes the variable/operation mixing problem.
+       61       * 
+       62       * @param requestedOutputs Variables we want to compute
+       63       * @return Properly structured DAG with operation-to-operation dependencies
+       64       */
+       65      public ForwardExecutionDAG buildForwardDAG(Collection<String> requestedOutputs) {
+       66          log.info("Building forward execution DAG for outputs: {}", requestedOutputs);
+       67  
+       68          Set<String> requiredOperations = new HashSet<>();
+       69          Set<String> requiredVariables = new HashSet<>();
+       70  
+       71          Set<String> allPlaceholders = findAllPlaceholders();
+       72          requiredVariables.addAll(allPlaceholders);
+       73          requiredVariables.addAll(requestedOutputs);
+       74  
+       75          boolean foundNewNodes = true;
+       76          int iteration = 0;
+       77  
+       78          while (foundNewNodes && iteration < 50) {
+       79              int prevOps = requiredOperations.size();
+       80              int prevVars = requiredVariables.size();
+       81  
+       82              findRequiredSubgraph(new ArrayList<>(requiredVariables), requiredOperations, requiredVariables);
+       83  
+       84              foundNewNodes = (requiredOperations.size() > prevOps) || (requiredVariables.size() > prevVars);
+       85              iteration++;
+       86  
+       87              if (iteration % 10 == 0) {
+       88                  log.debug("Iteration {}: {} ops, {} vars", iteration, requiredOperations.size(), requiredVariables.size());
+       89              }
+       90          }
+       91  
+       92          log.info("Converged after {} iterations: {} operations, {} variables",
+       93                  iteration, requiredOperations.size(), requiredVariables.size());
+       94  
+       95          validateCompleteness(requestedOutputs, allPlaceholders, requiredVariables);
+       96  
+       97          Map<String, ExecutionNode> operationNodes = buildExecutionNodes(requiredOperations, requiredVariables);
+       98          establishOperationDependencies(operationNodes);
+       99          List<ExecutionNode> executionOrder = createTopologicalOrder(operationNodes);
+      100  
+      101          Map<String, String> variableProducers = buildVariableProducerMap(operationNodes);
+      102          Map<String, Set<String>> variableConsumers = buildVariableConsumerMap(operationNodes);
+      103  
+      104          Set<String> constants = findConstants();
+      105          Set<String> variables = findVariables();
+      106  
+      107          ForwardExecutionDAG dag = new ForwardExecutionDAG(
+      108                  executionOrder, operationNodes, variableProducers, variableConsumers,
+      109                  allPlaceholders, constants, variables
+      110          );
+      111  
+      112          dag.validate();
+      113          return dag;
+      114      }
+      115      
+      116      /**
+      117       * FIXED: Find required subgraph using proper operation traversal.
+      118       * This replaces the broken mixed variable/operation approach.
+      119       * 
+      120       * Key fix: We traverse by finding producer OPERATIONS for variables,
+      121       * not mixing variables and operations in a single dependency chain.
+      122       */
+      123      private void findRequiredSubgraph(Collection<String> startingVariables,
+      124                                        Set<String> requiredOperations,
+      125                                        Set<String> requiredVariables) {
+      126  
+      127          Queue<String> variablesToProcess = new LinkedList<>(startingVariables);
+      128          Set<String> processedVariables = new HashSet<>();
+      129  
+      130          while (!variablesToProcess.isEmpty()) {
+      131              String currentVariable = variablesToProcess.poll();
+      132  
+      133              if (processedVariables.contains(currentVariable)) {
+      134                  continue;
+      135              }
+      136              processedVariables.add(currentVariable);
+      137              requiredVariables.add(currentVariable);
+      138  
+      139              String producerOpName = findProducerOperation(currentVariable);
+      140  
+      141              if (producerOpName != null) {
+      142                  requiredOperations.add(producerOpName);
+      143  
+      144                  SameDiffOp producerOp = sameDiff.getOps().get(producerOpName);
+      145                  if (producerOp != null && producerOp.getInputsToOp() != null) {
+      146                      for (String inputVar : producerOp.getInputsToOp()) {
+      147                          if (!processedVariables.contains(inputVar)) {
+      148                              variablesToProcess.offer(inputVar);
+      149                          }
+      150                      }
+      151                  }
+      152  
+      153                  if (producerOp != null && producerOp.getControlDeps() != null) {
+      154                      for (String controlDep : producerOp.getControlDeps()) {
+      155                          requiredOperations.add(controlDep);
+      156  
+      157                          SameDiffOp controlDepOp = sameDiff.getOps().get(controlDep);
+      158                          if (controlDepOp != null && controlDepOp.getOutputsOfOp() != null) {
+      159                              for (String controlDepOutput : controlDepOp.getOutputsOfOp()) {
+      160                                  if (!processedVariables.contains(controlDepOutput)) {
+      161                                      variablesToProcess.offer(controlDepOutput);
+      162                                  }
+      163                              }
+      164                          }
+      165                      }
+      166                  }
+      167              }
+      168  
+      169              // Handle placeholder multi-use: find ALL operations that consume this variable
+      170              if (isPlaceholder(currentVariable)) {
+      171                  Set<String> consumerOps = findAllConsumerOperations(currentVariable);
+      172                  for (String consumerOp : consumerOps) {
+      173                      if (!requiredOperations.contains(consumerOp)) {
+      174                          requiredOperations.add(consumerOp);
+      175  
+      176                          // Add outputs of consumer operations to ensure they're processed
+      177                          SameDiffOp op = sameDiff.getOps().get(consumerOp);
+      178                          if (op != null && op.getOutputsOfOp() != null) {
+      179                              for (String output : op.getOutputsOfOp()) {
+      180                                  if (!processedVariables.contains(output)) {
+      181                                      variablesToProcess.offer(output);
+      182                                  }
+      183                              }
+      184                          }
+      185                      }
+      186                  }
+      187              }
+      188          }
+      189      }
+      190  
+      191      private boolean isPlaceholder(String variableName) {
+      192          Variable var = sameDiff.getVariables().get(variableName);
+      193          return var != null && var.getVariable().getVariableType() == VariableType.PLACEHOLDER;
+      194      }
+      195  
+      196      private Set<String> findAllConsumerOperations(String variableName) {
+      197          Set<String> consumers = new HashSet<>();
+      198  
+      199          for (Map.Entry<String, SameDiffOp> entry : sameDiff.getOps().entrySet()) {
+      200              SameDiffOp op = entry.getValue();
+      201              if (op.getInputsToOp() != null) {
+      202                  for (String input : op.getInputsToOp()) {
+      203                      if (input.equals(variableName) || stripVariableSuffix(input).equals(stripVariableSuffix(variableName))) {
+      204                          consumers.add(entry.getKey());
+      205                          break;
+      206                      }
+      207                  }
+      208              }
+      209          }
+      210  
+      211          return consumers;
+      212      }
+      213  
+      214  
+      215      private Set<String> findAllPlaceholders() {
+      216          return sameDiff.getVariables().values().stream()
+      217                  .filter(v -> v.getVariable().getVariableType() == VariableType.PLACEHOLDER)
+      218                  .map(v -> v.getVariable().name())
+      219                  .collect(Collectors.toSet());
+      220      }
+      221  
+      222      private void validateCompleteness(Collection<String> requestedOutputs,
+      223                                        Set<String> allPlaceholders,
+      224                                        Set<String> requiredVariables) {
+      225  
+      226          for (String output : requestedOutputs) {
+      227              if (!requiredVariables.contains(output)) {
+      228                  throw new IllegalStateException("Required output not in graph: " + output);
+      229              }
+      230          }
+      231  
+      232          for (String placeholder : allPlaceholders) {
+      233              if (!requiredVariables.contains(placeholder)) {
+      234                  throw new IllegalStateException("Placeholder not in graph: " + placeholder);
+      235              }
+      236          }
+      237  
+      238          log.info("Validation passed: {} outputs, {} placeholders included",
+      239                  requestedOutputs.size(), allPlaceholders.size());
+      240      }
+      241  
+      242      /**
+      243       * Build execution nodes with proper separation of concerns.
+      244       * Each node represents either an operation or a variable initialization.
+      245       */
+      246      private Map<String, ExecutionNode> buildExecutionNodes(Set<String> requiredOperations, 
+      247                                                            Set<String> requiredVariables) {
+      248          Map<String, ExecutionNode> nodes = new HashMap<>();
+      249          
+      250          // Create nodes for actual operations
+      251          for (String opName : requiredOperations) {
+      252              SameDiffOp sameDiffOp = sameDiff.getOps().get(opName);
+      253              if (sameDiffOp == null) {
+      254                  log.warn("Operation {} not found in SameDiff ops", opName);
+      255                  continue;
+      256              }
+      257              
+      258              DifferentialFunction op = sameDiffOp.getOp();
+      259              
+      260              // Get input/output variables for this operation
+      261              List<String> inputs = sameDiffOp.getInputsToOp() != null ? 
+      262                  sameDiffOp.getInputsToOp() : Collections.emptyList();
+      263              List<String> outputs = sameDiffOp.getOutputsOfOp() != null ? 
+      264                  sameDiffOp.getOutputsOfOp() : Collections.emptyList();
+      265              
+      266              // Determine node type and frame info
+      267              ExecutionNode.ExecutionNodeType nodeType = determineNodeType(op);
+      268              FrameInfo frameInfo = determineFrameInfo(op, opName);
+      269              
+      270              ExecutionNode node = new ExecutionNode(
+      271                  opName, op, inputs, outputs, new HashSet<>(), nodeType, frameInfo
+      272              );
+      273              
+      274              nodes.put(opName, node);
+      275              log.trace("Created execution node: {}", node.getDescription());
+      276          }
+      277          
+      278          // Add special nodes for constants, variables, and placeholders
+      279          addSpecialVariableNodes(nodes, requiredVariables);
+      280          
+      281          return nodes;
+      282      }
+      283      
+      284      /**
+      285       * Establish dependencies between OPERATIONS, not variables.
+      286       * This is the key fix that solves the mixed dependency problem.
+      287       * 
+      288       * For each operation, we find the operations that produce its input variables,
+      289       * creating clean operation-to-operation dependencies.
+      290       */
+      291      private void establishOperationDependencies(Map<String, ExecutionNode> operationNodes) {
+      292          for (ExecutionNode node : operationNodes.values()) {
+      293              Set<String> dependencies = new HashSet<>();
+      294              
+      295              // For each input variable, find the operation that produces it
+      296              for (String inputVar : node.getInputVariables()) {
+      297                  String producerOpName = findProducerOperation(inputVar);
+      298                  
+      299                  if (producerOpName != null && operationNodes.containsKey(producerOpName)) {
+      300                      dependencies.add(producerOpName);
+      301                      log.trace("Operation {} depends on operation {} (via variable {})", 
+      302                              node.getOperationName(), producerOpName, inputVar);
+      303                  }
+      304              }
+      305              
+      306              // Add control dependencies
+      307              SameDiffOp sameDiffOp = sameDiff.getOps().get(node.getOperationName());
+      308              if (sameDiffOp != null && sameDiffOp.getControlDeps() != null) {
+      309                  for (String controlDep : sameDiffOp.getControlDeps()) {
+      310                      if (operationNodes.containsKey(controlDep)) {
+      311                          dependencies.add(controlDep);
+      312                          log.trace("Operation {} has control dependency on operation {}", 
+      313                                  node.getOperationName(), controlDep);
+      314                      }
+      315                  }
+      316              }
+      317              
+      318              // Handle special cases for control flow operations
+      319              addControlFlowDependencies(node, dependencies, operationNodes);
+      320              
+      321              node.getDependsOnOperations().addAll(dependencies);
+      322          }
+      323      }
+      324      
+      325      /**
+      326       * Handle special dependency cases for control flow operations.
+      327       * These operations have unique execution semantics that require special handling.
+      328       */
+      329      private void addControlFlowDependencies(ExecutionNode node, Set<String> dependencies, 
+      330                                            Map<String, ExecutionNode> operationNodes) {
+      331          DifferentialFunction op = node.getOperation();
+      332          
+      333          if (op instanceof Switch) {
+      334              // Switch depends on both input tensor and predicate
+      335              // Dependencies already handled by input variables
+      336              log.trace("Switch operation {} requires both input and predicate", node.getOperationName());
+      337          } else if (op instanceof Merge) {
+      338              // Merge can execute when ANY of its inputs is ready
+      339              // This requires special handling in the execution engine
+      340              log.trace("Merge operation {} requires special OR-dependency handling", node.getOperationName());
+      341          } else if (op instanceof Enter) {
+      342              // Enter creates new frame context
+      343              Enter enter = (Enter) op;
+      344              log.trace("Enter operation {} creates frame: {}", node.getOperationName(), enter.getFrameName());
+      345          } else if (op instanceof Exit) {
+      346              // Exit returns to parent frame
+      347              log.trace("Exit operation {} returns to parent frame", node.getOperationName());
+      348          } else if (op instanceof NextIteration) {
+      349              // NextIteration advances iteration counter
+      350              log.trace("NextIteration operation {} advances iteration", node.getOperationName());
+      351          } else if (op instanceof LoopCond) {
+      352              // LoopCond determines loop continuation
+      353              log.trace("LoopCond operation {} controls loop execution", node.getOperationName());
+      354          }
+      355      }
+      356      
+      357      /**
+      358       * Create topological execution order respecting dependencies.
+      359       * This ensures operations execute in the correct order.
+      360       */
+      361      private List<ExecutionNode> createTopologicalOrder(Map<String, ExecutionNode> operationNodes) {
+      362          List<ExecutionNode> result = new ArrayList<>();
+      363          Set<String> visited = new HashSet<>();
+      364          Set<String> visiting = new HashSet<>();
+      365          
+      366          // Start with nodes that have no dependencies (constants, variables, placeholders)
+      367          for (ExecutionNode node : operationNodes.values()) {
+      368              if (node.getDependsOnOperations().isEmpty()) {
+      369                  topologicalSort(node, operationNodes, visited, visiting, result);
+      370              }
+      371          }
+      372          
+      373          // Then process remaining nodes
+      374          for (ExecutionNode node : operationNodes.values()) {
+      375              if (!visited.contains(node.getOperationName())) {
+      376                  topologicalSort(node, operationNodes, visited, visiting, result);
+      377              }
+      378          }
+      379          
+      380          log.info("Created topological execution order with {} nodes", result.size());
+      381          return result;
+      382      }
+      383      
+      384      /**
+      385       * Recursive topological sort implementation
+      386       */
+      387      private void topologicalSort(ExecutionNode node, Map<String, ExecutionNode> allNodes,
+      388                                 Set<String> visited, Set<String> visiting, List<ExecutionNode> result) {
+      389          
+      390          String nodeName = node.getOperationName();
+      391          
+      392          if (visiting.contains(nodeName)) {
+      393              log.warn("Cycle detected involving node: {}", nodeName);
+      394              return;
+      395          }
+      396          
+      397          if (visited.contains(nodeName)) {
+      398              return;
+      399          }
+      400          
+      401          visiting.add(nodeName);
+      402          
+      403          // Visit all dependencies first
+      404          for (String depName : node.getDependsOnOperations()) {
+      405              ExecutionNode depNode = allNodes.get(depName);
+      406              if (depNode != null) {
+      407                  topologicalSort(depNode, allNodes, visited, visiting, result);
+      408              }
+      409          }
+      410          
+      411          visiting.remove(nodeName);
+      412          visited.add(nodeName);
+      413          result.add(node);
+      414      }
+      415      
+      416      /**
+      417       * Find the operation that produces a given variable.
+      418       * This fixes the core lookup logic that was causing the mixed dependencies.
+      419       * 
+      420       * Handles both TensorFlow and ONNX import patterns:
+      421       * - TensorFlow: multi-output ops use ":0", ":1" suffixes
+      422       * - ONNX: different naming patterns
+      423       */
+      424      private String findProducerOperation(String variableName) {
+      425          // Strip variable suffix for multi-output operations (e.g., "split:1" -> "split")
+      426          String baseVarName = stripVariableSuffix(variableName);
+      427          
+      428          // Check all operations to find the producer
+      429          for (Map.Entry<String, SameDiffOp> entry : sameDiff.getOps().entrySet()) {
+      430              SameDiffOp op = entry.getValue();
+      431              List<String> outputs = op.getOutputsOfOp();
+      432              
+      433              if (outputs != null) {
+      434                  // Direct match
+      435                  if (outputs.contains(variableName)) {
+      436                      return entry.getKey();
+      437                  }
+      438                  
+      439                  // Base name match (for multi-output ops)
+      440                  if (outputs.contains(baseVarName)) {
+      441                      return entry.getKey();
+      442                  }
+      443                  
+      444                  // Handle TensorFlow import patterns where output might be "op_name:index"
+      445                  for (String output : outputs) {
+      446                      if (variableName.startsWith(output + ":")) {
+      447                          return entry.getKey();
+      448                      }
+       ... truncated at 400 lines ...

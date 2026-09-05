@@ -1,0 +1,398 @@
+row 16   apache/solr#3913
+============================================================================
+CLASS org.apache.solr.update.UpdateLog.LogReplayer   loc=393 methods=6 wmc=64 lcom=0.0 c3=0.241233116920647
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+     2092    class LogReplayer implements Runnable {
+     2093      private final SolrParams BASE_REPLAY_PARAMS =
+     2094          new MapSolrParams(
+     2095              Map.of(
+     2096                  DISTRIB_UPDATE_PARAM,
+     2097                  FROMLEADER.toString(),
+     2098                  DistributedUpdateProcessor.LOG_REPLAY,
+     2099                  "true"));
+     2100  
+     2101      private Logger loglog = log; // set to something different?
+     2102  
+     2103      Deque<TransactionLog> translogs;
+     2104      TransactionLog.LogReader tlogReader;
+     2105      boolean activeLog;
+     2106      // state where we lock out other updates and finish those updates that snuck in before we locked
+     2107      boolean finishing = false;
+     2108      boolean debug = loglog.isDebugEnabled();
+     2109      boolean inSortedOrder;
+     2110  
+     2111      public LogReplayer(List<TransactionLog> translogs, boolean activeLog) {
+     2112        this.translogs = new ArrayDeque<>();
+     2113        this.translogs.addAll(translogs);
+     2114        this.activeLog = activeLog;
+     2115      }
+     2116  
+     2117      public LogReplayer(List<TransactionLog> translogs, boolean activeLog, boolean inSortedOrder) {
+     2118        this(translogs, activeLog);
+     2119        this.inSortedOrder = inSortedOrder;
+     2120      }
+     2121  
+     2122      private SolrQueryRequest req;
+     2123      private SolrQueryResponse rsp;
+     2124  
+     2125      @Override
+     2126      public void run() {
+     2127        req = new LocalSolrQueryRequest(uhandler.core, BASE_REPLAY_PARAMS);
+     2128        rsp = new SolrQueryResponse();
+     2129        // setting request info will help logging
+     2130        SolrRequestInfo.setRequestInfo(new SolrRequestInfo(req, rsp));
+     2131  
+     2132        try {
+     2133          for (; ; ) {
+     2134            TransactionLog translog = translogs.pollFirst();
+     2135            if (translog == null) break;
+     2136            doReplay(translog);
+     2137          }
+     2138        } catch (SolrException e) {
+     2139          if (e.code() == ErrorCode.SERVICE_UNAVAILABLE.code) {
+     2140            log.error("Replay failed service unavailable", e);
+     2141            recoveryInfo.failed = true;
+     2142          } else {
+     2143            recoveryInfo.errors.incrementAndGet();
+     2144            log.error("Replay failed due to exception", e);
+     2145          }
+     2146        } catch (Exception e) {
+     2147          recoveryInfo.errors.incrementAndGet();
+     2148          log.error("Replay failed due to exception", e);
+     2149        } finally {
+     2150          // change the state while updates are still blocked to prevent races
+     2151          state = State.ACTIVE;
+     2152          if (finishing) {
+     2153            updateLocks.unblockUpdates();
+     2154          }
+     2155  
+     2156          // clean up in case we hit some unexpected exception and didn't get
+     2157          // to more transaction logs
+     2158          for (TransactionLog translog : translogs) {
+     2159            log.error("ERROR: didn't get to recover from tlog {}", translog);
+     2160            translog.decref();
+     2161          }
+     2162        }
+     2163  
+     2164        loglog.warn("Log replay finished. recoveryInfo={}", recoveryInfo);
+     2165  
+     2166        if (testing_logReplayFinishHook != null) testing_logReplayFinishHook.run();
+     2167  
+     2168        SolrRequestInfo.clearRequestInfo();
+     2169      }
+     2170  
+     2171      public void doReplay(TransactionLog translog) {
+     2172        try {
+     2173          loglog.warn(
+     2174              "Starting log replay {}  active={} starting pos={} inSortedOrder={}",
+     2175              translog,
+     2176              activeLog,
+     2177              recoveryInfo.positionOfStart,
+     2178              inSortedOrder);
+     2179          long lastStatusTime = System.nanoTime();
+     2180          try {
+     2181            if (inSortedOrder) {
+     2182              tlogReader = translog.getSortedReader(recoveryInfo.positionOfStart);
+     2183            } else {
+     2184              tlogReader = translog.getReader(recoveryInfo.positionOfStart);
+     2185            }
+     2186          } catch (IOException e) {
+     2187            throw new UncheckedIOException(e);
+     2188          }
+     2189  
+     2190          // NOTE: we don't currently handle a core reload during recovery.  This would cause the core
+     2191          // to change underneath us.
+     2192  
+     2193          // Use a pool of URPs using a ThreadLocal to have them per-thread.  URPs aren't threadsafe.
+     2194          UpdateRequestProcessorChain processorChain = req.getCore().getUpdateProcessingChain(null);
+     2195          Collection<UpdateRequestProcessor> procPool =
+     2196              Collections.synchronizedList(new ArrayList<>());
+     2197          ThreadLocal<UpdateRequestProcessor> procThreadLocal =
+     2198              ThreadLocal.withInitial(
+     2199                  () -> {
+     2200                    // SolrQueryRequest is not thread-safe, so use a copy when creating URPs
+     2201                    final var localRequest =
+     2202                        new LocalSolrQueryRequest(uhandler.core, BASE_REPLAY_PARAMS);
+     2203                    var proc = processorChain.createProcessor(localRequest, rsp);
+     2204                    procPool.add(proc);
+     2205                    return proc;
+     2206                  });
+     2207  
+     2208          OrderedExecutor<BytesRef> executor =
+     2209              inSortedOrder ? null : req.getCoreContainer().getReplayUpdatesExecutor();
+     2210          AtomicInteger pendingTasks = new AtomicInteger(0);
+     2211          AtomicReference<SolrException> exceptionOnExecuteUpdate = new AtomicReference<>();
+     2212  
+     2213          long commitVersion = 0;
+     2214          int operationAndFlags = 0;
+     2215          long nextCount = 0;
+     2216  
+     2217          for (; ; ) {
+     2218            Object o = null;
+     2219            if (cancelApplyBufferUpdate) break;
+     2220            try {
+     2221              if (testing_logReplayHook != null) testing_logReplayHook.run();
+     2222              if (nextCount++ % 1000 == 0) {
+     2223                long now = System.nanoTime();
+     2224                if (now - lastStatusTime > STATUS_TIME) {
+     2225                  lastStatusTime = now;
+     2226                  long cpos = tlogReader.currentPos();
+     2227                  long csize = tlogReader.currentSize();
+     2228                  if (log.isInfoEnabled()) {
+     2229                    loglog.info(
+     2230                        "log replay status {} active={} starting pos={} current pos={} current size={} % read={}",
+     2231                        translog,
+     2232                        activeLog,
+     2233                        recoveryInfo.positionOfStart,
+     2234                        cpos,
+     2235                        csize,
+     2236                        Math.floor(cpos / (double) csize * 100.));
+     2237                  }
+     2238                }
+     2239              }
+     2240  
+     2241              o = null;
+     2242              o = tlogReader.next();
+     2243              if (o == null && activeLog) {
+     2244                if (!finishing) {
+     2245                  // about to block all the updates including the tasks in the executor
+     2246                  // therefore we must wait for them to be finished
+     2247                  waitForAllUpdatesGetExecuted(pendingTasks);
+     2248                  // from this point, remain updates will be executed in a single thread
+     2249                  executor = null;
+     2250                  // block to prevent new adds, but don't immediately unlock since
+     2251                  // we could be starved from ever completing recovery.  Only unlock
+     2252                  // after we've finished this recovery.
+     2253                  // NOTE: our own updates won't be blocked since the thread holding a write lock can
+     2254                  // lock a read lock.
+     2255                  updateLocks.blockUpdates();
+     2256                  finishing = true;
+     2257                  o = tlogReader.next();
+     2258                } else {
+     2259                  // we had previously blocked updates, so this "null" from the log is final.
+     2260  
+     2261                  // Wait until our final commit to change the state and unlock.
+     2262                  // This is only so no new updates are written to the current log file, and is
+     2263                  // only an issue if we crash before the commit (and we are paying attention
+     2264                  // to incomplete log files).
+     2265                  //
+     2266                  // versionInfo.unblockUpdates();
+     2267                }
+     2268              }
+     2269            } catch (Exception e) {
+     2270              log.error("Exception during replay", e);
+     2271            }
+     2272  
+     2273            if (o == null) break;
+     2274            // fail fast
+     2275            if (exceptionOnExecuteUpdate.get() != null) throw exceptionOnExecuteUpdate.get();
+     2276  
+     2277            try {
+     2278  
+     2279              // should currently be a List<Oper,Ver,Doc/Id>
+     2280              List<?> entry = (List<?>) o;
+     2281              operationAndFlags = (Integer) entry.get(UpdateLog.FLAGS_IDX);
+     2282              int oper = operationAndFlags & OPERATION_MASK;
+     2283              long version = (Long) entry.get(UpdateLog.VERSION_IDX);
+     2284  
+     2285              switch (oper) {
+     2286                case UpdateLog.UPDATE_INPLACE: // fall through to ADD
+     2287                case UpdateLog.ADD:
+     2288                  {
+     2289                    recoveryInfo.adds++;
+     2290                    AddUpdateCommand cmd =
+     2291                        convertTlogEntryToAddUpdateCommand(req, entry, oper, version);
+     2292                    cmd.setFlags(UpdateCommand.REPLAY | UpdateCommand.IGNORE_AUTOCOMMIT);
+     2293                    if (debug) log.debug("{} {}", oper == ADD ? "add" : "update", cmd);
+     2294                    execute(cmd, executor, pendingTasks, procThreadLocal, exceptionOnExecuteUpdate);
+     2295                    break;
+     2296                  }
+     2297                case UpdateLog.DELETE:
+     2298                  {
+     2299                    recoveryInfo.deletes++;
+     2300                    byte[] idBytes = (byte[]) entry.get(2);
+     2301                    DeleteUpdateCommand cmd = new DeleteUpdateCommand(req);
+     2302                    cmd.setIndexedId(new BytesRef(idBytes));
+     2303                    cmd.setVersion(version);
+     2304                    cmd.setFlags(UpdateCommand.REPLAY | UpdateCommand.IGNORE_AUTOCOMMIT);
+     2305                    if (debug) log.debug("delete {}", cmd);
+     2306                    execute(cmd, executor, pendingTasks, procThreadLocal, exceptionOnExecuteUpdate);
+     2307                    break;
+     2308                  }
+     2309  
+     2310                case UpdateLog.DELETE_BY_QUERY:
+     2311                  {
+     2312                    recoveryInfo.deleteByQuery++;
+     2313                    String query = (String) entry.get(2);
+     2314                    DeleteUpdateCommand cmd = new DeleteUpdateCommand(req);
+     2315                    cmd.query = query;
+     2316                    cmd.setVersion(version);
+     2317                    cmd.setFlags(UpdateCommand.REPLAY | UpdateCommand.IGNORE_AUTOCOMMIT);
+     2318                    if (debug) log.debug("deleteByQuery {}", cmd);
+     2319                    waitForAllUpdatesGetExecuted(pendingTasks);
+     2320                    // DBQ will be executed in the same thread
+     2321                    execute(cmd, null, pendingTasks, procThreadLocal, exceptionOnExecuteUpdate);
+     2322                    break;
+     2323                  }
+     2324                case UpdateLog.COMMIT:
+     2325                  {
+     2326                    commitVersion = version;
+     2327                    break;
+     2328                  }
+     2329  
+     2330                default:
+     2331                  throw new SolrException(
+     2332                      SolrException.ErrorCode.SERVER_ERROR, "Unknown Operation! " + oper);
+     2333              }
+     2334  
+     2335              if (rsp.getException() != null) {
+     2336                loglog.error("REPLAY_ERR: Exception replaying log {}", rsp.getException());
+     2337                throw rsp.getException();
+     2338              }
+     2339              if (state == State.REPLAYING) {
+     2340                replayOpsCounter.inc();
+     2341              } else if (state == State.APPLYING_BUFFERED) {
+     2342                applyingBufferedOpsCounter.inc();
+     2343              } else {
+     2344                // XXX should not happen?
+     2345              }
+     2346            } catch (ClassCastException cl) {
+     2347              recoveryInfo.errors.incrementAndGet();
+     2348              loglog.warn("REPLAY_ERR: Unexpected log entry or corrupt log.  Entry={}", o, cl);
+     2349              // would be caused by a corrupt transaction log
+     2350            } catch (Exception ex) {
+     2351              recoveryInfo.errors.incrementAndGet();
+     2352              loglog.warn("REPLAY_ERR: Exception replaying log", ex);
+     2353              // something wrong with the request?
+     2354            }
+     2355            assert TestInjection.injectUpdateLogReplayRandomPause();
+     2356          }
+     2357  
+     2358          waitForAllUpdatesGetExecuted(pendingTasks);
+     2359          if (exceptionOnExecuteUpdate.get() != null) throw exceptionOnExecuteUpdate.get();
+     2360  
+     2361          CommitUpdateCommand cmd = new CommitUpdateCommand(req, false);
+     2362          cmd.setVersion(commitVersion);
+     2363          cmd.softCommit = false;
+     2364          cmd.waitSearcher = true;
+     2365          cmd.setFlags(UpdateCommand.REPLAY);
+     2366          try {
+     2367            if (debug) log.debug("commit {}", cmd);
+     2368            // this should cause a commit to be added to the incomplete log and avoid it being
+     2369            // replayed again after a restart.
+     2370            uhandler.commit(cmd);
+     2371          } catch (IOException ex) {
+     2372            recoveryInfo.errors.incrementAndGet();
+     2373            loglog.error("Replay exception: final commit.", ex);
+     2374          }
+     2375  
+     2376          if (!activeLog) {
+     2377            // if we are replaying an old tlog file, we need to add a commit to the end
+     2378            // so we don't replay it again if we restart right after.
+     2379            translog.writeCommit(cmd);
+     2380          }
+     2381  
+     2382          for (UpdateRequestProcessor proc : procPool) {
+     2383            try {
+     2384              proc.finish();
+     2385            } catch (IOException ex) {
+     2386              recoveryInfo.errors.incrementAndGet();
+     2387              loglog.error("Replay exception: finish()", ex);
+     2388            } finally {
+     2389              IOUtils.closeQuietly(proc);
+     2390            }
+     2391          }
+     2392  
+     2393        } finally {
+     2394          if (tlogReader != null) tlogReader.close();
+     2395          translog.decref();
+     2396        }
+     2397      }
+     2398  
+     2399      private void waitForAllUpdatesGetExecuted(AtomicInteger pendingTasks) {
+     2400        TimeOut timeOut =
+     2401            new TimeOut(Integer.MAX_VALUE, TimeUnit.MILLISECONDS, TimeSource.CURRENT_TIME);
+     2402        try {
+     2403          timeOut.waitFor(
+     2404              "Timeout waiting for replay updates finish",
+     2405              () -> {
+     2406                // TODO handle the case when there are no progress after a long time
+     2407                return pendingTasks.get() == 0;
+     2408              });
+     2409        } catch (TimeoutException e) {
+     2410          throw new SolrException(ErrorCode.SERVER_ERROR, e);
+     2411        } catch (InterruptedException e) {
+     2412          Thread.currentThread().interrupt();
+     2413          throw new SolrException(ErrorCode.SERVER_ERROR, e);
+     2414        }
+     2415      }
+     2416  
+     2417      private BytesRef getIndexedId(UpdateCommand cmd) {
+     2418        if (cmd instanceof AddUpdateCommand) {
+     2419          return ((AddUpdateCommand) cmd).getIndexedId();
+     2420        }
+     2421        if (cmd instanceof DeleteUpdateCommand) {
+     2422          return ((DeleteUpdateCommand) cmd).getIndexedId();
+     2423        }
+     2424        return null;
+     2425      }
+     2426  
+     2427      private void execute(
+     2428          UpdateCommand cmd,
+     2429          OrderedExecutor<BytesRef> executor,
+     2430          AtomicInteger pendingTasks,
+     2431          ThreadLocal<UpdateRequestProcessor> procTl,
+     2432          AtomicReference<SolrException> exceptionHolder) {
+     2433        assert cmd instanceof AddUpdateCommand || cmd instanceof DeleteUpdateCommand;
+     2434  
+     2435        if (executor != null) {
+     2436          executor.execute(
+     2437              getIndexedId(cmd),
+     2438              () -> {
+     2439                try {
+     2440                  // fail fast
+     2441                  if (exceptionHolder.get() != null) return;
+     2442                  invokeCmdOnProc(cmd, procTl.get());
+     2443                } catch (IOException e) {
+     2444                  recoveryInfo.errors.incrementAndGet();
+     2445                  loglog.warn("REPLAY_ERR: IOException reading log", e);
+     2446                  // could be caused by an incomplete flush if recovering from log
+     2447                } catch (SolrException e) {
+     2448                  if (e.code() == ErrorCode.SERVICE_UNAVAILABLE.code) {
+     2449                    exceptionHolder.compareAndSet(null, e);
+     2450                    return;
+     2451                  }
+     2452                  recoveryInfo.errors.incrementAndGet();
+     2453                  loglog.warn("REPLAY_ERR: SolrException reading log", e);
+     2454                } finally {
+     2455                  pendingTasks.decrementAndGet();
+     2456                }
+     2457              });
+     2458          pendingTasks.incrementAndGet();
+     2459        } else {
+     2460          try {
+     2461            invokeCmdOnProc(cmd, procTl.get());
+     2462          } catch (IOException e) {
+     2463            recoveryInfo.errors.incrementAndGet();
+     2464            loglog.warn("REPLAY_ERR: IOException replaying log", e);
+     2465            // could be caused by an incomplete flush if recovering from log
+     2466          } catch (SolrException e) {
+     2467            if (e.code() == ErrorCode.SERVICE_UNAVAILABLE.code) {
+     2468              throw e;
+     2469            }
+     2470            recoveryInfo.errors.incrementAndGet();
+     2471            loglog.warn("REPLAY_ERR: SolrException replaying log", e);
+     2472          }
+     2473        }
+     2474      }
+     2475  
+     2476      private void invokeCmdOnProc(UpdateCommand cmd, UpdateRequestProcessor proc)
+     2477          throws IOException {
+     2478        if (cmd instanceof AddUpdateCommand) {
+     2479          proc.processAdd((AddUpdateCommand) cmd);
+     2480        } else {
+     2481          proc.processDelete((DeleteUpdateCommand) cmd);
+     2482        }
+     2483      }
+     2484    }

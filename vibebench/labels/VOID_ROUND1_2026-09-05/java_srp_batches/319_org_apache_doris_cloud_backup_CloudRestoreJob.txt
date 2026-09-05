@@ -1,0 +1,406 @@
+row 319   apache/doris#59827
+============================================================================
+CLASS org.apache.doris.cloud.backup.CloudRestoreJob   loc=489 methods=23 wmc=71 lcom=0.1363636363636363 c3=0.1603574967187635
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       74  public class CloudRestoreJob extends RestoreJob {
+       75  
+       76      private static final Logger LOG = LogManager.getLogger(CloudRestoreJob.class);
+       77  
+       78      private static final String PROP_STORAGE_VAULT_NAME = RestoreCommand.PROP_STORAGE_VAULT_NAME;
+       79  
+       80      @SerializedName("storageVaultName")
+       81      private String storageVaultName = null;
+       82  
+       83      @SerializedName("cloudClusterName")
+       84      private String cloudClusterName = null;
+       85  
+       86      private String storageVaultId = "";
+       87  
+       88      private String cloudClusterId = null;
+       89  
+       90      private Map<Pair<OlapTable, Partition>, List<Cloud.CreateTabletsRequest.Builder>> tabletRequests = new HashMap<>();
+       91  
+       92      public enum MetaSeriviceOperation {
+       93          PREPARE,
+       94          COMMIT,
+       95          DROP
+       96      }
+       97  
+       98      public CloudRestoreJob() {
+       99          super();
+      100      }
+      101  
+      102      public CloudRestoreJob(JobType jobType) {
+      103          super(jobType);
+      104      }
+      105  
+      106      public CloudRestoreJob(String label, String backupTs, long dbId, String dbName, BackupJobInfo jobInfo,
+      107              boolean allowLoad, ReplicaAllocation replicaAlloc, long timeoutMs, int metaVersion, boolean reserveReplica,
+      108              boolean reserveDynamicPartitionEnable, boolean isBeingSynced, boolean isCleanTables,
+      109              boolean isCleanPartitions, boolean isAtomicRestore, boolean isForceReplace, Env env, long repoId,
+      110              String storageVaultName) {
+      111          super(label, backupTs, dbId, dbName, jobInfo, allowLoad, replicaAlloc, timeoutMs, metaVersion, reserveReplica,
+      112                  false, reserveDynamicPartitionEnable, isBeingSynced, isCleanTables, isCleanPartitions,
+      113                  isAtomicRestore, isForceReplace, env, repoId);
+      114          if (((CloudEnv) env).getEnableStorageVault()) {
+      115              this.storageVaultName = storageVaultName;
+      116              properties.put(PROP_STORAGE_VAULT_NAME, storageVaultName);
+      117          }
+      118          ConnectContext context = ConnectContext.get();
+      119          if (context != null) {
+      120              String clusterName = "";
+      121              try {
+      122                  clusterName = context.getCloudCluster();
+      123              } catch (ComputeGroupException e) {
+      124                  LOG.warn("failed to get compute group name", e);
+      125              }
+      126              if (!Strings.isNullOrEmpty(clusterName)) {
+      127                  this.cloudClusterName = clusterName;
+      128                  this.cloudClusterId = ((CloudSystemInfoService) Env.getCurrentSystemInfo()).getCloudClusterIdByName(
+      129                          cloudClusterName);
+      130              }
+      131          }
+      132      }
+      133  
+      134      private AutoCloseConnectContext buildConnectContext() throws UserException {
+      135          if (Strings.isNullOrEmpty(cloudClusterName)) {
+      136              throw new UserException("compute group name is not set.");
+      137          }
+      138          if (ConnectContext.get() == null) {
+      139              ConnectContext ctx = new ConnectContext();
+      140              ctx.setCloudCluster(cloudClusterName);
+      141              return new AutoCloseConnectContext(ctx);
+      142          } else {
+      143              ConnectContext.get().setCloudCluster(cloudClusterName);
+      144              return null;
+      145          }
+      146      }
+      147  
+      148      @Override
+      149      public synchronized void run() {
+      150          if (state == RestoreJobState.FINISHED || state == RestoreJobState.CANCELLED) {
+      151              return;
+      152          }
+      153          try (AutoCloseConnectContext r = buildConnectContext()) {
+      154              super.run();
+      155          } catch (UserException e) {
+      156              LOG.error("failed to run cloud restore job", e);
+      157          }
+      158      }
+      159  
+      160      @Override
+      161      public void checkIfNeedCancel() {
+      162          super.checkIfNeedCancel();
+      163          if ((cloudClusterId = ((CloudSystemInfoService) Env.getCurrentSystemInfo()).getCloudClusterIdByName(
+      164                  cloudClusterName)) == null) {
+      165              status = new Status(Status.ErrCode.NOT_FOUND, "compute group " + cloudClusterName
+      166                      + " has been removed");
+      167          }
+      168      }
+      169  
+      170      @Override
+      171      public void checkStorageVault(OlapTable localTable) {
+      172          if (((CloudEnv) Env.getCurrentEnv()).getEnableStorageVault()) {
+      173              Preconditions.checkNotNull(storageVaultName);
+      174              if (localTable.getStorageVaultId().isEmpty()) {
+      175                  status = new Status(Status.ErrCode.COMMON_ERROR, "local table " + localTable.getName()
+      176                          + " has no storage vault.");
+      177                  return;
+      178              }
+      179              String localStorageVaultName = localTable.getStorageVaultName();
+      180              if (!localStorageVaultName.equals(storageVaultName)) {
+      181                  // currently we only support unique storage vault name in one restore job
+      182                  status = new Status(Status.ErrCode.COMMON_ERROR,
+      183                          "local table " + localTable.getName() + " storage vault is " + localStorageVaultName
+      184                                  + ", but restore job storage vault is " + storageVaultName);
+      185              }
+      186          }
+      187      }
+      188  
+      189      @Override
+      190      public void doCreateReplicas() {
+      191          try {
+      192              handleMetaObject(MetaSeriviceOperation.PREPARE);
+      193              // send create tablets requests
+      194              boolean needSetStorageVault = ((CloudEnv) Env.getCurrentEnv()).getEnableStorageVault();
+      195              for (Map.Entry<Pair<OlapTable, Partition>, List<Cloud.CreateTabletsRequest.Builder>> entry
+      196                      : tabletRequests.entrySet()) {
+      197                  Pair<OlapTable, Partition> tableToPartition = entry.getKey();
+      198                  OlapTable table = tableToPartition.first;
+      199                  List<Cloud.CreateTabletsRequest.Builder> requestBuilders = entry.getValue();
+      200                  for (Cloud.CreateTabletsRequest.Builder requestBuilder : requestBuilders) {
+      201                      Cloud.CreateTabletsResponse resp = sendCreateTabletsRequests(requestBuilder, table,
+      202                              needSetStorageVault);
+      203                      if (resp.hasStorageVaultId()) {
+      204                          storageVaultId = resp.getStorageVaultId();
+      205                          needSetStorageVault = false;
+      206                      }
+      207                  }
+      208              }
+      209              // set storage vault for new restoring table
+      210              if (((CloudEnv) Env.getCurrentEnv()).getEnableStorageVault()) {
+      211                  for (Table table : restoredTbls) {
+      212                      if (table.getType() == TableIf.TableType.OLAP) {
+      213                          OlapTable olapTable = (OlapTable) table;
+      214                          if (olapTable.getStorageVaultId().isEmpty() && storageVaultId != null) {
+      215                              olapTable.setStorageVaultId(storageVaultId);
+      216                          }
+      217                      }
+      218                  }
+      219              }
+      220          } catch (Exception e) {
+      221              status = new Status(Status.ErrCode.COMMON_ERROR, e.getMessage());
+      222          } finally {
+      223              tabletRequests.clear();
+      224          }
+      225      }
+      226  
+      227      @Override
+      228      public void waitingAllReplicasCreated() {
+      229          try {
+      230              handleMetaObject(MetaSeriviceOperation.COMMIT);
+      231          } catch (Exception e) {
+      232              status = new Status(Status.ErrCode.COMMON_ERROR, e.getMessage());
+      233              return;
+      234          }
+      235          if (LOG.isDebugEnabled()) {
+      236              LOG.debug("finished to create all restored replicas. {}", this);
+      237          }
+      238          allReplicasCreated();
+      239      }
+      240  
+      241      public void waitingAllSnapshotsFinished() {
+      242          snapshotFinishedTime = System.currentTimeMillis();
+      243          state = RestoreJobState.DOWNLOAD;
+      244          env.getEditLog().logRestoreJob(this);
+      245          LOG.info("finished making snapshots. {}", this);
+      246      }
+      247  
+      248      @Override
+      249      protected void prepareAndSendSnapshotTaskForOlapTable(Database db) {
+      250          LOG.info("begin to make snapshot. {} when restore content is ALL", this);
+      251          unfinishedSignatureToId.clear();
+      252          taskProgress.clear();
+      253          taskErrMsg.clear();
+      254          db.readLock();
+      255          try {
+      256              for (Map.Entry<IdChain, IdChain> entry : fileMapping.getMapping()
+      257                      .entrySet()) {
+      258                  IdChain idChain = entry.getKey();
+      259                  OlapTable tbl = (OlapTable) db.getTableNullable(idChain.getTblId());
+      260                  tbl.readLock();
+      261                  try {
+      262                      Partition part = tbl.getPartition(idChain.getPartId());
+      263                      MaterializedIndex index = part.getIndex(idChain.getIdxId());
+      264                      CloudTablet tablet = (CloudTablet) index.getTablet(idChain.getTabletId());
+      265                      Preconditions.checkState(tablet.getReplicas().size() == 1);
+      266                      CloudReplica replica = (CloudReplica) tablet.getReplicaById(idChain.getReplicaId());
+      267                      // Hash snapshot info to be(s) in cluster
+      268                      long backendId = replica.hashReplicaToBe(cloudClusterId, false);
+      269                      // cloud restore job does not need to send snapshot task to be
+      270                      SnapshotInfo info = new SnapshotInfo(db.getId(), tbl.getId(), part.getId(), index.getId(),
+      271                              tablet.getId(), backendId, tbl.getSchemaHashByIndexId(index.getId()), storageVaultId);
+      272                      snapshotInfos.put(tablet.getId(), backendId, info);
+      273                  } finally {
+      274                      tbl.readUnlock();
+      275                  }
+      276              }
+      277          } catch (Exception e) {
+      278              LOG.error("failed to make snapshot for {}", this, e);
+      279              status = new Status(Status.ErrCode.COMMON_ERROR, "failed to make snapshot, errMsg:"
+      280                      + e.getMessage());
+      281          } finally {
+      282              db.readUnlock();
+      283          }
+      284          LOG.info("finished to send snapshot tasks, num: {}. {}", 0, this);
+      285      }
+      286  
+      287      @Override
+      288      protected DownloadTask createDownloadTask(long beId, long signature, long jobId, long dbId,
+      289                                                Map<String, String> srcToDest, FsBroker brokerAddr) {
+      290          if (Strings.isNullOrEmpty(storageVaultId)) {
+      291              storageVaultId = snapshotInfos.values().iterator().next().getStorageVaultId();
+      292          }
+      293          Preconditions.checkState(storageVaultId != null, "Storage vault ID cannot be null");
+      294          return new DownloadTask(null, beId, signature, jobId, dbId, srcToDest,
+      295              brokerAddr, repo.getRemoteFileSystem().getStorageProperties().getBackendConfigProperties(),
+      296              repo.getRemoteFileSystem().getStorageType(), repo.getLocation(), storageVaultId);
+      297      }
+      298  
+      299      public void downloadLocalSnapshots() {
+      300          status = new Status(Status.ErrCode.COMMON_ERROR, "currently not support cloud mode");
+      301      }
+      302  
+      303      @Override
+      304      protected void cleanMetaObjects(boolean isReplay) {
+      305          super.cleanMetaObjects(isReplay);
+      306          try {
+      307              handleMetaObject(MetaSeriviceOperation.DROP);
+      308          } catch (Exception e) {
+      309              status = new Status(Status.ErrCode.COMMON_ERROR, e.getMessage());
+      310          }
+      311      }
+      312  
+      313      @Override
+      314      public Partition resetPartitionForRestore(OlapTable localTbl, OlapTable remoteTbl, String partName,
+      315                                                   ReplicaAllocation replicaAlloc) {
+      316          Partition restoredPart = super.resetPartitionForRestore(localTbl, remoteTbl, partName, replicaAlloc);
+      317          // convert partition to cloud partition
+      318          CloudPartition cloudPartition = CopyUtil.copyToChild(restoredPart, CloudPartition.class);
+      319          if (cloudPartition != null) {
+      320              cloudPartition.setTableId(localTbl.getId());
+      321              cloudPartition.setDbId(localTbl.getDatabase().getId());
+      322          }
+      323          return cloudPartition;
+      324      }
+      325  
+      326      @Override
+      327      public Partition resetTabletForRestore(OlapTable localTbl, OlapTable remoteTbl, Partition remotePart,
+      328                                                ReplicaAllocation replicaAlloc) {
+      329          // tablets
+      330          long partitionId = remotePart.getId();
+      331          long visibleVersion = remotePart.getVisibleVersion();
+      332          for (MaterializedIndex remoteIdx : remotePart.getMaterializedIndices(MaterializedIndex.IndexExtState.VISIBLE)) {
+      333              int schemaHash = remoteTbl.getSchemaHashByIndexId(remoteIdx.getId());
+      334              int remotetabletSize = remoteIdx.getTablets().size();
+      335              remoteIdx.clearTabletsForRestore();
+      336              for (int i = 0; i < remotetabletSize; i++) {
+      337                  // generate new tablet id
+      338                  long newTabletId = env.getNextId();
+      339                  Tablet newTablet = EnvFactory.getInstance().createTablet(newTabletId);
+      340                  // add tablet to index, but not add to TabletInvertedIndex
+      341                  remoteIdx.addTablet(newTablet, null /* tablet meta */, true /* is restore */);
+      342                  // replicas
+      343                  long newReplicaId = Env.getCurrentEnv().getNextId();
+      344                  Replica replica = new CloudReplica(newReplicaId, null, Replica.ReplicaState.NORMAL,
+      345                          visibleVersion, schemaHash, dbId, localTbl.getId(), partitionId, remoteIdx.getId(), i);
+      346                  newTablet.addReplica(replica, true /* is restore */);
+      347              }
+      348          }
+      349          return remotePart;
+      350      }
+      351  
+      352      @Override
+      353      public void createReplicas(Database db, OlapTable localTbl, Partition restorePart) {
+      354          createReplicas(db, localTbl, restorePart, null);
+      355      }
+      356  
+      357      @Override
+      358      public void createReplicas(Database db, OlapTable localTbl, Partition restorePart,
+      359                                 Map<Long, TabletRef> tabletBases) {
+      360          List<String> rowStoreColumns = localTbl.getTableProperty().getCopiedRowStoreColumns();
+      361          List<Cloud.CreateTabletsRequest.Builder> requestBuilders = tabletRequests.computeIfAbsent(
+      362                  Pair.of(localTbl, restorePart), r -> Lists.newArrayList());
+      363  
+      364          for (MaterializedIndex restoredIdx : restorePart.getMaterializedIndices(MaterializedIndex.IndexExtState
+      365                  .VISIBLE)) {
+      366              MaterializedIndexMeta indexMeta = localTbl.getIndexMetaByIndexId(restoredIdx.getId());
+      367              List<Index> indexes = restoredIdx.getId() == localTbl.getBaseIndexId()
+      368                      ? localTbl.getCopiedIndexes() : null;
+      369              List<Integer> clusterKeyUids = null;
+      370              if (indexMeta.getIndexId() == localTbl.getBaseIndexId()) {
+      371                  // only base and shadow index need cluster key unique column ids
+      372                  clusterKeyUids = OlapTable.getClusterKeyUids(indexMeta.getSchema());
+      373              }
+      374  
+      375              int maxCreateTabletBatchSize = Config.cloud_restore_create_tablet_batch_size;
+      376              List<Tablet> restoreTablets = restoredIdx.getTablets();
+      377              for (int i = 0; i < restoreTablets.size(); i += maxCreateTabletBatchSize) {
+      378                  int end = Math.min(i + maxCreateTabletBatchSize, restoreTablets.size());
+      379                  List<Tablet> subRestoreTablets = restoreTablets.subList(i, end);
+      380                  Cloud.CreateTabletsRequest.Builder requestBuilder = Cloud.CreateTabletsRequest.newBuilder()
+      381                          .setRequestIp(FrontendOptions.getLocalHostAddressCached());
+      382                  for (Tablet restoreTablet : subRestoreTablets) {
+      383                      try {
+      384                          requestBuilder.addTabletMetas(((CloudInternalCatalog) Env.getCurrentInternalCatalog())
+      385                                  .createTabletMetaBuilder(localTbl.getId(), restoredIdx.getId(),
+      386                                      restorePart.getId(), restoreTablet,
+      387                                      localTbl.getPartitionInfo().getTabletType(restorePart.getId()),
+      388                                      indexMeta.getSchemaHash(), indexMeta.getKeysType(),
+      389                                      indexMeta.getShortKeyColumnCount(), localTbl.getCopiedBfColumns(),
+      390                                      localTbl.getBfFpp(), indexes, indexMeta.getSchema(), localTbl.getDataSortInfo(),
+      391                                      localTbl.getCompressionType(), localTbl.getStorageFormat(),
+      392                                      localTbl.getStoragePolicy(),
+      393                                      localTbl.isInMemory(), false, localTbl.getName(), localTbl.getTTLSeconds(),
+      394                                      localTbl.getEnableUniqueKeyMergeOnWrite(), localTbl.storeRowColumn(),
+      395                                      localTbl.getBaseSchemaVersion(), localTbl.getCompactionPolicy(),
+      396                                      localTbl.getTimeSeriesCompactionGoalSizeMbytes(),
+      397                                      localTbl.getTimeSeriesCompactionFileCountThreshold(),
+      398                                      localTbl.getTimeSeriesCompactionTimeThresholdSeconds(),
+      399                                      localTbl.getTimeSeriesCompactionEmptyRowsetsThreshold(),
+      400                                      localTbl.getTimeSeriesCompactionLevelThreshold(), localTbl.disableAutoCompaction(),
+      401                                      localTbl.skipWriteIndexOnLoad(), localTbl.getRowStoreColumnsUniqueIds(rowStoreColumns),
+      402                                      localTbl.getInvertedIndexFileStorageFormat(),
+      403                                      localTbl.rowStorePageSize(),
+      404                                      localTbl.variantEnableFlattenNested(), clusterKeyUids,
+      405                                      localTbl.storagePageSize(), localTbl.getTDEAlgorithmPB(),
+      406                                      localTbl.storageDictPageSize(), false,
+      407                                      localTbl.getColumnSeqMapping()));
+      408                          // In cloud mode all storage medium will be saved to HDD.
+      409                          TabletMeta tabletMeta = new TabletMeta(db.getId(), localTbl.getId(), restorePart.getId(),
+      410                                  restoredIdx.getId(), indexMeta.getSchemaHash(), TStorageMedium.HDD);
+      411                          Env.getCurrentInvertedIndex().addTablet(restoreTablet.getId(), tabletMeta);
+      412                          Env.getCurrentInvertedIndex().addReplica(restoreTablet.getId(),
+      413                                  restoreTablet.getReplicaByBackendId(-1));
+      414                      } catch (Exception e) {
+      415                          String errMsg = String.format("create tablet meta builder failed, errMsg:%s, local table:%d, "
+      416                                  + "restore partition=%d, restore index=%d, restore tablet=%d", e.getMessage(),
+      417                                  localTbl.getId(), restorePart.getId(), restoredIdx.getId(), restoreTablet.getId());
+      418                          status = new Status(Status.ErrCode.COMMON_ERROR, errMsg);
+      419                          return;
+      420                      }
+      421                  }
+      422                  requestBuilders.add(requestBuilder);
+      423              }
+      424          }
+      425      }
+      426  
+      427      private void handleMetaObject(MetaSeriviceOperation operation) throws DdlException {
+      428          Database db = env.getInternalCatalog().getDbNullable(dbId);
+      429          if (db == null) {
+      430              throw new DdlException("database " + dbId + " does not exist");
+      431          }
+      432          // 1. for restoring tables for remote tables
+      433          for (Table table : restoredTbls) {
+      434              if (table.getType() == TableIf.TableType.OLAP) {
+      435                  OlapTable olapTable = (OlapTable) table;
+      436                  handleOlapTableMeta(operation, olapTable, olapTable.getAllPartitions());
+      437              }
+      438          }
+      439          // 2. for restoring partitions for local tables
+      440          // group partition ids by local table
+      441          Map<String, Collection<Partition>> localTableToPartitions = new HashMap<>();
+      442          for (Pair<String, Partition> entry : restoredPartitions) {
+      443              localTableToPartitions.computeIfAbsent(entry.first, k -> Lists.newArrayList())
+      444                      .add(entry.second);
+      445          }
+      446          for (Map.Entry<String, Collection<Partition>> entry : localTableToPartitions.entrySet()) {
+      447              OlapTable localTbl = (OlapTable) db.getTableOrDdlException(entry.getKey());
+      448              handleOlapTableMeta(operation, localTbl, entry.getValue());
+      449          }
+      450      }
+      451  
+      452      private void handleOlapTableMeta(MetaSeriviceOperation operation, OlapTable olapTable,
+      453                                       Collection<Partition> partitions) throws DdlException {
+      454          List<Long> partitionIds = new ArrayList<>();
+      455          switch (operation) {
+      456              case PREPARE: {
+      457                  List<Long> visibleVersions = new ArrayList<>();
+      458                  partitions.forEach(partition -> {
+      459                      visibleVersions.add(partition.getCachedVisibleVersion());
+      460                      partitionIds.add(partition.getId());
+      461                  });
+      462                  preparePartitions(olapTable, partitionIds, visibleVersions);
+      463                  break;
+      464              }
+      465              case COMMIT: {
+      466                  partitions.forEach(partition -> {
+      467                      partitionIds.add(partition.getId());
+      468                  });
+      469                  commitPartitions(olapTable, partitionIds);
+      470                  break;
+      471              }
+      472              case DROP: {
+      473                  partitions.forEach(partition -> {
+       ... truncated at 400 lines ...

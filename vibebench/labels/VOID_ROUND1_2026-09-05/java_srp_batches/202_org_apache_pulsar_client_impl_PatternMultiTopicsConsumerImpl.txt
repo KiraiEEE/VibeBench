@@ -1,0 +1,373 @@
+row 202   apache/pulsar#24592
+============================================================================
+CLASS org.apache.pulsar.client.impl.PatternMultiTopicsConsumerImpl   loc=368 methods=10 wmc=23 lcom=0.1111111111111111 c3=0.1717532480421305
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       50  public class PatternMultiTopicsConsumerImpl<T> extends MultiTopicsConsumerImpl<T> implements TimerTask {
+       51      private final TopicsPattern topicsPattern;
+       52      final TopicsChangedListener topicsChangeListener;
+       53      private final Mode subscriptionMode;
+       54      private final CompletableFuture<TopicListWatcher> watcherFuture = new CompletableFuture<>();
+       55      protected NamespaceName namespaceName;
+       56  
+       57      private final AtomicInteger recheckPatternEpoch = new AtomicInteger();
+       58      // If recheckPatternTimeout is not null, it means the broker's topic watcher is disabled.
+       59      // The client need falls back to the polling model.
+       60      private volatile Timeout recheckPatternTimeout = null;
+       61      private volatile String topicsHash;
+       62  
+       63      private PatternConsumerUpdateQueue updateTaskQueue;
+       64  
+       65      /***
+       66       * @param topicsPattern The regexp for the topic name(not contains partition suffix).
+       67       */
+       68      public PatternMultiTopicsConsumerImpl(TopicsPattern topicsPattern,
+       69                                            String topicsHash,
+       70                                            PulsarClientImpl client,
+       71                                            ConsumerConfigurationData<T> conf,
+       72                                            ExecutorProvider executorProvider,
+       73                                            CompletableFuture<Consumer<T>> subscribeFuture,
+       74                                            Schema<T> schema,
+       75                                            Mode subscriptionMode,
+       76                                            ConsumerInterceptors<T> interceptors) {
+       77          super(client, conf, executorProvider, subscribeFuture, schema, interceptors,
+       78                  false /* createTopicIfDoesNotExist */);
+       79          this.topicsPattern = topicsPattern;
+       80          this.topicsHash = topicsHash;
+       81          this.subscriptionMode = subscriptionMode;
+       82          this.namespaceName = topicsPattern.namespace();
+       83  
+       84          this.topicsChangeListener = new PatternTopicsChangedListener();
+       85          this.updateTaskQueue = new PatternConsumerUpdateQueue(this);
+       86          if (subscriptionMode == Mode.PERSISTENT) {
+       87              long watcherId = client.newTopicListWatcherId();
+       88              new TopicListWatcher(updateTaskQueue, client, topicsPattern, watcherId,
+       89                  namespaceName, topicsHash, watcherFuture, () -> recheckTopicsChangeAfterReconnect());
+       90              watcherFuture
+       91                 .exceptionally(ex -> {
+       92                     log.warn("Pattern consumer [{}] unable to create topic list watcher. Falling back to only polling"
+       93                             + " for new topics", conf.getSubscriptionName(), ex);
+       94                     this.recheckPatternTimeout = client.timer().newTimeout(
+       95                             this, Math.max(1, conf.getPatternAutoDiscoveryPeriod()), TimeUnit.SECONDS);
+       96                     return null;
+       97                 });
+       98          } else {
+       99              log.debug("Pattern consumer [{}] not creating topic list watcher for subscription mode {}",
+      100                      conf.getSubscriptionName(), subscriptionMode);
+      101              watcherFuture.complete(null);
+      102              this.recheckPatternTimeout = client.timer().newTimeout(
+      103                      this, Math.max(1, conf.getPatternAutoDiscoveryPeriod()), TimeUnit.SECONDS);
+      104          }
+      105      }
+      106  
+      107      /**
+      108       * This method will be called after the {@link TopicListWatcher} reconnected after enabled {@link TopicListWatcher}.
+      109       */
+      110      private void recheckTopicsChangeAfterReconnect() {
+      111          // Skip if closed or the task has been cancelled.
+      112          if (getState() == State.Closing || getState() == State.Closed) {
+      113              return;
+      114          }
+      115          // Do check.
+      116          updateTaskQueue.appendRecheckOp();
+      117      }
+      118  
+      119      // TimerTask to recheck topics change, and trigger subscribe/unsubscribe based on the change.
+      120      @Override
+      121      public void run(Timeout timeout) throws Exception {
+      122          if (timeout.isCancelled()) {
+      123              return;
+      124          }
+      125          updateTaskQueue.appendRecheckOp();
+      126      }
+      127  
+      128      CompletableFuture<Void> recheckTopicsChange() {
+      129          String pattern = topicsPattern.inputPattern();
+      130          final int epoch = recheckPatternEpoch.incrementAndGet();
+      131          return client.getLookup().getTopicsUnderNamespace(namespaceName, subscriptionMode, pattern, topicsHash)
+      132              .thenCompose(getTopicsResult -> {
+      133                  // If "recheckTopicsChange" has been called more than one times, only make the last one take affects.
+      134                  // Use "synchronized (recheckPatternTaskBackoff)" instead of
+      135                  // `synchronized(PatternMultiTopicsConsumerImpl.this)` to avoid locking in a wider range.
+      136                  synchronized (PatternMultiTopicsConsumerImpl.this) {
+      137                      if (recheckPatternEpoch.get() > epoch) {
+      138                          return CompletableFuture.completedFuture(null);
+      139                      }
+      140                      if (log.isDebugEnabled()) {
+      141                          log.debug("Pattern consumer [{}] get topics under namespace {}, topics.size: {},"
+      142                                          + " topicsHash: {}, filtered: {}",
+      143                                  PatternMultiTopicsConsumerImpl.this.getSubscription(),
+      144                                  namespaceName, getTopicsResult.getTopics().size(), getTopicsResult.getTopicsHash(),
+      145                                  getTopicsResult.isFiltered());
+      146                          getTopicsResult.getTopics().forEach(topicName ->
+      147                                  log.debug("Get topics under namespace {}, topic: {}", namespaceName, topicName));
+      148                      }
+      149  
+      150                      final List<String> oldTopics = new ArrayList<>(getPartitions());
+      151                      return updateSubscriptions(topicsPattern, this::setTopicsHash, getTopicsResult,
+      152                              topicsChangeListener, oldTopics, subscription);
+      153                  }
+      154              }).thenAccept(__ -> {
+      155                  if (recheckPatternTimeout != null) {
+      156                      this.recheckPatternTimeout = client.timer().newTimeout(
+      157                              this, Math.max(1, conf.getPatternAutoDiscoveryPeriod()), TimeUnit.SECONDS);
+      158                  }
+      159              });
+      160      }
+      161  
+      162      static CompletableFuture<Void> updateSubscriptions(TopicsPattern topicsPattern,
+      163                                                         java.util.function.Consumer<String> topicsHashSetter,
+      164                                                         GetTopicsResult getTopicsResult,
+      165                                                         TopicsChangedListener topicsChangedListener,
+      166                                                         List<String> oldTopics,
+      167                                                         String subscriptionForLog) {
+      168          topicsHashSetter.accept(getTopicsResult.getTopicsHash());
+      169          if (!getTopicsResult.isChanged()) {
+      170              return CompletableFuture.completedFuture(null);
+      171          }
+      172  
+      173          List<String> newTopics;
+      174          if (getTopicsResult.isFiltered()) {
+      175              newTopics = getTopicsResult.getNonPartitionedOrPartitionTopics();
+      176          } else {
+      177              newTopics = getTopicsResult.filterTopics(topicsPattern).getNonPartitionedOrPartitionTopics();
+      178          }
+      179  
+      180          final List<CompletableFuture<?>> listenersCallback = new ArrayList<>(2);
+      181          Set<String> topicsAdded = TopicList.minus(newTopics, oldTopics);
+      182          Set<String> topicsRemoved = TopicList.minus(oldTopics, newTopics);
+      183          if (log.isDebugEnabled()) {
+      184              log.debug("Pattern consumer [{}] Recheck pattern consumer's topics. topicsAdded: {}, topicsRemoved: {}",
+      185                      subscriptionForLog, topicsAdded, topicsRemoved);
+      186          }
+      187          listenersCallback.add(topicsChangedListener.onTopicsAdded(topicsAdded));
+      188          listenersCallback.add(topicsChangedListener.onTopicsRemoved(topicsRemoved));
+      189          return FutureUtil.waitForAll(Collections.unmodifiableList(listenersCallback));
+      190      }
+      191  
+      192      public TopicsPattern getPattern() {
+      193          return this.topicsPattern;
+      194      }
+      195  
+      196      @VisibleForTesting
+      197      void setTopicsHash(String topicsHash) {
+      198          this.topicsHash = topicsHash;
+      199      }
+      200  
+      201      interface TopicsChangedListener {
+      202          /***
+      203           * unsubscribe and delete {@link ConsumerImpl} in the {@link MultiTopicsConsumerImpl#consumers} map in
+      204           * {@link MultiTopicsConsumerImpl}.
+      205           * @param removedTopics topic names removed(contains the partition suffix).
+      206           */
+      207          CompletableFuture<Void> onTopicsRemoved(Collection<String> removedTopics);
+      208  
+      209          /***
+      210           * subscribe and create a list of new {@link ConsumerImpl}, added them to the
+      211           * {@link MultiTopicsConsumerImpl#consumers} map in {@link MultiTopicsConsumerImpl}.
+      212           * @param addedTopics topic names added(contains the partition suffix).
+      213           */
+      214          CompletableFuture<Void> onTopicsAdded(Collection<String> addedTopics);
+      215      }
+      216  
+      217      private class PatternTopicsChangedListener implements TopicsChangedListener {
+      218  
+      219          /**
+      220           * {@inheritDoc}
+      221           */
+      222          @Override
+      223          public CompletableFuture<Void> onTopicsRemoved(Collection<String> removedTopics) {
+      224              if (removedTopics.isEmpty()) {
+      225                  return CompletableFuture.completedFuture(null);
+      226              }
+      227  
+      228              // Unsubscribe and remove consumers in memory.
+      229              List<CompletableFuture<Void>> unsubscribeList = new ArrayList<>(removedTopics.size());
+      230              Set<String> partialRemoved = new HashSet<>(removedTopics.size());
+      231              Set<String> partialRemovedForLog = new HashSet<>(removedTopics.size());
+      232              for (String tp : removedTopics) {
+      233                  TopicName topicName = TopicName.get(tp);
+      234                  ConsumerImpl<T> consumer = consumers.get(topicName.toString());
+      235                  if (consumer != null) {
+      236                      CompletableFuture<Void> unsubscribeFuture = new CompletableFuture<>();
+      237                      consumer.closeAsync().whenComplete((__, ex) -> {
+      238                          if (ex != null) {
+      239                              log.error("Pattern consumer [{}] failed to unsubscribe from topics: {}",
+      240                                      PatternMultiTopicsConsumerImpl.this.getSubscription(), topicName.toString(), ex);
+      241                              unsubscribeFuture.completeExceptionally(ex);
+      242                          } else {
+      243                              consumers.remove(topicName.toString(), consumer);
+      244                              unsubscribeFuture.complete(null);
+      245                          }
+      246                      });
+      247                      unsubscribeList.add(unsubscribeFuture);
+      248                      partialRemoved.add(topicName.getPartitionedTopicName());
+      249                      partialRemovedForLog.add(topicName.toString());
+      250                  }
+      251              }
+      252              if (log.isDebugEnabled()) {
+      253                  log.debug("Pattern consumer [{}] remove topics. {}",
+      254                          PatternMultiTopicsConsumerImpl.this.getSubscription(),
+      255                          partialRemovedForLog);
+      256              }
+      257  
+      258              // Remove partitioned topics in memory.
+      259              return FutureUtil.waitForAll(unsubscribeList).handle((__, ex) -> {
+      260                  List<String> removedPartitionedTopicsForLog = new ArrayList<>();
+      261                  for (String groupedTopicRemoved : partialRemoved) {
+      262                      Integer partitions = partitionedTopics.get(groupedTopicRemoved);
+      263                      if (partitions != null) {
+      264                          boolean allPartitionsHasBeenRemoved = true;
+      265                          for (int i = 0; i < partitions; i++) {
+      266                              if (consumers.containsKey(
+      267                                      TopicName.get(groupedTopicRemoved).getPartition(i).toString())) {
+      268                                  allPartitionsHasBeenRemoved = false;
+      269                                  break;
+      270                              }
+      271                          }
+      272                          if (allPartitionsHasBeenRemoved) {
+      273                              removedPartitionedTopicsForLog.add(String.format("%s with %s partitions",
+      274                                      groupedTopicRemoved, partitions));
+      275                              partitionedTopics.remove(groupedTopicRemoved, partitions);
+      276                          }
+      277                      }
+      278                  }
+      279                  if (log.isDebugEnabled()) {
+      280                      log.debug("Pattern consumer [{}] remove partitioned topics because all partitions have been"
+      281                                      + " removed. {}", PatternMultiTopicsConsumerImpl.this.getSubscription(),
+      282                              removedPartitionedTopicsForLog);
+      283                  }
+      284                  return null;
+      285              });
+      286          }
+      287  
+      288          /**
+      289           * {@inheritDoc}
+      290           */
+      291          @Override
+      292          public CompletableFuture<Void> onTopicsAdded(Collection<String> addedTopics) {
+      293              if (addedTopics.isEmpty()) {
+      294                  return CompletableFuture.completedFuture(null);
+      295              }
+      296              List<CompletableFuture<Void>> futures = Lists.newArrayListWithExpectedSize(addedTopics.size());
+      297              /**
+      298               * Three normal cases:
+      299               *  1. Expand partitions.
+      300               *  2. Non-partitioned topic, but has been subscribing.
+      301               *  3. Non-partitioned topic or Partitioned topic, but has not been subscribing.
+      302               * Two unexpected cases:
+      303               *   Error-1: Received adding non-partitioned topic event, but has subscribed a partitioned topic with the
+      304               *     same name.
+      305               *   Error-2: Received adding partitioned topic event, but has subscribed a non-partitioned topic with the
+      306               *     same name.
+      307               *
+      308               * Note: The events that triggered by {@link TopicsPartitionChangedListener} after expanding partitions has
+      309               *    been disabled through "conf.setAutoUpdatePartitions(false)" when creating
+      310               *    {@link PatternMultiTopicsConsumerImpl}.
+      311               */
+      312              Set<String> groupedTopics = new HashSet<>();
+      313              List<String> expendPartitionsForLog = new ArrayList<>();
+      314              for (String tp : addedTopics) {
+      315                  TopicName topicName = TopicName.get(tp);
+      316                  groupedTopics.add(topicName.getPartitionedTopicName());
+      317              }
+      318              for (String tp : addedTopics) {
+      319                  TopicName topicName = TopicName.get(tp);
+      320                  // Case 1: Expand partitions.
+      321                  if (partitionedTopics.containsKey(topicName.getPartitionedTopicName())) {
+      322                      if (consumers.containsKey(topicName.toString())) {
+      323                          // Already subscribed.
+      324                      } else if (topicName.getPartitionIndex() < 0) {
+      325                          // Error-1: Received adding non-partitioned topic event, but has subscribed a partitioned topic
+      326                          // with the same name.
+      327                          log.error("Pattern consumer [{}] skip to subscribe to the non-partitioned topic {}, because has"
+      328                                  + "subscribed a partitioned topic with the same name",
+      329                                  PatternMultiTopicsConsumerImpl.this.getSubscription(), topicName.toString());
+      330                      } else {
+      331                          if (topicName.getPartitionIndex() + 1
+      332                                  > partitionedTopics.get(topicName.getPartitionedTopicName())) {
+      333                              partitionedTopics.put(topicName.getPartitionedTopicName(),
+      334                                      topicName.getPartitionIndex() + 1);
+      335                          }
+      336                          expendPartitionsForLog.add(topicName.toString());
+      337                          CompletableFuture consumerFuture = subscribeAsync(topicName.toString(),
+      338                                  PartitionedTopicMetadata.NON_PARTITIONED);
+      339                          consumerFuture.whenComplete((__, ex) -> {
+      340                              if (ex != null) {
+      341                                  log.warn("Pattern consumer [{}] Failed to subscribe to topics: {}",
+      342                                          PatternMultiTopicsConsumerImpl.this.getSubscription(), topicName, ex);
+      343                              }
+      344                          });
+      345                          futures.add(consumerFuture);
+      346                      }
+      347                      groupedTopics.remove(topicName.getPartitionedTopicName());
+      348                  } else if (consumers.containsKey(topicName.toString())) {
+      349                      // Case-2: Non-partitioned topic, but has been subscribing.
+      350                      groupedTopics.remove(topicName.getPartitionedTopicName());
+      351                  } else if (consumers.containsKey(topicName.getPartitionedTopicName())
+      352                          && topicName.getPartitionIndex() >= 0) {
+      353                      // Error-2: Received adding partitioned topic event, but has subscribed a non-partitioned topic
+      354                      // with the same name.
+      355                      log.error("Pattern consumer [{}] skip to subscribe to the partitioned topic {}, because has"
+      356                                      + "subscribed a non-partitioned topic with the same name",
+      357                              PatternMultiTopicsConsumerImpl.this.getSubscription(), topicName);
+      358                      groupedTopics.remove(topicName.getPartitionedTopicName());
+      359                  }
+      360              }
+      361              // Case 3: Non-partitioned topic or Partitioned topic, which has not been subscribed.
+      362              for (String partitionedTopic : groupedTopics) {
+      363                  CompletableFuture consumerFuture = subscribeAsync(partitionedTopic, false);
+      364                  consumerFuture.whenComplete((__, ex) -> {
+      365                      if (ex != null) {
+      366                          log.warn("Pattern consumer [{}] Failed to subscribe to topics: {}",
+      367                                  PatternMultiTopicsConsumerImpl.this.getSubscription(), partitionedTopic, ex);
+      368                      }
+      369                  });
+      370                  futures.add(consumerFuture);
+      371              }
+      372              if (log.isDebugEnabled()) {
+      373                  log.debug("Pattern consumer [{}] add topics. expend partitions {}, new subscribing {}",
+      374                          PatternMultiTopicsConsumerImpl.this.getSubscription(), expendPartitionsForLog, groupedTopics);
+      375              }
+      376              return FutureUtil.waitForAll(futures);
+      377          }
+      378      }
+      379  
+      380      @Override
+      381      @SuppressFBWarnings
+      382      public CompletableFuture<Void> closeAsync() {
+      383          Timeout timeout = recheckPatternTimeout;
+      384          if (timeout != null) {
+      385              timeout.cancel();
+      386              recheckPatternTimeout = null;
+      387          }
+      388          List<CompletableFuture<?>> closeFutures = new ArrayList<>(2);
+      389          if (watcherFuture.isDone() && !watcherFuture.isCompletedExceptionally()) {
+      390              TopicListWatcher watcher = watcherFuture.getNow(null);
+      391              // watcher can be null when subscription mode is not persistent
+      392              if (watcher != null) {
+      393                  closeFutures.add(watcher.closeAsync());
+      394              }
+      395          }
+      396          closeFutures.add(updateTaskQueue.cancelAllAndWaitForTheRunningTask().thenCompose(__ -> super.closeAsync()));
+      397          return FutureUtil.waitForAll(closeFutures);
+      398      }
+      399  
+      400      @VisibleForTesting
+      401      int getRecheckPatternEpoch() {
+      402          return recheckPatternEpoch.get();
+      403      }
+      404  
+      405      @VisibleForTesting
+      406      Timeout getRecheckPatternTimeout() {
+      407          return recheckPatternTimeout;
+      408      }
+      409  
+      410      protected void handleSubscribeOneTopicError(String topicName,
+      411                                                  Throwable error,
+      412                                                  CompletableFuture<Void> subscribeFuture) {
+      413          subscribeFuture.completeExceptionally(error);
+      414      }
+      415  
+      416      private static final Logger log = LoggerFactory.getLogger(PatternMultiTopicsConsumerImpl.class);
+      417  }

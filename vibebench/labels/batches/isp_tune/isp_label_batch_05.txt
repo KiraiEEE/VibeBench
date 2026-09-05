@@ -1,0 +1,829 @@
+======================================================================
+ROW 40 | implementer | Claude_Code | pyathena-dev/PyAthena#601
+implementer pyathena.pandas.cursor:PandasCursor of pyathena.common:CursorIterator (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[pyathena/common.py]
+METHOD INDEX:
+  L55: def __init__(...)
+  L62: def arraysize(...)
+  L66: def arraysize(...)
+  L74: def rownumber(...)
+  L78: def rowcount(...)
+  L82: def fetchone(...)
+  L86: def fetchmany(...)
+  L90: def fetchall(...)
+  L93: def __next__(...)
+  L99: def __iter__(...)
+
+SOURCE:
+class CursorIterator(metaclass=ABCMeta):
+    """Abstract base class providing iteration and result fetching capabilities for cursors.
+
+    This mixin class provides common functionality for iterating through query results
+    and managing cursor state. It implements the iterator protocol and provides
+    standard fetch methods that conform to the DB API 2.0 specification.
+
+    Attributes:
+        DEFAULT_FETCH_SIZE: Default number of rows to fetch per request (1000).
+        DEFAULT_RESULT_REUSE_MINUTES: Default minutes for Athena result reuse (60).
+        arraysize: Number of rows to fetch with fetchmany() if size not specified.
+
+    Note:
+        This is an abstract base class used by concrete cursor implementations.
+        It should not be instantiated directly.
+    """
+
+    # https://docs.aws.amazon.com/athena/latest/APIReference/API_GetQueryResults.html
+    # Valid Range: Minimum value of 1. Maximum value of 1000.
+    DEFAULT_FETCH_SIZE: int = 1000
+    # https://docs.aws.amazon.com/athena/latest/APIReference/API_ResultReuseByAgeConfiguration.html
+    # Specifies, in minutes, the maximum age of a previous query result
+    # that Athena should consider for reuse. The default is 60.
+    DEFAULT_RESULT_REUSE_MINUTES = 60
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__()
+        self.arraysize: int = kwargs.get("arraysize", self.DEFAULT_FETCH_SIZE)
+        self._rownumber: Optional[int] = None
+        self._rowcount: int = -1  # By default, return -1 to indicate that this is not supported.
+
+    @property
+    def arraysize(self) -> int:
+        return self._arraysize
+
+    @arraysize.setter
+    def arraysize(self, value: int) -> None:
+        if value <= 0 or value > self.DEFAULT_FETCH_SIZE:
+            raise ProgrammingError(
+                f"MaxResults is more than maximum allowed length {self.DEFAULT_FETCH_SIZE}."
+            )
+        self._arraysize = value
+
+    @property
+    def rownumber(self) -> Optional[int]:
+        return self._rownumber
+
+    @property
+    def rowcount(self) -> int:
+        return self._rowcount
+
+    @abstractmethod
+    def fetchone(self):
+        raise NotImplementedError  # pragma: no cover
+
+    @abstractmethod
+    def fetchmany(self):
+        raise NotImplementedError  # pragma: no cover
+
+    @abstractmethod
+    def fetchall(self):
+        raise NotImplementedError  # pragma: no cover
+
+    def __next__(self):
+        row = self.fetchone()
+        if row is None:
+            raise StopIteration
+        return row
+
+    def __iter__(self):
+        return self
+
+--- IMPLEMENTER ---
+[pyathena/pandas/cursor.py]
+METHOD INDEX:
+  L72: def __init__(...)
+  L145: def get_default_converter(...)
+  L153: def arraysize(...)
+  L157: def arraysize(...)
+  L163: def result_set(...)
+  L167: def result_set(...)
+  L171: def query_id(...)
+  L175: def query_id(...)
+  L179: def rownumber(...)
+  L182: def close(...)
+  L186: def execute(...)
+  L289: def executemany(...)
+  L300: def cancel(...)
+  L305: def fetchone(...)
+  L313: def fetchmany(...)
+  L321: def fetchall(...)
+  L329: def as_pandas(...)
+  L340: def iter_chunks(...)
+
+SOURCE:
+class PandasCursor(BaseCursor, CursorIterator, WithResultSet):
+    """Cursor for handling pandas DataFrame results from Athena queries.
+
+    This cursor returns query results as pandas DataFrames with memory-efficient
+    processing through chunking support and automatic chunksize optimization
+    for large result sets. It's ideal for data analysis and data science workflows.
+
+    The cursor supports both regular CSV-based results and high-performance
+    UNLOAD operations that return results in Parquet format, which is significantly
+    faster for large datasets and preserves data types more accurately.
+
+    Attributes:
+        description: Sequence of column descriptions for the last query.
+        rowcount: Number of rows affected by the last query (-1 for SELECT queries).
+        arraysize: Default number of rows to fetch with fetchmany().
+        chunksize: Number of rows per chunk when iterating through results.
+
+    Example:
+        >>> from pyathena.pandas.cursor import PandasCursor
+        >>> cursor = connection.cursor(PandasCursor)
+        >>> cursor.execute("SELECT * FROM sales_data WHERE year = 2023")
+        >>> df = cursor.fetchall()  # Returns pandas DataFrame
+        >>> print(df.describe())
+
+        # Memory-efficient iteration for large datasets
+        >>> cursor.execute("SELECT * FROM huge_table")
+        >>> for chunk_df in cursor:
+        ...     process_chunk(chunk_df)  # Process data in chunks
+
+        # High-performance UNLOAD for large datasets
+        >>> cursor = connection.cursor(PandasCursor, unload=True)
+        >>> cursor.execute("SELECT * FROM big_table")
+        >>> df = cursor.fetchall()  # Faster Parquet-based result
+    """
+
+    def __init__(
+        self,
+        s3_staging_dir: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        catalog_name: Optional[str] = None,
+        work_group: Optional[str] = None,
+        poll_interval: float = 1,
+        encryption_option: Optional[str] = None,
+        kms_key: Optional[str] = None,
+        kill_on_interrupt: bool = True,
+        unload: bool = False,
+        engine: str = "auto",
+        chunksize: Optional[int] = None,
+        block_size: Optional[int] = None,
+        cache_type: Optional[str] = None,
+        max_workers: int = (cpu_count() or 1) * 5,
+        result_reuse_enable: bool = False,
+        result_reuse_minutes: int = CursorIterator.DEFAULT_RESULT_REUSE_MINUTES,
+        auto_optimize_chunksize: bool = False,
+        on_start_query_execution: Optional[Callable[[str], None]] = None,
+        **kwargs,
+    ) -> None:
+        """Initialize PandasCursor with configuration options.
+
+        Args:
+            s3_staging_dir: S3 directory for query result staging.
+            schema_name: Default schema name for queries.
+            catalog_name: Default catalog name for queries.
+            work_group: Athena workgroup name.
+            poll_interval: Query polling interval in seconds.
+            encryption_option: S3 encryption option.
+            kms_key: KMS key for encryption.
+            kill_on_interrupt: Cancel query on interrupt signal.
+            unload: Use UNLOAD statement for faster result retrieval.
+            engine: CSV parsing engine ('auto', 'c', 'python', 'pyarrow').
+            chunksize: Number of rows per chunk for memory-efficient processing.
+                      If specified, takes precedence over auto_optimize_chunksize.
+            block_size: S3 read block size.
+            cache_type: S3 caching strategy.
+            max_workers: Maximum worker threads for parallel processing.
+            result_reuse_enable: Enable query result reuse.
+            result_reuse_minutes: Result reuse duration in minutes.
+            auto_optimize_chunksize: Enable automatic chunksize determination for
+                                   large files. Only effective when chunksize is None.
+                                   Default: False (no automatic chunking).
+            on_start_query_execution: Callback for query start events.
+            **kwargs: Additional arguments passed to pandas.read_csv.
+        """
+        super().__init__(
+            s3_staging_dir=s3_staging_dir,
+            schema_name=schema_name,
+            catalog_name=catalog_name,
+            work_group=work_group,
+            poll_interval=poll_interval,
+            encryption_option=encryption_option,
+            kms_key=kms_key,
+            kill_on_interrupt=kill_on_interrupt,
+            result_reuse_enable=result_reuse_enable,
+            result_reuse_minutes=result_reuse_minutes,
+            **kwargs,
+        )
+        self._unload = unload
+        self._engine = engine
+        self._chunksize = chunksize
+        self._block_size = block_size
+        self._cache_type = cache_type
+        self._max_workers = max_workers
+        self._auto_optimize_chunksize = auto_optimize_chunksize
+        self._on_start_query_execution = on_start_query_execution
+        self._query_id: Optional[str] = None
+        self._result_set: Optional[AthenaPandasResultSet] = None
+
+    @staticmethod
+    def get_default_converter(
+        unload: bool = False,
+    ) -> Union[DefaultPandasTypeConverter, Any]:
+        if unload:
+            return DefaultPandasUnloadTypeConverter()
+        return DefaultPandasTypeConverter()
+
+    @property
+    def arraysize(self) -> int:
+        return self._arraysize
+
+    @arraysize.setter
+... <<truncated, 236 more lines>>
+
+======================================================================
+ROW 41 | implementer | OpenAI_Codex | marin-community/levanter#1139
+implementer levanter.layers.rotary:DefaultRotaryEmbeddingsConfig of levanter.layers.rotary:RotaryEmbeddingsConfig (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/levanter/layers/rotary.py]
+METHOD INDEX:
+  L54: def build(...)
+  L58: def from_hf_config(...)
+  L66: def make_from_hf_config(...)
+  L70: def to_hf_config(...)
+
+SOURCE:
+class RotaryEmbeddingsConfig(abc.ABC, draccus.ChoiceRegistry):
+    theta: float = 10000.0
+
+    @abc.abstractmethod
+    def build(self, HeadSize: Axis) -> RotaryEmbeddings:
+        pass
+
+    @staticmethod
+    def from_hf_config(rope_theta, config: dict | None) -> "RotaryEmbeddingsConfig":
+        if config is None:
+            return DefaultRotaryEmbeddingsConfig(theta=rope_theta)
+        tpe = config.get("rope_type") or config.get("type") or "default"
+        return RotaryEmbeddingsConfig.get_choice_class(tpe).make_from_hf_config(rope_theta, config)
+
+    @classmethod
+    @abc.abstractmethod
+    def make_from_hf_config(cls, rope_theta: float, config: dict) -> "RotaryEmbeddingsConfig":
+        pass
+
+    @abc.abstractmethod
+    def to_hf_config(self) -> tuple[float, dict | None]:
+        """Returns the rope_theta and config dict for the HF config."""
+        pass
+
+--- IMPLEMENTER ---
+[src/levanter/layers/rotary.py]
+METHOD INDEX:
+  L80: def build(...)
+  L84: def make_from_hf_config(...)
+  L87: def to_hf_config(...)
+
+SOURCE:
+class DefaultRotaryEmbeddingsConfig(RotaryEmbeddingsConfig):
+    theta: float = 10000
+    factor: float = 1.0  # this should have been called scale_factor, but for hf compat
+
+    def build(self, HeadSize: Axis) -> RotaryEmbeddings:
+        return DefaultRotaryEmbeddings(HeadSize, self)
+
+    @classmethod
+    def make_from_hf_config(cls, rope_theta: float, config: dict) -> "RotaryEmbeddingsConfig":
+        return DefaultRotaryEmbeddingsConfig(theta=rope_theta, factor=config.get("factor", 1.0))
+
+    def to_hf_config(self) -> tuple[float, dict | None]:
+        if self.factor == 1.0:
+            return self.theta, None
+        return self.theta, {"factor": self.factor}
+
+======================================================================
+ROW 42 | interface | OpenAI_Codex | sooperset/mcp-atlassian#540
+interface mcp_atlassian.jira.protocols:AttachmentsOperationsProto kind=protocol
+======================================================================
+[src/mcp_atlassian/jira/protocols.py]
+METHOD INDEX:
+  L14: def upload_attachments(...)
+
+SOURCE:
+class AttachmentsOperationsProto(Protocol):
+    """Protocol defining attachments operations interface."""
+
+    @abstractmethod
+    def upload_attachments(
+        self, issue_key: str, file_paths: list[str]
+    ) -> dict[str, Any]:
+        """
+        Upload multiple attachments to a Jira issue.
+
+        Args:
+            issue_key: The Jira issue key (e.g., 'PROJ-123')
+            file_paths: List of paths to files to upload
+
+        Returns:
+            A dictionary with upload results
+        """
+
+======================================================================
+ROW 43 | implementer | Copilot | pytorch/ignite#3689
+implementer tests.ignite.metrics.test_metric:InvalidMetric of ignite.metrics.metric:Metric (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[ignite/metrics/metric.py]
+METHOD INDEX:
+  L363: def __init__(...)
+  L395: def reset(...)
+  L403: def update(...)
+  L414: def compute(...)
+  L429: def started(...)
+  L439: def iteration_completed(...)
+  L488: def completed(...)
+  L525: def _check_usage(...)
+  L541: def attach(...)
+  L582: def detach(...)
+  L625: def is_attached(...)
+  L638: def _state_dict_per_rank(...)
+  L663: def state_dict(...)
+  L673: def _load_state_dict_per_rank(...)
+  L693: def load_state_dict(...)
+  L727: def __add__(...)
+  L732: def __radd__(...)
+  L737: def __sub__(...)
+  L742: def __rsub__(...)
+  L747: def __mul__(...)
+  L752: def __rmul__(...)
+  L757: def __pow__(...)
+  L762: def __rpow__(...)
+  L767: def __mod__(...)
+  L772: def __truediv__(...)
+  L777: def __rtruediv__(...)
+  L782: def __floordiv__(...)
+  L787: def __getattr__(...)
+  L801: def __getitem__(...)
+  L806: def __getstate__(...)
+  L809: def __setstate__(...)
+  L639: def func(...)
+  L676: def func(...)
+  L793: def fn(...)
+  L796: def wrapper(...)
+
+SOURCE:
+class Metric(Serializable, metaclass=ABCMeta):
+    """
+    Base class for all Metrics.
+
+    Args:
+        output_transform: a callable that is used to transform the
+            :class:`~ignite.engine.engine.Engine`'s ``process_function``'s output into the
+            form expected by the metric. This can be useful if, for example, you have a multi-output model and
+            you want to compute the metric with respect to one of the outputs.
+            By default, metrics require the output as ``(y_pred, y)`` or ``{'y_pred': y_pred, 'y': y}``.
+        device: specifies which device updates are accumulated on. Setting the
+            metric's device to be the same as your ``update`` arguments ensures the ``update`` method is
+            non-blocking. By default, CPU.
+        skip_unrolling: specifies whether output should be unrolled before being fed to update method. Should be
+            true for multi-output model, for example, if ``y_pred`` contains multi-ouput as ``(y_pred_a, y_pred_b)``
+            Alternatively, ``output_transform`` can be used to handle this.
+        metrics_result_mode: specifies how to put the computed metrics results into
+            ``engine.state.metrics`` dictionary. Valid values are: "flatten", "named", "both".
+            - "flatten": if the computed result is a mapping, its keys/values are put directly into the engine state metrics dictionary
+            - "named": if the computed result is a mapping, the whole mapping is put into the engine state metrics dictionary under the metric name
+            - "both": combination of "flatten" and "named".
+
+
+            Examples:
+                The following example shows a custom loss metric that expects input from a multi-output model.
+
+                .. code-block:: python
+
+                    import torch
+                    import torch.nn as nn
+                    import torch.nn.functional as F
+
+                    from ignite.engine import create_supervised_evaluator
+                    from ignite.metrics import Loss
+
+                    class MyLoss(nn.Module):
+                        def __init__(self, ca: float = 1.0, cb: float = 1.0) -> None:
+                            super().__init__()
+                            self.ca = ca
+                            self.cb = cb
+
+                        def forward(self,
+                                    y_pred: Tuple[torch.Tensor, torch.Tensor],
+                                    y_true: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+                            a_true, b_true = y_true
+                            a_pred, b_pred = y_pred
+                            return self.ca * F.mse_loss(a_pred, a_true) + self.cb * F.cross_entropy(b_pred, b_true)
+
+
+                    def prepare_batch(batch, device, non_blocking):
+                        return torch.rand(4, 1), (torch.rand(4, 1), torch.rand(4, 2))
+
+
+                    class MyModel(nn.Module):
+
+                        def forward(self, x):
+                            return torch.rand(4, 1), torch.rand(4, 2)
+
+
+                    model = MyModel()
+
+                    device = "cpu"
+                    loss = MyLoss(0.5, 1.0)
+                    metrics = {
+                        "Loss": Loss(loss, skip_unrolling=True)
+                    }
+                    train_evaluator = create_supervised_evaluator(model, metrics, device, prepare_batch=prepare_batch)
+
+
+                    data = range(10)
+                    train_evaluator.run(data)
+                    train_evaluator.state.metrics["Loss"]
+
+    Attributes:
+        required_output_keys: dictionary defines required keys to be found in ``engine.state.output`` if the
+            latter is a dictionary. By default, ``("y_pred", "y")``. This is useful with custom metrics that can require
+            other arguments than predictions ``y_pred`` and targets ``y``. See an example below.
+
+    Examples:
+        Let's implement a custom metric that requires ``y_pred``, ``y`` and ``x`` as input for ``update`` function.
+        In the example below we show how to setup standard metric like Accuracy and the custom metric using by an
+        ``evaluator`` created with :meth:`~ignite.engine.create_supervised_evaluator` method.
+
+        For more information on how metric works with :class:`~ignite.engine.engine.Engine`, visit :ref:`attach-engine`.
+
+        .. code-block:: python
+
+            # https://discuss.pytorch.org/t/how-access-inputs-in-custom-ignite-metric/91221/5
+
+            import torch
+            import torch.nn as nn
+
+            from ignite.metrics import Metric, Accuracy
+            from ignite.engine import create_supervised_evaluator
+
+            class CustomMetric(Metric):
+
+                required_output_keys = ("y_pred", "y", "x")
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+
+                def update(self, output):
+                    y_pred, y, x = output
+                    # ...
+
+                def reset(self):
+                    # ...
+                    pass
+
+                def compute(self):
+                    # ...
+                    pass
+
+            model = ...
+
+            metrics = {
+                "Accuracy": Accuracy(),
+                "CustomMetric": CustomMetric()
+            }
+... <<truncated, 469 more lines>>
+
+--- IMPLEMENTER ---
+[tests/ignite/metrics/test_metric.py]
+METHOD INDEX:
+  L575: def reset(...)
+  L582: def compute(...)
+  L585: def update(...)
+  L589: def invalid_reduction_op_1(...)
+  L593: def invalid_reduction_op_2(...)
+  L597: def invalid_reduction_op_3(...)
+  L601: def invalid_reduction_op_4(...)
+  L605: def invalid_reduction_op_5(...)
+  L609: def invalid_reduction_op_6(...)
+
+SOURCE:
+    class InvalidMetric(Metric):
+        @reinit__is_reduced
+        def reset(self):
+            self.a = torch.tensor([0.0, 1.0, 2.0, 3.0], requires_grad=False)
+            self.c = 0.0
+            self.n = 0
+            self.m = -1
+            self.d = "a string"
+
+        def compute(self):
+            pass
+
+        def update(self):
+            pass
+
+        @sync_all_reduce("a:sum")
+        def invalid_reduction_op_1(self):
+            pass
+
+        @sync_all_reduce("c:MaX")
+        def invalid_reduction_op_2(self):
+            pass
+
+        @sync_all_reduce("n:MINN")
+        def invalid_reduction_op_3(self):
+            pass
+
+        @sync_all_reduce("m:PROduCT")
+        def invalid_reduction_op_4(self):
+            pass
+
+        @sync_all_reduce("missingattr")
+        def invalid_reduction_op_5(self):
+            pass
+
+        @sync_all_reduce("d")
+        def invalid_reduction_op_6(self):
+            pass
+
+======================================================================
+ROW 44 | implementer | Claude_Code | vllm-project/vllm#37322
+implementer tests.entrypoints.openai.test_serving_responses:MockConversationContext of vllm.entrypoints.openai.responses.context:ConversationContext (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[vllm/entrypoints/openai/responses/context.py]
+METHOD INDEX:
+  L109: def append_output(...)
+  L113: def append_tool_output(...)
+  L117: def call_tool(...)
+  L121: def need_builtin_tool_call(...)
+  L125: def render_for_completion(...)
+  L129: def init_tool_sessions(...)
+  L139: def cleanup_session(...)
+
+SOURCE:
+class ConversationContext(ABC):
+    @abstractmethod
+    def append_output(self, output: RequestOutput) -> None:
+        pass
+
+    @abstractmethod
+    def append_tool_output(self, output) -> None:
+        pass
+
+    @abstractmethod
+    async def call_tool(self) -> list[Message]:
+        pass
+
+    @abstractmethod
+    def need_builtin_tool_call(self) -> bool:
+        pass
+
+    @abstractmethod
+    def render_for_completion(self) -> list[int]:
+        pass
+
+    @abstractmethod
+    async def init_tool_sessions(
+        self,
+        tool_server: ToolServer | None,
+        exit_stack: AsyncExitStack,
+        request_id: str,
+        mcp_tools: dict[str, Mcp],
+    ) -> None:
+        pass
+
+    @abstractmethod
+    async def cleanup_session(self) -> None:
+        raise NotImplementedError("Should not be called.")
+
+--- IMPLEMENTER ---
+[tests/entrypoints/openai/test_serving_responses.py]
+METHOD INDEX:
+  L48: def __init__(...)
+  L53: def append_output(...)
+  L56: def append_tool_output(...)
+  L59: def call_tool(...)
+  L62: def need_builtin_tool_call(...)
+  L65: def render_for_completion(...)
+  L68: def init_tool_sessions(...)
+  L72: def cleanup_session(...)
+
+SOURCE:
+class MockConversationContext(ConversationContext):
+    """Mock conversation context for testing"""
+
+    def __init__(self):
+        self.init_tool_sessions_called = False
+        self.init_tool_sessions_args = None
+        self.init_tool_sessions_kwargs = None
+
+    def append_output(self, output) -> None:
+        pass
+
+    def append_tool_output(self, output) -> None:
+        pass
+
+    async def call_tool(self):
+        return []
+
+    def need_builtin_tool_call(self) -> bool:
+        return False
+
+    def render_for_completion(self):
+        return []
+
+    async def init_tool_sessions(self, tool_server, exit_stack, request_id, mcp_tools):
+        self.init_tool_sessions_called = True
+        self.init_tool_sessions_args = (tool_server, exit_stack, request_id, mcp_tools)
+
+    async def cleanup_session(self) -> None:
+        pass
+
+======================================================================
+ROW 45 | implementer | Copilot | zfit/zfit#644
+implementer zfit.models.dist_tfp:BifurGauss of zfit._interfaces:ZfitNumericParametrized (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/zfit/_interfaces.py]
+METHOD INDEX:
+  L683: def dtype(...)
+
+SOURCE:
+class ZfitNumericParametrized(ZfitParametrized):
+    @property
+    @abstractmethod
+    def dtype(self) -> tf.DType:
+        """The `DType` of `Tensor`s handled by this `model`."""
+        raise NotImplementedError
+
+--- IMPLEMENTER ---
+[src/zfit/models/dist_tfp.py]
+METHOD INDEX:
+  L936: def __init__(...)
+  L1015: def dist_params(...)
+
+SOURCE:
+class BifurGauss(WrapDistribution, SerializableMixin):
+    _N_OBS = 1
+
+    def __init__(
+        self,
+        mu: ztyping.ParamTypeInput,
+        sigmal: ztyping.ParamTypeInput,
+        sigmar: ztyping.ParamTypeInput,
+        obs: ztyping.ObsTypeInput,
+        *,
+        extended: ExtendedInputType = None,
+        norm: NormInputType = None,
+        name: str = "BifurGauss",
+        label: str | None = None,
+    ):
+        """Bifurcated Gaussian distribution different standard deviations for the left and right side of the mean.
+
+        The bifurcated Gaussian shape is defined as
+
+        .. math::
+
+            f(x \\mid \\mu, \\sigma_{L}, \\sigma_{R}) = \\begin{cases}
+            A \\exp{\\left(-\\frac{(x - \\mu)^2}{2 \\sigma_{L}^2}\\right)}, & \\mbox{for } x < \\mu \\newline
+            A \\exp{\\left(-\\frac{(x - \\mu)^2}{2 \\sigma_{R}^2}\\right)}, & \\mbox{for } x \\geq \\mu
+            \\end{cases}
+
+        with the normalization over [-inf, inf] of
+
+        .. math::
+
+            A = \\sqrt{\\frac{2}{\\pi}} \\frac{1}{\\sigma_{L} + \\sigma_{R}}
+
+        The normalization changes for different normalization ranges
+
+        Args:
+            mu: Mean of the distribution
+            sigmal: Standard deviation on the left side of the mean
+            sigmar: Standard deviation for the right side of the mean
+            obs: |@doc:pdf.init.obs| Observables of the
+               model. This will be used as the default space of the PDF and,
+               if not given explicitly, as the normalization range.
+
+               The default space is used for example in the sample method: if no
+               sampling limits are given, the default space is used.
+
+               If the observables are binned and the model is unbinned, the
+               model will be a binned model, by wrapping the model in a
+               :py:class:`~zfit.pdf.BinnedFromUnbinnedPDF`, equivalent to
+               calling :py:meth:`~zfit.pdf.BasePDF.to_binned`.
+
+               If the observables are binned and the model is unbinned, the
+               model will be a binned model, by wrapping the model in a
+               :py:class:`~zfit.pdf.BinnedFromUnbinnedPDF`, equivalent to
+               calling :py:meth:`~zfit.pdf.BasePDF.to_binned`.
+
+               The observables are not equal to the domain as it does not restrict or
+               truncate the model outside this range. |@docend:pdf.init.obs|
+            extended: |@doc:pdf.init.extended| The overall yield of the PDF.
+               If this is parameter-like, it will be used as the yield,
+               the expected number of events, and the PDF will be extended.
+               An extended PDF has additional functionality, such as the
+               ``ext_*`` methods and the ``counts`` (for binned PDFs). |@docend:pdf.init.extended|
+            norm: |@doc:pdf.init.norm| Normalization of the PDF.
+               By default, this is the same as the default space of the PDF. |@docend:pdf.init.norm|
+            name: |@doc:pdf.init.name| Name of the PDF.
+               Maybe has implications on the serialization and deserialization of the PDF.
+               For a human-readable name, use the label. |@docend:pdf.init.name|
+            label: |@doc:pdf.init.label| Human-readable name
+               or label of
+               the PDF for a better description, to be used with plots etc.
+               Has no programmatical functional purpose as identification. |@docend:pdf.init.label|
+        """
+        mu, sigmal, sigmar = self._check_input_params_tfp(mu, sigmal, sigmar)
+        params = {"mu": mu, "sigmal": sigmal, "sigmar": sigmar}
+
+        # sigmal = scale / skewness
+        # sigmar = scale * skewness
+        # scale = sigmal * skewness
+        # sigmar = sigmal * skewness^2
+        # skewness = sqrt(sigmar / sigmal)
+        # scale = sigmal * sqrt(sigmar / sigmal)
+
+        def dist_params():
+            scale = sigmal.value() * znp.sqrt(sigmar.value() / sigmal.value())
+            skewness = znp.sqrt(sigmar.value() / sigmal.value())
+            return {"loc": mu.value(), "scale": scale, "skewness": skewness}
+
+        distribution = tfp.distributions.TwoPieceNormal
+        super().__init__(
+            distribution=distribution,
+            dist_params=dist_params,
+            obs=obs,
+            params=params,
+            name=name,
+            extended=extended,
+            norm=norm,
+            label=label,
+        )
+
+======================================================================
+ROW 46 | implementer | OpenAI_Codex | NVIDIA/NVFlare#4368
+implementer tests.unit_test.app_common.widgets.metric_relay_test:_IdlePipe of nvflare.fuel.utils.attributes_exportable:AttributesExportable (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[nvflare/fuel/utils/attributes_exportable.py]
+METHOD INDEX:
+  L30: def export(...)
+
+SOURCE:
+class AttributesExportable(ABC):
+    """Export attributes."""
+
+    @abstractmethod
+    def export(self, export_mode: str) -> Tuple[str, dict]:
+        """Exports attributes.
+
+        Args:
+            export_mode (str): export to peer (`ExportMode.PEER`) or to self (`ExportMode.SELF`).
+
+        Returns:
+            A tuple of (export section name, arguments to be exported)
+        """
+        pass
+
+--- IMPLEMENTER ---
+[tests/unit_test/app_common/widgets/metric_relay_test.py]
+METHOD INDEX:
+  L258: def receive(...)
+
+SOURCE:
+class _IdlePipe(_FakePipe):
+    """Pipe whose receive() blocks briefly then returns None , keeps the reader alive."""
+
+    def receive(self, timeout=None):
+        time.sleep(0.01)
+        return None
+
+======================================================================
+ROW 47 | interface | Claude_Code | nexi-lab/nexus#2148
+interface nexus.bricks.memory.coref_resolver:CorefResolver kind=abc
+======================================================================
+[src/nexus/bricks/memory/coref_resolver.py]
+METHOD INDEX:
+  L59: def resolve(...)
+
+SOURCE:
+class CorefResolver(ABC):
+    """Abstract base class for coreference resolvers."""
+
+    @abstractmethod
+    def resolve(
+        self,
+        text: str,
+        context: str | None = None,
+        entity_hints: dict[str, str] | None = None,
+    ) -> CorefResult:
+        """Resolve coreferences in text.
+
+        Args:
+            text: Text to resolve pronouns in.
+            context: Optional prior conversation context (recommended: 2-3 preceding turns).
+            entity_hints: Optional dict mapping roles to names,
+                         e.g., {"speaker": "Alice", "other": "Bob"}
+
+        Returns:
+            CorefResult with resolved text and replacement details.
+        """
+        pass

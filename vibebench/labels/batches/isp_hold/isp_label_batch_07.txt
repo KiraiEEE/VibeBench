@@ -1,0 +1,1059 @@
+======================================================================
+ROW 56 | implementer | OpenAI_Codex | marin-community/levanter#1139
+implementer levanter.data.metrics_monitor:LoggerMetricsMonitor of levanter.data.metrics_monitor:MetricsMonitor (kind=protocol)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/levanter/data/metrics_monitor.py]
+METHOD INDEX:
+  L27: def __call__(...)
+
+SOURCE:
+class MetricsMonitor(Protocol):
+    def __call__(self, metrics: InProgressCacheMetrics): ...
+
+--- IMPLEMENTER ---
+[src/levanter/data/metrics_monitor.py]
+METHOD INDEX:
+  L66: def __init__(...)
+  L79: def __call__(...)
+
+SOURCE:
+class LoggerMetricsMonitor(MetricsMonitor):
+    # TODO: I'd like to get the trainer pbar migrated to rich and just use rich everywhere, but until then,
+    # we have separate logging
+    def __init__(
+        self,
+        logger: Optional[Union[pylogging.Logger, str]] = None,
+        level=pylogging.INFO,
+        log_interval: float | int = 30.0,
+    ):
+        if isinstance(logger, str):
+            logger = pylogging.getLogger(logger)
+        self.logger = logger or pylogging.getLogger(__name__)
+        self.level = level
+        self.log_interval = log_interval
+        self._last_log_time = time.time()
+
+    def __call__(self, metrics: InProgressCacheMetrics):
+        if jax.process_index() == 0:
+            if time.time() - self._last_log_time > self.log_interval:
+                self._last_log_time = time.time()
+
+                self.logger.log(
+                    self.level,
+                    f" done: Shards: {metrics.shards_finished} | Docs: {metrics.rows_finished}",
+                )
+
+        if metrics.is_finished:
+            self.logger.info("Cache creation finished")
+
+======================================================================
+ROW 57 | implementer | OpenAI_Codex | marin-community/levanter#1139
+implementer levanter.data.text:MultiturnChatDataset of levanter.data.dataset:AsyncDataset (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/levanter/data/dataset.py]
+METHOD INDEX:
+  L60: def __init__(...)
+  L64: def async_len(...)
+  L68: def final_length_is_known(...)
+  L74: def is_finite(...)
+  L82: def current_len(...)
+  L91: def getitem_async(...)
+  L100: def get_batch(...)
+  L103: def wait_until_len_at_least(...)
+  L117: def as_sync_dataset(...)
+  L120: def as_async_dataset(...)
+  L123: def map(...)
+  L126: def map_batches(...)
+  L129: def slice_dataset(...)
+  L135: def take(...)
+  L141: def shuffle(...)
+  L146: def era_shuffle(...)
+
+SOURCE:
+class AsyncDataset(DatasetBase[T_co]):
+    """
+    An asynchronous dataset that can be used with async/await syntax. In Levanter, we use AsyncDataset for two purposes:
+    * To represent datasets that are inherently asynchronous (e.g. reading from disk, network, etc.).
+    * To represent datasets that are still being constructed.
+
+    The core methods in this class are:
+    * `async_len`: Returns the final length of the dataset.
+    * `get_batch`: Returns a batch of items from the dataset.
+    * `current_len`: Returns the current length of the dataset. This may be None if no current length is known.
+    """
+
+    def __init__(self):
+        self._min_known_len = 0
+
+    @abc.abstractmethod
+    async def async_len(self) -> int:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def final_length_is_known(self) -> bool:
+        """Returns whether the final length of the dataset is known.
+        If this returns False, the current_len of the dataset may change in the future."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def is_finite(self) -> bool:
+        """
+        Returns whether the dataset will have a known length in the future (e.g. if it's being constructed).
+        If this returns False, the length of the dataset is infinite or unknowable.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def current_len(self) -> Optional[int]:
+        """
+        Returns the current length of the dataset that won't require (expensive) waiting.
+
+        If the current length is not known, returns None. This might block temporarily for a short time to get the
+        current length.
+        """
+        raise NotImplementedError
+
+    async def getitem_async(self, index: int) -> T_co:
+        """
+        Returns the item at the given index. Typically implemented as a wrapper around `get_batch`.
+
+        In general, it is better to call (and override) `get_batch` instead of this method.
+        """
+        return (await self.get_batch([index]))[0]
+
+    @abc.abstractmethod
+    async def get_batch(self, indices: Sequence[int]) -> Sequence[T_co]:
+        raise NotImplementedError
+
+    async def wait_until_len_at_least(self, length: int) -> int:
+        """
+        Returns the length of the dataset once it is at least `length` or if the dataset has a known (finished) length.
+
+        The default implementation is a naive busy-wait loop. You should override this method for more efficient
+        implementations.
+        """
+        if length <= self._min_known_len:
+            return self._min_known_len
+
+        res_len = await naive_busy_wait_until_len_at_least(self, length)
+        self._min_known_len = max(self._min_known_len, res_len)
+        return res_len
+
+    def as_sync_dataset(self):
+        return SyncifiedDataset(self)
+
+    def as_async_dataset(self) -> "AsyncDataset[T_co]":
+        return self
+
+    def map(self, fn: MapFunction[U], *extra_args, **extra_kwargs) -> "MappedAsyncDataset[T_co, U]":
+        return MappedAsyncDataset(self, fn, *extra_args, **extra_kwargs)
+
+    def map_batches(self, fn: MapFunction[Sequence[U]], *extra_args, **extra_kwargs) -> "BatchMappedAsyncDataset[U]":
+        return BatchMappedAsyncDataset(self, fn, *extra_args, **extra_kwargs)
+
+    def slice_dataset(self, start_index: Optional[int] = None, end_index: Optional[int] = None):
+        """
+        Slices the dataset from `start_index` to `end_index`.
+        """
+        return SlicedAsyncDataset(self, start_index, end_index)
+
+    def take(self, n: int):
+        """
+        Alias for `slice_dataset(end_index=n)`.
+        """
+        return self.slice_dataset(end_index=n)
+
+    def shuffle(self, key: PRNGKeyArray, *, perm_type: PermType = "feistel"):
+        import levanter.data.permutation as permutation
+
+        return permutation.PermutationDataset(self, key, perm_type=perm_type)
+
+    def era_shuffle(self, era_length: int, key: PRNGKeyArray, *, perm_type: PermType = "feistel"):
+        import levanter.data.permutation as permutation
+
+        return permutation.EraShufflingDataset(self, era_length, key=key, perm_type=perm_type)
+
+--- IMPLEMENTER ---
+[src/levanter/data/text.py]
+METHOD INDEX:
+  L1534: def __init__(...)
+  L1558: def _create_lm_example(...)
+
+SOURCE:
+class MultiturnChatDataset(MappedAsyncDataset[tuple[ProcessedChatDict, ProcessedChatDict], LmExample]):
+    """
+    A dataset that yields multiturn chat examples from a cache of processed chat data.
+
+
+    Args:
+        cache: The cache of processed chat data.
+        Pos: The position axis.
+        max_segments_per_example: The maximum number of segments to pack into a single example. Set to 1 to disable packing.
+        slice_strategy: The strategy to use when an example is too long.
+    """
+
+    def __init__(
+        self,
+        cache: TreeCache[ProcessedChatDict],
+        Pos: Axis,
+        max_segments_per_example: int = 64,
+        slice_strategy: Literal["left", "right", "raise"] = "left",
+        mask_user_turns: bool = True,
+    ):
+        # NB the GreedyPackedDataset returns a tuple, where the first has the packed leaves
+        # and the second has the segment ids
+        # TODO: do better with blocking
+        cache.await_finished()
+        self.packed: GreedyPrepackedDataset[ProcessedChatDict] = GreedyPrepackedDataset(
+            cache.store.tree,
+            Pos.size,
+            max_segments_per_example=max_segments_per_example,
+            slice_strategy=slice_strategy,
+        )
+        self.Pos = Pos
+
+        sharding = jax.sharding.SingleDeviceSharding(jax.local_devices(backend="cpu")[0])
+        self.mask_user_turns = mask_user_turns
+
+        @functools.partial(eqx.filter_jit, out_shardings=sharding)
+        def _create_lm_example(e: tuple[ProcessedChatDict, ProcessedChatDict]) -> LmExample:
+            example, seg_ids = e
+            tokens = hax.named(example["input_ids"], self.Pos)
+
+            if mask_user_turns:
+                # mask is 1 on the position of the assistant tokens
+                mask = example["assistant_masks"]
+                # loss_mask by convention is 1 on the positions where we compute loss, i.e. shifted back 1
+                mask = jnp.roll(mask, -1, axis=-1)
+                loss_mask = hax.named(mask, self.Pos)
+            else:
+                loss_mask = None
+
+            seg_ids = hax.named(seg_ids["input_ids"], self.Pos)
+
+            return LmExample.causal(tokens=tokens, loss_mask=loss_mask, segment_ids=seg_ids)
+
+        super().__init__(self.packed, _create_lm_example)
+
+======================================================================
+ROW 58 | implementer | Copilot | pytorch/ignite#3689
+implementer tests.ignite.metrics.test_metric:DummyMetric2 of ignite.metrics.metric:Metric (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[ignite/metrics/metric.py]
+METHOD INDEX:
+  L363: def __init__(...)
+  L395: def reset(...)
+  L403: def update(...)
+  L414: def compute(...)
+  L429: def started(...)
+  L439: def iteration_completed(...)
+  L488: def completed(...)
+  L525: def _check_usage(...)
+  L541: def attach(...)
+  L582: def detach(...)
+  L625: def is_attached(...)
+  L638: def _state_dict_per_rank(...)
+  L663: def state_dict(...)
+  L673: def _load_state_dict_per_rank(...)
+  L693: def load_state_dict(...)
+  L727: def __add__(...)
+  L732: def __radd__(...)
+  L737: def __sub__(...)
+  L742: def __rsub__(...)
+  L747: def __mul__(...)
+  L752: def __rmul__(...)
+  L757: def __pow__(...)
+  L762: def __rpow__(...)
+  L767: def __mod__(...)
+  L772: def __truediv__(...)
+  L777: def __rtruediv__(...)
+  L782: def __floordiv__(...)
+  L787: def __getattr__(...)
+  L801: def __getitem__(...)
+  L806: def __getstate__(...)
+  L809: def __setstate__(...)
+  L639: def func(...)
+  L676: def func(...)
+  L793: def fn(...)
+  L796: def wrapper(...)
+
+SOURCE:
+class Metric(Serializable, metaclass=ABCMeta):
+    """
+    Base class for all Metrics.
+
+    Args:
+        output_transform: a callable that is used to transform the
+            :class:`~ignite.engine.engine.Engine`'s ``process_function``'s output into the
+            form expected by the metric. This can be useful if, for example, you have a multi-output model and
+            you want to compute the metric with respect to one of the outputs.
+            By default, metrics require the output as ``(y_pred, y)`` or ``{'y_pred': y_pred, 'y': y}``.
+        device: specifies which device updates are accumulated on. Setting the
+            metric's device to be the same as your ``update`` arguments ensures the ``update`` method is
+            non-blocking. By default, CPU.
+        skip_unrolling: specifies whether output should be unrolled before being fed to update method. Should be
+            true for multi-output model, for example, if ``y_pred`` contains multi-ouput as ``(y_pred_a, y_pred_b)``
+            Alternatively, ``output_transform`` can be used to handle this.
+        metrics_result_mode: specifies how to put the computed metrics results into
+            ``engine.state.metrics`` dictionary. Valid values are: "flatten", "named", "both".
+            - "flatten": if the computed result is a mapping, its keys/values are put directly into the engine state metrics dictionary
+            - "named": if the computed result is a mapping, the whole mapping is put into the engine state metrics dictionary under the metric name
+            - "both": combination of "flatten" and "named".
+
+
+            Examples:
+                The following example shows a custom loss metric that expects input from a multi-output model.
+
+                .. code-block:: python
+
+                    import torch
+                    import torch.nn as nn
+                    import torch.nn.functional as F
+
+                    from ignite.engine import create_supervised_evaluator
+                    from ignite.metrics import Loss
+
+                    class MyLoss(nn.Module):
+                        def __init__(self, ca: float = 1.0, cb: float = 1.0) -> None:
+                            super().__init__()
+                            self.ca = ca
+                            self.cb = cb
+
+                        def forward(self,
+                                    y_pred: Tuple[torch.Tensor, torch.Tensor],
+                                    y_true: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+                            a_true, b_true = y_true
+                            a_pred, b_pred = y_pred
+                            return self.ca * F.mse_loss(a_pred, a_true) + self.cb * F.cross_entropy(b_pred, b_true)
+
+
+                    def prepare_batch(batch, device, non_blocking):
+                        return torch.rand(4, 1), (torch.rand(4, 1), torch.rand(4, 2))
+
+
+                    class MyModel(nn.Module):
+
+                        def forward(self, x):
+                            return torch.rand(4, 1), torch.rand(4, 2)
+
+
+                    model = MyModel()
+
+                    device = "cpu"
+                    loss = MyLoss(0.5, 1.0)
+                    metrics = {
+                        "Loss": Loss(loss, skip_unrolling=True)
+                    }
+                    train_evaluator = create_supervised_evaluator(model, metrics, device, prepare_batch=prepare_batch)
+
+
+                    data = range(10)
+                    train_evaluator.run(data)
+                    train_evaluator.state.metrics["Loss"]
+
+    Attributes:
+        required_output_keys: dictionary defines required keys to be found in ``engine.state.output`` if the
+            latter is a dictionary. By default, ``("y_pred", "y")``. This is useful with custom metrics that can require
+            other arguments than predictions ``y_pred`` and targets ``y``. See an example below.
+
+    Examples:
+        Let's implement a custom metric that requires ``y_pred``, ``y`` and ``x`` as input for ``update`` function.
+        In the example below we show how to setup standard metric like Accuracy and the custom metric using by an
+        ``evaluator`` created with :meth:`~ignite.engine.create_supervised_evaluator` method.
+
+        For more information on how metric works with :class:`~ignite.engine.engine.Engine`, visit :ref:`attach-engine`.
+
+        .. code-block:: python
+
+            # https://discuss.pytorch.org/t/how-access-inputs-in-custom-ignite-metric/91221/5
+
+            import torch
+            import torch.nn as nn
+
+            from ignite.metrics import Metric, Accuracy
+            from ignite.engine import create_supervised_evaluator
+
+            class CustomMetric(Metric):
+
+                required_output_keys = ("y_pred", "y", "x")
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+
+                def update(self, output):
+                    y_pred, y, x = output
+                    # ...
+
+                def reset(self):
+                    # ...
+                    pass
+
+                def compute(self):
+                    # ...
+                    pass
+
+            model = ...
+
+            metrics = {
+                "Accuracy": Accuracy(),
+                "CustomMetric": CustomMetric()
+            }
+... <<truncated, 469 more lines>>
+
+--- IMPLEMENTER ---
+[tests/ignite/metrics/test_metric.py]
+METHOD INDEX:
+  L538: def reset(...)
+  L541: def compute(...)
+  L545: def update(...)
+
+SOURCE:
+class DummyMetric2(Metric):
+    @reinit__is_reduced
+    def reset(self):
+        pass
+
+    def compute(self):
+        pass
+
+    @reinit__is_reduced
+    def update(self, output):
+        pass
+
+======================================================================
+ROW 59 | implementer | Copilot | zfit/zfit#644
+implementer zfit.models.functions:ProdFunc of zfit._interfaces:ZfitParametrized (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/zfit/_interfaces.py]
+METHOD INDEX:
+  L642: def get_params(...)
+  L676: def params(...)
+
+SOURCE:
+class ZfitParametrized(ZfitObject):
+    @abstractmethod
+    def get_params(
+        self,
+        floating: bool | None = True,
+        is_yield: bool | None = None,
+        extract_independent: bool | None = True,
+        *,
+        autograd: bool | None = None,
+    ) -> set[ZfitParameter]:
+        """Recursively collect parameters that this object depends on according to the filter criteria.
+
+        Which parameters should be included can be steered using the arguments as a filter.
+         - **None**: do not filter on this. E.g. `floating=None` will return parameters that are floating as well as
+            parameters that are fixed.
+         - **True**: only return parameters that fulfil this criterion
+         - **False**: only return parameters that do not fulfil this criterion. E.g. `floating=False` will return
+            only parameters that are not floating.
+
+        Args:
+
+            floating: if a parameter is floating, e.g. if :py:meth:`~ZfitParameter.floating` returns `True`
+            is_yield: if a parameter is a yield of the _current_ model. This won't be applied recursively, but may include
+               yields if they do also represent a parameter parametrizing the shape. So if the yield of the current
+               model depends on other yields (or also non-yields), this will be included. If, however, just submodels
+               depend on a yield (as their yield) and it is not correlated to the output of our model, they won't be
+               included.
+            extract_independent: If the parameter is an independent parameter, i.e. if it is a `ZfitIndependentParameter`.
+            autograd: Selection criteria if the parameter supports automatic differentiation. If `None`, no filtering
+                is done. If `True`, only parameters that support autograd are returned, if `False`, only parameters
+                that do not support autograd are returned.
+        """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def params(self) -> ztyping.ParameterType:
+        raise NotImplementedError
+
+--- IMPLEMENTER ---
+[src/zfit/models/functions.py]
+METHOD INDEX:
+  L86: def __init__(...)
+  L95: def _func(...)
+
+SOURCE:
+class ProdFunc(BaseFunctorFuncV1):
+    def __init__(
+        self,
+        funcs: Iterable[ZfitFunc],
+        obs: ztyping.ObsTypeInput = None,
+        name: str = "SumFunc",
+        **kwargs,
+    ):
+        super().__init__(funcs=funcs, obs=obs, name=name, **kwargs)
+
+    def _func(self, x):
+        funcs = [func.func(x) for func in self.funcs]
+        return znp.prod(funcs, axis=0)
+
+======================================================================
+ROW 60 | implementer | OpenAI_Codex | marin-community/levanter#1124
+implementer levanter.models.mixtral:MixtralLMHeadModel of levanter.models.lm_model:LmHeadModel (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/levanter/models/lm_model.py]
+METHOD INDEX:
+  L157: def config(...)
+  L162: def Vocab(...)
+  L166: def Pos(...)
+  L170: def KeyPos(...)
+  L174: def Embed(...)
+  L179: def init(...)
+  L182: def __call__(...)
+  L212: def activations(...)
+  L234: def get_lm_head(...)
+  L241: def resize_vocab(...)
+  L249: def vocab_size(...)
+
+SOURCE:
+class LmHeadModel(eqx.Module, Generic[LmConfigT]):
+    """
+    Superclass for models with a language modeling head.
+    """
+
+    @property
+    @abc.abstractmethod
+    def config(self) -> LmConfigT:
+        pass
+
+    @property
+    @abc.abstractmethod
+    def Vocab(self) -> Axis:
+        pass
+
+    @property
+    def Pos(self) -> Axis:
+        return self.config.Pos
+
+    @property
+    def KeyPos(self) -> Axis:
+        return self.config.KeyPos
+
+    @property
+    def Embed(self) -> Axis:
+        return self.config.Embed
+
+    @classmethod
+    @abc.abstractmethod
+    def init(cls, Vocab: Axis, config: LmConfigT, *, key: PRNGKeyArray) -> "LmHeadModel[LmConfigT]":
+        pass
+
+    def __call__(
+        self,
+        input_ids: NamedArray,
+        attn_mask: Optional[AttentionMask | NamedArray] = None,
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
+    ) -> NamedArray:
+        """
+        Compute the logits for the next token in a sequence.
+        Args:
+            input_ids: token IDs with shape [..., Pos]
+            attn_mask: attention mask with shape [..., Pos, KeyPos]
+            key: PRNGKeyArray for random number generation
+
+        Returns:
+            NamedArray: logits with shape [..., Pos, Vocab]
+
+        """
+        try:
+            x = self.activations(input_ids, attn_mask, key=key, pos_ids=pos_ids)
+        except TypeError:
+            # For backward compatibility with models that don't yet support pos_ids
+            x = self.activations(input_ids, attn_mask, key=key)
+
+        lm_logits = hax.dot(x, self.get_lm_head(), axis=self.Embed)
+
+        return lm_logits
+
+    @abc.abstractmethod
+    def activations(
+        self,
+        input_ids: NamedArray,
+        attn_mask: Optional[AttentionMask | NamedArray] = None,
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
+    ) -> NamedArray:
+        """
+        Compute the activations for the next token in a sequence.
+        Args:
+            input_ids: token IDs with shape {Pos}
+            attn_mask: attention mask with shape {Pos, KeyPos}
+            key: PRNGKeyArray for random number generation
+
+        Returns:
+            NamedArray: activations with shape {Pos, Embed}
+
+        """
+        pass
+
+    @abc.abstractmethod
+    def get_lm_head(self) -> hax.NamedArray:
+        """
+        The language modeling head of the model. Should have shape {Embed, Vocab}.
+        """
+        raise NotImplementedError("get_lm_head not implemented")
+
+    @abc.abstractmethod
+    def resize_vocab(self, new_size: int, key: Optional[PRNGKeyArray] = None) -> "LmHeadModel[LmConfigT]":
+        """
+        Resizes the vocabulary of the model. Key may be provided to use random initialization, otherwise, there
+        should be some deterministic initialization of any new parameters.
+        """
+        pass
+
+    @property
+    def vocab_size(self) -> int:
+        return self.Vocab.size
+
+--- IMPLEMENTER ---
+[src/levanter/models/mixtral.py]
+METHOD INDEX:
+  L571: def config(...)
+  L575: def vocab_size(...)
+  L579: def Vocab(...)
+  L583: def init(...)
+  L594: def __call__(...)
+  L619: def activations(...)
+  L648: def get_lm_head(...)
+  L654: def resize_vocab(...)
+  L665: def _state_dict_key_map(...)
+
+SOURCE:
+class MixtralLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[MixtralConfig]):
+    transformer: MixtralTransformer
+    embeddings: LlamaEmbedding
+    lm_head: Optional[hnn.Linear]
+
+    @property
+    def config(self):
+        return self.transformer.config
+
+    @property
+    def vocab_size(self) -> int:
+        return self.Vocab.size
+
+    @property
+    def Vocab(self) -> Axis:
+        return self.embeddings.Vocab
+
+    @classmethod
+    def init(cls, Vocab: Axis, config: MistralConfig, *, key) -> "MixtralLMHeadModel":
+        k_t, k_emb = jrandom.split(key, 2)
+        transformer = MixtralTransformer.init(config, key=k_t)
+        embeddings = LlamaEmbedding.init(Vocab, config, key=k_emb)
+        if config.tie_word_embeddings:
+            lm_head = None
+        else:
+            lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
+
+        return MixtralLMHeadModel(transformer, embeddings, lm_head)
+
+    def __call__(
+        self,
+        input_ids: NamedArray,
+        attn_mask: Optional[Union[NamedArray, AttentionMask]] = None,
+        pos_ids: NamedArray | None = None,
+        *,
+        key=None,
+    ) -> NamedArray:
+        """
+        Args:
+            input_ids (NamedArray): [batch, position]
+                Indices of input sequence tokens in the vocabulary.
+            attn_mask (Union[NamedArray, AttentionMask], optional): [batch, position]
+                Mask to avoid performing attention on the padding token indices of the encoder input.
+                The attn_mask from training pipeline may be an AttentionMask object instead of NamedArray
+        """
+        k_t, k_head = maybe_rng_split(key, 2)
+        x = self.embeddings.embed(input_ids)
+        x, _ = self.transformer(x, attn_mask=attn_mask, key=k_t, pos_ids=pos_ids)
+        if self.lm_head:
+            lm_logits = self.lm_head(x, key=k_head)
+        else:
+            lm_logits = self.embeddings.unembed(x)
+        return lm_logits
+
+    def activations(
+        self,
+        input_ids: NamedArray,
+        attn_mask: Optional[AttentionMask | NamedArray] = None,
+        pos_ids: NamedArray | None = None,
+        *,
+        key=None,
+    ) -> NamedArray:
+        """
+        Compute the activations for the next token in a sequence.
+        Args:
+            input_ids: token IDs with shape {Pos}
+            attn_mask: attention mask with shape {Pos, KeyPos}
+            key: PRNGKey for random number generation
+
+        Returns:
+            NamedArray: activations with shape {Pos, Embed}
+
+        """
+        x = self.embeddings.embed(input_ids)
+        x, extras = self.transformer(x, attn_mask=attn_mask, key=key, pos_ids=pos_ids)
+
+        aux_loss = 0
+        if self.config.lbl_coef is not None:
+            aux_loss += extras["load_balancing_loss"]
+        if self.config.rzl_coef is not None:
+            aux_loss += extras["router_z_loss"]
+        return x, aux_loss
+
+    def get_lm_head(self) -> hax.NamedArray:
+        if self.lm_head is None:
+            return self.embeddings.token_embeddings.weight
+        else:
+            return self.lm_head.weight
+
+    def resize_vocab(self, new_size: int, key=None) -> "LmHeadModel[MixtralConfig]":
+        new_Vocab = self.Vocab.resize(new_size)
+        k1, k2 = maybe_rng_split(key, 2)
+        new_embeddings = self.embeddings.resize_embeddings(new_size, key=k1)
+        if self.lm_head is not None:
+            new_lm_matrix = hax.tree_util.resize_axis(self.lm_head.weight, self.Vocab, new_size, key=k2)
+            new_lm_head = dataclasses.replace(self.lm_head, Out=new_Vocab, weight=new_lm_matrix)
+            return dataclasses.replace(self, embeddings=new_embeddings, lm_head=new_lm_head)
+        else:
+            return dataclasses.replace(self, embeddings=new_embeddings)
+
+    def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
+        return {"transformer": "model", "embeddings": None}
+
+======================================================================
+ROW 61 | interface | Copilot | pytorch/ignite#3503
+interface ignite.metrics.metric:Metric kind=abc
+======================================================================
+[ignite/metrics/metric.py]
+METHOD INDEX:
+  L358: def __init__(...)
+  L384: def reset(...)
+  L393: def update(...)
+  L405: def compute(...)
+  L421: def started(...)
+  L431: def iteration_completed(...)
+  L480: def completed(...)
+  L513: def _check_usage(...)
+  L529: def attach(...)
+  L570: def detach(...)
+  L613: def is_attached(...)
+  L626: def _state_dict_per_rank(...)
+  L653: def state_dict(...)
+  L663: def _load_state_dict_per_rank(...)
+  L683: def load_state_dict(...)
+  L717: def __add__(...)
+  L722: def __radd__(...)
+  L727: def __sub__(...)
+  L732: def __rsub__(...)
+  L737: def __mul__(...)
+  L742: def __rmul__(...)
+  L747: def __pow__(...)
+  L752: def __rpow__(...)
+  L757: def __mod__(...)
+  L762: def __truediv__(...)
+  L767: def __rtruediv__(...)
+  L772: def __floordiv__(...)
+  L777: def __getattr__(...)
+  L791: def __getitem__(...)
+  L796: def __getstate__(...)
+  L799: def __setstate__(...)
+  L627: def func(...)
+  L666: def func(...)
+  L783: def fn(...)
+  L786: def wrapper(...)
+
+SOURCE:
+class Metric(Serializable, metaclass=ABCMeta):
+    """
+    Base class for all Metrics.
+
+    Args:
+        output_transform: a callable that is used to transform the
+            :class:`~ignite.engine.engine.Engine`'s ``process_function``'s output into the
+            form expected by the metric. This can be useful if, for example, you have a multi-output model and
+            you want to compute the metric with respect to one of the outputs.
+            By default, metrics require the output as ``(y_pred, y)`` or ``{'y_pred': y_pred, 'y': y}``.
+        device: specifies which device updates are accumulated on. Setting the
+            metric's device to be the same as your ``update`` arguments ensures the ``update`` method is
+            non-blocking. By default, CPU.
+        skip_unrolling: specifies whether output should be unrolled before being fed to update method. Should be
+            true for multi-output model, for example, if ``y_pred`` contains multi-ouput as ``(y_pred_a, y_pred_b)``
+            Alternatively, ``output_transform`` can be used to handle this.
+
+            Examples:
+                The following example shows a custom loss metric that expects input from a multi-output model.
+
+                .. code-block:: python
+
+                    import torch
+                    import torch.nn as nn
+                    import torch.nn.functional as F
+
+                    from ignite.engine import create_supervised_evaluator
+                    from ignite.metrics import Loss
+
+                    class MyLoss(nn.Module):
+                        def __init__(self, ca: float = 1.0, cb: float = 1.0) -> None:
+                            super().__init__()
+                            self.ca = ca
+                            self.cb = cb
+
+                        def forward(self,
+                                    y_pred: Tuple[torch.Tensor, torch.Tensor],
+                                    y_true: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+                            a_true, b_true = y_true
+                            a_pred, b_pred = y_pred
+                            return self.ca * F.mse_loss(a_pred, a_true) + self.cb * F.cross_entropy(b_pred, b_true)
+
+
+                    def prepare_batch(batch, device, non_blocking):
+                        return torch.rand(4, 1), (torch.rand(4, 1), torch.rand(4, 2))
+
+
+                    class MyModel(nn.Module):
+
+                        def forward(self, x):
+                            return torch.rand(4, 1), torch.rand(4, 2)
+
+
+                    model = MyModel()
+
+                    device = "cpu"
+                    loss = MyLoss(0.5, 1.0)
+                    metrics = {
+                        "Loss": Loss(loss, skip_unrolling=True)
+                    }
+                    train_evaluator = create_supervised_evaluator(model, metrics, device, prepare_batch=prepare_batch)
+
+
+                    data = range(10)
+                    train_evaluator.run(data)
+                    train_evaluator.state.metrics["Loss"]
+
+    Attributes:
+        required_output_keys: dictionary defines required keys to be found in ``engine.state.output`` if the
+            latter is a dictionary. By default, ``("y_pred", "y")``. This is useful with custom metrics that can require
+            other arguments than predictions ``y_pred`` and targets ``y``. See an example below.
+
+    Examples:
+        Let's implement a custom metric that requires ``y_pred``, ``y`` and ``x`` as input for ``update`` function.
+        In the example below we show how to setup standard metric like Accuracy and the custom metric using by an
+        ``evaluator`` created with :meth:`~ignite.engine.create_supervised_evaluator` method.
+
+        For more information on how metric works with :class:`~ignite.engine.engine.Engine`, visit :ref:`attach-engine`.
+
+        .. code-block:: python
+
+            # https://discuss.pytorch.org/t/how-access-inputs-in-custom-ignite-metric/91221/5
+
+            import torch
+            import torch.nn as nn
+
+            from ignite.metrics import Metric, Accuracy
+            from ignite.engine import create_supervised_evaluator
+
+            class CustomMetric(Metric):
+
+                required_output_keys = ("y_pred", "y", "x")
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+
+                def update(self, output):
+                    y_pred, y, x = output
+                    # ...
+
+                def reset(self):
+                    # ...
+                    pass
+
+                def compute(self):
+                    # ...
+                    pass
+
+            model = ...
+
+            metrics = {
+                "Accuracy": Accuracy(),
+                "CustomMetric": CustomMetric()
+            }
+
+            evaluator = create_supervised_evaluator(
+                model,
+                metrics=metrics,
+                output_transform=lambda x, y, y_pred: {"x": x, "y": y, "y_pred": y_pred}
+            )
+... <<truncated, 458 more lines>>
+
+======================================================================
+ROW 62 | interface | Claude_Code | nexi-lab/nexus#2148
+interface nexus.bricks.skills.protocols:SkillManagerProtocol kind=protocol
+======================================================================
+[src/nexus/bricks/skills/protocols.py]
+METHOD INDEX:
+  L105: def create_skill(...)
+  L122: def create_skill_from_content(...)
+  L137: def fork_skill(...)
+  L150: def publish_skill(...)
+  L162: def search_skills(...)
+
+SOURCE:
+class SkillManagerProtocol(Protocol):
+    """Protocol for skill lifecycle management.
+
+    Concrete implementation: ``nexus.bricks.skills.manager.SkillManager``.
+    """
+
+    async def create_skill(
+        self,
+        name: str,
+        description: str,
+        template: str = "basic",
+        tier: str = "user",
+        author: str | None = None,
+        version: str = "1.0.0",
+        creator_id: str | None = None,
+        creator_type: str = "agent",
+        zone_id: str | None = None,
+        context: Any = None,
+        **kwargs: str,
+    ) -> str:
+        """Create a new skill from a template."""
+        ...
+
+    async def create_skill_from_content(
+        self,
+        name: str,
+        description: str,
+        content: str,
+        tier: str = "user",
+        author: str | None = None,
+        version: str = "1.0.0",
+        source_url: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        context: Any = None,
+    ) -> str:
+        """Create a new skill from raw content."""
+        ...
+
+    async def fork_skill(
+        self,
+        source_name: str,
+        target_name: str,
+        tier: str = "user",
+        author: str | None = None,
+        creator_id: str | None = None,
+        creator_type: str = "user",
+        zone_id: str | None = None,
+    ) -> str:
+        """Fork an existing skill with lineage tracking."""
+        ...
+
+    async def publish_skill(
+        self,
+        name: str,
+        source_tier: str = "agent",
+        target_tier: str = "zone",
+        publisher_id: str | None = None,
+        publisher_type: str = "agent",
+        zone_id: str | None = None,
+    ) -> str:
+        """Publish a skill to a wider audience."""
+        ...
+
+    async def search_skills(
+        self,
+        query: str,
+        tier: str | None = None,
+        limit: int | None = 10,
+    ) -> list[tuple[str, float]]:
+        """Search skills by description using text matching."""
+        ...
+
+======================================================================
+ROW 63 | interface | OpenAI_Codex | marin-community/levanter#1139
+interface levanter.models.asr_model:ASRMixin kind=abc
+======================================================================
+[src/levanter/models/asr_model.py]
+METHOD INDEX:
+  L71: def Vocab(...)
+  L76: def Pos(...)
+  L80: def resize_vocab(...)
+  L88: def __call__(...)
+  L98: def compute_loss(...)
+  L122: def vocab_size(...)
+
+SOURCE:
+class ASRMixin(abc.ABC):
+    """
+    Superclass for models performing ASR
+    """
+
+    @property
+    @abc.abstractmethod
+    def Vocab(self) -> Axis:
+        pass
+
+    @property
+    @abc.abstractmethod
+    def Pos(self) -> Axis:
+        pass
+
+    @abc.abstractmethod
+    def resize_vocab(self, new_size: int, key: Optional[PRNGKeyArray] = None) -> "ASRMixin":
+        """
+        Resizes the vocabulary of the ASR Output space. Key may be provided to use random initialization, otherwise,
+        there should be some deterministic initialization of any new parameters.
+        """
+        pass
+
+    @abc.abstractmethod
+    def __call__(
+        self,
+        mel: NamedArray,
+        input_ids: NamedArray,
+        attn_mask: Optional[AttentionMask | NamedArray] = None,
+        *,
+        key=None,
+    ) -> NamedArray:
+        pass
+
+    def compute_loss(
+        self,
+        example: AudioTextExample,
+        *,
+        key=None,
+        reduction: Optional[hax.ReductionFunction] = hax.mean,
+        reduction_axis: Optional[hax.AxisSelection] = None,
+    ) -> jnp.ndarray | NamedArray:
+        """
+        Computes the cross-entropy loss for predicted ASR tokens. If reduction is not None, the loss is reduced
+        across the reduction axis (with reduction_axis=None meaning all axes). If reduction is None, the loss is not
+        reduced, and the result is a named array with axes (*batch axes, sequence_length).
+        """
+        logits = self(example.audio, example.tokens, example.attn_mask, key=key)
+        logits = logits.astype(jnp.float32)
+        targets = hax.roll(example.tokens, -1, axis=self.Pos.name)
+        target_y = hax.nn.one_hot(targets, self.Vocab, dtype=logits.dtype)
+        loss = cross_entropy_loss(
+            logits, self.Vocab, target_y, reduction, reduction_axis=reduction_axis, where=example.loss_mask
+        )
+
+        return loss
+
+    @property
+    def vocab_size(self) -> int:
+        return self.Vocab.size

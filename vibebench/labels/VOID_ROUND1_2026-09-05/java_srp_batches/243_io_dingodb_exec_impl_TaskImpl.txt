@@ -1,0 +1,307 @@
+row 243   dingodb/dingo#1831
+============================================================================
+CLASS io.dingodb.exec.impl.TaskImpl   loc=302 methods=14 wmc=35 lcom=0.0769230769230769 c3=0.1429668504294199
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       75  @Slf4j
+       76  @JsonPropertyOrder({"txnType", "isolationLevel", "txnId" , "jobId",
+       77      "location", "operators", "runList", "parasType", "bachTask"})
+       78  @JsonInclude(JsonInclude.Include.NON_NULL)
+       79  public final class TaskImpl implements Task {
+       80      @JsonProperty("id")
+       81      @Getter
+       82      @JsonSerialize(using = CommonId.JacksonSerializer.class)
+       83      @JsonDeserialize(using = CommonId.JacksonDeserializer.class)
+       84      private final CommonId id;
+       85      @JsonProperty("jobId")
+       86      @Getter
+       87      @JsonSerialize(using = CommonId.JacksonSerializer.class)
+       88      @JsonDeserialize(using = CommonId.JacksonDeserializer.class)
+       89      private final CommonId jobId;
+       90      @JsonProperty("txnId")
+       91      @Getter
+       92      @Setter
+       93      @JsonSerialize(using = CommonId.JacksonSerializer.class)
+       94      @JsonDeserialize(using = CommonId.JacksonDeserializer.class)
+       95      private CommonId txnId;
+       96      @JsonProperty("location")
+       97      @Getter
+       98      private final Location location;
+       99      @Getter
+      100      @JsonProperty("vertexes")
+      101      @JsonSerialize(keyUsing = CommonId.JacksonKeySerializer.class, contentAs = Vertex.class)
+      102      @JsonDeserialize(keyUsing = CommonId.JacksonKeyDeserializer.class, contentAs = Vertex.class)
+      103      private final Map<CommonId, Vertex> vertexes;
+      104      @JsonProperty("runList")
+      105      @Getter
+      106      @JsonSerialize(contentUsing = CommonId.JacksonSerializer.class)
+      107      @JsonDeserialize(contentUsing = CommonId.JacksonDeserializer.class)
+      108      private final List<CommonId> runList;
+      109      @JsonProperty("parasType")
+      110      @Getter
+      111      private final DingoType parasType;
+      112      @JsonProperty("txnType")
+      113      @Getter
+      114      private final TransactionType transactionType;
+      115      @JsonProperty("isolationLevel")
+      116      @Getter
+      117      private final IsolationLevel isolationLevel;
+      118      @JsonProperty("bachTask")
+      119      private boolean bachTask;
+      120  
+      121      @JsonProperty("maxExecutionTime")
+      122      private long maxExecutionTime;
+      123  
+      124      @JsonProperty("isSelect")
+      125      private Boolean isSelect;
+      126  
+      127      @Getter
+      128      private transient final Map<TxnPartData, Boolean> partData;
+      129      private CommonId rootOperatorId = null;
+      130  
+      131      private transient AtomicInteger status = new AtomicInteger(Status.BORN);
+      132      private transient CountDownLatch activeThreads = null;
+      133      @Getter
+      134      private transient TaskStatus taskInitStatus;
+      135      @Setter
+      136      private transient Context context;
+      137      @Getter
+      138      private transient AtomicBoolean isLockWait = new AtomicBoolean(false);
+      139  
+      140      @JsonCreator
+      141      public TaskImpl(
+      142          @JsonProperty("id") CommonId id,
+      143          @JsonProperty("jobId") CommonId jobId,
+      144          @JsonProperty("txnId") CommonId txnId,
+      145          @JsonProperty("location") Location location,
+      146          @JsonProperty("parasType") DingoType parasType,
+      147          @JsonProperty("txnType") TransactionType transactionType,
+      148          @JsonProperty("isolationLevel") IsolationLevel isolationLevel,
+      149          @JsonProperty("maxExecutionTime") long maxExecutionTime,
+      150          @JsonProperty("isSelect") Boolean isSelect
+      151      ) {
+      152          this.id = id;
+      153          this.jobId = jobId;
+      154          this.txnId = txnId;
+      155          this.location = location;
+      156          this.parasType = parasType;
+      157          this.runList = new LinkedList<>();
+      158          this.vertexes = new HashMap<>();
+      159          this.transactionType = transactionType;
+      160          this.isolationLevel = isolationLevel;
+      161          this.maxExecutionTime = maxExecutionTime;
+      162          this.isSelect = isSelect;
+      163          this.context = Context.builder().pin(0).keyState(new ArrayList<>()).build();
+      164          this.partData = new ConcurrentHashMap<>();
+      165      }
+      166  
+      167      public Context getContext() {
+      168          if (this.context == null) {
+      169              this.context = Context.builder().pin(0).keyState(new ArrayList<>()).build();
+      170          }
+      171          return this.context;
+      172      }
+      173  
+      174      @Override
+      175      public Vertex getRoot() {
+      176          return vertexes.get(rootOperatorId);
+      177      }
+      178  
+      179      @Override
+      180      public void markRoot(CommonId operatorId) {
+      181          assert vertexes.get(operatorId).getOp().equals(ROOT)
+      182              : "The root operator must be a `RootOperator`.";
+      183          rootOperatorId = operatorId;
+      184      }
+      185  
+      186      @Override
+      187      public int getStatus() {
+      188          return status.get();
+      189      }
+      190  
+      191      @Override
+      192      public void putVertex(@NonNull Vertex vertex) {
+      193          vertex.setTask(this);
+      194          vertexes.put(vertex.getId(), vertex);
+      195          if (vertex.getOp().domain == SOURCE) {
+      196              runList.add(vertex.getId());
+      197          }
+      198      }
+      199  
+      200      @Override
+      201      public void init() {
+      202          status = new AtomicInteger(Status.BORN);
+      203          isLockWait = new AtomicBoolean(false);
+      204          boolean isStatusOK = true;
+      205          String statusErrMsg = "";
+      206          this.getVertexes().forEach((id, v) -> {
+      207              v.setId(id);
+      208              v.setTask(this);
+      209          });
+      210  
+      211          for (Vertex vertex : this.getVertexes().values()) {
+      212              try {
+      213                  vertex.init();
+      214              } catch (Exception ex) {
+      215                  LogUtils.error(log, "Init operator:" + vertex.getOp() + "in jobId:" + jobId.toString()
+      216                      + " task:" + this.id.toString() + " failed catch exception:", ex);
+      217                  statusErrMsg = ex.toString();
+      218                  isStatusOK = false;
+      219              }
+      220          }
+      221          taskInitStatus = new TaskStatus();
+      222          taskInitStatus.setStatus(isStatusOK);
+      223          taskInitStatus.setTaskId(this.id.toString());
+      224          taskInitStatus.setErrorMsg(statusErrMsg);
+      225          if (taskInitStatus.getStatus()) {
+      226              status.compareAndSet(Status.BORN, Status.READY);
+      227          }
+      228      }
+      229  
+      230      @Override
+      231      public void run(Object @Nullable [] paras) {
+      232          if (status.get() == Status.BORN) {
+      233              LogUtils.error(log, "jobId:{}, taskId:{}, Run task but check task has init failed: {}",
+      234                  jobId.toString(), id.toString(), taskInitStatus);
+      235              Vertex vertex = vertexes.get(runList.get(0));
+      236              // Try to propagate error by any operator, may not succeed because task init failed.
+      237              // operator.fin(0, FinWithException.of(taskInitStatus));
+      238              Operator operator = OperatorFactory.getInstance(vertex.getOp());
+      239              operator.fin(0, FinWithException.of(taskInitStatus), vertex);
+      240              return;
+      241          }
+      242          DingoTimeZoneProcessor processor = DingoTimeZoneContext.getProcessor();
+      243          // This method should not be blocked, so schedule a running thread.
+      244          Executors.execute("task-" + jobId + "-" + id, () -> internalRun(paras, processor));
+      245      }
+      246  
+      247      // Synchronize to make sure there are only one thread run this.
+      248      private synchronized void internalRun(Object @Nullable [] paras, DingoTimeZoneProcessor processor) {
+      249          MdcUtils.setTxnId(txnId.toString());
+      250          if (!status.compareAndSet(Status.READY, Status.RUNNING)) {
+      251              throw new RuntimeException("Status should be READY.");
+      252          }
+      253          LogUtils.debug(log, "Task is starting at {}...", location);
+      254          activeThreads = new CountDownLatch(runList.size());
+      255          setParas(paras);
+      256          if (bachTask) {
+      257              setStartTs(txnId.seq);
+      258          }
+      259          for (CommonId operatorId : runList) {
+      260              Vertex vertex = vertexes.get(operatorId);
+      261              Operator operator = OperatorFactory.getInstance(vertex.getOp());
+      262              assert operator instanceof SourceOperator
+      263                  : "Operators in run list must be source operator.";
+      264              Executors.execute("operator-" + jobId + "-" + id + "-" + operatorId, () -> {
+      265                  DingoTimeZoneContext.setProcessor(processor);
+      266                  MdcUtils.setTxnId(txnId.toString());
+      267                  final long startTime = System.currentTimeMillis();
+      268                  activeTaskCount.incrementAndGet();
+      269                  try {
+      270                      while (operator.push(getContext().copy(), null, vertex)) {
+      271                          LogUtils.info(log, "Operator {} need another pushing.", vertex.getId());
+      272                      }
+      273                      operator.fin(0, null, vertex);
+      274                  } catch (DingoTypeRangeException e) {
+      275                      LogUtils.error(log, "Run Task:" + getId().toString()
+      276                          + ",catch operator:" + vertex.getId() + " run Exception: ", e);
+      277                      status.compareAndSet(Status.RUNNING, Status.STOPPED);
+      278                      TaskStatus taskStatus = new TaskStatus();
+      279                      taskStatus.setStatus(false);
+      280                      taskStatus.setTaskId(vertex.getTask().getId().toString());
+      281                      taskStatus.setErrorMsg(e.getMessage());
+      282                      taskStatus.setErrorType(ErrorType.OutOfValueRange);
+      283  
+      284                      try {
+      285                          operator.fin(0, FinWithException.of(taskStatus), vertex);
+      286                      } catch (RuntimeException exception) {
+      287                          LogUtils.error(log, "Run Task Fin:" + getId() + " catch operator:" + vertex.getId()
+      288                              + " run Exception:", exception);
+      289                          throw exception;
+      290                      }
+      291                  } catch (RuntimeException e) {
+      292                      LogUtils.error(log, "Run Task:" + getId().toString()
+      293                              + ",catch operator:" + vertex.getId() + " run Exception: ", e);
+      294                      TaskStatus taskStatus = new TaskStatus();
+      295                      taskStatus.setStatus(false);
+      296                      taskStatus.setTaskId(vertex.getTask().getId().toString());
+      297                      taskStatus.setErrorMsg(e.toString());
+      298                      if (e instanceof WriteConflictException) {
+      299                          taskStatus.setErrorType(ErrorType.WriteConflict);
+      300                      } else if (e instanceof DuplicateEntryException) {
+      301                          taskStatus.setErrorType(ErrorType.DuplicateEntry);
+      302                      } else if (e instanceof LockWaitException) {
+      303                          taskStatus.setErrorType(ErrorType.LockWait);
+      304                          this.isLockWait.compareAndSet(false, true);
+      305                      } else if (e instanceof TaskCancelException) {
+      306                          taskStatus.setErrorType(ErrorType.TaskCancel);
+      307                      } else {
+      308                          taskStatus.setErrorType(ErrorType.TaskFin);
+      309                      }
+      310                      status.compareAndSet(Status.RUNNING, Status.STOPPED);
+      311                      try {
+      312                          operator.fin(0, FinWithException.of(taskStatus), vertex);
+      313                      } catch (RuntimeException exception) {
+      314                          LogUtils.error(log, "Run Task Fin:" + getId() + " catch operator:" + vertex.getId()
+      315                              + " run Exception:", exception);
+      316                          throw exception;
+      317                      }
+      318                  } finally {
+      319                      activeTaskCount.decrementAndGet();
+      320                      LogUtils.debug(log, "TaskImpl run cost: {}ms.", System.currentTimeMillis() - startTime);
+      321                      MdcUtils.removeTxnId();
+      322                      activeThreads.countDown();
+      323                      // DingoTimeZoneContext.clear();
+      324                  }
+      325              });
+      326          }
+      327          while (true) {
+      328              try {
+      329                  activeThreads.await();
+      330                  break;
+      331              } catch (InterruptedException ignored) {
+      332              }
+      333          }
+      334          status.compareAndSet(Status.RUNNING, Status.READY);
+      335          status.compareAndSet(Status.STOPPED, Status.READY);
+      336      }
+      337  
+      338      @Override
+      339      public boolean cancel() {
+      340          status.set(Status.CANCEL);
+      341          return true;
+      342      }
+      343  
+      344      @Override
+      345      public boolean getBachTask() {
+      346          return bachTask;
+      347      }
+      348  
+      349      @Override
+      350      public void setBathTask(boolean bathTask) {
+      351          this.bachTask = bathTask;
+      352      }
+      353  
+      354      @Override
+      355      public String toString() {
+      356          try {
+      357              return JobImpl.PARSER.stringify(this);
+      358          } catch (JsonProcessingException e) {
+      359              throw new RuntimeException(e);
+      360          }
+      361      }
+      362  
+      363      @Override
+      364      public boolean isLockWait() {
+      365          return isLockWait.get();
+      366      }
+      367  
+      368      @Override
+      369      public MemoryPool getMemoryPool() {
+      370          return this.vertexes.values().stream()
+      371              .filter(vertex -> vertex.getParam() instanceof RevokerParams)
+      372              .map(vertex -> ((RevokerParams) vertex.getParam()).getQueryMemoryPool())
+      373              .filter(Objects::nonNull)
+      374              .findFirst().orElse(null);
+      375      }
+      376  }

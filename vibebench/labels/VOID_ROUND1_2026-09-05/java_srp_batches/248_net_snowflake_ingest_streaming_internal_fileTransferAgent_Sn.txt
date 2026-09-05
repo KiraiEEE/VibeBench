@@ -1,0 +1,406 @@
+row 248   snowflakedb/snowflake-ingest-java#1124
+============================================================================
+CLASS net.snowflake.ingest.streaming.internal.fileTransferAgent.SnowflakeFileTransferAgent   loc=1007 methods=20 wmc=146 lcom=0.0 c3=0.177758605520328
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       53  public class SnowflakeFileTransferAgent extends SFBaseFileTransferAgent {
+       54    private static final SFLogger logger =
+       55        SFLoggerFactory.getLogger(SnowflakeFileTransferAgent.class);
+       56  
+       57    private static final ObjectMapper mapper = ObjectMapperFactory.getObjectMapper();
+       58  
+       59    // We will allow buffering of upto 128M data before spilling to disk during
+       60    // compression and digest computation
+       61    static final int MAX_BUFFER_SIZE = 1 << 27;
+       62  
+       63    private static final String localFSFileSep = systemGetProperty("file.separator");
+       64  
+       65    // For testing purpose
+       66    private static Throwable injectedFileTransferException = null;
+       67  
+       68    public static void setInjectedFileTransferException(Throwable th) {
+       69      injectedFileTransferException = th;
+       70    }
+       71  
+       72    static boolean isInjectedFileTransferExceptionEnabled() {
+       73      return injectedFileTransferException != null;
+       74    }
+       75  
+       76    static List<RemoteStoreFileEncryptionMaterial> getEncryptionMaterial(
+       77        CommandType commandType, JsonNode jsonNode)
+       78        throws SnowflakeSQLException, JsonProcessingException {
+       79      List<RemoteStoreFileEncryptionMaterial> encryptionMaterial = new ArrayList<>();
+       80      JsonNode rootNode = jsonNode.path("data").path("encryptionMaterial");
+       81      if (commandType == CommandType.UPLOAD) {
+       82        logger.debug("InitEncryptionMaterial: UPLOAD", false);
+       83  
+       84        RemoteStoreFileEncryptionMaterial encMat = null;
+       85        if (!rootNode.isMissingNode() && !rootNode.isNull()) {
+       86          encMat = mapper.treeToValue(rootNode, RemoteStoreFileEncryptionMaterial.class);
+       87        }
+       88        encryptionMaterial.add(encMat);
+       89  
+       90      } else {
+       91        logger.debug("InitEncryptionMaterial: DOWNLOAD", false);
+       92  
+       93        if (!rootNode.isMissingNode() && !rootNode.isNull()) {
+       94          encryptionMaterial =
+       95              Arrays.asList(mapper.treeToValue(rootNode, RemoteStoreFileEncryptionMaterial[].class));
+       96        }
+       97      }
+       98      return encryptionMaterial;
+       99    }
+      100  
+      101    static StageInfo getStageInfo(JsonNode jsonNode, SFSession session) throws SnowflakeSQLException {
+      102      String queryId = jsonNode.path("data").path("queryId").asText();
+      103  
+      104      // more parameters common to upload/download
+      105      String stageLocation = jsonNode.path("data").path("stageInfo").path("location").asText();
+      106  
+      107      String stageLocationType =
+      108          jsonNode.path("data").path("stageInfo").path("locationType").asText();
+      109  
+      110      String stageRegion = null;
+      111      if (!jsonNode.path("data").path("stageInfo").path("region").isMissingNode()) {
+      112        stageRegion = jsonNode.path("data").path("stageInfo").path("region").asText();
+      113      }
+      114  
+      115      boolean isClientSideEncrypted = true;
+      116      if (!jsonNode.path("data").path("stageInfo").path("isClientSideEncrypted").isMissingNode()) {
+      117        isClientSideEncrypted =
+      118            jsonNode.path("data").path("stageInfo").path("isClientSideEncrypted").asBoolean(true);
+      119      }
+      120  
+      121      // endPoint is currently known to be set for Azure stages or S3. For S3 it will be set
+      122      // specifically
+      123      // for FIPS or VPCE S3 endpoint. SNOW-652696
+      124      String endPoint = null;
+      125      if ("AZURE".equalsIgnoreCase(stageLocationType)
+      126          || "S3".equalsIgnoreCase(stageLocationType)
+      127          || "GCS".equalsIgnoreCase(stageLocationType)) {
+      128        endPoint = jsonNode.path("data").path("stageInfo").findValue("endPoint").asText();
+      129        if ("GCS".equalsIgnoreCase(stageLocationType)
+      130            && endPoint != null
+      131            && (endPoint.trim().isEmpty() || "null".equals(endPoint))) {
+      132          // setting to null to preserve previous behaviour for GCS
+      133          endPoint = null;
+      134        }
+      135      }
+      136  
+      137      String stgAcct = null;
+      138      // storageAccount are only available in Azure stages. Value
+      139      // will be present but null in other platforms.
+      140      if ("AZURE".equalsIgnoreCase(stageLocationType)) {
+      141        // Jackson is doing some very strange things trying to pull the value of
+      142        // the storageAccount node after adding the GCP library dependencies.
+      143        // If we try to pull the value by name, we get back null, but clearly the
+      144        // node is there. This code works around the issue by enumerating through
+      145        // all the nodes and getting the one that starts with "sto". The value
+      146        // then comes back with double quotes around it, so we're stripping them
+      147        // off. As long as our JSON doc doesn't add another node that starts with
+      148        // "sto", this should work fine.
+      149        Iterator<Entry<String, JsonNode>> fields = jsonNode.path("data").path("stageInfo").fields();
+      150        while (fields.hasNext()) {
+      151          Entry<String, JsonNode> jsonField = fields.next();
+      152          if (jsonField.getKey().startsWith("sto")) {
+      153            stgAcct =
+      154                jsonField
+      155                    .getValue()
+      156                    .toString()
+      157                    .trim()
+      158                    .substring(1, jsonField.getValue().toString().trim().lastIndexOf("\""));
+      159          }
+      160        }
+      161      }
+      162  
+      163      if ("LOCAL_FS".equalsIgnoreCase(stageLocationType)) {
+      164        if (stageLocation.startsWith("~")) {
+      165          // replace ~ with user home
+      166          stageLocation = systemGetProperty("user.home") + stageLocation.substring(1);
+      167        }
+      168  
+      169        if (!(new File(stageLocation)).isAbsolute()) {
+      170          String cwd = systemGetProperty("user.dir");
+      171  
+      172          logger.debug("Adding current working dir to stage file path.");
+      173  
+      174          stageLocation = cwd + localFSFileSep + stageLocation;
+      175        }
+      176      }
+      177  
+      178      Map<?, ?> stageCredentials = extractStageCreds(jsonNode, queryId);
+      179  
+      180      StageInfo stageInfo =
+      181          StageInfo.createStageInfo(
+      182              stageLocationType,
+      183              stageLocation,
+      184              stageCredentials,
+      185              stageRegion,
+      186              endPoint,
+      187              stgAcct,
+      188              isClientSideEncrypted);
+      189  
+      190      // Setup pre-signed URL into stage info if pre-signed URL is returned.
+      191      if (stageInfo.getStageType() == StageInfo.StageType.GCS) {
+      192        JsonNode presignedUrlNode = jsonNode.path("data").path("stageInfo").path("presignedUrl");
+      193        if (!presignedUrlNode.isMissingNode()) {
+      194          String presignedUrl = presignedUrlNode.asText();
+      195          if (!isNullOrEmpty(presignedUrl)) {
+      196            stageInfo.setPresignedUrl(presignedUrl);
+      197          }
+      198        }
+      199      }
+      200  
+      201      setupUseRegionalUrl(jsonNode, stageInfo);
+      202      setupUseVirtualUrl(jsonNode, stageInfo);
+      203  
+      204      if (stageInfo.getStageType() == StageInfo.StageType.S3) {
+      205        if (session == null) {
+      206          // This node's value is set if PUT is used without Session. (For Snowpipe Streaming, we rely
+      207          // on a response from a server to have this field set to use S3RegionalURL)
+      208          JsonNode useS3RegionalURLNode =
+      209              jsonNode.path("data").path("stageInfo").path("useS3RegionalUrl");
+      210          if (!useS3RegionalURLNode.isMissingNode()) {
+      211            boolean useS3RegionalUrl = useS3RegionalURLNode.asBoolean(false);
+      212            stageInfo.setUseS3RegionalUrl(useS3RegionalUrl);
+      213          }
+      214        } else {
+      215          // Update StageInfo to reflect use of S3 regional URL.
+      216          // This is required for connecting to S3 over privatelink when the
+      217          // target stage is in us-east-1
+      218          stageInfo.setUseS3RegionalUrl(session.getUseRegionalS3EndpointsForPresignedURL());
+      219        }
+      220      }
+      221  
+      222      return stageInfo;
+      223    }
+      224  
+      225    private static void setupUseRegionalUrl(JsonNode jsonNode, StageInfo stageInfo) {
+      226      if (stageInfo.getStageType() != StageInfo.StageType.GCS
+      227          && stageInfo.getStageType() != StageInfo.StageType.S3) {
+      228        return;
+      229      }
+      230      JsonNode useRegionalURLNode = jsonNode.path("data").path("stageInfo").path("useRegionalUrl");
+      231      if (!useRegionalURLNode.isMissingNode()) {
+      232        boolean useRegionalURL = useRegionalURLNode.asBoolean(false);
+      233        stageInfo.setUseRegionalUrl(useRegionalURL);
+      234      }
+      235    }
+      236  
+      237    private static void setupUseVirtualUrl(JsonNode jsonNode, StageInfo stageInfo) {
+      238      if (stageInfo.getStageType() != StageInfo.StageType.GCS) {
+      239        return;
+      240      }
+      241      JsonNode useVirtualURLNode = jsonNode.path("data").path("stageInfo").path("useVirtualUrl");
+      242      if (!useVirtualURLNode.isMissingNode()) {
+      243        boolean useVirtualURL = useVirtualURLNode.asBoolean(false);
+      244        stageInfo.setUseVirtualUrl(useVirtualURL);
+      245      } else {
+      246        logger.debug("useVirtualUrl property missing from stage info");
+      247      }
+      248    }
+      249  
+      250    private static Map<?, ?> extractStageCreds(JsonNode rootNode, String queryId)
+      251        throws SnowflakeSQLException {
+      252      JsonNode credsNode = rootNode.path("data").path("stageInfo").path("creds");
+      253      Map<?, ?> stageCredentials = null;
+      254  
+      255      try {
+      256        TypeReference<HashMap<String, String>> typeRef =
+      257            new TypeReference<HashMap<String, String>>() {};
+      258        stageCredentials = mapper.readValue(credsNode.toString(), typeRef);
+      259  
+      260      } catch (Exception ex) {
+      261        throw new SnowflakeSQLException(
+      262            queryId,
+      263            ex,
+      264            SqlState.INTERNAL_ERROR,
+      265            ErrorCode.INTERNAL_ERROR.getMessageCode(),
+      266            "Failed to parse the credentials ("
+      267                + (credsNode != null ? credsNode.toString() : "null")
+      268                + ") due to exception: "
+      269                + ex.getMessage());
+      270      }
+      271  
+      272      return stageCredentials;
+      273    }
+      274  
+      275    public static List<SnowflakeFileTransferMetadata> getFileTransferMetadatas(JsonNode jsonNode)
+      276        throws SnowflakeSQLException {
+      277      return getFileTransferMetadatas(jsonNode, null);
+      278    }
+      279  
+      280    /**
+      281     * This is API function to parse the File Transfer Metadatas from a supplied PUT call response.
+      282     *
+      283     * <p>NOTE: It only supports PUT on S3/AZURE/GCS (i.e. NOT LOCAL_FS)
+      284     *
+      285     * <p>It also assumes there is no active SFSession
+      286     *
+      287     * @param jsonNode JSON doc returned by GS from PUT call
+      288     * @param queryId String last executed query id if available
+      289     * @return The file transfer metadatas for to-be-transferred files.
+      290     * @throws SnowflakeSQLException if any error occurs
+      291     */
+      292    public static List<SnowflakeFileTransferMetadata> getFileTransferMetadatas(
+      293        JsonNode jsonNode, String queryId) throws SnowflakeSQLException {
+      294      CommandType commandType =
+      295          !jsonNode.path("data").path("command").isMissingNode()
+      296              ? CommandType.valueOf(jsonNode.path("data").path("command").asText())
+      297              : CommandType.UPLOAD;
+      298      if (commandType != CommandType.UPLOAD) {
+      299        throw new SnowflakeSQLException(
+      300            queryId, ErrorCode.INTERNAL_ERROR, "This API only supports PUT commands");
+      301      }
+      302  
+      303      JsonNode locationsNode = jsonNode.path("data").path("src_locations");
+      304  
+      305      if (!locationsNode.isArray()) {
+      306        throw new SnowflakeSQLException(
+      307            queryId, ErrorCode.INTERNAL_ERROR, "src_locations must be an array");
+      308      }
+      309  
+      310      final String[] srcLocations;
+      311      final List<RemoteStoreFileEncryptionMaterial> encryptionMaterial;
+      312      try {
+      313        srcLocations = mapper.readValue(locationsNode.toString(), String[].class);
+      314      } catch (Exception ex) {
+      315        throw new SnowflakeSQLException(
+      316            queryId,
+      317            ErrorCode.INTERNAL_ERROR,
+      318            "Failed to parse the locations due to: " + ex.getMessage());
+      319      }
+      320  
+      321      try {
+      322        encryptionMaterial = getEncryptionMaterial(commandType, jsonNode);
+      323      } catch (Exception ex) {
+      324        throw new SnowflakeSQLException(
+      325            queryId,
+      326            ErrorCode.INTERNAL_ERROR,
+      327            "Failed to parse encryptionMaterial due to: " + ex.getMessage());
+      328      }
+      329  
+      330      // For UPLOAD we expect encryptionMaterial to have length 1
+      331      if (encryptionMaterial.size() != 1) {
+      332        throw new SnowflakeSQLException(
+      333            queryId,
+      334            ErrorCode.INTERNAL_ERROR,
+      335            "Encryption material for UPLOAD should have size 1 but have "
+      336                + encryptionMaterial.size());
+      337      }
+      338  
+      339      final Set<String> sourceFiles = expandFileNames(srcLocations, queryId);
+      340  
+      341      StageInfo stageInfo = getStageInfo(jsonNode, null /*SFSession*/);
+      342  
+      343      List<SnowflakeFileTransferMetadata> result = new ArrayList<>();
+      344      if (stageInfo.getStageType() != StageInfo.StageType.GCS
+      345          && stageInfo.getStageType() != StageInfo.StageType.AZURE
+      346          && stageInfo.getStageType() != StageInfo.StageType.S3) {
+      347        throw new SnowflakeSQLException(
+      348            queryId,
+      349            ErrorCode.INTERNAL_ERROR,
+      350            "This API only supports S3/AZURE/GCS, received=" + stageInfo.getStageType());
+      351      }
+      352  
+      353      for (String sourceFilePath : sourceFiles) {
+      354        String sourceFileName = sourceFilePath.substring(sourceFilePath.lastIndexOf("/") + 1);
+      355        result.add(
+      356            new SnowflakeFileTransferMetadataV1(
+      357                stageInfo.getPresignedUrl(),
+      358                sourceFileName,
+      359                encryptionMaterial.get(0) != null
+      360                    ? encryptionMaterial.get(0).getQueryStageMasterKey()
+      361                    : null,
+      362                encryptionMaterial.get(0) != null ? encryptionMaterial.get(0).getQueryId() : null,
+      363                encryptionMaterial.get(0) != null ? encryptionMaterial.get(0).getSmkId() : null,
+      364                commandType,
+      365                stageInfo));
+      366      }
+      367  
+      368      return result;
+      369    }
+      370  
+      371    static Set<String> expandFileNames(String[] filePathList, String queryId)
+      372        throws SnowflakeSQLException {
+      373      Set<String> result = new HashSet<String>();
+      374  
+      375      // a location to file pattern map so that we only need to list the
+      376      // same directory once when they appear in multiple times.
+      377      Map<String, List<String>> locationToFilePatterns;
+      378  
+      379      locationToFilePatterns = new HashMap<String, List<String>>();
+      380  
+      381      String cwd = systemGetProperty("user.dir");
+      382  
+      383      for (String path : filePathList) {
+      384        // replace ~ with user home
+      385        if (path.startsWith("~")) {
+      386          path = systemGetProperty("user.home") + path.substring(1);
+      387        }
+      388  
+      389        // user may also specify files relative to current directory
+      390        // add the current path if that is the case
+      391        if (!(new File(path)).isAbsolute()) {
+      392          logger.debug("Adding current working dir to relative file path.");
+      393  
+      394          path = cwd + localFSFileSep + path;
+      395        }
+      396  
+      397        // check if the path contains any wildcards
+      398        if (!path.contains("*")
+      399            && !path.contains("?")
+      400            && !(path.contains("[") && path.contains("]"))) {
+      401          /* this file path doesn't have any wildcard, so we don't need to
+      402           * expand it
+      403           */
+      404          result.add(path);
+      405        } else {
+      406          // get the directory path
+      407          int lastFileSepIndex = path.lastIndexOf(localFSFileSep);
+      408  
+      409          // SNOW-15203: if we don't find a default file sep, try "/" if it is not
+      410          // the default file sep.
+      411          if (lastFileSepIndex < 0 && !"/".equals(localFSFileSep)) {
+      412            lastFileSepIndex = path.lastIndexOf("/");
+      413          }
+      414  
+      415          String loc = path.substring(0, lastFileSepIndex + 1);
+      416  
+      417          String filePattern = path.substring(lastFileSepIndex + 1);
+      418  
+      419          List<String> filePatterns = locationToFilePatterns.get(loc);
+      420  
+      421          if (filePatterns == null) {
+      422            filePatterns = new ArrayList<String>();
+      423            locationToFilePatterns.put(loc, filePatterns);
+      424          }
+      425  
+      426          filePatterns.add(filePattern);
+      427        }
+      428      }
+      429  
+      430      // For each location, list files and match against the patterns
+      431      for (Map.Entry<String, List<String>> entry : locationToFilePatterns.entrySet()) {
+      432        try {
+      433          File dir = new File(entry.getKey());
+      434  
+      435          logger.debug(
+      436              "Listing files under: {} with patterns: {}",
+      437              entry.getKey(),
+      438              entry.getValue().toString());
+      439  
+      440          // Normal flow will never hit here. This is only for testing purposes
+      441          if (isInjectedFileTransferExceptionEnabled()
+      442              && injectedFileTransferException instanceof Exception) {
+      443            throw (Exception) SnowflakeFileTransferAgent.injectedFileTransferException;
+      444          }
+      445          // The following currently ignore sub directories
+      446          File[] filesMatchingPattern =
+      447              dir.listFiles((FileFilter) new WildcardFileFilter(entry.getValue()));
+      448          if (filesMatchingPattern != null) {
+      449            for (File file : filesMatchingPattern) {
+      450              result.add(file.getCanonicalPath());
+      451            }
+      452          } else {
+       ... truncated at 400 lines ...

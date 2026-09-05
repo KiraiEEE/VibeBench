@@ -1,0 +1,1450 @@
+======================================================================
+ROW 48 | implementer | Claude_Code | vllm-project/vllm#37322
+implementer vllm.model_executor.layers.fused_moe.cutlass_moe:CutlassBatchedExpertsFp8 of vllm.model_executor.layers.fused_moe.modular_kernel:FusedMoEExpertsModular (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[vllm/model_executor/layers/fused_moe/modular_kernel.py]
+METHOD INDEX:
+  L743: def is_monolithic(...)
+  L746: def moe_problem_size(...)
+  L789: def workspace_dtype(...)
+  L796: def workspace_shapes(...)
+  L837: def adjust_N_for_activation(...)
+  L856: def activation(...)
+  L862: def finalize_weight_and_reduce_impl(...)
+  L866: def apply(...)
+
+SOURCE:
+class FusedMoEExpertsModular(FusedMoEExperts):
+    """
+    An abstract base class for the [Permute-Experts-Unpermute] step described
+        above.
+    """
+
+    @staticmethod
+    def is_monolithic() -> bool:
+        return False
+
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        """
+        Extract the MoE problem size from the given tensor arguments:
+        - a: The hidden states, input to the MoE layer.
+        - w1: The first set of expert weights.
+        - w2: The second set of expert weights.
+        - topk_ids: The topk ids.
+
+        Note: extracting the problem shape from the weight and activation
+        tensors is not obvious.  It needs to be done this way specifically
+        due to subtle issues with particular kernels, e.g. the int4 kernels
+        divide the trailing dimension by two, so it's not "correct" to
+        extract N or K from the trailing dimension of w1 or w2.  Similarly,
+        some kernels transpose the weights, so this needs to be kept in mind.
+
+        Note: This implementation covers most cases. However, if experts
+        require a specialized implementation, like MarlinExperts, they are free
+        to override this function.
+        """
+        assert w1.dim() == 3 and w2.dim() == 3
+        E, N, _ = w1.size()
+        K = a1.size(-1)
+
+        if a1.dim() == 2:
+            # Make sure we are using the correct a1 (pre-permute).
+            assert topk_ids.size(0) == a1.size(0), f"{topk_ids.size(0)} != {a1.size(0)}"
+            M = a1.size(0)
+        else:
+            assert a1.dim() == 3
+            assert a1.size(0) == E, f"{a1.size(0)} == {E}"
+            M = a1.size(1)  # This is max_num_tokens
+
+        assert topk_ids.dim() == 2
+        topk = topk_ids.size(1)
+
+        return E, M, N, K, topk
+
+    def workspace_dtype(self, act_dtype: torch.dtype) -> torch.dtype:
+        """
+        Workspace type: The dtype to use for the workspace tensors.
+        """
+        return act_dtype
+
+    @abstractmethod
+    def workspace_shapes(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: ExpertTokensMetadata | None,
+        activation: MoEActivation,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        """
+        Compute the shapes for the temporary and final outputs of the two gemms
+        and activation in the fused expert function.  Since the gemms are
+        independent, the workspace for the first gemm can be shared with the
+        workspace for the last gemm.
+
+        Inputs:
+        - M: number of tokens.
+        - N: Row (or column) dimension of expert weights.
+        - K: hidden dimension
+        - topk: The number of top-k experts to select.
+        - global_num_experts: global number of experts.
+        - local_num_experts: local number of experts due to DP/EP.
+        - expert_tokens_meta: number of tokens per expert metadata for batched
+                              format.
+
+        Returns a tuple of:
+        - workspace13 shape tuple: must be large enough to hold the
+          result of either expert gemm.
+        - workspace2 shape tuple: must be large enough to hold the
+          result of the activation function.
+        - output shape tuple: must be exact size of the final gemm output.
+        - Note: workspace shapes can be 0 if the workspace is not needed.
+          But in order for activation chunking to work, the first dimension
+          of each tuple must be the number of tokens when the shape is
+          not 0.
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def adjust_N_for_activation(N: int, activation: MoEActivation) -> int:
+        """
+        Calculate the output dimension for the activation function.
+
+        For *_no_mul activations (e.g. relu2_no_mul),
+        there's no gate/up split, so output size equals input size (N).
+
+        For regular gated activations (e.g., silu, gelu, swigluoai),
+        output size is N // 2 due to gate × activation(up) multiplication.
+
+        Args:
+            N: The intermediate size (width of w1/w3 weights).
+            activation: The activation function enum.
+
+        Returns:
+            The output dimension after activation.
+        """
+        return N if not activation.is_gated else N // 2
+
+... <<truncated, 64 more lines>>
+
+--- IMPLEMENTER ---
+[vllm/model_executor/layers/fused_moe/cutlass_moe.py]
+METHOD INDEX:
+  L436: def _supports_parallel_config(...)
+  L443: def activation_format(...)
+  L446: def supports_expert_map(...)
+  L449: def workspace_dtype(...)
+  L452: def workspace_shapes(...)
+
+SOURCE:
+class CutlassBatchedExpertsFp8(CutlassExpertsFp8Base):
+    """Batched CUTLASS FP8 fused MoE expert implementation."""
+
+    @staticmethod
+    def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+        # BATCHED activation format works with EP because
+        # expert_map is not used to identify experts (the
+        # info is encoded/managed by the P/F logic).
+        return True
+
+    @staticmethod
+    def activation_format() -> mk.FusedMoEActivationFormat:
+        return mk.FusedMoEActivationFormat.BatchedExperts
+
+    def supports_expert_map(self) -> bool:
+        return False
+
+    def workspace_dtype(self, act_dtype: torch.dtype) -> torch.dtype:
+        return self.out_dtype if self.out_dtype is not None else act_dtype
+
+    def workspace_shapes(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        activation: MoEActivation,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        num_dp = self.num_dispatchers
+        assert num_dp is not None
+        experts_per_worker = self.moe_config.num_local_experts
+        activation_out_dim = self.adjust_N_for_activation(N, activation)
+        workspace1 = (experts_per_worker, M * num_dp, max(N, K))
+        workspace2 = (
+            experts_per_worker,
+            M * num_dp,
+            max(activation_out_dim, K),
+        )
+        output = (experts_per_worker, M, K)
+        return (workspace1, workspace2, output)
+
+======================================================================
+ROW 49 | implementer | Copilot | zfit/zfit#644
+implementer zfit.models.truncated:TruncatedPDF of zfit.core.basemodel:BaseModel (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/zfit/core/basemodel.py]
+METHOD INDEX:
+  L112: def __init__(...)
+  L148: def __init_subclass__(...)
+  L160: def _subclass_check_support(...)
+  L205: def _func_to_integrate(...)
+  L209: def _func_to_sample_from(...)
+  L213: def space(...)
+  L216: def _check_set_space(...)
+  L223: def _convert_sort_x(...)
+  L248: def update_integration_options(...)
+  L294: def _check_input_norm(...)
+  L315: def _check_input_limits(...)
+  L322: def _convert_sort_space(...)
+  L353: def _integrate(...)
+  L357: def integrate(...)
+  L403: def _single_hook_integrate(...)
+  L407: def _hook_integrate(...)
+  L410: def _norm_integrate(...)
+  L419: def _limits_integrate(...)
+  L429: def _call_integrate(...)
+  L436: def _fallback_integrate(...)
+  L453: def register_analytic_integral(...)
+  L502: def register_inverse_analytic_integral(...)
+  L516: def _analytic_integrate(...)
+  L520: def analytic_integrate(...)
+  L555: def _single_hook_analytic_integrate(...)
+  L558: def _hook_analytic_integrate(...)
+  L561: def _norm_analytic_integrate(...)
+  L583: def _limits_analytic_integrate(...)
+  L593: def _call_analytic_integrate(...)
+  L598: def _fallback_analytic_integrate(...)
+  L612: def has_analytic_integral(...)
+  L637: def _numeric_integrate(...)
+  L641: def numeric_integrate(...)
+  L681: def _single_hook_numeric_integrate(...)
+  L684: def _hook_numeric_integrate(...)
+  L687: def _norm_numeric_integrate(...)
+  L697: def _limits_numeric_integrate(...)
+  L708: def _call_numeric_integrate(...)
+  L715: def _fallback_numeric_integrate(...)
+  L719: def _partial_integrate(...)
+  L723: def partial_integrate(...)
+  L773: def _single_hook_partial_integrate(...)
+  L776: def _hook_partial_integrate(...)
+  L779: def _norm_partial_integrate(...)
+  L789: def _limits_partial_integrate(...)
+  L800: def _call_partial_integrate(...)
+  L810: def _fallback_partial_integrate(...)
+  L830: def _partial_analytic_integrate(...)
+  L834: def partial_analytic_integrate(...)
+  L879: def _single_hook_partial_analytic_integrate(...)
+  L882: def _hook_partial_analytic_integrate(...)
+  L885: def _norm_partial_analytic_integrate(...)
+  L905: def _limits_partial_analytic_integrate(...)
+  L916: def _call_partial_analytic_integrate(...)
+  L921: def _fallback_partial_analytic_integrate(...)
+  L936: def _partial_numeric_integrate(...)
+  L940: def partial_numeric_integrate(...)
+  L979: def _single_hook_partial_numeric_integrate(...)
+  L982: def _hook_partial_numeric_integrate(...)
+  L985: def _norm_partial_numeric_integrate(...)
+  L994: def _limits_partial_numeric_integrate(...)
+  L1004: def _call_partial_numeric_integrate(...)
+  L1009: def _fallback_partial_numeric_integrate(...)
+  L1014: def _auto_numeric_integrate(...)
+  L1053: def _inverse_analytic_integrate(...)
+  L1068: def create_sampler(...)
+  L1151: def _create_sampler_tensor(...)
+  L1155: def _sample(...)
+  L1158: def sample(...)
+  L1214: def _single_hook_sample(...)
+  L1218: def _hook_sample(...)
+  L1221: def _limits_sample(...)
+  L1247: def _call_sample(...)
+  L1254: def _analytic_sample(...)
+  L1290: def _fallback_sample(...)
+  L1301: def _register_additional_repr(...)
+  L1319: def _get_additional_repr(...)
+  L1344: def __repr__(...)
+  L1350: def _check_input_x_function(...)
+  L1357: def __add__(...)
+  L1362: def __radd__(...)
+  L1367: def __mul__(...)
+  L1372: def __rmul__(...)
+  L1138: def sample_func(...)
+  L1205: def run_tf(...)
+  L816: def part_int(...)
+  L443: def part_int(...)
+
+SOURCE:
+class BaseModel(BaseNumeric, GraphCachable, BaseDimensional, ZfitModel):
+    """Base class for any generic model.
+
+    # TODO instructions on how to use
+    """
+
+    DEFAULTS_integration = DotMap()
+    DEFAULTS_integration.mc_sampler = lambda *args, **kwargs: mc.sample_halton_sequence(
+        *args, randomized=False, **kwargs
+    )
+    DEFAULTS_integration.draws_per_dim = "auto"
+    DEFAULTS_integration.draws_simpson = "auto"
+    DEFAULTS_integration.max_draws = 1_200_000
+    DEFAULTS_integration.tol = 3e-6
+    DEFAULTS_integration.auto_numeric_integrator = zintegrate.auto_integrate
+
+    _analytic_integral = None
+    _inverse_analytic_integral = None
+    _additional_repr = None
+
+    def __init__(
+        self,
+        obs: ztyping.ObsTypeInput,
+        params: dict[str, ZfitParameter] | None = None,
+        name: str = "BaseModel",
+        dtype=ztypes.float,
+        **kwargs,
+    ):
+        """The base model to inherit from and overwrite ``_unnormalized_pdf``.
+
+        Args:
+            dtype: the dtype of the model
+            name: the name of the model
+            params: A dictionary with the internal name of the parameter and
+                the parameters itself the model depends on
+        """
+        super().__init__(name=name, dtype=dtype, params=params, **kwargs)
+        self._check_set_space(obs)
+
+        self._integration = DotMap()
+        self._integration.auto_numeric_integrator = self.DEFAULTS_integration.auto_numeric_integrator
+        self.integration = Integration(
+            mc_sampler=self.DEFAULTS_integration.mc_sampler,
+            draws_per_dim=self.DEFAULTS_integration.draws_per_dim,
+            max_draws=self.DEFAULTS_integration.max_draws,
+            tol=self.DEFAULTS_integration.tol,
+            draws_simpson=None,
+        )
+        self.update_integration_options(
+            draws_per_dim=self.DEFAULTS_integration.draws_per_dim,
+            draws_simpson=self.DEFAULTS_integration.draws_simpson,
+        )
+
+        self._sample_and_weights = UniformSampleAndWeights
+
+    @classmethod
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # check if subclass has decorator if required
+        cls._subclass_check_support(
+            methods_to_check=_BaseModel_USER_IMPL_METHODS_TO_CHECK,
+            wrapper_not_overwritten=_BaseModel_register_check_support,
+        )
+        cls._analytic_integral = zintegrate.AnalyticIntegral()
+        cls._inverse_analytic_integral = []
+        cls._additional_repr = {}
+
+    @classmethod
+    def _subclass_check_support(cls, methods_to_check, wrapper_not_overwritten):
+        for method_name, has_support in methods_to_check.items():
+            method = getattr(cls, method_name)
+            if hasattr(method, "__wrapped__") and method.__wrapped__ == wrapper_not_overwritten:
+                continue  # not overwritten, fine
+
+            # here means: overwritten
+            if hasattr(method, "__wrapped__"):
+                if method.__wrapped__ == supports:
+                    if has_support:
+                        continue  # needs support, has been wrapped
+
+                    msg = (
+                        f"Method {method_name} has been wrapped with supports but"
+                        f" is not allowed to. Has to handle all arguments."
+                    )
+                    raise BasePDFSubclassingError(msg)
+                if has_support:
+                    msg = (
+                        f"Method {method_name} has been overwritten and *has to* be"
+                        f" wrapped by `supports` decorator (don't forget () ) to call the decorator"
+                        f" as it takes arguments"
+                    )
+                    raise BasePDFSubclassingError(msg)
+                if not has_support:
+                    continue  # no support, has not been wrapped with
+            elif not has_support:
+                continue  # not wrapped, no support, need no
+
+            # if we reach this points, somethings was implemented wrongly
+            if method_name not in ["_pdf"]:
+                msg = (
+                    f"Method {method_name} has not been correctly wrapped with @supports "
+                    "OR has been wrapped but it should not be"
+                )
+                raise BasePDFSubclassingError(msg)
+            warnings.warn(
+                "For the future, also decorate _pdf with @supports and specify what you support"
+                " (such as 'norm=True' to keep the same behavior as before)",
+                FutureWarning,
+                stacklevel=2,
+            )
+
+    # since subclasses can be funcs of pdfs, we need to now what to sample/integrate from
+    @abc.abstractmethod
+    def _func_to_integrate(self, x: ztyping.XType, *, params=None) -> tf.Tensor:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def _func_to_sample_from(self, x: ztyping.XType, *, params=None) -> Data:
+        raise NotImplementedError
+
+... <<truncated, 1164 more lines>>
+
+--- IMPLEMENTER ---
+[src/zfit/models/truncated.py]
+METHOD INDEX:
+  L100: def __init__(...)
+  L207: def limits(...)
+  L210: def _unnormalized_pdf(...)
+  L226: def _integrate(...)
+  L243: def _analytic_integrate(...)
+  L262: def _sample(...)
+  L175: def scaled_yield(...)
+
+SOURCE:
+class TruncatedPDF(BaseFunctor, SerializableMixin):
+    def __init__(
+        self,
+        pdf: ZfitPDF,
+        limits: ZfitSpace | Iterable[ZfitSpace],
+        obs: ztyping.ObsTypeInput = None,
+        *,
+        extended: ztyping.ExtendedInputType = None,
+        norm: ztyping.NormRangeTypeInput = None,
+        name: str | None = None,
+        label: str | None = None,
+    ):
+        """Truncated PDF in one or multiple ranges.
+
+        The PDF is truncated to the given limits, i.e. the PDF is only evaluated within the given limits
+        and outside the limits, the PDF is zero. The limits can be given as a single or as a list of limits.
+        This solves two problems: first, the PDF is only evaluated where it is defined and zero outside,
+        which enables PDFs that are not defined outside the limits to be used (Poisson, LogNormal, Chi2,...).
+        Second, the list of limits can be used to effectively create a multilimit PDF, that means, a PDF that
+        is defined in multiple ranges and zero outside these ranges, also in between.
+
+        Historically, this was implemented in zfit through MultipleLimits, which is now deprecated and replaced
+        by this class.
+
+        Args:
+            pdf: The PDF to be truncated.
+            limits: The limits to truncate the PDF. Can be a single limit or multiple limits.
+            obs: |@doc:pdf.init.obs| Observables of the
+               model. This will be used as the default space of the PDF and,
+               if not given explicitly, as the normalization range.
+
+               The default space is used for example in the sample method: if no
+               sampling limits are given, the default space is used.
+
+               If the observables are binned and the model is unbinned, the
+               model will be a binned model, by wrapping the model in a
+               :py:class:`~zfit.pdf.BinnedFromUnbinnedPDF`, equivalent to
+               calling :py:meth:`~zfit.pdf.BasePDF.to_binned`.
+
+               If the observables are binned and the model is unbinned, the
+               model will be a binned model, by wrapping the model in a
+               :py:class:`~zfit.pdf.BinnedFromUnbinnedPDF`, equivalent to
+               calling :py:meth:`~zfit.pdf.BasePDF.to_binned`.
+
+               The observables are not equal to the domain as it does not restrict or
+               truncate the model outside this range. |@docend:pdf.init.obs|
+            extended: |@doc:pdf.init.extended| The overall yield of the PDF.
+               If this is parameter-like, it will be used as the yield,
+               the expected number of events, and the PDF will be extended.
+               An extended PDF has additional functionality, such as the
+               ``ext_*`` methods and the ``counts`` (for binned PDFs). |@docend:pdf.init.extended|
+               If None, the PDF will be extended if the original PDF is extended.
+               If ``True`` and the original PDF is extended, the yield will be scaled to the
+               fraction of the total integral that is within the limits.
+               Therefore, the overall yield is comparable, i.e. the pdfs can be plotted
+               "on top of each other".
+            norm: |@doc:pdf.init.norm| Normalization of the PDF.
+               By default, this is the same as the default space of the PDF. |@docend:pdf.init.norm|
+            name: |@doc:pdf.init.name| Name of the PDF.
+               Maybe has implications on the serialization and deserialization of the PDF.
+               For a human-readable name, use the label. |@docend:pdf.init.name|
+            label: |@doc:pdf.init.label| Human-readable name
+               or label of
+               the PDF for a better description, to be used with plots etc.
+               Has no programmatical functional purpose as identification. |@docend:pdf.init.label|
+        """
+        original_init = {"extended": extended, "obs": obs}
+        if name is None:
+            name = "TruncatedPDF"
+        obs = pdf.space if obs is None else convert_to_space(obs)
+        self._limits = check_limits(limits, obs=obs)
+        if extended is None:
+            extended = pdf.is_extended
+        if extended is True and pdf.is_extended:
+            paramname = "wrapped_yield"
+
+            def scaled_yield(params: dict[str, tf.Tensor]) -> tuple[tf.Tensor]:
+                base_norm = pdf.integrate(limits=obs, norm=False)
+                piecewise_norms = znp.asarray([pdf.integrate(limits=limit, norm=False) for limit in self._limits])
+                relative_scale = znp.sum(piecewise_norms / base_norm)
+                return (params[paramname] * relative_scale,)
+
+            import zfit  # noqa: PLC0415
+
+            params_deps = {p.name: p for p in pdf.get_params(floating=None)}
+            toreplace = paramname
+            while toreplace in params_deps:
+                newtoreplace = f"{toreplace}_x"
+                params_deps[newtoreplace] = params_deps.pop(toreplace)
+                toreplace = newtoreplace
+
+            pdfyield = pdf.get_yield()
+            params_deps[paramname] = pdfyield
+            if pdfyield.name in params_deps:
+                params_deps.pop(pdfyield.name)
+
+            extended = zfit.param.ComposedParameter(
+                name=f"AUTO_yield{zfit.core.parameter.get_auto_number()!s}_{name}",
+                func=scaled_yield,
+                params=params_deps,
+            )
+        super().__init__(obs=obs, name=name, extended=extended, norm=norm, pdfs=pdf, label=label)
+        if self.obs != pdf.obs:
+            msg = f"The space of the TruncatedPDF ({self.obs}) must be the same as the PDF ({pdf.space})."
+            raise ValueError(msg)
+        self.hs3.original_init.update(original_init)
+
+    @property
+    def limits(self):
+        return self._limits
+
+    def _unnormalized_pdf(self, x):
+        # the implementation only feeds the pdf with data that is inside the limits that we want to evaluate
+        # this maybe has a speedup (although limited as we're using dynamic shapes -> needs to change for JAX)
+        # but most importantly avoids any issue if we take the gradient of a pdf that is not defined outside
+        # the limits, because this can yield NaNs using a naive multiplication with a mask
+        from zfit import Data  # noqa: PLC0415
+
+        xarray = znp.asarray(x.value())
+        inside_arrays = [limit.inside(x) for limit in self._limits]
+... <<truncated, 66 more lines>>
+
+======================================================================
+ROW 50 | interface | OpenAI_Codex | vllm-project/vllm#36136
+interface vllm.model_executor.models.interfaces:SupportsMultiModal kind=protocol
+======================================================================
+[vllm/model_executor/models/interfaces.py]
+METHOD INDEX:
+  L142: def get_placeholder_str(...)
+  L148: def embed_multimodal(...)
+  L160: def configure_mm_token_handling(...)
+  L171: def get_language_model(...)
+  L209: def _mark_language_model(...)
+  L244: def _mark_tower_model(...)
+  L288: def _mark_composite_model(...)
+  L318: def get_num_mm_encoder_tokens(...)
+  L327: def get_num_mm_connector_tokens(...)
+  L337: def embed_input_ids(...)
+  L340: def embed_input_ids(...)
+  L348: def _embed_text_input_ids(...)
+  L365: def embed_input_ids(...)
+
+SOURCE:
+class SupportsMultiModal(Protocol):
+    """The interface required for all multi-modal models."""
+
+    supports_multimodal: ClassVar[Literal[True]] = True
+    """
+    A flag that indicates this model supports multi-modal inputs.
+
+    Note:
+        There is no need to redefine this flag if this class is in the
+        MRO of your model class.
+    """
+
+    supports_multimodal_raw_input_only: ClassVar[bool] = False
+    """
+    A flag that indicates this model supports multi-modal inputs and processes
+    them in their raw form and not embeddings.
+    """
+
+    supports_encoder_tp_data: ClassVar[bool] = False
+    """
+    A flag that indicates whether this model supports
+    `multimodal_config.mm_encoder_tp_mode="data"`.
+    """
+
+    requires_raw_input_tokens: ClassVar[bool] = False
+    """
+    A flag that indicates this model processes input id tokens
+    in their raw form and not input embeddings.
+    """
+
+    _processor_factory: ClassVar[_ProcessorFactories]
+    """
+    Set internally by `MultiModalRegistry.register_processor`.
+    """
+
+    _language_model_names: list[str] = []
+    """
+    Set internally by `_mark_language_model`.
+    """
+
+    _tower_model_names: list[str] = []
+    """
+    Set internally by `_mark_tower_model`.
+    """
+
+    _has_oov_mm_tokens: bool = False
+    """
+    In general, this should be set at init time by invoking
+    `configure_mm_token_handling` models & passing all potentially
+    OOV multimodal tokens.
+    """
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        """
+        Get the placeholder text for the `i`th `modality` item in the prompt.
+        """
+        ...
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        """
+        Returns multimodal embeddings generated from multimodal kwargs
+        to be merged with text embeddings.
+
+        Note:
+            The returned multimodal embeddings must be in the same order as
+            the appearances of their corresponding multimodal data item in the
+            input prompt.
+        """
+        ...
+
+    def configure_mm_token_handling(self, vocab_size: int, mm_token_ids: list[int]):
+        """Check if any multimodal tokens are out of vocabulary. If so, we will
+        explicitly mask all multimodal tokens out when computing text embeddings,
+        since the multimodal embeddings will be scattered over the results.
+        """
+        self._has_oov_mm_tokens = any(tok_id >= vocab_size for tok_id in mm_token_ids)
+        logger.info(
+            "Contains out of vocabulary multimodal tokens? %s",
+            self._has_oov_mm_tokens,
+        )
+
+    def get_language_model(self) -> VllmModel:
+        """
+        Returns the underlying language model used for text generation.
+
+        This is typically the `torch.nn.Module` instance responsible for
+        processing the merged multimodal embeddings and producing hidden states
+
+        Returns:
+            torch.nn.Module: The core language model component.
+        """
+        # Cached
+        if self in _language_model_by_module:
+            return _language_model_by_module[self]
+
+        if self._language_model_names:
+            mod = self
+            for attr in common_prefix(
+                [name.split(".") for name in self._language_model_names]
+            ):
+                if attr:
+                    mod = getattr(mod, attr)
+
+            if mod is not self and hasattr(mod, "embed_input_ids"):
+                _language_model_by_module[self] = mod
+                return mod
+
+        # Fallback
+        for mod in self.children():
+            if hasattr(mod, "embed_input_ids"):
+                _language_model_by_module[self] = mod
+                return mod
+
+        raise NotImplementedError(
+            f"No language model found in {type(self).__name__}! "
+            "You should initialize it via `_mark_language_model`."
+        )
+
+    @contextmanager
+... <<truncated, 192 more lines>>
+
+======================================================================
+ROW 51 | interface | Claude_Code | nexi-lab/nexus#944
+interface nexus.core.filesystem:NexusFilesystem kind=abc
+======================================================================
+[src/nexus/core/filesystem.py]
+METHOD INDEX:
+  L42: def agent_id(...)
+  L48: def tenant_id(...)
+  L57: def read(...)
+  L80: def write(...)
+  L114: def write_batch(...)
+  L158: def append(...)
+  L189: def delete(...)
+  L205: def rename(...)
+  L226: def exists(...)
+  L243: def list(...)
+  L281: def glob(...)
+  L312: def grep(...)
+  L365: def mkdir(...)
+  L384: def rmdir(...)
+  L402: def is_directory(...)
+  L420: def get_available_namespaces(...)
+  L443: def get_version(...)
+  L463: def list_versions(...)
+  L480: def rollback(...)
+  L499: def diff_versions(...)
+  L528: def workspace_snapshot(...)
+  L553: def workspace_restore(...)
+  L576: def workspace_log(...)
+  L598: def workspace_diff(...)
+  L625: def register_workspace(...)
+  L654: def unregister_workspace(...)
+  L666: def list_workspaces(...)
+  L675: def get_workspace_info(...)
+  L689: def register_memory(...)
+  L716: def unregister_memory(...)
+  L728: def list_memories(...)
+  L737: def get_memory_info(...)
+  L751: def sandbox_create(...)
+  L774: def sandbox_get_or_create(...)
+  L799: def sandbox_run(...)
+  L829: def sandbox_pause(...)
+  L842: def sandbox_resume(...)
+  L855: def sandbox_stop(...)
+  L868: def sandbox_list(...)
+  L893: def sandbox_status(...)
+  L906: def sandbox_connect(...)
+  L936: def sandbox_disconnect(...)
+  L961: def add_mount(...)
+  L988: def remove_mount(...)
+  L1004: def list_mounts(...)
+  L1013: def get_mount(...)
+  L1025: def close(...)
+  L1029: def __enter__(...)
+  L1033: def __exit__(...)
+
+SOURCE:
+class NexusFilesystem(ABC):
+    """
+    Abstract base class for Nexus filesystem implementations.
+
+    All filesystem modes (Embedded, Monolith, Distributed) must implement
+    this interface to ensure consistent behavior across modes.
+
+    This interface provides:
+    - Core file operations (read, write, delete, exists)
+    - File discovery operations (list, glob, grep)
+    - Directory operations (mkdir, rmdir, is_directory)
+    - Lifecycle management (close, context manager)
+
+    Version History:
+    Initial interface includes file operations, discovery operations, and directory operations.
+    Permission operations use ReBAC (Relationship-Based Access Control).
+    """
+
+    # Instance attributes (set by implementations)
+    # Note: These are implemented as read-only properties by subclasses
+    @property
+    @abstractmethod
+    def agent_id(self) -> str | None:
+        """Agent ID for this filesystem instance."""
+        ...
+
+    @property
+    @abstractmethod
+    def tenant_id(self) -> str | None:
+        """Tenant ID for this filesystem instance."""
+        ...
+
+    # ============================================================
+    # Core File Operations
+    # ============================================================
+
+    @abstractmethod
+    def read(
+        self, path: str, context: Any = None, return_metadata: bool = False
+    ) -> bytes | dict[str, Any]:
+        """
+        Read file content as bytes.
+
+        Args:
+            path: Virtual path to read
+            context: Optional operation context for permission checks
+            return_metadata: If True, return dict with content and metadata
+
+        Returns:
+            If return_metadata=False: File content as bytes
+            If return_metadata=True: Dict with content, etag, version, etc.
+
+        Raises:
+            NexusFileNotFoundError: If file doesn't exist
+            InvalidPathError: If path is invalid
+            AccessDeniedError: If access is denied
+        """
+        ...
+
+    @abstractmethod
+    def write(
+        self,
+        path: str,
+        content: bytes,
+        context: Any = None,
+        if_match: str | None = None,
+        if_none_match: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Write content to a file with optional optimistic concurrency control.
+
+        Creates parent directories if needed. Overwrites existing files.
+
+        Args:
+            path: Virtual path to write
+            content: File content as bytes
+            context: Optional operation context for permission checks
+            if_match: Optional etag for optimistic concurrency control
+            if_none_match: If True, create-only mode
+            force: If True, skip version check
+
+        Returns:
+            Dict with metadata (etag, version, modified_at, size)
+
+        Raises:
+            InvalidPathError: If path is invalid
+            AccessDeniedError: If access is denied
+            PermissionError: If path is read-only
+            ConflictError: If if_match doesn't match current etag
+        """
+        ...
+
+    @abstractmethod
+    def write_batch(
+        self, files: builtins.list[tuple[str, bytes]], context: Any = None
+    ) -> builtins.list[dict[str, Any]]:
+        """
+        Write multiple files in a single transaction for improved performance.
+
+        This is 4x faster than calling write() multiple times for small files
+        because it uses a single database transaction instead of N transactions.
+
+        All files are written atomically - either all succeed or all fail.
+
+        Args:
+            files: List of (path, content) tuples to write
+            context: Optional operation context for permission checks (uses default if not provided)
+
+        Returns:
+            List of metadata dicts for each file (in same order as input):
+                - etag: Content hash (SHA-256) of the written content
+                - version: New version number
+                - modified_at: Modification timestamp
+                - size: File size in bytes
+
+        Raises:
+            InvalidPathError: If any path is invalid
+            BackendError: If write operation fails
+            AccessDeniedError: If access is denied (tenant isolation or read-only namespace)
+... <<truncated, 896 more lines>>
+
+======================================================================
+ROW 52 | interface | Claude_Code | oraios/serena#656
+interface serena.mcp:SerenaMCPFactory kind=abc
+======================================================================
+[src/serena/mcp.py]
+METHOD INDEX:
+  L50: def __init__(...)
+  L61: def _sanitize_for_openai_tools(...)
+  L168: def make_mcp_tool(...)
+  L229: def _iter_tools(...)
+  L233: def _set_mcp_tools(...)
+  L243: def _instantiate_agent(...)
+  L246: def create_mcp_server(...)
+  L304: def server_lifespan(...)
+  L309: def _get_initial_instructions(...)
+  L74: def walk(...)
+  L213: def execute_fn(...)
+
+SOURCE:
+class SerenaMCPFactory:
+    def __init__(self, context: str = DEFAULT_CONTEXT, project: str | None = None):
+        """
+        :param context: The context name or path to context file
+        :param project: Either an absolute path to the project directory or a name of an already registered project.
+            If the project passed here hasn't been registered yet, it will be registered automatically and can be activated by its name
+            afterward.
+        """
+        self.context = SerenaAgentContext.load(context)
+        self.project = project
+
+    @staticmethod
+    def _sanitize_for_openai_tools(schema: dict) -> dict:
+        """
+        This method was written by GPT-5, I have not reviewed it in detail.
+        Only called when `openai_tool_compatible` is True.
+
+        Make a Pydantic/JSON Schema object compatible with OpenAI tool schema.
+        - 'integer' -> 'number' (+ multipleOf: 1)
+        - remove 'null' from union type arrays
+        - coerce integer-only enums to number
+        - best-effort simplify oneOf/anyOf when they only differ by integer/number
+        """
+        s = deepcopy(schema)
+
+        def walk(node):  # type: ignore
+            if not isinstance(node, dict):
+                # lists get handled by parent calls
+                return node
+
+            # ---- handle type ----
+            t = node.get("type")
+            if isinstance(t, str):
+                if t == "integer":
+                    node["type"] = "number"
+                    # preserve existing multipleOf but ensure it's integer-like
+                    if "multipleOf" not in node:
+                        node["multipleOf"] = 1
+            elif isinstance(t, list):
+                # remove 'null' (OpenAI tools don't support nullables)
+                t2 = [x if x != "integer" else "number" for x in t if x != "null"]
+                if not t2:
+                    # fall back to object if it somehow becomes empty
+                    t2 = ["object"]
+                node["type"] = t2[0] if len(t2) == 1 else t2
+                if "integer" in t or "number" in t2:
+                    # if integers were present, keep integer-like restriction
+                    node.setdefault("multipleOf", 1)
+
+            # ---- enums of integers -> number ----
+            if "enum" in node and isinstance(node["enum"], list):
+                vals = node["enum"]
+                if vals and all(isinstance(v, int) for v in vals):
+                    node.setdefault("type", "number")
+                    # keep them as ints; JSON 'number' covers ints
+                    node.setdefault("multipleOf", 1)
+
+            # ---- simplify anyOf/oneOf if they only differ by integer/number ----
+            for key in ("oneOf", "anyOf"):
+                if key in node and isinstance(node[key], list):
+                    # Special case: anyOf or oneOf with "type X" and "null"
+                    if len(node[key]) == 2:
+                        types = [sub.get("type") for sub in node[key]]
+                        if "null" in types:
+                            non_null_type = next(t for t in types if t != "null")
+                            if isinstance(non_null_type, str):
+                                node["type"] = non_null_type
+                                node.pop(key, None)
+                                continue
+                    simplified = []
+                    changed = False
+                    for sub in node[key]:
+                        sub = walk(sub)  # recurse
+                        simplified.append(sub)
+                    # If all subs are the same after integer→number, collapse
+                    try:
+                        import json
+
+                        canon = [json.dumps(x, sort_keys=True) for x in simplified]
+                        if len(set(canon)) == 1:
+                            # copy the single schema up
+                            only = simplified[0]
+                            node.pop(key, None)
+                            for k, v in only.items():
+                                if k not in node:
+                                    node[k] = v
+                            changed = True
+                    except Exception:
+                        pass
+                    if not changed:
+                        node[key] = simplified
+
+            # ---- recurse into known schema containers ----
+            for child_key in ("properties", "patternProperties", "definitions", "$defs"):
+                if child_key in node and isinstance(node[child_key], dict):
+                    for k, v in list(node[child_key].items()):
+                        node[child_key][k] = walk(v)
+
+            # arrays/items
+            if "items" in node:
+                node["items"] = walk(node["items"])
+
+            # allOf/if/then/else - pass through with integer→number conversions applied inside
+            for key in ("allOf",):
+                if key in node and isinstance(node[key], list):
+                    node[key] = [walk(x) for x in node[key]]
+
+            if "if" in node:
+                node["if"] = walk(node["if"])
+            if "then" in node:
+                node["then"] = walk(node["then"])
+            if "else" in node:
+                node["else"] = walk(node["else"])
+
+            return node
+
+        return walk(s)
+
+    @staticmethod
+    def make_mcp_tool(tool: Tool, openai_tool_compatible: bool = True) -> MCPTool:
+... <<truncated, 142 more lines>>
+
+======================================================================
+ROW 53 | implementer | Claude_Code | nexi-lab/nexus#2148
+implementer tests.unit.backends.test_registry:IdentityBackend of nexus.backends.backend:Backend (kind=abc)
+======================================================================
+--- INTERFACE (the contract) ---
+[src/nexus/backends/backend.py]
+METHOD INDEX:
+  L93: def resolve_database_url(...)
+  L119: def name(...)
+  L129: def user_scoped(...)
+  L156: def is_connected(...)
+  L171: def thread_safe(...)
+  L190: def supports_rename(...)
+  L203: def has_virtual_filesystem(...)
+  L217: def has_root_path(...)
+  L230: def has_token_manager(...)
+  L243: def has_data_dir(...)
+  L256: def is_passthrough(...)
+  L269: def supports_parallel_mmap_read(...)
+  L282: def describe(...)
+  L294: def connect(...)
+  L314: def disconnect(...)
+  L330: def check_connection(...)
+  L365: def write_content(...)
+  L388: def read_content(...)
+  L407: def batch_read_content(...)
+  L446: def stream_content(...)
+  L479: def stream_range(...)
+  L508: def write_stream(...)
+  L546: def delete_content(...)
+  L569: def content_exists(...)
+  L589: def get_content_size(...)
+  L609: def get_ref_count(...)
+  L631: def mkdir(...)
+  L660: def rmdir(...)
+  L680: def is_directory(...)
+  L695: def list_dir(...)
+  L727: def get_file_info(...)
+  L769: def get_object_type(...)
+  L797: def get_object_id(...)
+
+SOURCE:
+class Backend(ABC):
+    """
+    Unified backend interface for storage operations.
+
+    All storage backends (LocalFS, S3, GCS, etc.) implement this interface.
+    It combines:
+    - Content-addressable storage (CAS) for automatic deduplication
+    - Directory operations for filesystem compatibility
+
+    Content Operations:
+    - Files stored by SHA-256 hash
+    - Automatic deduplication (same content = stored once)
+    - Reference counting for safe deletion
+
+    Directory Operations:
+    - Virtual directory structure (metadata-based or backend-native)
+    - Compatible with path router and mounting
+    """
+
+    @staticmethod
+    def resolve_database_url(db_param: str) -> str:
+        """
+        Resolve database URL with TOKEN_MANAGER_DB environment variable priority.
+
+        This utility method is used by connector backends (GDrive, Gmail, X) to
+        resolve the database URL for TokenManager, giving priority to the
+        TOKEN_MANAGER_DB environment variable over the provided parameter.
+
+        Args:
+            db_param: Database URL or path provided to the connector
+
+        Returns:
+            Resolved database URL (from env var if set, otherwise db_param)
+
+        Examples:
+            >>> import os
+            >>> os.environ['TOKEN_MANAGER_DB'] = 'postgresql://localhost/nexus'
+            >>> Backend.resolve_database_url('sqlite:///local.db')
+            'postgresql://localhost/nexus'
+        """
+        import os
+
+        return os.getenv("TOKEN_MANAGER_DB") or db_param
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """
+        Backend identifier name.
+
+        Returns:
+            Backend name (e.g., "local", "gcs", "s3")
+        """
+        pass
+
+    @property
+    def user_scoped(self) -> bool:
+        """
+        Whether this backend requires per-user credentials (OAuth-based).
+
+        User-scoped backends (e.g., Google Drive, OneDrive) use different
+        credentials for each user. The backend will receive OperationContext
+        to determine which user's credentials to use.
+
+        Non-user-scoped backends (e.g., GCS, S3) use shared service account
+        credentials and ignore the context parameter.
+
+        Returns:
+            True if backend requires per-user credentials, False otherwise
+            Default: False (shared credentials)
+
+        Examples:
+            >>> # Shared credentials (GCS, S3)
+            >>> gcs_backend.user_scoped
+            False
+
+            >>> # Per-user OAuth (Google Drive, OneDrive)
+            >>> gdrive_backend.user_scoped
+            True
+        """
+        return False
+
+    @property
+    def is_connected(self) -> bool:
+        """
+        Whether the backend is currently connected.
+
+        For stateless backends (e.g., local filesystem), this always returns True.
+        For stateful backends (e.g., databases, cloud services with sessions),
+        this reflects the actual connection state.
+
+        Returns:
+            True if connected/ready, False otherwise
+            Default: True (for stateless backends)
+        """
+        return True
+
+    @property
+    def thread_safe(self) -> bool:
+        """
+        Whether this backend is safe for concurrent access from multiple threads.
+
+        Thread-safe backends can share a single instance across threads.
+        Non-thread-safe backends require per-thread instances or connection pooling.
+
+        Returns:
+            True if thread-safe, False otherwise
+            Default: True (most backends are thread-safe)
+        """
+        return True
+
+    # === Capability Flags ===
+    # These properties declare backend capabilities so that core code can use
+    # polymorphic dispatch instead of hasattr/isinstance/getattr checks.
+    # Each defaults to False; concrete backends override to return True.
+
+    @property
+    def supports_rename(self) -> bool:
+        """Whether this backend supports direct file rename/move.
+
+... <<truncated, 630 more lines>>
+
+--- IMPLEMENTER ---
+[tests/unit/backends/test_registry.py]
+METHOD INDEX:
+
+
+SOURCE:
+        class IdentityBackend(DummyBackend):
+            CONNECTION_ARGS = {
+                "data_dir": ConnectionArg(
+                    type=ArgType.PATH,
+                    description="Data directory",
+                ),
+            }
+
+======================================================================
+ROW 54 | interface | Claude_Code | datajoint/datajoint-python#1338
+interface datajoint.adapters.base:DatabaseAdapter kind=abc
+======================================================================
+[src/datajoint/adapters/base.py]
+METHOD INDEX:
+  L27: def connect(...)
+  L59: def close(...)
+  L71: def ping(...)
+  L88: def get_connection_id(...)
+  L106: def default_port(...)
+  L118: def get_cursor(...)
+  L143: def quote_identifier(...)
+  L160: def quote_string(...)
+  L178: def parameter_placeholder(...)
+  L194: def core_type_to_sql(...)
+  L216: def sql_type_to_core(...)
+  L237: def create_schema_sql(...)
+  L254: def drop_schema_sql(...)
+  L273: def create_table_sql(...)
+  L308: def drop_table_sql(...)
+  L327: def alter_table_sql(...)
+  L356: def add_comment_sql(...)
+  L386: def insert_sql(...)
+  L412: def update_sql(...)
+  L438: def delete_sql(...)
+  L455: def upsert_on_duplicate_sql(...)
+  L499: def list_schemas_sql(...)
+  L511: def list_tables_sql(...)
+  L528: def get_table_info_sql(...)
+  L547: def get_columns_sql(...)
+  L566: def get_primary_key_sql(...)
+  L585: def get_foreign_keys_sql(...)
+  L604: def get_constraint_info_sql(...)
+  L631: def parse_foreign_key_error(...)
+  L670: def get_indexes_sql(...)
+  L689: def parse_column_info(...)
+  L711: def start_transaction_sql(...)
+  L728: def commit_sql(...)
+  L740: def rollback_sql(...)
+  L756: def current_timestamp_expr(...)
+  L773: def interval_expr(...)
+  L793: def json_path_expr(...)
+  L823: def format_column_definition(...)
+  L860: def table_options_clause(...)
+  L882: def table_comment_ddl(...)
+  L906: def column_comment_ddl(...)
+  L932: def enum_type_ddl(...)
+  L956: def job_metadata_columns(...)
+  L983: def translate_error(...)
+  L1004: def validate_native_type(...)
+
+SOURCE:
+class DatabaseAdapter(ABC):
+    """
+    Abstract base class for database backend adapters.
+
+    Adapters provide database-specific implementations for SQL generation,
+    type mapping, error translation, and connection management.
+    """
+
+    # =========================================================================
+    # Connection Management
+    # =========================================================================
+
+    @abstractmethod
+    def connect(
+        self,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        **kwargs: Any,
+    ) -> Any:
+        """
+        Establish database connection.
+
+        Parameters
+        ----------
+        host : str
+            Database server hostname.
+        port : int
+            Database server port.
+        user : str
+            Username for authentication.
+        password : str
+            Password for authentication.
+        **kwargs : Any
+            Additional backend-specific connection parameters.
+
+        Returns
+        -------
+        Any
+            Database connection object (backend-specific).
+        """
+        ...
+
+    @abstractmethod
+    def close(self, connection: Any) -> None:
+        """
+        Close the database connection.
+
+        Parameters
+        ----------
+        connection : Any
+            Database connection object to close.
+        """
+        ...
+
+    @abstractmethod
+    def ping(self, connection: Any) -> bool:
+        """
+        Check if connection is alive.
+
+        Parameters
+        ----------
+        connection : Any
+            Database connection object to check.
+
+        Returns
+        -------
+        bool
+            True if connection is alive, False otherwise.
+        """
+        ...
+
+    @abstractmethod
+    def get_connection_id(self, connection: Any) -> int:
+        """
+        Get the current connection/backend process ID.
+
+        Parameters
+        ----------
+        connection : Any
+            Database connection object.
+
+        Returns
+        -------
+        int
+            Connection or process ID.
+        """
+        ...
+
+    @property
+    @abstractmethod
+    def default_port(self) -> int:
+        """
+        Default port for this database backend.
+
+        Returns
+        -------
+        int
+            Default port number (3306 for MySQL, 5432 for PostgreSQL).
+        """
+        ...
+
+    @abstractmethod
+    def get_cursor(self, connection: Any, as_dict: bool = False) -> Any:
+        """
+        Get a cursor from the database connection.
+
+        Parameters
+        ----------
+        connection : Any
+            Database connection object.
+        as_dict : bool, optional
+            If True, return cursor that yields rows as dictionaries.
+            If False, return cursor that yields rows as tuples.
+            Default False.
+
+        Returns
+        -------
+        Any
+... <<truncated, 885 more lines>>
+
+======================================================================
+ROW 55 | interface | Claude_Code | quay/quay#5316
+interface data.secscan_model.interface:SecurityScannerInterface kind=abc
+======================================================================
+[data/secscan_model/interface.py]
+METHOD INDEX:
+  L23: def load_security_information(...)
+  L35: def perform_indexing(...)
+  L46: def perform_indexing_recent_manifests(...)
+  L52: def register_model_cleanup_callbacks(...)
+  L62: def legacy_api_handler(...)
+  L68: def lookup_notification_page(...)
+  L77: def process_notification_page(...)
+  L83: def mark_notification_handled(...)
+
+SOURCE:
+class SecurityScannerInterface(object):
+    """
+    Interface for code to work with the security scan data model.
+
+    This model encapsulates all access when speaking to an external security scanner, as well as any
+    data tracking in the database.
+    """
+
+    @abstractmethod
+    def load_security_information(
+        self, manifest_or_legacy_image, include_vulnerabilities=False, model_cache=None
+    ):
+        """
+        Loads the security information for the given manifest or legacy image, returning a
+        SecurityInformationLookupResult structure.
+
+        The manifest_or_legacy_image must be a Manifest or LegacyImage datatype from the
+        registry_model.
+        """
+
+    @abstractmethod
+    def perform_indexing(self, start_token=None, batch_size=None):
+        """
+        Performs indexing of the next set of unindexed manifests/images.
+
+        If start_token is given, the indexing should resume from that point. Returns a new start
+        index for the next iteration of indexing. The tokens returned and given are assumed to be
+        opaque outside of this implementation and should not be relied upon by the caller to conform
+        to any particular format.
+        """
+
+    @abstractmethod
+    def perform_indexing_recent_manifests(self, batch_size=None):
+        """
+        Performs indexing of a recent set of unindexed manifests/images.
+        """
+
+    @abstractmethod
+    def register_model_cleanup_callbacks(self, data_model_config):
+        """
+        Registers any cleanup callbacks with the data model.
+
+        Typically, a callback is registered to remove the manifest/image from the security indexer
+        if it has been GCed in the data model.
+        """
+
+    @abstractproperty
+    @deprecated(details="Only exposed for the legacy notification worker")
+    def legacy_api_handler(self):
+        """
+        Exposes the legacy security scan API for legacy workers that need it or None if none.
+        """
+
+    @abstractmethod
+    def lookup_notification_page(self, notification_id, page_index=None):
+        """
+        Performs the lookup of a page of results for an incoming notification from the security
+        scanner.
+
+        Returns a PaginatedNotificationResult or None if this engine doesn't support this method.
+        """
+
+    @abstractmethod
+    def process_notification_page(self, page_result):
+        """
+        Processes the page of notification information given and yields UpdatedVulnerability's.
+        """
+
+    @abstractmethod
+    def mark_notification_handled(self, notification_id):
+        """
+        Marks that a security notification from the scanner has been handled.
+        """

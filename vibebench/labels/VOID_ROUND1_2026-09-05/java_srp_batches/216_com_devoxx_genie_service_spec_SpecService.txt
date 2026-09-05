@@ -1,0 +1,406 @@
+row 216   devoxx/DevoxxGenieIDEAPlugin#985
+============================================================================
+CLASS com.devoxx.genie.service.spec.SpecService   loc=768 methods=39 wmc=136 lcom=0.0 c3=0.1262762186118922
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       45  @Slf4j
+       46  @Service(Service.Level.PROJECT)
+       47  public final class SpecService implements Disposable {
+       48  
+       49      private final Project project;
+       50      private final Map<String, TaskSpec> specCache = new ConcurrentHashMap<>();
+       51      private final Map<String, BacklogDocument> documentCache = new ConcurrentHashMap<>();
+       52      private final List<Runnable> changeListeners = new ArrayList<>();
+       53      private final ReentrantLock writeLock = new ReentrantLock();
+       54      private final AtomicBoolean pendingCliBacklogMutation = new AtomicBoolean(false);
+       55      private MessageBusConnection messageBusConnection;
+       56  
+       57      public SpecService(@NotNull Project project) {
+       58          this.project = project;
+       59          initFileWatcher();
+       60          refresh();
+       61      }
+       62  
+       63      public static SpecService getInstance(@NotNull Project project) {
+       64          return project.getService(SpecService.class);
+       65      }
+       66  
+       67      // ===== Task Read Operations =====
+       68  
+       69      /**
+       70       * Returns all cached task specs.
+       71       */
+       72      public @NotNull List<TaskSpec> getAllSpecs() {
+       73          return new ArrayList<>(specCache.values());
+       74      }
+       75  
+       76      /**
+       77       * Returns specs filtered by status.
+       78       */
+       79      public @NotNull List<TaskSpec> getSpecsByStatus(@NotNull String status) {
+       80          return specCache.values().stream()
+       81                  .filter(spec -> status.equalsIgnoreCase(spec.getStatus()))
+       82                  .toList();
+       83      }
+       84  
+       85      /**
+       86       * Returns a spec by its ID.
+       87       */
+       88      public @Nullable TaskSpec getSpec(@NotNull String id) {
+       89          return specCache.values().stream()
+       90                  .filter(spec -> id.equalsIgnoreCase(spec.getId()))
+       91                  .findFirst()
+       92                  .orElse(null);
+       93      }
+       94  
+       95      /**
+       96       * Returns all distinct statuses present in the cached specs.
+       97       */
+       98      public @NotNull List<String> getStatuses() {
+       99          return specCache.values().stream()
+      100                  .map(TaskSpec::getStatus)
+      101                  .filter(Objects::nonNull)
+      102                  .distinct()
+      103                  .toList();
+      104      }
+      105  
+      106      /**
+      107       * Returns true if the spec directory exists in the project.
+      108       */
+      109      public boolean hasSpecDirectory() {
+      110          Path specDir = getSpecDirectoryPath();
+      111          return specDir != null && Files.isDirectory(specDir);
+      112      }
+      113  
+      114      /**
+      115       * Returns specs matching the given filters.
+      116       * When a search term is provided, results are fuzzy-matched and ranked by relevance.
+      117       */
+      118      public @NotNull List<TaskSpec> getSpecsByFilters(@Nullable String status,
+      119                                                        @Nullable String assignee,
+      120                                                        @Nullable List<String> labels,
+      121                                                        @Nullable String search,
+      122                                                        int limit) {
+      123          Stream<TaskSpec> stream = specCache.values().stream();
+      124  
+      125          if (status != null && !status.isEmpty()) {
+      126              stream = stream.filter(s -> status.equalsIgnoreCase(s.getStatus()));
+      127          }
+      128          if (assignee != null && !assignee.isEmpty()) {
+      129              stream = stream.filter(s -> s.getAssignees() != null &&
+      130                      s.getAssignees().stream().anyMatch(a -> a.equalsIgnoreCase(assignee)));
+      131          }
+      132          if (labels != null && !labels.isEmpty()) {
+      133              stream = stream.filter(s -> s.getLabels() != null &&
+      134                      labels.stream().allMatch(l -> s.getLabels().stream().anyMatch(sl -> sl.equalsIgnoreCase(l))));
+      135          }
+      136  
+      137          if (search != null && !search.isEmpty()) {
+      138              // Score, filter, and sort by relevance
+      139              List<Map.Entry<TaskSpec, Double>> scored = stream
+      140                      .map(s -> Map.entry(s, FuzzySearchHelper.scoreMultiField(search, s.getTitle(), s.getDescription(), s.getId())))
+      141                      .filter(e -> e.getValue() >= 0.3)
+      142                      .sorted(Map.Entry.<TaskSpec, Double>comparingByValue().reversed())
+      143                      .toList();
+      144  
+      145              Stream<TaskSpec> resultStream = scored.stream().map(Map.Entry::getKey);
+      146              if (limit > 0) {
+      147                  resultStream = resultStream.limit(limit);
+      148              }
+      149              return resultStream.toList();
+      150          }
+      151  
+      152          if (limit > 0) {
+      153              stream = stream.limit(limit);
+      154          }
+      155  
+      156          return stream.toList();
+      157      }
+      158  
+      159      /**
+      160       * Search specs by query string with fuzzy matching on title and description.
+      161       * Results are ranked by relevance score (best matches first).
+      162       */
+      163      public @NotNull List<TaskSpec> searchSpecs(@NotNull String query,
+      164                                                  @Nullable String status,
+      165                                                  @Nullable String priority,
+      166                                                  int limit) {
+      167          java.util.Map<String, TaskSpec> candidates = new java.util.LinkedHashMap<>();
+      168          specCache.values().forEach(spec -> candidates.put(spec.getId().toUpperCase(java.util.Locale.ROOT), spec));
+      169          getArchivedTasks().forEach(spec -> candidates.putIfAbsent(spec.getId().toUpperCase(java.util.Locale.ROOT), spec));
+      170  
+      171          Stream<TaskSpec> stream = candidates.values().stream();
+      172  
+      173          if (status != null && !status.isEmpty()) {
+      174              stream = stream.filter(s -> status.equalsIgnoreCase(s.getStatus()));
+      175          }
+      176          if (priority != null && !priority.isEmpty()) {
+      177              stream = stream.filter(s -> priority.equalsIgnoreCase(s.getPriority()));
+      178          }
+      179  
+      180          // Score each spec and filter out non-matches, then sort by relevance
+      181          List<Map.Entry<TaskSpec, Double>> scored = stream
+      182                  .map(s -> Map.entry(s, FuzzySearchHelper.scoreMultiField(query, s.getTitle(), s.getDescription())))
+      183                  .filter(e -> e.getValue() >= 0.3)
+      184                  .sorted(Map.Entry.<TaskSpec, Double>comparingByValue().reversed())
+      185                  .toList();
+      186  
+      187          Stream<TaskSpec> resultStream = scored.stream().map(Map.Entry::getKey);
+      188          if (limit > 0) {
+      189              resultStream = resultStream.limit(limit);
+      190          }
+      191  
+      192          return resultStream.toList();
+      193      }
+      194  
+      195      // ===== Task Write Operations =====
+      196  
+      197      /**
+      198       * Creates a new task file and returns the created spec.
+      199       * If the task has no Definition of Done items, project-wide DoD defaults from config.yml
+      200       * are automatically applied (unless skipDodDefaults is true).
+      201       */
+      202      public @NotNull TaskSpec createTask(@NotNull TaskSpec spec) throws IOException {
+      203          return createTask(spec, false);
+      204      }
+      205  
+      206      /**
+      207       * Creates a new task file and returns the created spec.
+      208       *
+      209       * @param spec             the task specification to create
+      210       * @param skipDodDefaults  if true, project-wide Definition of Done defaults are NOT applied
+      211       */
+      212      public @NotNull TaskSpec createTask(@NotNull TaskSpec spec, boolean skipDodDefaults) throws IOException {
+      213          writeLock.lock();
+      214          try {
+      215              BacklogConfigService configService = BacklogConfigService.getInstance(project);
+      216              configService.ensureInitialized();
+      217              if (spec.getId() == null || spec.getId().isEmpty()) {
+      218                  spec.setId(configService.getNextTaskId());
+      219              }
+      220              if (spec.getCreatedAt() == null) {
+      221                  spec.setCreatedAt(LocalDateTime.now(java.time.ZoneOffset.UTC).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")));
+      222              }
+      223  
+      224              // Apply Definition of Done defaults from config if the task has none
+      225              if (!skipDodDefaults && (spec.getDefinitionOfDone() == null || spec.getDefinitionOfDone().isEmpty())) {
+      226                  BacklogConfig config = configService.getConfig();
+      227                  List<String> dodDefaults = config.getDefinitionOfDone();
+      228                  if (dodDefaults != null && !dodDefaults.isEmpty()) {
+      229                      List<DefinitionOfDoneItem> dodItems = new ArrayList<>();
+      230                      for (int i = 0; i < dodDefaults.size(); i++) {
+      231                          dodItems.add(DefinitionOfDoneItem.builder()
+      232                                  .index(i)
+      233                                  .text(dodDefaults.get(i))
+      234                                  .checked(false)
+      235                                  .build());
+      236                      }
+      237                      spec.setDefinitionOfDone(dodItems);
+      238                  }
+      239              }
+      240  
+      241              Path tasksDir = configService.getTasksDir();
+      242              if (tasksDir == null) {
+      243                  throw new IOException("Cannot determine tasks directory");
+      244              }
+      245              Files.createDirectories(tasksDir);
+      246  
+      247              String fileName = buildTaskFileName(spec.getId(), spec.getTitle());
+      248              Path filePath = tasksDir.resolve(fileName);
+      249              spec.setFilePath(filePath.toAbsolutePath().toString());
+      250  
+      251              String content = SpecFrontmatterGenerator.generate(spec);
+      252              Files.writeString(filePath, content, StandardCharsets.UTF_8);
+      253              refreshVfs();
+      254              refresh();
+      255              return spec;
+      256          } finally {
+      257              writeLock.unlock();
+      258          }
+      259      }
+      260  
+      261      /**
+      262       * Updates an existing task file on disk.
+      263       */
+      264      public void updateTask(@NotNull TaskSpec spec) throws IOException {
+      265          writeLock.lock();
+      266          try {
+      267              if (spec.getFilePath() == null) {
+      268                  throw new IOException("Task has no file path");
+      269              }
+      270              spec.setUpdatedAt(LocalDateTime.now(java.time.ZoneOffset.UTC).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")));
+      271              String content = SpecFrontmatterGenerator.generate(spec);
+      272              Files.writeString(Paths.get(spec.getFilePath()), content, StandardCharsets.UTF_8);
+      273              refreshVfs();
+      274              refresh();
+      275          } finally {
+      276              writeLock.unlock();
+      277          }
+      278      }
+      279  
+      280      /**
+      281       * Completes a task by setting status to "Done". The file stays in place.
+      282       * Use archiveTask() to move it to the archive directory.
+      283       */
+      284      public void completeTask(@NotNull String id) throws IOException {
+      285          writeLock.lock();
+      286          try {
+      287              TaskSpec spec = getSpec(id);
+      288              if (spec == null) {
+      289                  throw new IOException("Task not found: " + id);
+      290              }
+      291  
+      292              spec.setStatus("Done");
+      293              spec.setUpdatedAt(LocalDateTime.now(java.time.ZoneOffset.UTC).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")));
+      294  
+      295              String content = SpecFrontmatterGenerator.generate(spec);
+      296              Files.writeString(Paths.get(spec.getFilePath()), content, StandardCharsets.UTF_8);
+      297  
+      298              refreshVfs();
+      299              refresh();
+      300          } finally {
+      301              writeLock.unlock();
+      302          }
+      303      }
+      304  
+      305      /**
+      306       * Archives a task by moving it to archive/tasks/ directory.
+      307       */
+      308      public void archiveTask(@NotNull String id) throws IOException {
+      309          writeLock.lock();
+      310          try {
+      311              TaskSpec spec = getSpec(id);
+      312              if (spec == null) {
+      313                  throw new IOException("Task not found: " + id);
+      314              }
+      315  
+      316              BacklogConfigService configService = BacklogConfigService.getInstance(project);
+      317              Path archiveDir = configService.getArchiveTasksDir();
+      318              if (archiveDir == null) {
+      319                  throw new IOException("Cannot determine archive directory");
+      320              }
+      321              Files.createDirectories(archiveDir);
+      322  
+      323              Path source = Paths.get(spec.getFilePath());
+      324              Path target = archiveDir.resolve(source.getFileName());
+      325              Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+      326  
+      327              refreshVfs();
+      328              refresh();
+      329          } finally {
+      330              writeLock.unlock();
+      331          }
+      332      }
+      333  
+      334      /**
+      335       * Archives all tasks with status "Done". Returns the number of tasks archived.
+      336       */
+      337      public int archiveDoneTasks() throws IOException {
+      338          writeLock.lock();
+      339          try {
+      340              List<TaskSpec> doneTasks = specCache.values().stream()
+      341                      .filter(s -> "Done".equalsIgnoreCase(s.getStatus()))
+      342                      .toList();
+      343  
+      344              if (doneTasks.isEmpty()) {
+      345                  return 0;
+      346              }
+      347  
+      348              BacklogConfigService configService = BacklogConfigService.getInstance(project);
+      349              Path archiveDir = configService.getArchiveTasksDir();
+      350              if (archiveDir == null) {
+      351                  throw new IOException("Cannot determine archive directory");
+      352              }
+      353              Files.createDirectories(archiveDir);
+      354  
+      355              int count = 0;
+      356              for (TaskSpec spec : doneTasks) {
+      357                  if (spec.getFilePath() == null) continue;
+      358                  Path source = Paths.get(spec.getFilePath());
+      359                  if (!Files.exists(source)) continue;
+      360                  Path target = archiveDir.resolve(source.getFileName());
+      361                  Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+      362                  count++;
+      363              }
+      364  
+      365              refreshVfs();
+      366              refresh();
+      367              return count;
+      368          } finally {
+      369              writeLock.unlock();
+      370          }
+      371      }
+      372  
+      373      /**
+      374       * Returns all archived tasks by scanning the archive/tasks/ directory.
+      375       * These are NOT part of the normal specCache.
+      376       */
+      377      public @NotNull List<TaskSpec> getArchivedTasks() {
+      378          BacklogConfigService configService = BacklogConfigService.getInstance(project);
+      379          Path archiveDir = configService.getArchiveTasksDir();
+      380          if (archiveDir == null || !Files.isDirectory(archiveDir)) {
+      381              return List.of();
+      382          }
+      383  
+      384          List<TaskSpec> archived = new ArrayList<>();
+      385          try (Stream<Path> files = Files.walk(archiveDir)) {
+      386              files.filter(p -> p.toString().endsWith(".md"))
+      387                      .filter(Files::isRegularFile)
+      388                      .forEach(file -> {
+      389                          try {
+      390                              String content = Files.readString(file, StandardCharsets.UTF_8);
+      391                              TaskSpec spec = SpecFrontmatterParser.parse(content, file.toAbsolutePath().toString());
+      392                              if (spec != null && spec.getId() != null) {
+      393                                  spec.setLastModified(Files.getLastModifiedTime(file).toMillis());
+      394                                  archived.add(spec);
+      395                              }
+      396                          } catch (IOException e) {
+      397                              log.warn("Failed to read archived task file: {}", file, e);
+      398                          }
+      399                      });
+      400          } catch (IOException e) {
+      401              log.warn("Failed to scan archive directory: {}", archiveDir, e);
+      402          }
+      403          return archived;
+      404      }
+      405  
+      406      /**
+      407       * Unarchives a task by moving it from archive/tasks/ back to tasks/.
+      408       */
+      409      public void unarchiveTask(@NotNull String id) throws IOException {
+      410          writeLock.lock();
+      411          try {
+      412              // Find the task in the archive directory
+      413              List<TaskSpec> archivedTasks = getArchivedTasks();
+      414              TaskSpec spec = archivedTasks.stream()
+      415                      .filter(s -> id.equalsIgnoreCase(s.getId()))
+      416                      .findFirst()
+      417                      .orElse(null);
+      418  
+      419              if (spec == null) {
+      420                  throw new IOException("Archived task not found: " + id);
+      421              }
+      422  
+      423              BacklogConfigService configService = BacklogConfigService.getInstance(project);
+      424              Path tasksDir = configService.getTasksDir();
+      425              if (tasksDir == null) {
+      426                  throw new IOException("Cannot determine tasks directory");
+      427              }
+      428              Files.createDirectories(tasksDir);
+      429  
+      430              Path source = Paths.get(spec.getFilePath());
+      431              Path target = tasksDir.resolve(source.getFileName());
+      432              Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+      433  
+      434              refreshVfs();
+      435              refresh();
+      436          } finally {
+      437              writeLock.unlock();
+      438          }
+      439      }
+      440  
+      441      // ===== Document Operations =====
+      442  
+      443      /**
+      444       * Returns all cached documents.
+       ... truncated at 400 lines ...

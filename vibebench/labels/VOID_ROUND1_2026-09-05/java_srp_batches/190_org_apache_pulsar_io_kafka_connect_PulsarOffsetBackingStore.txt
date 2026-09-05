@@ -1,0 +1,221 @@
+row 190   apache/pulsar#24592
+============================================================================
+CLASS org.apache.pulsar.io.kafka.connect.PulsarOffsetBackingStore   loc=216 methods=11 wmc=32 lcom=0.1 c3=0.1386829961829019
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       56  @Slf4j
+       57  public class PulsarOffsetBackingStore implements OffsetBackingStore {
+       58  
+       59      private final ObjectMapper mapper = new ObjectMapper();
+       60      private final Map<ByteBuffer, ByteBuffer> data = new ConcurrentHashMap<>();
+       61      private PulsarClient client;
+       62      private String topic;
+       63      private Map<String, Object> readerConfigMap = new HashMap<>();
+       64      private Producer<byte[]> producer;
+       65      private Reader<byte[]> reader;
+       66      private volatile CompletableFuture<Void> outstandingReadToEnd = null;
+       67  
+       68      public PulsarOffsetBackingStore(PulsarClient client) {
+       69          checkArgument(client != null, "Pulsar Client must be provided");
+       70          this.client = client;
+       71      }
+       72  
+       73      @Override
+       74      public void configure(WorkerConfig workerConfig) {
+       75          this.topic = workerConfig.getString(PulsarKafkaWorkerConfig.OFFSET_STORAGE_TOPIC_CONFIG);
+       76          checkArgument(!isBlank(topic), "Offset storage topic must be specified");
+       77          try {
+       78              this.readerConfigMap = loadConfigFromJsonString(
+       79                      workerConfig.getString(PulsarKafkaWorkerConfig.OFFSET_STORAGE_READER_CONFIG));
+       80          } catch (JsonProcessingException exception) {
+       81              log.warn("The provided reader configs are invalid, "
+       82                      + "will not passing any extra config to the reader builder.", exception);
+       83          }
+       84  
+       85          log.info("Configure offset backing store on pulsar topic {}", topic);
+       86      }
+       87  
+       88      void readToEnd(CompletableFuture<Void> future) {
+       89          synchronized (this) {
+       90              if (outstandingReadToEnd != null) {
+       91                  outstandingReadToEnd.whenComplete((result, cause) -> {
+       92                      if (null != cause) {
+       93                          future.completeExceptionally(cause);
+       94                      } else {
+       95                          future.complete(result);
+       96                      }
+       97                  });
+       98                  // return if the outstanding read has been issued
+       99                  return;
+      100              } else {
+      101                  outstandingReadToEnd = future;
+      102                  future.whenComplete((result, cause) -> {
+      103                      synchronized (PulsarOffsetBackingStore.this) {
+      104                          outstandingReadToEnd = null;
+      105                      }
+      106                  });
+      107              }
+      108          }
+      109          producer.flushAsync().whenComplete((ignored, cause) -> {
+      110              if (null != cause) {
+      111                  future.completeExceptionally(cause);
+      112              } else {
+      113                  checkAndReadNext(future);
+      114              }
+      115          });
+      116      }
+      117  
+      118      private void checkAndReadNext(CompletableFuture<Void> endFuture) {
+      119          reader.hasMessageAvailableAsync().whenComplete((hasMessageAvailable, cause) -> {
+      120              if (null != cause) {
+      121                  endFuture.completeExceptionally(cause);
+      122              } else {
+      123                  if (hasMessageAvailable) {
+      124                      readNext(endFuture);
+      125                  } else {
+      126                      endFuture.complete(null);
+      127                  }
+      128              }
+      129          });
+      130      }
+      131  
+      132      private void readNext(CompletableFuture<Void> endFuture) {
+      133          reader.readNextAsync().whenComplete((message, cause) -> {
+      134              if (null != cause) {
+      135                  endFuture.completeExceptionally(cause);
+      136              } else {
+      137                  processMessage(message);
+      138                  checkAndReadNext(endFuture);
+      139              }
+      140          });
+      141      }
+      142  
+      143      void processMessage(Message<byte[]> message) {
+      144          if (message.getKey() != null) {
+      145              data.put(
+      146                  ByteBuffer.wrap(message.getKey().getBytes(UTF_8)),
+      147                  ByteBuffer.wrap(message.getValue()));
+      148          } else {
+      149              log.debug("Got message without key from the offset storage topic, skip it. message value: {}",
+      150                      message.getValue());
+      151          }
+      152      }
+      153  
+      154      @Override
+      155      public void start() {
+      156          try {
+      157              producer = client.newProducer(Schema.BYTES)
+      158                  .topic(topic)
+      159                  .create();
+      160              log.info("Successfully created producer to produce updates to topic {}", topic);
+      161  
+      162              reader = client.newReader(Schema.BYTES)
+      163                      .topic(topic)
+      164                      .startMessageId(MessageId.earliest)
+      165                      .loadConf(readerConfigMap)
+      166                  .create();
+      167              log.info("Successfully created reader to replay updates from topic {}", topic);
+      168  
+      169              CompletableFuture<Void> endFuture = new CompletableFuture<>();
+      170              readToEnd(endFuture);
+      171              endFuture.get();
+      172          } catch (PulsarClientException e) {
+      173              log.error("Failed to setup pulsar producer/reader to cluster", e);
+      174              throw new RuntimeException("Failed to setup pulsar producer/reader to cluster ",  e);
+      175          } catch (ExecutionException | InterruptedException e) {
+      176              log.error("Failed to start PulsarOffsetBackingStore", e);
+      177              throw new RuntimeException("Failed to start PulsarOffsetBackingStore",  e);
+      178          }
+      179      }
+      180  
+      181      @Override
+      182      public void stop() {
+      183          log.info("Stopping PulsarOffsetBackingStore");
+      184          if (null != producer) {
+      185              try {
+      186                  producer.flush();
+      187              } catch (PulsarClientException pce) {
+      188                  log.warn("Failed to flush the producer", pce);
+      189              }
+      190              try {
+      191                  producer.close();
+      192              } catch (PulsarClientException e) {
+      193                  log.warn("Failed to close producer", e);
+      194              }
+      195              producer = null;
+      196          }
+      197          if (null != reader) {
+      198              try {
+      199                  reader.close();
+      200              } catch (IOException e) {
+      201                  log.warn("Failed to close reader", e);
+      202              }
+      203              reader = null;
+      204          }
+      205          data.clear();
+      206  
+      207          // do not close the client, it is provided by the sink context
+      208      }
+      209  
+      210      @Override
+      211      public Future<Map<ByteBuffer, ByteBuffer>> get(Collection<ByteBuffer> keys) {
+      212          CompletableFuture<Void> endFuture = new CompletableFuture<>();
+      213          readToEnd(endFuture);
+      214          return endFuture.thenApply(ignored -> {
+      215              Map<ByteBuffer, ByteBuffer> values = new HashMap<>();
+      216              for (ByteBuffer key : keys) {
+      217                  ByteBuffer value = data.get(key);
+      218                  if (null != value) {
+      219                      values.put(key, value);
+      220                  }
+      221              }
+      222              return values;
+      223          });
+      224      }
+      225  
+      226      @Override
+      227      public Future<Void> set(Map<ByteBuffer, ByteBuffer> values, Callback<Void> callback) {
+      228          values.forEach((key, value) -> {
+      229              ByteBuf bb = Unpooled.wrappedBuffer(key);
+      230              byte[] keyBytes = ByteBufUtil.getBytes(bb);
+      231              byte[] valBytes = null;
+      232              if (value != null) {
+      233                  bb = Unpooled.wrappedBuffer(value);
+      234                  valBytes = ByteBufUtil.getBytes(bb);
+      235              } else {
+      236                  // It does not actually matter if it is earliest or latest.
+      237                  // The connector that provides null offsets works with the
+      238                  // system that cannot seek to the offset anyway.
+      239                  // Just need to store something to keep the offset store happy.
+      240                  valBytes = MessageId.earliest.toByteArray();
+      241              }
+      242              producer.newMessage()
+      243                  .key(new String(keyBytes, UTF_8))
+      244                  .value(valBytes)
+      245                  .sendAsync();
+      246          });
+      247          return producer.flushAsync().whenComplete((ignored, cause) -> {
+      248              if (null != callback) {
+      249                  callback.onCompletion(cause, ignored);
+      250              }
+      251              if (null == cause) {
+      252                  readToEnd(new CompletableFuture<>());
+      253              }
+      254          });
+      255      }
+      256  
+      257      private Map<String, Object> loadConfigFromJsonString(String config) throws JsonProcessingException {
+      258          if (!isBlank(config)) {
+      259              return mapper.readValue(config, new TypeReference<>() {});
+      260          } else {
+      261              return Collections.emptyMap();
+      262          }
+      263      }
+      264  
+      265      @Override
+      266      public Set<Map<String, Object>> connectorPartitions(String connectorName) {
+      267          // skip implementing this method which was added in Kafka for
+      268          // KIP-875: First-class offsets support in Kafka Connect
+      269          return null;
+      270      }
+      271  }

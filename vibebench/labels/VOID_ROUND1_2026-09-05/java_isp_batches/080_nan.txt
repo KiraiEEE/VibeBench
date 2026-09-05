@@ -1,0 +1,490 @@
+row 80   mr3project/hive-mr3#78
+============================================================================
+CONTRACT org.apache.hadoop.hive.common.io.Allocator   members=6.0 implementers=7.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       23  public interface Allocator {
+       24    public static class AllocatorOutOfMemoryException extends RuntimeException {
+       25      public AllocatorOutOfMemoryException(String msg) {
+       26        super(msg);
+       27      }
+       28  
+       29      private static final long serialVersionUID = 268124648177151761L;
+       30    }
+       31  
+       32    public interface BufferObjectFactory {
+       33      MemoryBuffer create();
+       34    }
+       35  
+       36    /**
+       37     * Allocates multiple buffers of a given size.
+       38     * @param dest Array where buffers are placed. Objects are reused if already there
+       39     *             (see createUnallocated), created otherwise.
+       40     * @param size Allocation size.
+       41     * @throws AllocatorOutOfMemoryException Cannot allocate.
+       42     */
+       43    @Deprecated
+       44    void allocateMultiple(MemoryBuffer[] dest, int size) throws AllocatorOutOfMemoryException;
+       45  
+       46    /**
+       47     * Allocates multiple buffers of a given size.
+       48     * @param dest Array where buffers are placed. Objects are reused if already there
+       49     *             (see createUnallocated), created otherwise.
+       50     * @param size Allocation size.
+       51     * @param factory A factory to create the objects in the dest array, if needed.
+       52     * @throws AllocatorOutOfMemoryException Cannot allocate.
+       53     */
+       54    void allocateMultiple(MemoryBuffer[] dest, int size, BufferObjectFactory factory)
+       55        throws AllocatorOutOfMemoryException;
+       56  
+       57    /**
+       58     * Creates an unallocated memory buffer object. This object can be passed to allocateMultiple
+       59     * to allocate; this is useful if data structures are created for separate buffers that can
+       60     * later be allocated together.
+       61     * @return a new unallocated memory buffer
+       62     */
+       63    @Deprecated
+       64    MemoryBuffer createUnallocated();
+       65  
+       66    /** Deallocates a memory buffer.
+       67     * @param buffer the buffer to deallocate
+       68     */
+       69    void deallocate(MemoryBuffer buffer);
+       70  
+       71    /** Whether the allocator uses direct buffers.
+       72     * @return are they direct buffers?
+       73     */
+       74    boolean isDirectAlloc();
+       75  
+       76    /** Maximum allocation size supported by this allocator.
+       77     * @return a number of bytes
+       78     */
+       79    int getMaxAllocation();
+       80  }
+
+---------- IMPLEMENTER org.apache.hadoop.hive.llap.cache.BuddyAllocator  stubs=0/6 ----------
+       73  public final class BuddyAllocator
+       74      implements EvictionAwareStoppableAllocator, BuddyAllocatorMXBean {
+       75    private static final String FAILED_TO_ALLOCATE_MSG =
+       76        "Failed to allocate [{}]X[{}] bytes after [{}] attempt, evicted [{}] bytes and partially allocated [{}] bytes";
+       77    private final Arena[] arenas;
+       78    private final AtomicInteger allocatedArenas = new AtomicInteger(0);
+       79  
+       80    private final MemoryManager memoryManager;
+       81    private static final long MAX_DUMP_INTERVAL_NS = 300 * 1000000000L; // 5 minutes.
+       82    private final AtomicLong lastLog = new AtomicLong(-1);
+       83    private final LlapDaemonCacheMetrics metrics;
+       84    private static final int MAX_DISCARD_ATTEMPTS = 10, LOG_DISCARD_ATTEMPTS = 5;
+       85  
+       86    // Config settings
+       87    private final int minAllocLog2, maxAllocLog2, arenaSizeLog2, maxArenas;
+       88    private final int minAllocation, maxAllocation, arenaSize;
+       89    private final long maxSize;
+       90    private final boolean isDirect;
+       91    private final boolean isMapped;
+       92    private final int maxForcedEvictionSize;
+       93    private final Path cacheDir;
+       94  
+       95    // These are only used for tests.
+       96    private boolean enableDefragShortcut = true, oomLogging = true;
+       97  
+       98    // We don't know the acceptable size for Java array, so we'll use 1Gb boundary.
+       99    // That is guaranteed to fit any maximum allocation.
+      100    private static final int MAX_ARENA_SIZE = 1024 * 1024 * 1024;
+      101    // Don't try to operate with less than MIN_SIZE allocator space, it will just give you grief.
+      102    private static final int MIN_TOTAL_MEMORY_SIZE = 64 * 1024 * 1024;
+      103    // Maximum reasonable defragmentation headroom. Mostly kicks in on very small caches.
+      104    private static final float MAX_DEFRAG_HEADROOM_FRACTION = 0.01f;
+      105    /**
+      106     * Max number of attempts to try allocations before giving up and move to forced evictions or/and freelist/brute
+      107     * force discards,
+      108     * Note to reader: why 5, i don't know, i run with 2 and 5 seems providing same results, thus the 5, better try more
+      109     * than start evictions, Also I am sure any value less than one will hurt.
+      110     */
+      111    private static final int MAX_FAST_ATTEMPT = 5;
+      112    /**
+      113     * Default max amount of bytes to force evict on failed allocation attempts 16MB. used for testing, for production
+      114     * please adjust {@link ConfVars.LLAP_ALLOCATOR_MAX_FORCE_EVICTED}
+      115     */
+      116    private static final int MAX_FORCED_EVICTION_SIZE = 1024 * 1024 * 16;
+      117    private static final FileAttribute<Set<PosixFilePermission>> RWX = PosixFilePermissions
+      118        .asFileAttribute(PosixFilePermissions.fromString("rwx------"));
+      119    private final AtomicLong[] defragCounters;
+      120    private final boolean doUseFreeListDiscard, doUseBruteDiscard;
+      121    private final static boolean assertsEnabled = areAssertsEnabled();
+      122    // Discard context that is cached for reuse per thread to avoid allocating lots of arrays,
+      123    // and then resizing them down the line if we need a bigger size.
+      124    // Only the IO threads need this, so there'd be at most few dozen objects.
+      125    private final static ThreadLocal<DiscardContext> threadCtx = ThreadLocal.withInitial(DiscardContext::new);
+      126  
+      127    public BuddyAllocator(Configuration conf, MemoryManager mm, LlapDaemonCacheMetrics metrics) {
+      128      this(HiveConf.getBoolVar(conf, ConfVars.LLAP_ALLOCATOR_DIRECT),
+      129          HiveConf.getBoolVar(conf, ConfVars.LLAP_ALLOCATOR_MAPPED),
+      130          (int) HiveConf.getSizeVar(conf, ConfVars.LLAP_ALLOCATOR_MIN_ALLOC),
+      131          (int) HiveConf.getSizeVar(conf, ConfVars.LLAP_ALLOCATOR_MAX_ALLOC),
+      132          HiveConf.getIntVar(conf, ConfVars.LLAP_ALLOCATOR_ARENA_COUNT),
+      133          getMaxTotalMemorySize(conf),
+      134          HiveConf.getSizeVar(conf, ConfVars.LLAP_ALLOCATOR_DEFRAG_HEADROOM),
+      135          HiveConf.getVar(conf, ConfVars.LLAP_ALLOCATOR_MAPPED_PATH),
+      136          mm,
+      137          metrics,
+      138          HiveConf.getVar(conf, ConfVars.LLAP_ALLOCATOR_DISCARD_METHOD),
+      139          HiveConf.getBoolVar(conf, ConfVars.LLAP_ALLOCATOR_PREALLOCATE),
+      140          (int) HiveConf.getSizeVar(conf, ConfVars.LLAP_ALLOCATOR_MAX_FORCE_EVICTED));
+      141    }
+      142  
+      143    private static boolean areAssertsEnabled() {
+      144      boolean assertsEnabled = false;
+      145      assert assertsEnabled = true;
+      146      return assertsEnabled;
+      147    }
+      148  
+      149    private static long getMaxTotalMemorySize(Configuration conf) {
+      150      long maxSize = HiveConf.getSizeVar(conf, ConfVars.LLAP_IO_MEMORY_MAX_SIZE);
+      151      if (maxSize > MIN_TOTAL_MEMORY_SIZE || HiveConf.getBoolVar(conf, ConfVars.HIVE_IN_TEST)) {
+      152        return maxSize;
+      153      }
+      154      throw new RuntimeException("Allocator space is too small for reasonable operation; "
+      155          + ConfVars.LLAP_IO_MEMORY_MAX_SIZE.varname + "=" + maxSize + ", but at least "
+      156          + MIN_TOTAL_MEMORY_SIZE + " is required. If you cannot spare any memory, you can "
+      157          + "disable LLAP IO entirely via " + ConfVars.LLAP_IO_ENABLED.varname);
+      158    }
+      159  
+      160    @VisibleForTesting public BuddyAllocator(boolean isDirectVal,
+      161        boolean isMappedVal,
+      162        int minAllocVal,
+      163        int maxAllocVal,
+      164        int arenaCount,
+      165        long maxSizeVal,
+      166        long defragHeadroom,
+      167        String mapPath,
+      168        MemoryManager memoryManager,
+      169        LlapDaemonCacheMetrics metrics,
+      170        String discardMethod,
+      171        boolean doPreallocate) {
+      172      this(isDirectVal,
+      173          isMappedVal,
+      174          minAllocVal,
+      175          maxAllocVal,
+      176          arenaCount,
+      177          maxSizeVal,
+      178          defragHeadroom,
+      179          mapPath,
+      180          memoryManager,
+      181          metrics,
+      182          discardMethod,
+      183          doPreallocate,
+      184          MAX_FORCED_EVICTION_SIZE);
+      185    }
+      186    @VisibleForTesting
+      187    public BuddyAllocator(boolean isDirectVal, boolean isMappedVal, int minAllocVal, int maxAllocVal,
+      188        int arenaCount, long maxSizeVal, long defragHeadroom, String mapPath,
+      189        MemoryManager memoryManager, LlapDaemonCacheMetrics metrics, String discardMethod,
+      190        boolean doPreallocate, int maxForcedEvictionSize) {
+      191      isDirect = isDirectVal;
+      192      isMapped = isMappedVal;
+      193      minAllocation = minAllocVal;
+      194      maxAllocation = maxAllocVal;
+      195      if (isMapped) {
+      196        try {
+      197          Path path = FileSystems.getDefault().getPath(mapPath);
+      198          if (!Files.exists(path)) {
+      199            Files.createDirectory(path);
+      200          }
+      201          cacheDir = Files.createTempDirectory(path, "llap-", RWX);
+      202        } catch (IOException ioe) {
+      203          // conf validator already checks this, so it will never trigger usually
+      204          throw new AssertionError("Configured mmap directory should be writable", ioe);
+      205        }
+      206      } else {
+      207        cacheDir = null;
+      208      }
+      209  
+      210      arenaSize = validateAndDetermineArenaSize(arenaCount, maxSizeVal);
+      211      maxSize = validateAndDetermineMaxSize(maxSizeVal);
+      212      memoryManager.updateMaxSize(determineMaxMmSize(defragHeadroom, maxSize));
+      213  
+      214      minAllocLog2 = 31 - Integer.numberOfLeadingZeros(minAllocation);
+      215      maxAllocLog2 = 31 - Integer.numberOfLeadingZeros(maxAllocation);
+      216      arenaSizeLog2 = 63 - Long.numberOfLeadingZeros(arenaSize);
+      217      maxArenas = (int)(maxSize / arenaSize);
+      218      arenas = new Arena[maxArenas];
+      219      for (int i = 0; i < maxArenas; ++i) {
+      220        arenas[i] = new Arena();
+      221      }
+      222      int initCount = doPreallocate ? maxArenas : 1;
+      223      for (int i = 0; i < initCount; ++i) {
+      224        try {
+      225          arenas[i].init(i);
+      226        } catch (ClosedByInterruptException e) {
+      227          throw new RuntimeException("Failed pre-allocating buddy allocator arena. ", e);
+      228        }
+      229        metrics.incrAllocatedArena();
+      230      }
+      231      allocatedArenas.set(initCount);
+      232      this.memoryManager = memoryManager;
+
+---------- IMPLEMENTER org.apache.hadoop.hive.llap.cache.EvictionAwareSimpleAllocator  stubs=0/6 ----------
+       26  public final class EvictionAwareSimpleAllocator implements EvictionAwareStoppableAllocator {
+       27  
+       28    private final SimpleAllocator delegate;
+       29    private final MemoryManager memoryManager;
+       30    private final int allocatorMaxAlloc;  // corresponds to LLAP_ALLOCATOR_MAX_ALLOC
+       31  
+       32    public EvictionAwareSimpleAllocator(
+       33        SimpleAllocator delegate, MemoryManager memoryManager, int allocatorMaxAlloc) {
+       34      this.delegate = delegate;
+       35      this.memoryManager = memoryManager;
+       36      this.allocatorMaxAlloc = allocatorMaxAlloc;
+       37    }
+       38  
+       39    // MemoryBuffer in dest[] is either null or uninitialized (i.e., with no backing ByteBuffer).
+       40    @Override
+       41    public void allocateMultiple(MemoryBuffer[] dest, int size,
+       42                                 BufferObjectFactory factory,
+       43                                 AtomicBoolean isStopped) throws AllocatorOutOfMemoryException {
+       44      final long reserved = (long) size * dest.length;
+       45      memoryManager.reserveMemory(reserved, isStopped);
+       46      initMemoryBuffers(dest, factory);
+       47  
+       48      try {
+       49        // All-or-nothing guarantee is enforced by SimpleAllocator.
+       50        delegate.allocateMultiple(dest, size, factory);
+       51      } catch (Throwable t) {
+       52        // We reserved; delegate didn’t deliver → release everything and rethrow.
+       53        memoryManager.releaseMemory(reserved);
+       54        throw new AllocatorOutOfMemoryException("Memory allocation fails, size=" + reserved);
+       55      }
+       56    }
+       57  
+       58    private void initMemoryBuffers(MemoryBuffer[] dest, BufferObjectFactory factory) {
+       59      for (int i = 0; i < dest.length; ++i) {
+       60        if (dest[i] != null) continue;
+       61        dest[i] = factory != null ? factory.create() : new LlapDataBuffer();
+       62      }
+       63    }
+       64  
+       65    // Deallocate for proactive/instant eviction
+       66    @Override
+       67    public void deallocateProactivelyEvicted(MemoryBuffer buffer) {
+       68      LlapAllocatorBuffer buf = (LlapAllocatorBuffer)buffer;
+       69      assert buf.isInvalid();
+       70      delegate.deallocate(buf);
+       71      memoryManager.releaseMemory(buf.getMemoryUsage());
+       72    }
+       73  
+       74    // Deallocate for reactive eviction (from memory manager)
+       75    @Override
+       76    public void deallocateEvicted(MemoryBuffer buffer) {
+       77      // For reactive eviction, memory is not released back to the manager,
+       78      // as it's assumed to be immediately re-used by the pending allocation.
+       79      delegate.deallocate(buffer);
+       80    }
+       81  
+       82    // Deallocate for normal buffer release (e.g., uncached buffer)
+       83    @Override
+       84    public void deallocate(MemoryBuffer buffer) {
+       85      LlapAllocatorBuffer buf = (LlapAllocatorBuffer)buffer;
+       86      memoryManager.releaseMemory(buf.getMemoryUsage());
+       87      delegate.deallocate(buffer);
+       88    }
+       89  
+       90    @Override
+       91    public boolean isDirectAlloc() {
+       92      return delegate.isDirectAlloc();
+       93    }
+       94  
+       95    @Override
+       96    public void allocateMultiple(MemoryBuffer[] dest, int size, BufferObjectFactory factory) {
+       97      allocateMultiple(dest, size, factory, null);
+       98    }
+       99  
+      100    @Override
+      101    public void allocateMultiple(MemoryBuffer[] dest, int size) {
+      102      allocateMultiple(dest, size, null, null);
+      103    }
+      104  
+      105    @Override
+      106    public MemoryBuffer createUnallocated() {
+      107      return new LlapDataBuffer();
+      108    }
+      109  
+      110    @Override
+      111    public int getMaxAllocation() {
+      112      return allocatorMaxAlloc;
+      113    }
+      114  
+      115    @Override
+      116    public void debugDumpShort(StringBuilder sb) {
+      117      sb.append("\nAllocator memory state: ");
+      118      long currentFreeMemory = Runtime.getRuntime().freeMemory();
+      119      sb.append("\nCurrent free memory = ").append(currentFreeMemory);
+      120      sb.append("\n");
+      121    }
+      122  }
+
+---------- IMPLEMENTER org.apache.hadoop.hive.llap.cache.SimpleAllocator  stubs=0/6 ----------
+       29  public final class SimpleAllocator implements Allocator, BuddyAllocatorMXBean {
+       30    private final boolean isDirect;
+       31  
+       32    public SimpleAllocator(Configuration conf) {
+       33      isDirect = HiveConf.getBoolVar(conf, HiveConf.ConfVars.LLAP_ALLOCATOR_DIRECT);
+       34      if (LlapIoImpl.LOG.isInfoEnabled()) {
+       35        LlapIoImpl.LOG.info("Simple allocator with " + (isDirect ? "direct" : "byte") + " buffers");
+       36      }
+       37    }
+       38  
+       39    @Override
+       40    @Deprecated
+       41    public void allocateMultiple(MemoryBuffer[] dest, int size) {
+       42      allocateMultiple(dest, size, null);
+       43    }
+       44  
+       45    /* All-or-nothing semantics:
+       46     * If ByteBuffer allocation fails, cleanupByteBuffers(bbs) cleans up and dest[] remains untouched.
+       47     * Only after all allocations succeed does it update dest[].
+       48     */
+       49    // MemoryBuffer in dest[] is uninitialized, i.e., with no backing ByteBuffer.
+       50    @Override
+       51    public void allocateMultiple(MemoryBuffer[] dest, int size, BufferObjectFactory factory) {
+       52      int len = dest.length;
+       53  
+       54      // Pre-allocate the ByteBuffers for those slots
+       55      ByteBuffer[] bbs = new ByteBuffer[len];
+       56      try {
+       57        for (int k = 0; k < len; k++) {
+       58          bbs[k] = isDirect ? ByteBuffer.allocateDirect(size) : ByteBuffer.allocate(size);
+       59        }
+       60      } catch (OutOfMemoryError | RuntimeException e) {
+       61        cleanupByteBuffers(bbs); // frees only the ones actually created
+       62        throw e;
+       63      }
+       64  
+       65      // Success → initialize and publish
+       66      for (int k = 0; k < len; k++) {
+       67        LlapAllocatorBuffer buf = (LlapAllocatorBuffer)dest[k];
+       68        buf.initialize(bbs[k], 0, size);
+       69      }
+       70    }
+       71  
+       72    /**
+       73     * Helper method to cleanup partially allocated ByteBuffers
+       74     */
+       75    private void cleanupByteBuffers(ByteBuffer[] byteBuffers) {
+       76      for (int i = 0; i < byteBuffers.length; ++i) {
+       77        ByteBuffer bb = byteBuffers[i];
+       78        if (bb == null) continue; // This and subsequent buffers were not allocated
+       79  
+       80        // Only cleanup direct buffers as heap buffers will be GC'd
+       81        if (bb.isDirect() && CleanerUtil.UNMAP_SUPPORTED) {
+       82          try {
+       83            CleanerUtil.getCleaner().freeBuffer(bb);
+       84          } catch (Throwable t) {
+       85            LlapIoImpl.LOG.warn("Error cleaning up DirectByteBuffer during allocation failure", t);
+       86          }
+       87        }
+       88        byteBuffers[i] = null; // Help GC
+       89      }
+       90    }
+       91  
+       92    @Override
+       93    public void deallocate(MemoryBuffer buffer) {
+       94      LlapAllocatorBuffer buf = (LlapAllocatorBuffer)buffer;
+       95      ByteBuffer bb = buf.byteBuffer;
+       96      buf.byteBuffer = null;
+       97      if (!bb.isDirect()) return;
+       98      if (!CleanerUtil.UNMAP_SUPPORTED) {
+       99        return;
+      100      }
+      101      try {
+      102        CleanerUtil.getCleaner().freeBuffer(bb);
+      103      } catch (Throwable t) {
+      104        LlapIoImpl.LOG.warn("Error using DirectByteBuffer cleaner", t);
+      105      }
+      106    }
+      107  
+      108    @Override
+      109    public boolean isDirectAlloc() {
+      110      return isDirect;
+      111    }
+      112  
+      113    @Override
+      114    @Deprecated
+      115    public LlapAllocatorBuffer createUnallocated() {
+      116      return new LlapDataBuffer();
+      117    }
+      118  
+      119    // BuddyAllocatorMXBean
+      120    @Override
+      121    public boolean getIsDirect() {
+      122      return isDirect;
+      123    }
+      124  
+      125    @Override
+      126    public int getMinAllocation() {
+      127      return 0;
+      128    }
+      129  
+      130    @Override
+      131    public int getMaxAllocation() {
+      132      return Integer.MAX_VALUE;
+      133    }
+      134  
+      135    @Override
+      136    public int getArenaSize() {
+      137      return -1;
+      138    }
+      139  
+      140    @Override
+      141    public long getMaxCacheSize() {
+      142      return Integer.MAX_VALUE;
+      143    }
+      144  }
+
+---------- IMPLEMENTER org.apache.hadoop.hive.llap.cache.TestLowLevelCacheImpl.DummyAllocator  stubs=0/6 ----------
+       62    private static class DummyAllocator implements EvictionAwareAllocator {
+       63      @Override
+       64      public void allocateMultiple(MemoryBuffer[] dest, int size) {
+       65        for (int i = 0; i < dest.length; ++i) {
+       66          LlapDataBuffer buf = new LlapDataBuffer();
+       67          buf.initialize(null, -1, size);
+       68          dest[i] = buf;
+       69        }
+       70      }
+       71  
+       72      @Override
+       73      public void deallocate(MemoryBuffer buffer) {
+       74        if (buffer instanceof LlapCacheableBuffer) {
+       75          ((LlapCacheableBuffer)buffer).invalidate();
+       76        }
+       77      }
+       78  
+       79      @Override
+       80      public void deallocateEvicted(MemoryBuffer buffer) {
+       81      }
+       82  
+       83      @Override
+       84      public void deallocateProactivelyEvicted(MemoryBuffer buffer) {
+       85      }
+       86  
+       87      @Override
+       88      public boolean isDirectAlloc() {
+       89        return false;
+       90      }
+       91  
+       92      @Override
+       93      public int getMaxAllocation() {
+       94        return 0;
+       95      }
+       96  
+       97      @Override
+       98      public MemoryBuffer createUnallocated() {
+       99        return new LlapDataBuffer();
+      100      }
+      101  
+      102      @Override
+      103      public void allocateMultiple(MemoryBuffer[] dest, int size,
+      104          BufferObjectFactory factory) throws AllocatorOutOfMemoryException {
+      105        allocateMultiple(dest, size);
+      106      }
+      107    }

@@ -1,0 +1,169 @@
+row 171   networknt/light-4j#2669
+============================================================================
+CLASS com.networknt.token.exchange.TokenExchangeService   loc=164 methods=5 wmc=19 lcom=0.0 c3=0.3222119073234991
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       24  public class TokenExchangeService {
+       25  
+       26      private static final Logger LOG = LoggerFactory.getLogger(TokenExchangeService.class);
+       27  
+       28      public static final String REQUEST_HEADERS = "requestHeaders";
+       29      public static final String UPDATE = "update";
+       30  
+       31      private final TokenExchangeConfig config;
+       32      private final JwtBuilder jwtBuilder;
+       33      private final TokenHttpClientFactory httpClientFactory;
+       34  
+       35      /**
+       36       * Creates a new TokenTransformationService with the default configuration.
+       37       */
+       38      public TokenExchangeService() {
+       39          this(TokenExchangeConfig.load());
+       40      }
+       41  
+       42      /**
+       43       * Creates a new TokenTransformationService with the provided configuration.
+       44       *
+       45       * @param config the token transformer configuration
+       46       */
+       47      public TokenExchangeService(final TokenExchangeConfig config) {
+       48          this.config = config;
+       49          final var keyStoreManager = new TokenKeyStoreManager();
+       50          this.jwtBuilder = new JwtBuilder(keyStoreManager);
+       51          this.httpClientFactory = new TokenHttpClientFactory(
+       52                  keyStoreManager,
+       53                  config.getProxyHost(),
+       54                  config.getProxyPort()
+       55          );
+       56      }
+       57  
+       58      public void transform(final RequestContext.Parser incomingContext) throws InterruptedException {
+       59          var parsedContext = incomingContext.parseContext();
+       60          if (parsedContext == null) {
+       61              LOG.debug("Parser returned null context - skipping token transformation");
+       62              return;
+       63          }
+       64  
+       65          final var tokenSchema = this.config.getTokenSchemas().get(parsedContext.schemaKey());
+       66          if (tokenSchema == null) {
+       67              throw new IllegalArgumentException("Token schema '" + parsedContext.schemaKey() + "' does not exist");
+       68          }
+       69          final var sharedVariables = tokenSchema.getSharedVariables();
+       70          if (isTokenExpired(tokenSchema)) {
+       71              LOG.debug("Cached token is expired. Requesting a new token.");
+       72              refreshTokenSafely(tokenSchema, sharedVariables, parsedContext);
+       73          } else {
+       74              LOG.debug("Using cached token.");
+       75          }
+       76  
+       77          var update = tokenSchema.getTokenUpdate();
+       78          var resultMap = this.createResultMap(update, sharedVariables, parsedContext);
+       79          incomingContext.updateRequest(resultMap);
+       80      }
+       81  
+       82      /**
+       83       * Updates the result map with resolved token data.
+       84       */
+       85      private Map<String, Object> createResultMap(
+       86              final UpdateSchema update,
+       87              final SharedVariableSchema sharedVariables,
+       88              final RequestContext requestContext
+       89      ) {
+       90          var resultMap = new HashMap<String, Object>();
+       91          // Update body if configured
+       92          if (update.getBody() != null && !update.getBody().isEmpty()) {
+       93              resultMap.put("requestBody", new HashMap<>(update.getResolvedBody(sharedVariables, requestContext)));
+       94          }
+       95  
+       96          // Update headers if configured
+       97          if (update.getHeaders() != null && !update.getHeaders().isEmpty()) {
+       98              @SuppressWarnings("unchecked")
+       99              var requestHeaders = (Map<String, Object>) resultMap.get(REQUEST_HEADERS);
+      100              if (requestHeaders == null) {
+      101                  requestHeaders = new HashMap<>();
+      102                  resultMap.put(REQUEST_HEADERS, requestHeaders);
+      103              }
+      104  
+      105              @SuppressWarnings("unchecked")
+      106              var updateMap = (Map<String, String>) requestHeaders.get(UPDATE);
+      107              if (updateMap == null) {
+      108                  updateMap = new HashMap<>();
+      109                  requestHeaders.put(UPDATE, updateMap);
+      110              }
+      111              updateMap.putAll(update.getResolvedHeaders(sharedVariables, requestContext));
+      112          }
+      113          return resultMap;
+      114      }
+      115  
+      116      /**
+      117       * Thread-safe wrapper that ensures only one thread refreshes the token at a time.
+      118       */
+      119      private void refreshTokenSafely(
+      120              final TokenSchema schema,
+      121              final SharedVariableSchema sharedVariables,
+      122              final RequestContext requestContext
+      123      ) throws InterruptedException {
+      124          final var lock = schema.getTokenRefreshLock();
+      125          lock.lockInterruptibly();
+      126          try {
+      127              // Double-check if token is still expired after acquiring lock
+      128              // Another thread may have already refreshed it
+      129              if (isTokenExpired(schema)) {
+      130                  refreshToken(schema, sharedVariables, requestContext);
+      131              } else {
+      132                  LOG.debug("Token was refreshed by another thread, using cached token.");
+      133              }
+      134          } finally {
+      135              lock.unlock();
+      136          }
+      137      }
+      138  
+      139      /**
+      140       * Refreshes the token by making a request to the token service.
+      141       * This method should only be called within a lock to ensure thread safety.
+      142       */
+      143      private void refreshToken(
+      144              final TokenSchema schema,
+      145              final SharedVariableSchema sharedVariables,
+      146              final RequestContext requestContext
+      147      ) throws InterruptedException {
+      148          final var requestSchema = schema.getTokenRequest();
+      149  
+      150          // Build JWT if required
+      151          if (requestSchema.getJwtSchema() != null) {
+      152              final var jwt = this.jwtBuilder.build(requestSchema.getJwtSchema());
+      153              sharedVariables.set(SharedVariableSchema.CONSTRUCTED_JWT, jwt);
+      154              LOG.trace("Constructed JWT for token request");
+      155          }
+      156  
+      157          // Prepare and send request
+      158          final var resolvedHeaders = requestSchema.getResolvedHeaders(sharedVariables, requestContext);
+      159          final var resolvedBody = requestSchema.getResolvedBody(sharedVariables, requestContext);
+      160  
+      161          final var client = this.httpClientFactory.getOrCreateClient(requestSchema);
+      162          final var request = this.httpClientFactory.buildRequest(requestSchema, resolvedHeaders, resolvedBody);
+      163          final var response = this.httpClientFactory.send(client, request);
+      164  
+      165          if (response.statusCode() < 200 || response.statusCode() > 299) {
+      166              LOG.error("Token request returned status code: {}", response.statusCode());
+      167              return;
+      168          }
+      169  
+      170          // Write response data to shared variables
+      171          schema.getTokenSource().writeResponseToSharedVariables(sharedVariables, response);
+      172  
+      173          // Update expiration if configured
+      174          if (schema.getTokenUpdate().isUpdateExpirationFromTtl()) {
+      175              sharedVariables.updateExpiration();
+      176          }
+      177      }
+      178  
+      179      /**
+      180       * Checks if the cached token is expired (including grace period).
+      181       */
+      182      private boolean isTokenExpired(final TokenSchema schema) {
+      183          final var sharedVariables = schema.getSharedVariables();
+      184          final var waitLength = sharedVariables.getTokenTtlUnit().unitToMillis(sharedVariables.getWaitLength());
+      185          return System.currentTimeMillis() >= (sharedVariables.getExpiration() - waitLength);
+      186      }
+      187  }

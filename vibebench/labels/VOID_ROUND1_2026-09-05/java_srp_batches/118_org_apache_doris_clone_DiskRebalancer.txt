@@ -1,0 +1,344 @@
+row 118   apache/doris#61565
+============================================================================
+CLASS org.apache.doris.clone.DiskRebalancer   loc=339 methods=4 wmc=66 lcom=0.0 c3=0.2770079091781152
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       55  public class DiskRebalancer extends Rebalancer {
+       56      private static final Logger LOG = LogManager.getLogger(DiskRebalancer.class);
+       57  
+       58      public DiskRebalancer(SystemInfoService infoService, TabletInvertedIndex invertedIndex,
+       59              Map<Long, PathSlot> backendsWorkingSlots) {
+       60          super(infoService, invertedIndex, backendsWorkingSlots);
+       61          canBalanceColocateTable = true;
+       62      }
+       63  
+       64      public List<BackendLoadStatistic> filterByPrioBackends(List<BackendLoadStatistic> bes) {
+       65          List<BackendLoadStatistic> stats = Lists.newArrayList();
+       66          for (BackendLoadStatistic backend : bes) {
+       67              long backendId = backend.getBeId();
+       68              Long timeoutS = prioBackends.getOrDefault(backendId, 0L);
+       69              if (timeoutS != 0) {
+       70                  if (timeoutS > System.currentTimeMillis()) {
+       71                      // remove backends from prio if timeout
+       72                      prioBackends.remove(backendId);
+       73                      continue;
+       74                  }
+       75                  stats.add(backend);
+       76              }
+       77          }
+       78          return stats;
+       79      }
+       80  
+       81      // true means BE has low and high paths for balance after reclassification
+       82      private boolean checkAndReclassifyPaths(Set<Long> pathLow, Set<Long> pathMid, Set<Long> pathHigh) {
+       83          if (pathLow.isEmpty() && pathHigh.isEmpty()) {
+       84              // balanced
+       85              return false;
+       86          }
+       87          if (pathLow.isEmpty()) {
+       88              // mid => low
+       89              pathLow.addAll(pathMid);
+       90          } else if (pathHigh.isEmpty()) {
+       91              // mid => high
+       92              pathHigh.addAll(pathMid);
+       93          }
+       94          if (pathLow.isEmpty() || pathHigh.isEmpty()) {
+       95              // check again
+       96              return false;
+       97          }
+       98          return true;
+       99      }
+      100  
+      101      /*
+      102       * Try to select alternative tablets to balance the disks.
+      103       * 1. Classify the backend into low, mid and high class by load score.
+      104       * 2. Try to select tablets from mid load backends.
+      105       *      1. Here we only select alternative tablets, without considering selected tablets' status,
+      106       *         and whether it is benefit for balance (All these will be checked in tablet scheduler)
+      107       *      2. Only select tablets from 'mid' backends.
+      108       *      3. Only select tablets from 'high' paths.
+      109       * 3. Try to select tablets from prio backends.
+      110       *
+      111       * Here we only select tablets from mid load node, do not set its dest, all this will be set
+      112       * when this tablet is being scheduled in tablet scheduler.
+      113       *
+      114       * NOTICE that we may select any available tablets here, ignore their state.
+      115       * The state will be checked when being scheduled in tablet scheduler.
+      116       */
+      117      @Override
+      118      protected List<TabletSchedCtx> selectAlternativeTabletsForCluster(
+      119              LoadStatisticForTag clusterStat, TStorageMedium medium) {
+      120          List<TabletSchedCtx> alternativeTablets = Lists.newArrayList();
+      121  
+      122          // get classification of backends
+      123          List<BackendLoadStatistic> lowBEs = Lists.newArrayList();
+      124          List<BackendLoadStatistic> midBEs = Lists.newArrayList();
+      125          List<BackendLoadStatistic> highBEs = Lists.newArrayList();
+      126          clusterStat.getBackendStatisticByClass(lowBEs, midBEs, highBEs, medium);
+      127  
+      128          Rebalancer rebalancer = FeConstants.runningUnitTest ? null
+      129                  : Env.getCurrentEnv().getTabletScheduler().getRebalancer();
+      130          if (rebalancer != null && rebalancer.unPickOverLongTime(clusterStat.getTag(), medium)) {
+      131              midBEs.addAll(lowBEs);
+      132              midBEs.addAll(highBEs);
+      133              lowBEs.clear();
+      134              highBEs.clear();
+      135          }
+      136  
+      137          if (!(lowBEs.isEmpty() && highBEs.isEmpty())) {
+      138              // the cluster is not balanced
+      139              if (prioBackends.isEmpty()) {
+      140                  LOG.info("cluster is not balanced with medium: {}. skip", medium);
+      141                  return alternativeTablets;
+      142              } else {
+      143                  // prioBEs are not empty, we only schedule prioBEs' disk balance task
+      144                  midBEs.addAll(lowBEs);
+      145                  midBEs.addAll(highBEs);
+      146                  midBEs = filterByPrioBackends(midBEs);
+      147              }
+      148          }
+      149  
+      150          // first we should check if mid backends is available.
+      151          // if all mid backends is not available, we should not start balance
+      152          if (midBEs.stream().noneMatch(BackendLoadStatistic::isAvailable)) {
+      153              if (LOG.isDebugEnabled()) {
+      154                  LOG.debug("all mid load backends is dead: {} with medium: {}. skip",
+      155                          midBEs.stream().mapToLong(BackendLoadStatistic::getBeId).toArray(), medium);
+      156              }
+      157              return alternativeTablets;
+      158          }
+      159  
+      160          if (midBEs.stream().noneMatch(BackendLoadStatistic::hasAvailDisk)) {
+      161              LOG.info("all mid load backends {} have no available disk with medium: {}. skip",
+      162                      midBEs.stream().mapToLong(BackendLoadStatistic::getBeId).toArray(), medium);
+      163              return alternativeTablets;
+      164          }
+      165  
+      166          Set<Long> alternativeTabletIds = Sets.newHashSet();
+      167          Set<Long> unbalancedBEs = Sets.newHashSet();
+      168          // choose tablets from backends randomly.
+      169          Collections.shuffle(midBEs);
+      170          for (int i = midBEs.size() - 1; i >= 0; i--) {
+      171              BackendLoadStatistic beStat = midBEs.get(i);
+      172              PathSlot pathSlot = backendsWorkingSlots.get(beStat.getBeId());
+      173              if (pathSlot == null) {
+      174                  continue;
+      175              }
+      176  
+      177              // classify the paths.
+      178              Set<Long> pathLow = Sets.newHashSet();
+      179              Set<Long> pathMid = Sets.newHashSet();
+      180              Set<Long> pathHigh = Sets.newHashSet();
+      181              // we only select tablets from available high load path
+      182              beStat.getPathStatisticByClass(pathLow, pathMid, pathHigh, medium);
+      183              // check if BE has low and high paths for balance after reclassification
+      184              if (!checkAndReclassifyPaths(pathLow, pathMid, pathHigh)) {
+      185                  continue;
+      186              }
+      187  
+      188              // get all tablets on this backend, and shuffle them for random selection
+      189              List<Long> tabletIds = invertedIndex.getTabletIdsByBackendIdAndStorageMedium(beStat.getBeId(), medium);
+      190              Collections.shuffle(tabletIds);
+      191  
+      192              // for each path, we try to select at most BALANCE_SLOT_NUM_FOR_PATH tablets
+      193              Map<Long, Integer> remainingPaths = Maps.newHashMap();
+      194              for (Long pathHash : pathHigh) {
+      195                  int availBalanceNum = pathSlot.getAvailableBalanceNum(pathHash);
+      196                  if (availBalanceNum > 0) {
+      197                      remainingPaths.put(pathHash, availBalanceNum);
+      198                  }
+      199              }
+      200  
+      201              if (remainingPaths.isEmpty()) {
+      202                  continue;
+      203              }
+      204  
+      205              // select tablet from shuffled tablets
+      206              for (Long tabletId : tabletIds) {
+      207                  if (alternativeTabletIds.contains(tabletId)) {
+      208                      continue;
+      209                  }
+      210                  if (!Config.enable_disk_balance_for_single_replica
+      211                          && invertedIndex.getReplicasByTabletId(tabletId).size() <= 1) {
+      212                      continue;
+      213                  }
+      214                  Replica replica = null;
+      215                  try {
+      216                      replica = invertedIndex.getReplica(tabletId, beStat.getBeId());
+      217                  } catch (IllegalStateException e) {
+      218                      continue;
+      219                  }
+      220                  if (replica == null) {
+      221                      continue;
+      222                  }
+      223                  // ignore empty replicas as they do not make disk more balance. (disk usage)
+      224                  if (replica.getDataSize() == 0) {
+      225                      continue;
+      226                  }
+      227  
+      228                  // backend not support migrate cooldown tablets
+      229                  TUniqueId cooldownMetaId = replica.getCooldownMetaId();
+      230                  if (cooldownMetaId != null && (cooldownMetaId.getLo() != 0 || cooldownMetaId.getHi() != 0)) {
+      231                      continue;
+      232                  }
+      233  
+      234                  // check if replica's is on 'high' path.
+      235                  // and only select it if the selected tablets num of this path
+      236                  // does not exceed the limit (BALANCE_SLOT_NUM_FOR_PATH).
+      237                  long replicaPathHash = replica.getPathHash();
+      238                  if (remainingPaths.containsKey(replicaPathHash)) {
+      239                      TabletMeta tabletMeta = invertedIndex.getTabletMeta(tabletId);
+      240                      if (!canBalanceTablet(tabletMeta)) {
+      241                          continue;
+      242                      }
+      243  
+      244                      TabletSchedCtx tabletCtx = new TabletSchedCtx(TabletSchedCtx.Type.BALANCE,
+      245                              tabletMeta.getDbId(), tabletMeta.getTableId(), tabletMeta.getPartitionId(),
+      246                              tabletMeta.getIndexId(), tabletId, null /* replica alloc is not used for balance*/,
+      247                              System.currentTimeMillis());
+      248                      // we set temp src here to simplify completeSchedCtx method, and avoid take slot here
+      249                      tabletCtx.setTempSrc(replica);
+      250                      tabletCtx.setTag(clusterStat.getTag());
+      251                      if (prioBackends.containsKey(beStat.getBeId())) {
+      252                          // priority of balance task of prio BE is NORMAL
+      253                          tabletCtx.setPriority(Priority.NORMAL);
+      254                      } else {
+      255                          // balance task's default priority is LOW
+      256                          tabletCtx.setPriority(Priority.LOW);
+      257                      }
+      258                      // we must set balanceType to DISK_BALANCE for create migration task
+      259                      tabletCtx.setBalanceType(BalanceType.DISK_BALANCE);
+      260  
+      261                      alternativeTablets.add(tabletCtx);
+      262                      alternativeTabletIds.add(tabletId);
+      263                      unbalancedBEs.add(beStat.getBeId());
+      264                      // update remaining paths
+      265                      int remaining = remainingPaths.get(replicaPathHash) - 1;
+      266                      if (remaining <= 0) {
+      267                          remainingPaths.remove(replicaPathHash);
+      268                      } else {
+      269                          remainingPaths.put(replicaPathHash, remaining);
+      270                      }
+      271                  }
+      272              }
+      273          } // end for mid backends
+      274  
+      275          // remove balanced BEs from prio backends
+      276          prioBackends.keySet().removeIf(id -> !unbalancedBEs.contains(id));
+      277          if (!alternativeTablets.isEmpty()) {
+      278              LOG.info("select alternative tablets, medium: {}, num: {}, detail: {}",
+      279                      medium, alternativeTablets.size(),
+      280                      alternativeTablets.stream().mapToLong(TabletSchedCtx::getTabletId).toArray());
+      281          }
+      282          return alternativeTablets;
+      283      }
+      284  
+      285      /*
+      286       * Create a StorageMediaMigrationTask of this selected tablet for balance.
+      287       * 1. Check if the cluster is balanced. if not, the balance will be cancelled.
+      288       * 2. Check if the src replica still on high load path. If not, the balance will be cancelled.
+      289       * 3. Select a low load path from this backend as destination.
+      290       */
+      291      @Override
+      292      public void completeSchedCtx(TabletSchedCtx tabletCtx) throws SchedException {
+      293          LoadStatisticForTag clusterStat = statisticMap.get(tabletCtx.getTag());
+      294          if (clusterStat == null) {
+      295              throw new SchedException(Status.UNRECOVERABLE,
+      296                      String.format("tag %s does not exist", tabletCtx.getTag()));
+      297          }
+      298          if (tabletCtx.getTempSrcBackendId() == -1 || tabletCtx.getTempSrcPathHash() == -1) {
+      299              throw new SchedException(Status.UNRECOVERABLE,
+      300                  "src does not appear to be set correctly, something goes wrong");
+      301          }
+      302          Replica replica = null;
+      303          try {
+      304              replica = invertedIndex.getReplica(tabletCtx.getTabletId(), tabletCtx.getTempSrcBackendId());
+      305          } catch (IllegalStateException e) {
+      306              replica = null;
+      307          }
+      308          // check src replica still there
+      309          if (replica == null || replica.getPathHash() != tabletCtx.getTempSrcPathHash()) {
+      310              throw new SchedException(Status.UNRECOVERABLE, SubCode.DIAGNOSE_IGNORE, "src replica may be rebalanced");
+      311          }
+      312          // ignore empty replicas as they do not make disk more balance
+      313          if (replica.getDataSize() == 0) {
+      314              throw new SchedException(Status.UNRECOVERABLE, SubCode.DIAGNOSE_IGNORE, "size of src replica is zero");
+      315          }
+      316  
+      317          // check src slot
+      318          PathSlot slot = backendsWorkingSlots.get(replica.getBackendIdWithoutException());
+      319          if (slot == null) {
+      320              if (LOG.isDebugEnabled()) {
+      321                  LOG.debug("BE does not have slot: {}", replica.getBackendIdWithoutException());
+      322              }
+      323              throw new SchedException(Status.UNRECOVERABLE, "unable to take src slot");
+      324          }
+      325          long pathHash = slot.takeBalanceSlot(replica.getPathHash());
+      326          if (pathHash == -1) {
+      327              throw new SchedException(Status.UNRECOVERABLE, SubCode.DIAGNOSE_IGNORE, "unable to take src slot");
+      328          }
+      329          // after take src slot, we can set src replica now
+      330          tabletCtx.setSrc(replica);
+      331  
+      332          BackendLoadStatistic beStat = clusterStat.getBackendLoadStatistic(replica.getBackendIdWithoutException());
+      333          if (!beStat.isAvailable()) {
+      334              throw new SchedException(Status.UNRECOVERABLE, "the backend is not available");
+      335          }
+      336          // classify the paths.
+      337          // If src path is 'high', then we can select path from 'low' and 'mid'
+      338          // If src path is 'mid', then we can only select path from 'low'
+      339          // If src path is 'low', then we have nothing to do
+      340          Set<Long> pathLow = Sets.newHashSet();
+      341          Set<Long> pathMid = Sets.newHashSet();
+      342          Set<Long> pathHigh = Sets.newHashSet();
+      343          beStat.getPathStatisticByClass(pathLow, pathMid, pathHigh, tabletCtx.getStorageMedium());
+      344          if (pathHigh.contains(replica.getPathHash())) {
+      345              pathLow.addAll(pathMid);
+      346          } else if (!pathMid.contains(replica.getPathHash())) {
+      347              throw new SchedException(Status.UNRECOVERABLE, SubCode.DIAGNOSE_IGNORE, "src path is low load");
+      348          }
+      349          // check if this migration task can make the be's disks more balance.
+      350          List<RootPathLoadStatistic> availPaths = Lists.newArrayList();
+      351          BalanceStatus bs;
+      352          if ((bs = beStat.isFit(tabletCtx.getTabletSize(), tabletCtx.getStorageMedium(), availPaths,
+      353                  false /* not supplement */)) != BalanceStatus.OK) {
+      354              if (LOG.isDebugEnabled()) {
+      355                  LOG.debug("tablet not fit in BE {}, reason: {}", beStat.getBeId(), bs.getErrMsgs());
+      356              }
+      357              throw new SchedException(Status.UNRECOVERABLE, "tablet not fit in BE");
+      358          }
+      359          // Select a low load path as destination.
+      360          boolean setDest = false;
+      361          for (RootPathLoadStatistic stat : availPaths) {
+      362              // check if avail path is src path
+      363              if (stat.getPathHash() == replica.getPathHash()) {
+      364                  continue;
+      365              }
+      366              // check if avail path is low path
+      367              if (!pathLow.contains(stat.getPathHash())) {
+      368                  if (LOG.isDebugEnabled()) {
+      369                      LOG.debug("the path :{} is not low load", stat.getPathHash());
+      370                  }
+      371                  continue;
+      372              }
+      373              if (!beStat.isMoreBalanced(tabletCtx.getSrcPathHash(), stat.getPathHash(),
+      374                      tabletCtx.getTabletId(), tabletCtx.getTabletSize(), tabletCtx.getStorageMedium())) {
+      375                  if (LOG.isDebugEnabled()) {
+      376                      LOG.debug("the path :{} can not make more balance", stat.getPathHash());
+      377                  }
+      378                  continue;
+      379              }
+      380              long destPathHash = slot.takeBalanceSlot(stat.getPathHash());
+      381              if (destPathHash == -1) {
+      382                  continue;
+      383              }
+      384              tabletCtx.setDest(beStat.getBeId(), destPathHash, stat.getPath());
+      385              setDest = true;
+      386              break;
+      387          }
+      388  
+      389          if (!setDest) {
+      390              throw new SchedException(Status.UNRECOVERABLE, SubCode.DIAGNOSE_IGNORE, "unable to find low load path");
+      391          }
+      392      }
+      393  }

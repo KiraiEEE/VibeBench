@@ -1,0 +1,406 @@
+row 392   ArcadeData/arcadedb#3734
+============================================================================
+CLASS com.arcadedb.log.DefaultLogger   loc=411 methods=12 wmc=102 lcom=0.0 c3=0.1460182956222906
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       42  public class DefaultLogger implements Logger {
+       43    private static final String DEFAULT_LOG                  = "com.arcadedb";
+       44    private static final String ENV_INSTALL_CUSTOM_FORMATTER = "arcadedb.installCustomFormatter";
+       45    private static final String FILE_LOG_PROPERTIES          = "arcadedb-log.properties";
+       46  
+       47    private volatile boolean initialized = false;
+       48  
+       49    /**
+       50     * Flag to indicate the JVM is shutting down. When true, log messages are written
+       51     * directly to System.err to avoid race conditions with the Java logging framework's
+       52     * shutdown hook that may close handlers before we're done logging.
+       53     * <p>
+       54     * See issue #2813: Irregular Null Pointer Exception on shutdown
+       55     */
+       56    private static volatile boolean shuttingDown = false;
+       57  
+       58    static {
+       59      // Register a shutdown hook with highest priority to detect shutdown early.
+       60      // This allows us to bypass the Java logging framework during shutdown and
+       61      // avoid NPE when handlers are closed before our shutdown hooks complete.
+       62      Runtime.getRuntime().addShutdownHook(new Thread(() -> shuttingDown = true, "ArcadeDB-LoggerShutdownDetector"));
+       63    }
+       64  
+       65    /**
+       66     * Marks the logger as shutting down. This causes all log messages to be written
+       67     * directly to System.err, bypassing the Java logging framework.
+       68     * <p>
+       69     * This is primarily used for testing and for explicit shutdown sequences.
+       70     */
+       71    public static void setShuttingDown(final boolean value) {
+       72      shuttingDown = value;
+       73    }
+       74  
+       75    /**
+       76     * Returns true if the logger is in shutdown mode.
+       77     */
+       78    public static boolean isShuttingDown() {
+       79      return shuttingDown;
+       80    }
+       81  
+       82    private final ConcurrentMap<String, java.util.logging.Logger> loggersCache =
+       83        new ConcurrentHashMap<>();
+       84  
+       85    public void init() {
+       86      if (initialized)
+       87        return;
+       88  
+       89      initialized = true;
+       90  
+       91      // Pre-create the log directory (if any) before loading the configuration.
+       92      // JUL's FileHandler opens its output file immediately when the LogManager reads the
+       93      // configuration, so the parent directory must exist at that point.
+       94      // We only create the directory when a FileHandler is actually configured, and we derive
+       95      // the path from the configured pattern — not from a hardcoded "./log" (issue #3732).
+       96      createLogDirectoryFromConfig();
+       97  
+       98      installCustomFormatter();
+       99    }
+      100  
+      101    /**
+      102     * Reads the pending log-configuration source (the same one that {@link #installCustomFormatter()}
+      103     * will later load into the LogManager) and pre-creates the parent directory of the configured
+      104     * {@code java.util.logging.FileHandler.pattern}, if any.
+      105     */
+      106    private void createLogDirectoryFromConfig() {
+      107      final String pattern = findConfiguredFileHandlerPattern();
+      108      if (pattern == null)
+      109        return;
+      110  
+      111      // Resolve JUL pattern substitutions to obtain a concrete path.
+      112      // Use a placeholder for "%%" so that single-percent substitutions (%t, %h, %g, %u)
+      113      // do not incorrectly expand the second character of an escaped "%%x" sequence.
+      114      final String resolved = pattern
+      115          .replace("%%", "\u0000")
+      116          .replace("%t", System.getProperty("java.io.tmpdir", "/tmp"))
+      117          .replace("%h", System.getProperty("user.home", "/"))
+      118          .replace("%g", "0")
+      119          .replace("%u", "0")
+      120          .replace("\u0000", "%");
+      121  
+      122      final File logDir = new File(resolved).getParentFile();
+      123      if (logDir == null)
+      124        return;
+      125  
+      126      try {
+      127        if (!logDir.exists() || !logDir.isDirectory())
+      128          if (!logDir.mkdirs())
+      129            System.err.println("Cannot create log directory: " + logDir.getAbsolutePath());
+      130      } catch (final Exception e) {
+      131        System.err.println("Error creating log directory: " + e.getMessage());
+      132      }
+      133    }
+      134  
+      135    /**
+      136     * Peeks at the log-configuration source that will be used (without loading it into the
+      137     * LogManager) and returns the value of {@code java.util.logging.FileHandler.pattern}, or
+      138     * {@code null} if no FileHandler pattern is configured.
+      139     */
+      140    private String findConfiguredFileHandlerPattern() {
+      141      final String configFileProp = System.getProperty("java.util.logging.config.file");
+      142      if (configFileProp != null) {
+      143        final File file = new File(configFileProp);
+      144        if (file.exists())
+      145          return readFileHandlerPatternFrom(file);
+      146        // Custom file specified but missing — installCustomFormatter() will emit the warning
+      147        return null;
+      148      }
+      149  
+      150      // Try the classpath resource (e.g. inside a JAR)
+      151      try (final InputStream stream = getClass().getClassLoader().getResourceAsStream(FILE_LOG_PROPERTIES)) {
+      152        if (stream != null)
+      153          return loadPatternFromStream(stream);
+      154      } catch (final IOException ignored) {
+      155      }
+      156  
+      157      // Try the production "config/" directory layout
+      158      try (final InputStream configStream = new FileInputStream("config/" + FILE_LOG_PROPERTIES)) {
+      159        return loadPatternFromStream(configStream);
+      160      } catch (final IOException e) {
+      161        return null;
+      162      }
+      163    }
+      164  
+      165    private String readFileHandlerPatternFrom(final File file) {
+      166      try (final InputStream fis = new FileInputStream(file)) {
+      167        return loadPatternFromStream(fis);
+      168      } catch (final IOException e) {
+      169        return null;
+      170      }
+      171    }
+      172  
+      173    private String loadPatternFromStream(final InputStream stream) {
+      174      final Properties props = new Properties();
+      175      try {
+      176        props.load(stream);
+      177      } catch (final IOException e) {
+      178        return null;
+      179      }
+      180      return props.getProperty("java.util.logging.FileHandler.pattern");
+      181    }
+      182  
+      183    public void installCustomFormatter() {
+      184      InputStream stream = null;
+      185  
+      186      final String defaultLogConfigurationFile = System.getProperty("java.util.logging.config.file");
+      187      if (defaultLogConfigurationFile != null) {
+      188        final File file = new File(defaultLogConfigurationFile);
+      189        if (file.exists()) {
+      190          try {
+      191            stream = new FileInputStream(file);
+      192          } catch (Exception e) {
+      193            // USE DEFAULT SETTINGS
+      194            System.err.println(
+      195                "Error on loading logging configuration file '" + defaultLogConfigurationFile + "'. Using default " +
+      196                    "settings");
+      197          }
+      198        } else
+      199          System.err.println("Error on loading logging configuration file '" + defaultLogConfigurationFile
+      200              + "': file not found. Using default settings");
+      201      }
+      202  
+      203      if (stream == null) {
+      204        stream = getClass().getClassLoader().getResourceAsStream(FILE_LOG_PROPERTIES);
+      205        if (stream == null) {
+      206          try {
+      207            stream = new FileInputStream("config/" + FILE_LOG_PROPERTIES);
+      208          } catch (final FileNotFoundException e) {
+      209            // USE DEFAULT SETTINGS
+      210          }
+      211        }
+      212      }
+      213  
+      214      if (stream != null)
+      215        try {
+      216          LogManager.getLogManager().readConfiguration(stream);
+      217        } catch (final IOException e) {
+      218          // NOT FOUND, APPLY DEFAULTS
+      219          System.err.println("Cannot find ArcadeDB log file `arcadedb-log.properties`. Using default settings");
+      220        }
+      221      else
+      222        System.err.println("Cannot find ArcadeDB log file `arcadedb-log.properties`. Using default settings");
+      223  
+      224      final boolean installCustomFormatter = Boolean.parseBoolean(
+      225          SystemVariableResolver.INSTANCE.resolveSystemVariables("${" + ENV_INSTALL_CUSTOM_FORMATTER + "}", "true"));
+      226  
+      227      if (!installCustomFormatter)
+      228        return;
+      229  
+      230      try {
+      231        // ASSURE TO HAVE THE LOG FORMATTER TO THE CONSOLE EVEN IF NO CONFIGURATION FILE IS TAKEN
+      232        final java.util.logging.Logger log = java.util.logging.Logger.getLogger("");
+      233  
+      234        if (log.getHandlers().length == 0) {
+      235          // SET DEFAULT LOG FORMATTER
+      236          final Handler h = new ConsoleHandler();
+      237          h.setFormatter(new AnsiLogFormatter());
+      238          log.addHandler(h);
+      239        } else {
+      240          for (final Handler h : log.getHandlers()) {
+      241            if (h instanceof ConsoleHandler && !h.getFormatter().getClass().equals(AnsiLogFormatter.class))
+      242              h.setFormatter(new AnsiLogFormatter());
+      243          }
+      244        }
+      245      } catch (final Exception e) {
+      246        System.err.println("Error while installing custom formatter. Logging could be disabled. Cause: " + e);
+      247      }
+      248    }
+      249  
+      250    public void log(final Object requester, final Level level, String message, final Throwable exception,
+      251                    final String context,
+      252                    final Object arg1, final Object arg2, final Object arg3, final Object arg4, final Object arg5,
+      253                    final Object arg6, final Object arg7, final Object arg8, final Object arg9, final Object arg10,
+      254                    final Object arg11, final Object arg12, final Object arg13, final Object arg14, final Object arg15,
+      255                    final Object arg16, final Object arg17) {
+      256      if (message == null)
+      257        return;
+      258  
+      259      final boolean hasParams =
+      260          arg1 != null || arg2 != null || arg3 != null || arg4 != null || arg5 != null || arg6 != null || arg7 != null || arg8 != null
+      261              || arg9 != null || arg10 != null || arg11 != null || arg12 != null || arg13 != null || arg14 != null || arg15 != null
+      262              || arg16 != null || arg17 != null;
+      263  
+      264      // During JVM shutdown, bypass the logging framework and use System.err directly
+      265      // to avoid NPE when handlers are closed (issue #2813)
+      266      if (shuttingDown) {
+      267        if (level.intValue() >= Level.INFO.intValue())
+      268          logToSystemErr(message, exception, context, hasParams, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9,
+      269              arg10, arg11, arg12, arg13, arg14, arg15, arg16, arg17);
+      270        return;
+      271      }
+      272  
+      273      init();
+      274  
+      275      final String requesterName;
+      276      if (requester instanceof String string)
+      277        requesterName = string;
+      278      else if (requester instanceof Class<?> class1)
+      279        requesterName = class1.getName();
+      280      else if (requester != null)
+      281        requesterName = requester.getClass().getName();
+      282      else
+      283        requesterName = DEFAULT_LOG;
+      284  
+      285      java.util.logging.Logger log = loggersCache.get(requesterName);
+      286      if (log == null) {
+      287        log = java.util.logging.Logger.getLogger(requesterName);
+      288  
+      289        if (log != null) {
+      290          final java.util.logging.Logger oldLogger = loggersCache.putIfAbsent(requesterName, log);
+      291  
+      292          if (oldLogger != null)
+      293            log = oldLogger;
+      294        }
+      295      }
+      296  
+      297      if (log == null) {
+      298        if (context != null)
+      299          message = "<" + context + "> " + message;
+      300  
+      301        // USE SYS ERR
+      302        try {
+      303          String msg = message;
+      304          if (hasParams)
+      305            msg = message.formatted(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11, arg12, arg13,
+      306                arg14,
+      307                arg15, arg16, arg17);
+      308  
+      309          System.err.println(msg);
+      310  
+      311        } catch (final Exception e) {
+      312          System.err.print("Error on formatting message '%s'. Exception: %s".formatted(message, e));
+      313        } finally {
+      314          if (level == Level.SEVERE)
+      315            System.err.flush();
+      316        }
+      317      } else if (log.isLoggable(level)) {
+      318        // USE THE LOG
+      319        try {
+      320          if (context != null)
+      321            message = "<" + context + "> " + message;
+      322  
+      323          String msg = message;
+      324          if (hasParams)
+      325            msg = message.formatted(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11, arg12, arg13,
+      326                arg14,
+      327                arg15, arg16, arg17);
+      328  
+      329          if (exception != null)
+      330            log.log(level, msg, exception);
+      331          else
+      332            log.log(level, msg);
+      333  
+      334          if (level == Level.SEVERE)
+      335            flush();
+      336  
+      337        } catch (final Exception e) {
+      338          System.err.printf("Error on formatting message '%s'. Exception: %s", message, e);
+      339          System.err.flush();
+      340        }
+      341      }
+      342    }
+      343  
+      344    /**
+      345     * Helper method to log directly to System.err during shutdown.
+      346     */
+      347    private void logToSystemErr(String message, final Throwable exception, final String context,
+      348                                final boolean hasParams, final Object... args) {
+      349      try {
+      350        if (context != null)
+      351          message = "<" + context + "> " + message;
+      352  
+      353        String msg = message;
+      354        if (hasParams && args.length > 0)
+      355          msg = message.formatted(args);
+      356  
+      357        System.err.println(msg);
+      358        if (exception != null)
+      359          exception.printStackTrace(System.err);
+      360        System.err.flush();
+      361      } catch (final Exception e) {
+      362        // Silently ignore errors during shutdown logging
+      363      }
+      364    }
+      365  
+      366    public void log(final Object requester, final Level level, String message, final Throwable exception,
+      367                    final String context, final Object... args) {
+      368      if (message == null)
+      369        return;
+      370  
+      371      // During JVM shutdown, bypass the logging framework and use System.err directly
+      372      // to avoid NPE when handlers are closed (issue #2813)
+      373      if (shuttingDown) {
+      374        logToSystemErr(message, exception, context, args.length > 0, args);
+      375        return;
+      376      }
+      377  
+      378      init();
+      379  
+      380      final String requesterName;
+      381      if (requester instanceof String string)
+      382        requesterName = string;
+      383      else if (requester instanceof Class<?> class1)
+      384        requesterName = class1.getName();
+      385      else if (requester != null)
+      386        requesterName = requester.getClass().getName();
+      387      else
+      388        requesterName = DEFAULT_LOG;
+      389  
+      390      java.util.logging.Logger log = loggersCache.get(requesterName);
+      391      if (log == null) {
+      392        log = java.util.logging.Logger.getLogger(requesterName);
+      393  
+      394        if (log != null) {
+      395          final java.util.logging.Logger oldLogger = loggersCache.putIfAbsent(requesterName, log);
+      396  
+      397          if (oldLogger != null)
+      398            log = oldLogger;
+      399        }
+      400      }
+      401  
+      402      if (log == null) {
+      403        if (context != null)
+      404          message = "<" + context + "> " + message;
+      405  
+      406        try {
+      407          String msg = message;
+      408          if (args.length > 0)
+      409            msg = message.formatted(args);
+      410          System.err.println(msg);
+      411  
+      412        } catch (final Exception e) {
+      413          System.err.printf("Error on formatting message '%s'. Exception: %s", message, e);
+      414        }
+      415      } else {
+      416        // USE THE LOG
+      417        try {
+      418          if (context != null)
+      419            message = "<" + context + "> " + message;
+      420  
+      421          String msg = message;
+      422          if (args.length > 0)
+      423            msg = message.formatted(args);
+      424  
+      425          if (log.isLoggable(level)) {
+      426            if (exception != null)
+      427              log.log(level, msg, exception);
+      428            else
+      429              log.log(level, msg);
+      430          } else if (com.arcadedb.log.LogManager.instance().isDebugEnabled()) {
+      431            if (exception != null) {
+      432              System.out.print(new LogFormatter().format(new LogRecord(level, msg)));
+      433              exception.printStackTrace();
+      434            } else
+      435              System.out.println(msg);
+      436          }
+      437        } catch (final Exception e) {
+      438          System.err.printf("Error on formatting message '%s'. Exception: %s", message, e);
+      439        }
+      440      }
+      441    }
+       ... truncated at 400 lines ...

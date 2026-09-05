@@ -1,0 +1,406 @@
+row 348   apache/cxf#2948
+============================================================================
+CLASS org.apache.cxf.rs.security.oauth2.provider.AbstractOAuthDataProvider   loc=659 methods=74 wmc=168 lcom=0.0547945205479452 c3=0.1186010196769395
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       45  public abstract class AbstractOAuthDataProvider implements OAuthDataProvider, ClientRegistrationProvider {
+       46      private long accessTokenLifetime = 3600L;
+       47      private long refreshTokenLifetime; // refresh tokens are eternal by default
+       48      private boolean recycleRefreshTokens = true;
+       49      private Object refreshTokenLock;
+       50      private Map<String, OAuthPermission> permissionMap = new HashMap<>();
+       51      private MessageContext messageContext;
+       52      private List<String> defaultScopes;
+       53      private List<String> requiredScopes;
+       54      private List<String> invisibleToClientScopes;
+       55      private boolean supportPreauthorizedTokens;
+       56  
+       57      private boolean useJwtFormatForAccessTokens;
+       58      private boolean persistJwtEncoding = true;
+       59      private OAuthJoseJwtProducer jwtAccessTokenProducer;
+       60      private Map<String, String> jwtAccessTokenClaimMap;
+       61      private ProviderAuthenticationStrategy authenticationStrategy;
+       62      private String issuer;
+       63  
+       64      protected AbstractOAuthDataProvider() {
+       65      }
+       66  
+       67      @Override
+       68      public ServerAccessToken createAccessToken(AccessTokenRegistration reg)
+       69          throws OAuthServiceException {
+       70          ServerAccessToken at = doCreateAccessToken(reg);
+       71          saveAccessToken(at);
+       72          if (isRefreshTokenSupported(reg.getApprovedScope())) {
+       73              createNewRefreshToken(at);
+       74          }
+       75          return at;
+       76      }
+       77  
+       78      protected ServerAccessToken doCreateAccessToken(AccessTokenRegistration atReg) {
+       79          ServerAccessToken at = doCreateAccessToken(
+       80              atReg.getAudiences(), atReg.getClient(),
+       81              atReg.getClientCodeVerifier(), atReg.getExtraProperties(),
+       82              atReg.getGrantCode(), atReg.getGrantType(), atReg.getNonce(),
+       83              atReg.getResponseType(),
+       84              convertScopeToPermissions(
+       85                      atReg.getClient(), atReg.getApprovedScope()),
+       86              atReg.getSubject());
+       87  
+       88          if (messageContext != null) {
+       89              String certCnf = (String)messageContext.get(JoseConstants.HEADER_X509_THUMBPRINT_SHA256);
+       90              if (certCnf != null) {
+       91                  // At a later stage we will likely introduce a dedicated Confirmation bean (as it is used in POP etc)
+       92                  at.getExtraProperties().put(JoseConstants.HEADER_X509_THUMBPRINT_SHA256, certCnf);
+       93              }
+       94          }
+       95  
+       96          if (isUseJwtFormatForAccessTokens()) {
+       97              convertToJWTAccessToken(at);
+       98          }
+       99  
+      100          return at;
+      101      }
+      102  
+      103      //CHECKSTYLE:OFF
+      104      @SuppressWarnings("PMD.ExcessiveParameterList")
+      105      protected ServerAccessToken doCreateAccessToken(List<String> audiences,
+      106                                                      Client client,
+      107                                                      String clientCodeVerifier,
+      108                                                      Map<String, String> extraProperties,
+      109                                                      String grantCode,
+      110                                                      String grantType,
+      111                                                      String nonce,
+      112                                                      String responseType,
+      113                                                      List<OAuthPermission> scopes,
+      114                                                      UserSubject userSubject) {
+      115      //CHECKSTYLE:ON
+      116  
+      117          ServerAccessToken at =
+      118              createNewAccessToken(client, userSubject);
+      119          at.setAudiences(audiences);
+      120          at.setGrantType(grantType);
+      121          at.setScopes(scopes);
+      122          at.setSubject(userSubject);
+      123          at.setClientCodeVerifier(clientCodeVerifier);
+      124          at.setNonce(nonce);
+      125          at.setResponseType(responseType);
+      126          at.setGrantCode(grantCode);
+      127          at.getExtraProperties().putAll(extraProperties);
+      128  
+      129          return at;
+      130      }
+      131  
+      132      protected JwtClaims createJwtAccessToken(ServerAccessToken at) {
+      133          JwtClaims claims = new JwtClaims();
+      134          claims.setTokenId(at.getTokenKey());
+      135  
+      136          // 'client_id' or 'cid', default client_id
+      137          String clientIdClaimName =
+      138              JwtTokenUtils.getClaimName(OAuthConstants.CLIENT_ID, OAuthConstants.CLIENT_ID,
+      139                                               getJwtAccessTokenClaimMap());
+      140          claims.setClaim(clientIdClaimName, at.getClient().getClientId());
+      141          claims.setIssuedAt(at.getIssuedAt());
+      142          if (at.getExpiresIn() > 0) {
+      143              claims.setExpiryTime(at.getIssuedAt() + at.getExpiresIn());
+      144          }
+      145          UserSubject userSubject = at.getSubject();
+      146          if (userSubject != null) {
+      147              if (userSubject.getId() != null) {
+      148                  claims.setSubject(userSubject.getId());
+      149              }
+      150  
+      151              // 'username' by default to be consistent with the token introspection response
+      152              final String usernameProp = "username";
+      153              String usernameClaimName =
+      154                  JwtTokenUtils.getClaimName(usernameProp, usernameProp, getJwtAccessTokenClaimMap());
+      155              claims.setClaim(usernameClaimName, userSubject.getLogin());
+      156          }
+      157          if (at.getIssuer() != null) {
+      158              claims.setIssuer(at.getIssuer());
+      159          }
+      160          if (!at.getScopes().isEmpty()) { // rfc8693, section 4.2
+      161              claims.setClaim(OAuthConstants.SCOPE,
+      162                  OAuthUtils.convertListOfScopesToString(OAuthUtils.convertPermissionsToScopeList(at.getScopes())));
+      163          }
+      164          // OAuth2 resource indicators (resource server audience)
+      165          if (!at.getAudiences().isEmpty()) {
+      166              List<String> resourceAudiences = at.getAudiences();
+      167              if (resourceAudiences.size() == 1) {
+      168                  claims.setAudience(resourceAudiences.get(0));
+      169              } else {
+      170                  claims.setAudiences(resourceAudiences);
+      171              }
+      172          }
+      173          if (!at.getExtraProperties().isEmpty()) {
+      174              Map<String, String> actualExtraProps = new HashMap<>();
+      175              for (Map.Entry<String, String> entry : at.getExtraProperties().entrySet()) {
+      176                  if (JoseConstants.HEADER_X509_THUMBPRINT_SHA256.equals(entry.getKey())) {
+      177                      claims.setClaim(JwtConstants.CLAIM_CONFIRMATION,
+      178                          Collections.singletonMap(JoseConstants.HEADER_X509_THUMBPRINT_SHA256,
+      179                                                   entry.getValue()));
+      180                  } else {
+      181                      actualExtraProps.put(entry.getKey(), entry.getValue());
+      182                  }
+      183              }
+      184              claims.setClaim("extra_properties", actualExtraProps);
+      185          }
+      186          // Can be used to check at RS/etc which grant was used to get this token issued
+      187          if (at.getGrantType() != null) {
+      188              claims.setClaim(OAuthConstants.GRANT_TYPE, at.getGrantType());
+      189          }
+      190          // Can be used to check the original code grant value which was removed from the storage
+      191          // (and is no longer valid) when this token was issued; relevant only if the authorization
+      192          // code flow was used
+      193          if (at.getGrantCode() != null) {
+      194              claims.setClaim(OAuthConstants.AUTHORIZATION_CODE_GRANT, at.getGrantCode());
+      195          }
+      196          // Can be used to link the clients (especially public ones) to this token
+      197          // to have a knowledge which client instance is using this token - might be handy at the RS/etc
+      198          if (at.getClientCodeVerifier() != null) {
+      199              claims.setClaim(OAuthConstants.AUTHORIZATION_CODE_VERIFIER, at.getClientCodeVerifier());
+      200          }
+      201          if (at.getNonce() != null) {
+      202              claims.setClaim(OAuthConstants.NONCE, at.getNonce());
+      203          }
+      204          return claims;
+      205      }
+      206  
+      207      protected void convertToJWTAccessToken(ServerAccessToken at) {
+      208          JwtClaims claims = createJwtAccessToken(at);
+      209          String jose = processJwtAccessToken(claims);
+      210          if (isPersistJwtEncoding()) {
+      211              at.setTokenKey(jose);
+      212          } else {
+      213              at.setEncodedToken(jose);
+      214          }
+      215      }
+      216  
+      217      protected ServerAccessToken createNewAccessToken(Client client, UserSubject userSub) {
+      218          BearerAccessToken token = new BearerAccessToken(client, accessTokenLifetime);
+      219          if (getIssuer() != null) {
+      220              token.setIssuer(getIssuer());
+      221          }
+      222          return token;
+      223      }
+      224  
+      225      @Override
+      226      public ServerAccessToken refreshAccessToken(Client client, String refreshTokenKey,
+      227                                                  List<String> restrictedScopes) throws OAuthServiceException {
+      228          RefreshToken currentRefreshToken = recycleRefreshTokens
+      229              ? revokeRefreshToken(client, refreshTokenKey) : getRefreshToken(refreshTokenKey);
+      230          if (currentRefreshToken == null) {
+      231              throw new OAuthServiceException(OAuthConstants.ACCESS_DENIED);
+      232          }
+      233          if (OAuthUtils.isExpired(currentRefreshToken.getIssuedAt(), currentRefreshToken.getExpiresIn())) {
+      234              if (!recycleRefreshTokens) {
+      235                  revokeRefreshToken(client, refreshTokenKey);
+      236              }
+      237              throw new OAuthServiceException(OAuthConstants.ACCESS_DENIED);
+      238          }
+      239          if (recycleRefreshTokens) {
+      240              revokeAccessTokens(client, currentRefreshToken);
+      241          }
+      242  
+      243          ServerAccessToken at = doRefreshAccessToken(client, currentRefreshToken, restrictedScopes);
+      244          saveAccessToken(at);
+      245          if (recycleRefreshTokens) {
+      246              createNewRefreshToken(at);
+      247          } else {
+      248              updateExistingRefreshToken(currentRefreshToken, at);
+      249          }
+      250          return at;
+      251      }
+      252  
+      253      @Override
+      254      public void revokeToken(Client client, String tokenKey, String tokenTypeHint) throws OAuthServiceException {
+      255          ServerAccessToken accessToken = null;
+      256          if (!OAuthConstants.REFRESH_TOKEN.equals(tokenTypeHint)) {
+      257              accessToken = revokeAccessToken(client, tokenKey);
+      258          }
+      259          if (accessToken != null) {
+      260              handleLinkedRefreshToken(client, accessToken);
+      261          } else if (!OAuthConstants.ACCESS_TOKEN.equals(tokenTypeHint)) {
+      262              RefreshToken currentRefreshToken = revokeRefreshToken(client, tokenKey);
+      263              revokeAccessTokens(client, currentRefreshToken);
+      264          }
+      265      }
+      266  
+      267      protected void handleLinkedRefreshToken(Client client, ServerAccessToken accessToken) {
+      268          if (accessToken != null && accessToken.getRefreshToken() != null) {
+      269              RefreshToken rt = getRefreshToken(accessToken.getRefreshToken());
+      270              if (rt == null) {
+      271                  return;
+      272              }
+      273  
+      274              unlinkRefreshAccessToken(rt, accessToken.getTokenKey());
+      275              if (rt.getAccessTokens().isEmpty()) {
+      276                  revokeRefreshToken(client, rt.getTokenKey());
+      277              } else {
+      278                  saveRefreshToken(rt);
+      279              }
+      280          }
+      281  
+      282      }
+      283  
+      284      protected void revokeAccessTokens(Client client, RefreshToken currentRefreshToken) {
+      285          if (currentRefreshToken != null) {
+      286              for (String accessTokenKey : currentRefreshToken.getAccessTokens()) {
+      287                  revokeAccessToken(client, accessTokenKey);
+      288              }
+      289          }
+      290      }
+      291  
+      292      protected void unlinkRefreshAccessToken(RefreshToken rt, String tokenKey) {
+      293          List<String> accessTokenKeys = rt.getAccessTokens();
+      294          for (int i = 0; i < accessTokenKeys.size(); i++) {
+      295              if (accessTokenKeys.get(i).equals(tokenKey)) {
+      296                  accessTokenKeys.remove(i);
+      297                  break;
+      298              }
+      299          }
+      300      }
+      301  
+      302  
+      303  
+      304      @Override
+      305      public List<OAuthPermission> convertScopeToPermissions(Client client, List<String> requestedScopes) {
+      306          checkRequestedScopes(client, requestedScopes);
+      307          if (requestedScopes.isEmpty()) {
+      308              return Collections.emptyList();
+      309          }
+      310          List<OAuthPermission> list = new ArrayList<>();
+      311          for (String scope : requestedScopes) {
+      312              convertSingleScopeToPermission(client, scope, list);
+      313          }
+      314          if (!list.isEmpty()) {
+      315              return list;
+      316          }
+      317          throw new OAuthServiceException("Requested scopes can not be mapped");
+      318  
+      319      }
+      320  
+      321      protected void checkRequestedScopes(Client client, List<String> requestedScopes) {
+      322          if (requiredScopes != null && !requestedScopes.containsAll(requiredScopes)) {
+      323              throw new OAuthServiceException("Required scopes are missing");
+      324          }
+      325      }
+      326  
+      327      protected void convertSingleScopeToPermission(Client client,
+      328                                                    String scope,
+      329                                                    List<OAuthPermission> perms) {
+      330          OAuthPermission permission = permissionMap.get(scope);
+      331          if (permission == null) {
+      332              throw new OAuthServiceException("Unexpected scope: " + scope);
+      333          }
+      334          perms.add(permission);
+      335      }
+      336  
+      337      @Override
+      338      public ServerAccessToken getPreauthorizedToken(Client client,
+      339                                                     List<String> requestedScopes,
+      340                                                     UserSubject sub,
+      341                                                     String grantType) throws OAuthServiceException {
+      342          if (!isSupportPreauthorizedTokens()) {
+      343              return null;
+      344          }
+      345  
+      346          ServerAccessToken token = null;
+      347          for (ServerAccessToken at : getAccessTokens(client, sub)) {
+      348              if (at.getClient().getClientId().equals(client.getClientId())
+      349                  && at.getGrantType().equals(grantType)
+      350                  && (sub == null && at.getSubject() == null
+      351                  || sub != null && at.getSubject().getLogin().equals(sub.getLogin()))) {
+      352                  if (!OAuthUtils.isExpired(at.getIssuedAt(), at.getExpiresIn())) {
+      353                      token = at;
+      354                  } else {
+      355                      revokeToken(client, at.getTokenKey(), OAuthConstants.ACCESS_TOKEN);
+      356                  }
+      357                  break;
+      358              }
+      359          }
+      360          return token;
+      361  
+      362      }
+      363  
+      364      protected boolean isRefreshTokenSupported(List<String> theScopes) {
+      365          return theScopes.contains(OAuthConstants.REFRESH_TOKEN_SCOPE);
+      366      }
+      367  
+      368      protected String getCurrentRequestedGrantType() {
+      369          return messageContext != null ? (String)messageContext.get(OAuthConstants.GRANT_TYPE) : null;
+      370      }
+      371      protected String getCurrentClientSecret() {
+      372          return messageContext != null ? (String)messageContext.get(OAuthConstants.CLIENT_SECRET) : null;
+      373      }
+      374      protected MultivaluedMap<String, String> getCurrentTokenRequestParams() {
+      375          if (messageContext != null) {
+      376              @SuppressWarnings("unchecked")
+      377              MultivaluedMap<String, String> params =
+      378                  (MultivaluedMap<String, String>)messageContext.get(OAuthConstants.TOKEN_REQUEST_PARAMS);
+      379              return params;
+      380          }
+      381          return null;
+      382      }
+      383      protected RefreshToken updateExistingRefreshToken(RefreshToken rt, ServerAccessToken at) {
+      384          synchronized (refreshTokenLock) {
+      385              return updateRefreshToken(rt, at);
+      386          }
+      387      }
+      388      protected RefreshToken updateRefreshToken(RefreshToken rt, ServerAccessToken at) {
+      389          linkAccessTokenToRefreshToken(rt, at);
+      390          saveRefreshToken(rt);
+      391          linkRefreshTokenToAccessToken(rt, at);
+      392          return rt;
+      393      }
+      394      protected RefreshToken createNewRefreshToken(ServerAccessToken at) {
+      395          RefreshToken rt = doCreateNewRefreshToken(at);
+      396          return updateRefreshToken(rt, at);
+      397      }
+      398      protected RefreshToken doCreateNewRefreshToken(ServerAccessToken at) {
+      399          RefreshToken rt = new RefreshToken(at.getClient(), refreshTokenLifetime);
+      400          if (at.getAudiences() != null) {
+      401              rt.setAudiences(new ArrayList<>(at.getAudiences()));
+      402          }
+      403          rt.setGrantType(at.getGrantType());
+      404          if (at.getScopes() != null) {
+      405              rt.setScopes(new ArrayList<>(at.getScopes()));
+      406          }
+      407          rt.setGrantCode(at.getGrantCode());
+      408          rt.setNonce(at.getNonce());
+      409          rt.setSubject(at.getSubject());
+      410          rt.setClientCodeVerifier(at.getClientCodeVerifier());
+      411          return rt;
+      412      }
+      413  
+      414      protected void linkAccessTokenToRefreshToken(RefreshToken rt, ServerAccessToken at) {
+      415          if (!rt.getAccessTokens().contains(at.getTokenKey())) {
+      416              rt.getAccessTokens().add(at.getTokenKey());
+      417          }
+      418      }
+      419      protected void linkRefreshTokenToAccessToken(RefreshToken rt, ServerAccessToken at) {
+      420          at.setRefreshToken(rt.getTokenKey());
+      421      }
+      422  
+      423      protected ServerAccessToken doRefreshAccessToken(Client client,
+      424                                                       RefreshToken oldRefreshToken,
+      425                                                       List<String> restrictedScopes) {
+      426  
+      427          List<OAuthPermission> theNewScopes = null;
+      428  
+      429          if (restrictedScopes.isEmpty()) {
+      430              theNewScopes = oldRefreshToken.getScopes() != null
+      431                      ? new ArrayList<OAuthPermission>(oldRefreshToken.getScopes()) : null;
+      432          } else {
+      433              theNewScopes = convertScopeToPermissions(client, restrictedScopes);
+      434              if (!oldRefreshToken.getScopes().containsAll(theNewScopes)) {
+      435                  throw new OAuthServiceException("Invalid scopes");
+      436              }
+      437          }
+      438  
+      439          ServerAccessToken at =
+      440              doCreateAccessToken(
+      441                  oldRefreshToken.getAudiences() != null
+      442                      ? new ArrayList<String>(oldRefreshToken.getAudiences()) : null,
+      443                  client, oldRefreshToken.getClientCodeVerifier(),
+      444                  oldRefreshToken.getExtraProperties(), oldRefreshToken.getGrantCode(),
+       ... truncated at 400 lines ...

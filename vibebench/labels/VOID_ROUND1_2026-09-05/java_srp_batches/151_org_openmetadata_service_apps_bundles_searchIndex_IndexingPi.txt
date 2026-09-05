@@ -1,0 +1,406 @@
+row 151   open-metadata/OpenMetadata#26572
+============================================================================
+CLASS org.openmetadata.service.apps.bundles.searchIndex.IndexingPipeline   loc=563 methods=23 wmc=115 lcom=0.0 c3=0.1421377708564229
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       46  @Slf4j
+       47  public class IndexingPipeline implements AutoCloseable {
+       48  
+       49    private static final String POISON_PILL = "__POISON_PILL__";
+       50    private static final int DEFAULT_QUEUE_SIZE = 20000;
+       51    private static final int MAX_CONSUMER_THREADS =
+       52        Math.min(20, Runtime.getRuntime().availableProcessors() * 2);
+       53    private static final int MAX_JOB_THREADS =
+       54        Math.min(30, Runtime.getRuntime().availableProcessors() * 4);
+       55    private static final String ENTITY_TYPE_KEY = "entityType";
+       56    private static final String RECREATE_INDEX = "recreateIndex";
+       57  
+       58    private final SearchRepository searchRepository;
+       59    private final CompositeProgressListener listeners;
+       60    private final AtomicBoolean stopped = new AtomicBoolean(false);
+       61    @Getter private final AtomicReference<Stats> stats = new AtomicReference<>();
+       62  
+       63    private BulkSink searchIndexSink;
+       64    private RecreateIndexHandler recreateIndexHandler;
+       65    private ReindexContext recreateContext;
+       66    private EntityReader entityReader;
+       67    private ExecutorService consumerExecutor;
+       68    private ExecutorService producerExecutor;
+       69    private ExecutorService jobExecutor;
+       70    private BlockingQueue<IndexingTask<?>> taskQueue;
+       71    private final Set<String> promotedEntities = java.util.concurrent.ConcurrentHashMap.newKeySet();
+       72  
+       73    record IndexingTask<T>(String entityType, ResultList<T> entities, int offset) {}
+       74  
+       75    public IndexingPipeline(SearchRepository searchRepository) {
+       76      this.searchRepository = searchRepository;
+       77      this.listeners = new CompositeProgressListener();
+       78    }
+       79  
+       80    public IndexingPipeline addListener(ReindexingProgressListener listener) {
+       81      listeners.addListener(listener);
+       82      return this;
+       83    }
+       84  
+       85    public ExecutionResult execute(
+       86        ReindexingConfiguration config,
+       87        ReindexingJobContext context,
+       88        Set<String> entities,
+       89        BulkSink sink,
+       90        RecreateIndexHandler handler,
+       91        ReindexContext recreateCtx) {
+       92      this.searchIndexSink = sink;
+       93      this.recreateIndexHandler = handler;
+       94      this.recreateContext = recreateCtx;
+       95      long startTime = System.currentTimeMillis();
+       96  
+       97      stats.set(initializeStats(config, entities));
+       98      listeners.onJobStarted(context);
+       99  
+      100      try {
+      101        runPipeline(config, entities);
+      102        closeSink();
+      103        finalizeReindex();
+      104        return buildResult(startTime);
+      105      } catch (Exception e) {
+      106        LOG.error("Pipeline execution failed", e);
+      107        listeners.onJobFailed(stats.get(), e);
+      108        return ExecutionResult.fromStats(stats.get(), ExecutionResult.Status.FAILED, startTime);
+      109      }
+      110    }
+      111  
+      112    private void runPipeline(ReindexingConfiguration config, Set<String> entities)
+      113        throws InterruptedException {
+      114      int numConsumers =
+      115          config.consumerThreads() > 0 ? Math.min(config.consumerThreads(), MAX_CONSUMER_THREADS) : 2;
+      116      int queueSize = config.queueSize() > 0 ? config.queueSize() : DEFAULT_QUEUE_SIZE;
+      117      int batchSize = config.batchSize();
+      118  
+      119      taskQueue = new LinkedBlockingQueue<>(queueSize);
+      120      String jobIdTag = MDC.get("reindexJobId");
+      121      String threadPrefix = "reindex-" + (jobIdTag != null ? jobIdTag + "-" : "");
+      122      consumerExecutor =
+      123          Executors.newFixedThreadPool(
+      124              numConsumers,
+      125              Thread.ofPlatform().name(threadPrefix + "pipeline-consumer-", 0).factory());
+      126      producerExecutor =
+      127          Executors.newFixedThreadPool(
+      128              config.producerThreads() > 0 ? config.producerThreads() : 2,
+      129              Thread.ofPlatform().name(threadPrefix + "pipeline-producer-", 0).factory());
+      130      jobExecutor =
+      131          Executors.newFixedThreadPool(
+      132              Math.min(entities.size(), MAX_JOB_THREADS),
+      133              Thread.ofPlatform().name(threadPrefix + "pipeline-job-", 0).factory());
+      134  
+      135      entityReader = new EntityReader(producerExecutor, stopped);
+      136  
+      137      CountDownLatch consumerLatch = new CountDownLatch(numConsumers);
+      138      Map<String, String> mdc = MDC.getCopyOfContextMap();
+      139      for (int i = 0; i < numConsumers; i++) {
+      140        final int id = i;
+      141        consumerExecutor.submit(
+      142            () -> {
+      143              if (mdc != null) MDC.setContextMap(mdc);
+      144              try {
+      145                runConsumer(id, consumerLatch);
+      146              } finally {
+      147                MDC.clear();
+      148              }
+      149            });
+      150      }
+      151  
+      152      try {
+      153        readAllEntities(config, entities, batchSize);
+      154        signalConsumersToStop(numConsumers);
+      155        consumerLatch.await();
+      156      } catch (InterruptedException e) {
+      157        stopped.set(true);
+      158        Thread.currentThread().interrupt();
+      159        throw e;
+      160      } finally {
+      161        shutdownExecutors();
+      162      }
+      163    }
+      164  
+      165    private void readAllEntities(ReindexingConfiguration config, Set<String> entities, int batchSize)
+      166        throws InterruptedException {
+      167      List<String> ordered = EntityPriority.sortByPriority(entities);
+      168      Phaser producerPhaser = new Phaser(entities.size());
+      169      Map<String, String> mdc = MDC.getCopyOfContextMap();
+      170  
+      171      for (String entityType : ordered) {
+      172        jobExecutor.submit(
+      173            () -> {
+      174              if (mdc != null) MDC.setContextMap(mdc);
+      175              try {
+      176                int totalRecords = getTotalEntityRecords(entityType);
+      177                listeners.onEntityTypeStarted(entityType, totalRecords);
+      178  
+      179                int effectiveBatchSize =
+      180                    EntityBatchSizeEstimator.estimateBatchSize(entityType, batchSize);
+      181                Long filterStartTs = null;
+      182                Long filterEndTs = null;
+      183                long startTs = config.getTimeSeriesStartTs(entityType);
+      184                if (startTs > 0) {
+      185                  filterStartTs = startTs;
+      186                  filterEndTs = System.currentTimeMillis();
+      187                }
+      188                entityReader.readEntity(
+      189                    entityType,
+      190                    totalRecords,
+      191                    effectiveBatchSize,
+      192                    producerPhaser,
+      193                    (type, batch, offset) -> {
+      194                      if (!stopped.get()) {
+      195                        taskQueue.put(new IndexingTask<>(type, batch, offset));
+      196                      }
+      197                    },
+      198                    filterStartTs,
+      199                    filterEndTs);
+      200              } catch (Exception e) {
+      201                LOG.error("Error reading entity type {}", entityType, e);
+      202              } finally {
+      203                producerPhaser.arriveAndDeregister();
+      204                MDC.clear();
+      205              }
+      206            });
+      207      }
+      208  
+      209      int phase = 0;
+      210      while (!producerPhaser.isTerminated()) {
+      211        if (stopped.get() || Thread.currentThread().isInterrupted()) {
+      212          break;
+      213        }
+      214        try {
+      215          producerPhaser.awaitAdvanceInterruptibly(phase, 1, TimeUnit.SECONDS);
+      216          break;
+      217        } catch (TimeoutException e) {
+      218          // Continue
+      219        }
+      220      }
+      221    }
+      222  
+      223    @SuppressWarnings("unchecked")
+      224    private void runConsumer(int consumerId, CountDownLatch consumerLatch) {
+      225      try {
+      226        while (!stopped.get()) {
+      227          IndexingTask<?> task = taskQueue.poll(200, TimeUnit.MILLISECONDS);
+      228          if (task == null) continue;
+      229          if (POISON_PILL.equals(task.entityType())) break;
+      230  
+      231          String entityType = task.entityType();
+      232          ResultList<?> entities = task.entities();
+      233          Map<String, Object> contextData = createContextData(entityType);
+      234  
+      235          int readerSuccess = listOrEmpty(entities.getData()).size();
+      236          int readerFailed = listOrEmpty(entities.getErrors()).size();
+      237          int readerWarnings = entities.getWarningsCount() != null ? entities.getWarningsCount() : 0;
+      238          updateReaderStats(readerSuccess, readerFailed, readerWarnings);
+      239  
+      240          try {
+      241            if (!EntityReader.TIME_SERIES_ENTITIES.contains(entityType)) {
+      242              searchIndexSink.write(
+      243                  (java.util.List<EntityInterface>) entities.getData(), contextData);
+      244            } else {
+      245              searchIndexSink.write(
+      246                  (java.util.List<EntityTimeSeriesInterface>) entities.getData(), contextData);
+      247            }
+      248  
+      249            StepStats entityStats = new StepStats();
+      250            entityStats.setSuccessRecords(readerSuccess);
+      251            entityStats.setFailedRecords(readerFailed);
+      252            updateEntityAndJobStats(entityType, entityStats);
+      253  
+      254            if (Entity.TABLE.equals(entityType)) {
+      255              updateColumnStatsFromSink();
+      256            }
+      257  
+      258            listeners.onProgressUpdate(stats.get(), null);
+      259          } catch (Exception e) {
+      260            LOG.error("Sink error for {}", entityType, e);
+      261            IndexingError error =
+      262                new IndexingError()
+      263                    .withErrorSource(IndexingError.ErrorSource.SINK)
+      264                    .withMessage(e.getMessage());
+      265            listeners.onError(entityType, error, stats.get());
+      266          }
+      267        }
+      268      } catch (InterruptedException e) {
+      269        Thread.currentThread().interrupt();
+      270      } finally {
+      271        consumerLatch.countDown();
+      272      }
+      273    }
+      274  
+      275    private Map<String, Object> createContextData(String entityType) {
+      276      Map<String, Object> contextData = new HashMap<>();
+      277      contextData.put(ENTITY_TYPE_KEY, entityType);
+      278      contextData.put(RECREATE_INDEX, recreateContext != null);
+      279      if (recreateContext != null) {
+      280        contextData.put(ReindexingUtil.RECREATE_CONTEXT, recreateContext);
+      281        recreateContext
+      282            .getStagedIndex(entityType)
+      283            .ifPresent(index -> contextData.put(ReindexingUtil.TARGET_INDEX_KEY, index));
+      284      }
+      285      return contextData;
+      286    }
+      287  
+      288    private void signalConsumersToStop(int numConsumers) throws InterruptedException {
+      289      for (int i = 0; i < numConsumers; i++) {
+      290        taskQueue.put(new IndexingTask<>(POISON_PILL, null, -1));
+      291      }
+      292    }
+      293  
+      294    private void closeSink() throws IOException {
+      295      if (searchIndexSink != null) {
+      296        int pendingVectorTasks = searchIndexSink.getPendingVectorTaskCount();
+      297        if (pendingVectorTasks > 0) {
+      298          LOG.info("Waiting for {} pending vector embedding tasks", pendingVectorTasks);
+      299          VectorCompletionResult vcResult = searchIndexSink.awaitVectorCompletionWithDetails(300);
+      300          LOG.info(
+      301              "Vector completion: completed={}, pending={}, waited={}ms",
+      302              vcResult.completed(),
+      303              vcResult.pendingTaskCount(),
+      304              vcResult.waitedMillis());
+      305        }
+      306        searchIndexSink.close();
+      307        syncSinkStats();
+      308      }
+      309    }
+      310  
+      311    private void finalizeReindex() {
+      312      if (recreateIndexHandler == null || recreateContext == null) return;
+      313  
+      314      try {
+      315        recreateContext
+      316            .getEntities()
+      317            .forEach(
+      318                entityType -> {
+      319                  if (promotedEntities.contains(entityType)) return;
+      320                  try {
+      321                    EntityReindexContext ctx = buildEntityReindexContext(entityType);
+      322                    recreateIndexHandler.finalizeReindex(ctx, !stopped.get());
+      323                  } catch (Exception ex) {
+      324                    LOG.error("Failed to finalize reindex for {}", entityType, ex);
+      325                  }
+      326                });
+      327      } finally {
+      328        recreateContext = null;
+      329        promotedEntities.clear();
+      330      }
+      331    }
+      332  
+      333    private EntityReindexContext buildEntityReindexContext(String entityType) {
+      334      return EntityReindexContext.builder()
+      335          .entityType(entityType)
+      336          .originalIndex(recreateContext.getOriginalIndex(entityType).orElse(null))
+      337          .canonicalIndex(recreateContext.getCanonicalIndex(entityType).orElse(null))
+      338          .activeIndex(recreateContext.getOriginalIndex(entityType).orElse(null))
+      339          .stagedIndex(recreateContext.getStagedIndex(entityType).orElse(null))
+      340          .canonicalAliases(recreateContext.getCanonicalAlias(entityType).orElse(null))
+      341          .existingAliases(recreateContext.getExistingAliases(entityType))
+      342          .parentAliases(
+      343              new HashSet<>(
+      344                  org.openmetadata.common.utils.CommonUtil.listOrEmpty(
+      345                      recreateContext.getParentAliases(entityType))))
+      346          .build();
+      347    }
+      348  
+      349    private ExecutionResult buildResult(long startTime) {
+      350      syncSinkStats();
+      351      updateColumnStatsFromSink();
+      352      Stats currentStats = stats.get();
+      353      if (currentStats != null) {
+      354        StatsReconciler.reconcile(currentStats);
+      355      }
+      356  
+      357      ExecutionResult.Status status;
+      358      if (stopped.get()) {
+      359        status = ExecutionResult.Status.STOPPED;
+      360        listeners.onJobStopped(currentStats);
+      361      } else if (hasFailures()) {
+      362        status = ExecutionResult.Status.COMPLETED_WITH_ERRORS;
+      363        listeners.onJobCompletedWithErrors(currentStats, System.currentTimeMillis() - startTime);
+      364      } else {
+      365        status = ExecutionResult.Status.COMPLETED;
+      366        listeners.onJobCompleted(currentStats, System.currentTimeMillis() - startTime);
+      367      }
+      368  
+      369      return ExecutionResult.fromStats(currentStats, status, startTime);
+      370    }
+      371  
+      372    private boolean hasFailures() {
+      373      Stats s = stats.get();
+      374      if (s == null || s.getJobStats() == null) return false;
+      375      StepStats js = s.getJobStats();
+      376      long failed = js.getFailedRecords() != null ? js.getFailedRecords() : 0;
+      377      long success = js.getSuccessRecords() != null ? js.getSuccessRecords() : 0;
+      378      long total = js.getTotalRecords() != null ? js.getTotalRecords() : 0;
+      379      return failed > 0 || (total > 0 && success < total);
+      380    }
+      381  
+      382    private Stats initializeStats(ReindexingConfiguration config, Set<String> entities) {
+      383      Stats s = new Stats();
+      384      s.setEntityStats(new org.openmetadata.schema.system.EntityStats());
+      385      s.setJobStats(new StepStats());
+      386      s.setReaderStats(new StepStats());
+      387      s.setSinkStats(new StepStats());
+      388  
+      389      int total = 0;
+      390      for (String entityType : entities) {
+      391        int entityTotal = getEntityTotal(entityType, config);
+      392        total += entityTotal;
+      393        StepStats es = new StepStats();
+      394        es.setTotalRecords(entityTotal);
+      395        es.setSuccessRecords(0);
+      396        es.setFailedRecords(0);
+      397        s.getEntityStats().getAdditionalProperties().put(entityType, es);
+      398      }
+      399  
+      400      if (entities.contains(Entity.TABLE) && !entities.contains(Entity.TABLE_COLUMN)) {
+      401        StepStats columnStats = new StepStats();
+      402        columnStats.setTotalRecords(0);
+      403        columnStats.setSuccessRecords(0);
+      404        columnStats.setFailedRecords(0);
+      405        s.getEntityStats().getAdditionalProperties().put(Entity.TABLE_COLUMN, columnStats);
+      406      }
+      407  
+      408      s.getJobStats().setTotalRecords(total);
+      409      s.getJobStats().setSuccessRecords(0);
+      410      s.getJobStats().setFailedRecords(0);
+      411      s.getReaderStats().setTotalRecords(total);
+      412      s.getReaderStats().setSuccessRecords(0);
+      413      s.getReaderStats().setFailedRecords(0);
+      414      s.getReaderStats().setWarningRecords(0);
+      415      s.getSinkStats().setTotalRecords(0);
+      416      s.getSinkStats().setSuccessRecords(0);
+      417      s.getSinkStats().setFailedRecords(0);
+      418  
+      419      s.setProcessStats(new StepStats());
+      420      s.getProcessStats().setTotalRecords(0);
+      421      s.getProcessStats().setSuccessRecords(0);
+      422      s.getProcessStats().setFailedRecords(0);
+      423      return s;
+      424    }
+      425  
+      426    private int getEntityTotal(String entityType, ReindexingConfiguration config) {
+      427      try {
+      428        if (!EntityReader.TIME_SERIES_ENTITIES.contains(entityType)) {
+      429          EntityRepository<?> repository = Entity.getEntityRepository(entityType);
+      430          return repository
+      431              .getDao()
+      432              .listCount(new ListFilter(org.openmetadata.schema.type.Include.ALL));
+      433        }
+      434  
+      435        EntityTimeSeriesRepository<?> repository;
+      436        ListFilter listFilter = new ListFilter(null);
+      437        if (isDataInsightIndex(entityType)) {
+      438          listFilter.addQueryParam("entityFQNHash", FullyQualifiedName.buildHash(entityType));
+      439          repository = Entity.getEntityTimeSeriesRepository(Entity.ENTITY_REPORT_DATA);
+      440        } else {
+      441          repository = Entity.getEntityTimeSeriesRepository(entityType);
+      442        }
+      443  
+      444        long startTs = config != null ? config.getTimeSeriesStartTs(entityType) : -1;
+      445        if (startTs > 0) {
+       ... truncated at 400 lines ...
