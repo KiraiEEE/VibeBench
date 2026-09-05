@@ -72,6 +72,22 @@ def tree_for(full_name: str, pr_number: int) -> dict | None:
                                 C.JAVA_EXCLUDED_PATH_PARTS, full_name)
 
 
+def before_tree_for(full_name: str, pr_number: int) -> dict | None:
+    """The BEFORE tree, so the DIP section can show what the PR actually ADDED."""
+    gold = _frame("gold")
+    g = gold[(gold.full_name == full_name) & (gold.pr_number == pr_number)]
+    if not len(g):
+        return None
+    pr = g.iloc[0]
+    d = gitsnap.ensure_repo(full_name)
+    with gitsnap.repo_lock(full_name):
+        pair = gitsnap.delta_pair(d, pr)
+        if pair is None:
+            return None
+        return gitsnap.src_tree(d, pair[0], C.JAVA_SOURCE_EXTENSIONS,
+                                C.JAVA_EXCLUDED_PATH_PARTS, full_name)
+
+
 def span(files: dict, path: str, lineno: int, loc: int, pad: int = 0,
          mark: int | None = None, cap: int = 400) -> str:
     """Print [lineno, lineno+loc) with 1-based numbering.
@@ -242,16 +258,42 @@ def main() -> None:
             head.append("          low-level one (or close an import cycle)?")
             mods = D.dip_modules(ix)
             import graph as dipgraph  # noqa
-            for c in dipgraph.find_cycles(mods):
-                body.append("CYCLE: " + " -> ".join(sorted(c)))
-            body.append("\nNEW IMPORT EDGES (target marked abstract or CONCRETE):")
+            # DIFF AGAINST THE BEFORE GRAPH (fixed 2026-09-04). This section
+            # used to print a heading that said "NEW IMPORT EDGES" over a loop
+            # across EVERY module and EVERY import in the after-state. It never
+            # computed a difference, so the judge was shown the whole repository
+            # graph as though the PR had created it: 53,473 "new" edges for a PR
+            # touching a handful of files. Judging that is judging the wrong
+            # question, and it would have made DIP precision meaningless.
+            btree = before_tree_for(*key)
+            bmods = D.dip_modules(D.build_index(analyze_tree(btree))) if btree else {}
+            bcycles = {frozenset(c) for c in dipgraph.find_cycles(bmods)} if bmods else set()
+            acycles = list(dipgraph.find_cycles(mods))
+            new_c = [c for c in acycles if frozenset(c) not in bcycles]
+            old_c = [c for c in acycles if frozenset(c) in bcycles]
+            for c in new_c:
+                body.append("NEW CYCLE: " + " -> ".join(sorted(c)))
+            for c in old_c[:5]:
+                body.append("pre-existing cycle (NOT this PR): " + " -> ".join(sorted(c)))
+            if len(old_c) > 5:
+                body.append(f"... and {len(old_c) - 5} more pre-existing cycles")
+            bedges = {(mn, t) for mn, mi in bmods.items() for t in mi.imports}
+            body.append("\nNEW IMPORT EDGES (absent from the before-tree; "
+                        "target marked abstract or CONCRETE):")
+            n_new = 0
             for mn, mi in sorted(mods.items()):
                 for tgt in sorted(mi.imports):
+                    if (mn, tgt) in bedges:
+                        continue
                     tm = mods.get(tgt)
                     if tm is None:
                         continue
                     kind = "abstract" if tm.n_abstract_classes else "CONCRETE"
                     body.append(f"  {mn} -> {tgt}   [{kind}]")
+                    n_new += 1
+            if not n_new:
+                body.append("  (none -- this PR added no import edge between "
+                            "resolvable internal modules)")
 
         # The slug must be filename-safe AND unique. DIP rows have no `type_id`,
         # so it falls back to `full_name` -- which contains "/" and silently
