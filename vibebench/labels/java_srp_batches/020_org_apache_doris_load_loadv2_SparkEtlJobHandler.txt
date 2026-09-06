@@ -1,0 +1,351 @@
+row 20   apache/doris#61565
+============================================================================
+CLASS org.apache.doris.load.loadv2.SparkEtlJobHandler   loc=346 methods=8 wmc=57 lcom=0.0 c3=0.2003564248018116
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       63  public class SparkEtlJobHandler {
+       64      private static final Logger LOG = LogManager.getLogger(SparkEtlJobHandler.class);
+       65  
+       66      private static final String CONFIG_FILE_NAME = "jobconfig.json";
+       67      private static final String JOB_CONFIG_DIR = "configs";
+       68      private static final String ETL_JOB_NAME = "doris__%s";
+       69      private static final String LAUNCHER_LOG = "spark_launcher_%s_%s.log";
+       70      // 5min
+       71      private static final long GET_APPID_TIMEOUT_MS = 300000L;
+       72      // 30s
+       73      private static final long EXEC_CMD_TIMEOUT_MS = 30000L;
+       74      // yarn command
+       75      private static final String YARN_STATUS_CMD = "%s --config %s application -status %s";
+       76      private static final String YARN_KILL_CMD = "%s --config %s application -kill %s";
+       77  
+       78      private static final String SPARK_ETL_JOB_CLASS = "org.apache.doris.load.loadv2.etl.SparkEtlJob";
+       79  
+       80      public void submitEtlJob(long loadJobId, String loadLabel, EtlJobConfig etlJobConfig, SparkResource resource,
+       81              BrokerDesc brokerDesc, SparkLoadAppHandle handle, SparkPendingTaskAttachment attachment)
+       82              throws LoadException {
+       83          // delete outputPath
+       84          deleteEtlOutputPath(etlJobConfig.outputPath, brokerDesc);
+       85  
+       86          // init local dir
+       87          if (!FeConstants.runningUnitTest) {
+       88              initLocalDir();
+       89          }
+       90  
+       91          // prepare dpp archive
+       92          SparkRepository.SparkArchive archive = resource.prepareArchive();
+       93          SparkRepository.SparkLibrary dppLibrary = archive.getDppLibrary();
+       94          SparkRepository.SparkLibrary spark2xLibrary = archive.getSpark2xLibrary();
+       95  
+       96          // spark home
+       97          String sparkHome = Config.spark_home_default_dir;
+       98          // etl config path
+       99          String configsHdfsDir = etlJobConfig.outputPath + "/" + JOB_CONFIG_DIR + "/";
+      100          // etl config json path
+      101          String jobConfigHdfsPath = configsHdfsDir + CONFIG_FILE_NAME;
+      102          // spark submit app resource path
+      103          String appResourceHdfsPath = dppLibrary.remotePath;
+      104          // spark yarn archive path
+      105          String jobArchiveHdfsPath = spark2xLibrary.remotePath;
+      106          // spark yarn stage dir
+      107          String jobStageHdfsPath = resource.getWorkingDir();
+      108          // spark launcher log path
+      109          String logFilePath = Config.spark_launcher_log_dir + "/" + String.format(LAUNCHER_LOG, loadJobId, loadLabel);
+      110  
+      111          // update archive and stage configs here
+      112          Map<String, String> sparkConfigs = resource.getSparkConfigs();
+      113          if (Strings.isNullOrEmpty(sparkConfigs.get("spark.yarn.archive"))) {
+      114              sparkConfigs.put("spark.yarn.archive", jobArchiveHdfsPath);
+      115          }
+      116          if (Strings.isNullOrEmpty(sparkConfigs.get("spark.yarn.stage.dir"))) {
+      117              sparkConfigs.put("spark.yarn.stage.dir", jobStageHdfsPath);
+      118          }
+      119  
+      120          LOG.info("submit etl spark job, sparkConfigs:{}", sparkConfigs);
+      121  
+      122          try {
+      123              byte[] configData = etlJobConfig.configToJson().getBytes("UTF-8");
+      124              BrokerUtil.writeFile(configData, jobConfigHdfsPath, brokerDesc);
+      125          } catch (UserException | UnsupportedEncodingException e) {
+      126              throw new LoadException(e.getMessage());
+      127          }
+      128  
+      129          Map<String, String> envParams = resource.getEnvConfigsWithoutPrefix();
+      130          LOG.info("submit etl job,env:{}", envParams);
+      131  
+      132          SparkLauncher launcher = new SparkLauncher(envParams);
+      133          // master      |  deployMode
+      134          // ------------|-------------
+      135          // yarn        |  cluster
+      136          // spark://xx  |  client
+      137          launcher.setMaster(resource.getMaster())
+      138                  .setDeployMode(resource.getDeployMode().name().toLowerCase())
+      139                  .setAppResource(appResourceHdfsPath)
+      140                  .setMainClass(SPARK_ETL_JOB_CLASS)
+      141                  .setAppName(String.format(ETL_JOB_NAME, loadLabel))
+      142                  .setSparkHome(sparkHome)
+      143                  .addAppArgs(jobConfigHdfsPath)
+      144                  .redirectError();
+      145  
+      146          // spark configs
+      147          for (Map.Entry<String, String> entry : resource.getSparkConfigs().entrySet()) {
+      148              launcher.setConf(entry.getKey(), entry.getValue());
+      149          }
+      150  
+      151          // start app
+      152          State state = null;
+      153          String appId = null;
+      154          String errMsg = "start spark app failed. error: ";
+      155          try {
+      156              Process process = launcher.launch();
+      157              handle.setProcess(process);
+      158              if (!FeConstants.runningUnitTest) {
+      159                  SparkLauncherMonitor.LogMonitor logMonitor =
+      160                          SparkLauncherMonitor.createLogMonitor(handle, sparkConfigs);
+      161                  logMonitor.setSubmitTimeoutMs(GET_APPID_TIMEOUT_MS);
+      162                  logMonitor.setRedirectLogPath(logFilePath);
+      163                  logMonitor.start();
+      164                  try {
+      165                      logMonitor.join();
+      166                  } catch (InterruptedException e) {
+      167                      logMonitor.interrupt();
+      168                      throw new LoadException(errMsg + e.getMessage());
+      169                  }
+      170              }
+      171              appId = handle.getAppId();
+      172              state = handle.getState();
+      173          } catch (IOException e) {
+      174              LOG.warn(errMsg, e);
+      175              throw new LoadException(errMsg + e.getMessage());
+      176          }
+      177  
+      178          if (fromSparkState(state) == TEtlState.CANCELLED) {
+      179              throw new LoadException(errMsg + "spark app state: " + state.toString() + ", loadJobId:" + loadJobId);
+      180          }
+      181  
+      182          if (appId == null) {
+      183              throw new LoadException(errMsg + "Waiting too much time to get appId from handle. spark app state: "
+      184                      + state.toString() + ", loadJobId:" + loadJobId);
+      185          }
+      186  
+      187          // success
+      188          attachment.setAppId(appId);
+      189          attachment.setHandle(handle);
+      190      }
+      191  
+      192      public EtlStatus getEtlJobStatus(SparkLoadAppHandle handle, String appId, long loadJobId, String etlOutputPath,
+      193                                       SparkResource resource, BrokerDesc brokerDesc) throws LoadException {
+      194          EtlStatus status = new EtlStatus();
+      195  
+      196          Preconditions.checkState(appId != null && !appId.isEmpty());
+      197          if (resource.isYarnMaster()) {
+      198              // prepare yarn config
+      199              String configDir = resource.prepareYarnConfig();
+      200              // yarn client path
+      201              String yarnClient = resource.getYarnClientPath();
+      202              // command: yarn --config configDir application -status appId
+      203              String yarnStatusCmd = String.format(YARN_STATUS_CMD, yarnClient, configDir, appId);
+      204              LOG.info(yarnStatusCmd);
+      205  
+      206              Map<String, String> envParams = resource.getEnvConfigsWithoutPrefix();
+      207              int envNums = envParams.size() + 1;
+      208              String[] envp = new String[envNums];
+      209              int idx = 0;
+      210              envp[idx++] = "LC_ALL=" + Config.locale;
+      211              if (envParams.size() > 0) {
+      212                  for (Map.Entry<String, String> entry : envParams.entrySet()) {
+      213                      String envItem = entry.getKey() + "=" + entry.getValue();
+      214                      envp[idx++] = envItem;
+      215                  }
+      216              }
+      217              LOG.info("getEtlJobStatus,appId:{}, loadJobId:{}, env:{},resource:{}", appId, loadJobId, envp, resource);
+      218              CommandResult result = Util.executeCommand(yarnStatusCmd, envp, EXEC_CMD_TIMEOUT_MS);
+      219              if (result.getReturnCode() != 0) {
+      220                  String stderr = result.getStderr();
+      221                  if (stderr != null) {
+      222                      // case application not exists
+      223                      if (stderr.contains("doesn't exist in RM")) {
+      224                          LOG.warn("spark app not found. spark app id: {}, load job id: {}", appId, loadJobId);
+      225                          status.setState(TEtlState.CANCELLED);
+      226                          status.setFailMsg(stderr);
+      227                      }
+      228                  }
+      229                  LOG.warn("yarn application status failed. spark app id: {}, load job id: {}, timeout: {}, msg: {}",
+      230                              appId, loadJobId, EXEC_CMD_TIMEOUT_MS, stderr);
+      231                  status.setState(TEtlState.CANCELLED);
+      232                  status.setFailMsg(stderr);
+      233                  return status;
+      234              }
+      235              ApplicationReport report = new YarnApplicationReport(result.getStdout()).getReport();
+      236              LOG.info("yarn application -status {}. load job id: {}, output: {}, report: {}",
+      237                      appId, loadJobId, result.getStdout(), report);
+      238              YarnApplicationState state = report.getYarnApplicationState();
+      239              FinalApplicationStatus faStatus = report.getFinalApplicationStatus();
+      240              status.setState(fromYarnState(state, faStatus));
+      241              if (status.getState() == TEtlState.CANCELLED) {
+      242                  if (state == YarnApplicationState.FINISHED) {
+      243                      status.setFailMsg("spark app state: " + faStatus.toString());
+      244                  } else {
+      245                      status.setFailMsg("yarn app state: " + state.toString());
+      246                  }
+      247              }
+      248              status.setTrackingUrl(handle.getUrl() != null ? handle.getUrl() : report.getTrackingUrl());
+      249              status.setProgress((int) (report.getProgress() * 100));
+      250          } else {
+      251              // state from handle
+      252              if (handle == null) {
+      253                  status.setFailMsg("spark app handle is null");
+      254                  status.setState(TEtlState.CANCELLED);
+      255                  return status;
+      256              }
+      257  
+      258              State state = handle.getState();
+      259              status.setState(fromSparkState(state));
+      260              if (status.getState() == TEtlState.CANCELLED) {
+      261                  status.setFailMsg("spark app state: " + state.toString());
+      262              }
+      263              LOG.info("spark app id: {}, load job id: {}, app state: {}", appId, loadJobId, state);
+      264          }
+      265  
+      266          if (status.getState() == TEtlState.FINISHED || status.getState() == TEtlState.CANCELLED) {
+      267              // get dpp result
+      268              String dppResultFilePath = EtlJobConfig.getDppResultFilePath(etlOutputPath);
+      269              try {
+      270                  byte[] data = BrokerUtil.readFile(dppResultFilePath, brokerDesc, 0);
+      271                  String dppResultStr = new String(data, "UTF-8");
+      272                  DppResult dppResult = new Gson().fromJson(dppResultStr, DppResult.class);
+      273                  if (dppResult != null) {
+      274                      status.setDppResult(dppResult);
+      275                      if (status.getState() == TEtlState.CANCELLED && !Strings.isNullOrEmpty(dppResult.failedReason)) {
+      276                          status.setFailMsg(dppResult.failedReason);
+      277                      }
+      278                  }
+      279              } catch (UserException | JsonSyntaxException | UnsupportedEncodingException e) {
+      280                  LOG.warn("read broker file failed. path: {}", dppResultFilePath, e);
+      281              }
+      282          }
+      283  
+      284          return status;
+      285      }
+      286  
+      287      public void killEtlJob(SparkLoadAppHandle handle, String appId,
+      288              long loadJobId, SparkResource resource) throws LoadException {
+      289          if (resource.isYarnMaster()) {
+      290              // The appId may be empty when the load job is in PENDING phase. This is because the appId is
+      291              // parsed from the spark launcher process's output (spark launcher process submit job and then
+      292              // return appId). In this case, the spark job has still not been submitted, we only need to kill
+      293              // the spark launcher process.
+      294              if (Strings.isNullOrEmpty(appId)) {
+      295                  appId = handle.getAppId();
+      296                  if (Strings.isNullOrEmpty(appId)) {
+      297                      handle.kill();
+      298                      return;
+      299                  }
+      300              }
+      301              // prepare yarn config
+      302              String configDir = resource.prepareYarnConfig();
+      303              // yarn client path
+      304              String yarnClient = resource.getYarnClientPath();
+      305              // command: yarn --config configDir application -kill appId
+      306              String yarnKillCmd = String.format(YARN_KILL_CMD, yarnClient, configDir, appId);
+      307              LOG.info(yarnKillCmd);
+      308              Map<String, String> envParams = resource.getEnvConfigsWithoutPrefix();
+      309              int envNums = envParams.size() + 1;
+      310              String[] envp = new String[envNums];
+      311              int idx = 0;
+      312              envp[idx++] = "LC_ALL=" + Config.locale;
+      313              if (envParams.size() > 0) {
+      314                  for (Map.Entry<String, String> entry : envParams.entrySet()) {
+      315                      String envItem = entry.getKey() + "=" + entry.getValue();
+      316                      envp[idx++] = envItem;
+      317                  }
+      318              }
+      319              LOG.info("killEtlJob, env:{}", envp);
+      320              CommandResult result = Util.executeCommand(yarnKillCmd, envp, EXEC_CMD_TIMEOUT_MS);
+      321              LOG.info("yarn application -kill {}, output: {}", appId, result.getStdout());
+      322              if (result.getReturnCode() != 0) {
+      323                  String stderr = result.getStderr();
+      324                  LOG.warn("yarn application kill failed. app id: {}, load job id: {}, msg: {}",
+      325                          appId, loadJobId, stderr);
+      326              }
+      327          } else {
+      328              if (handle != null) {
+      329                  handle.stop();
+      330              }
+      331          }
+      332      }
+      333  
+      334      public Map<String, Long> getEtlFilePaths(String outputPath, BrokerDesc brokerDesc) throws Exception {
+      335          Map<String, Long> filePathToSize = Maps.newHashMap();
+      336  
+      337          List<TBrokerFileStatus> fileStatuses = Lists.newArrayList();
+      338          String etlFilePaths = outputPath + "/*";
+      339          try {
+      340              BrokerUtil.parseFile(etlFilePaths, brokerDesc, fileStatuses);
+      341          } catch (UserException e) {
+      342              throw new Exception(e);
+      343          }
+      344  
+      345          for (TBrokerFileStatus fstatus : fileStatuses) {
+      346              if (fstatus.isDir) {
+      347                  continue;
+      348              }
+      349              filePathToSize.put(fstatus.getPath(), fstatus.getSize());
+      350          }
+      351          if (LOG.isDebugEnabled()) {
+      352              LOG.debug("get spark etl file paths. files map: {}", filePathToSize);
+      353          }
+      354  
+      355          return filePathToSize;
+      356      }
+      357  
+      358      public static synchronized void initLocalDir() {
+      359          String logDir = Config.spark_launcher_log_dir;
+      360          File file = new File(logDir);
+      361          if (!file.exists()) {
+      362              file.mkdirs();
+      363          }
+      364      }
+      365  
+      366      public void deleteEtlOutputPath(String outputPath, BrokerDesc brokerDesc) {
+      367          try {
+      368              BrokerUtil.deletePathWithBroker(outputPath, brokerDesc);
+      369              LOG.info("delete path success. path: {}", outputPath);
+      370          } catch (UserException e) {
+      371              LOG.warn("delete path failed. path: {}", outputPath, e);
+      372          }
+      373      }
+      374  
+      375      private TEtlState fromYarnState(YarnApplicationState state, FinalApplicationStatus faStatus) {
+      376          switch (state) {
+      377              case FINISHED:
+      378                  if (faStatus == FinalApplicationStatus.SUCCEEDED) {
+      379                      // finish and success
+      380                      return TEtlState.FINISHED;
+      381                  } else {
+      382                      // finish but fail
+      383                      return TEtlState.CANCELLED;
+      384                  }
+      385              case FAILED:
+      386              case KILLED:
+      387                  // not finish
+      388                  return TEtlState.CANCELLED;
+      389              default:
+      390                  // ACCEPTED NEW NEW_SAVING RUNNING SUBMITTED
+      391                  return TEtlState.RUNNING;
+      392          }
+      393      }
+      394  
+      395      private TEtlState fromSparkState(State state) {
+      396          switch (state) {
+      397              case FINISHED:
+      398                  return TEtlState.FINISHED;
+      399              case FAILED:
+      400              case KILLED:
+      401              case LOST:
+      402                  return TEtlState.CANCELLED;
+      403              default:
+      404                  // UNKNOWN CONNECTED SUBMITTED RUNNING
+      405                  return TEtlState.RUNNING;
+      406          }
+      407      }
+      408  }

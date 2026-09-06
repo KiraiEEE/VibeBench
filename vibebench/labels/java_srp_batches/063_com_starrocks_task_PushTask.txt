@@ -1,0 +1,221 @@
+row 63   StarRocks/starrocks#70342
+============================================================================
+CLASS com.starrocks.task.PushTask   loc=216 methods=14 wmc=31 lcom=0.3846153846153846 c3=0.0945323141595483
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       65  public class PushTask extends AgentTask {
+       66      private static final Logger LOG = LogManager.getLogger(PushTask.class);
+       67  
+       68      private long replicaId;
+       69      private int schemaHash;
+       70      private long version;
+       71      private int timeoutSecond;
+       72      private long loadJobId;
+       73      private TPushType pushType;
+       74      private List<Predicate> conditions;
+       75      // for synchronous delete
+       76      private MarkedCountDownLatch latch;
+       77  
+       78      private TPriority priority;
+       79      private boolean isSyncDelete;
+       80      private long asyncDeleteJobId;
+       81  
+       82      private final long transactionId;
+       83      private boolean isSchemaChanging;
+       84  
+       85      // for load v2 (spark load)
+       86      private TBrokerScanRange tBrokerScanRange;
+       87      private TDescriptorTable tDescriptorTable;
+       88      private boolean useVectorized;
+       89      private String timezone;
+       90  
+       91      private TTabletType tabletType;
+       92  
+       93      // for light schema change
+       94      private List<TColumn> columnsDesc = null;
+       95  
+       96      public PushTask(TResourceInfo resourceInfo, long backendId, long dbId, long tableId, long partitionId,
+       97                      long indexId, long tabletId, long replicaId, int schemaHash, long version,
+       98                      int timeoutSecond, long loadJobId, TPushType pushType,
+       99                      List<Predicate> conditions, TPriority priority, TTaskType taskType,
+      100                      long transactionId, long signature, List<TColumn> columnsDesc) {
+      101          super(resourceInfo, backendId, taskType, dbId, tableId, partitionId, indexId, tabletId, signature);
+      102          this.replicaId = replicaId;
+      103          this.schemaHash = schemaHash;
+      104          this.version = version;
+      105          this.timeoutSecond = timeoutSecond;
+      106          this.loadJobId = loadJobId;
+      107          this.pushType = pushType;
+      108          this.conditions = conditions;
+      109          this.latch = null;
+      110          this.priority = priority;
+      111          this.isSyncDelete = true;
+      112          this.asyncDeleteJobId = -1;
+      113          this.transactionId = transactionId;
+      114          this.tBrokerScanRange = null;
+      115          this.tDescriptorTable = null;
+      116          this.useVectorized = true;
+      117          this.columnsDesc = columnsDesc;
+      118      }
+      119  
+      120      // for cancel delete
+      121      public PushTask(long backendId, TPushType pushType, TPriority priority, TTaskType taskType,
+      122                      long transactionId, long signature) {
+      123          super(null, backendId, taskType, -1, -1, -1, -1, -1);
+      124          this.pushType = pushType;
+      125          this.priority = priority;
+      126          this.transactionId = transactionId;
+      127          this.signature = signature;
+      128      }
+      129  
+      130      // for load v2 (SparkLoadJob)
+      131      public PushTask(long backendId, long dbId, long tableId, long partitionId, long indexId, long tabletId,
+      132                      long replicaId, int schemaHash, long version, int timeoutSecond, long loadJobId, TPushType pushType,
+      133                      TPriority priority, long transactionId, long signature, TBrokerScanRange tBrokerScanRange,
+      134                      TDescriptorTable tDescriptorTable, String timezone, TTabletType tabletType, List<TColumn> columnsDesc) {
+      135          this(null, backendId, dbId, tableId, partitionId, indexId,
+      136                  tabletId, replicaId, schemaHash, version, timeoutSecond, loadJobId, pushType, null,
+      137                  priority, TTaskType.REALTIME_PUSH, transactionId, signature, columnsDesc);
+      138          this.tBrokerScanRange = tBrokerScanRange;
+      139          this.tDescriptorTable = tDescriptorTable;
+      140          this.useVectorized = true;
+      141          this.timezone = timezone;
+      142          this.tabletType = tabletType;
+      143      }
+      144  
+      145      public TPushReq toThrift() {
+      146          TPushReq request = new TPushReq(tabletId, schemaHash, version, 0, timeoutSecond, pushType);
+      147          if (taskType == TTaskType.REALTIME_PUSH) {
+      148              request.setPartition_id(partitionId);
+      149              request.setTransaction_id(transactionId);
+      150              request.setTimezone(timezone);
+      151          }
+      152          request.setIs_schema_changing(isSchemaChanging);
+      153          switch (pushType) {
+      154              case LOAD:
+      155              case LOAD_DELETE:
+      156                  Preconditions.checkArgument(false, "LOAD and LOAD_DELETE not supported");
+      157                  break;
+      158              case DELETE:
+      159                  List<TCondition> tConditions = new ArrayList<TCondition>();
+      160                  for (Predicate condition : conditions) {
+      161                      TCondition tCondition = new TCondition();
+      162                      ArrayList<String> conditionValues = new ArrayList<String>();
+      163                      if (condition instanceof BinaryPredicate) {
+      164                          BinaryPredicate binaryPredicate = (BinaryPredicate) condition;
+      165                          String columnName = ((SlotRef) binaryPredicate.getChild(0)).getColumnName();
+      166                          String value = ((LiteralExpr) binaryPredicate.getChild(1)).getStringValue();
+      167                          BinaryType op = binaryPredicate.getOp();
+      168                          tCondition.setColumn_name(MetaUtils.getColumnByColumnName(dbId, tableId, columnName)
+      169                                  .getColumnId().getId());
+      170                          tCondition.setCondition_op(op.toString());
+      171                          conditionValues.add(value);
+      172                      } else if (condition instanceof IsNullPredicate) {
+      173                          IsNullPredicate isNullPredicate = (IsNullPredicate) condition;
+      174                          String columnName = ((SlotRef) isNullPredicate.getChild(0)).getColumnName();
+      175                          String op = "IS";
+      176                          String value = "NULL";
+      177                          if (isNullPredicate.isNotNull()) {
+      178                              value = "NOT NULL";
+      179                          }
+      180                          tCondition.setColumn_name(MetaUtils.getColumnByColumnName(dbId, tableId, columnName)
+      181                                  .getColumnId().getId());
+      182                          tCondition.setCondition_op(op);
+      183                          conditionValues.add(value);
+      184                      } else if (condition instanceof InPredicate) {
+      185                          InPredicate inPredicate = (InPredicate) condition;
+      186                          String columnName = ((SlotRef) inPredicate.getChild(0)).getColumnName();
+      187                          String op = inPredicate.isNotIn() ? "!*=" : "*=";
+      188                          tCondition.setColumn_name(MetaUtils.getColumnByColumnName(dbId, tableId, columnName)
+      189                                  .getColumnId().getId());
+      190                          tCondition.setCondition_op(op);
+      191                          for (int i = 1; i <= inPredicate.getInElementNum(); i++) {
+      192                              conditionValues.add(((LiteralExpr) inPredicate.getChild(i)).getStringValue());
+      193                          }
+      194                      }
+      195  
+      196                      tCondition.setCondition_values(conditionValues);
+      197  
+      198                      tConditions.add(tCondition);
+      199                  }
+      200                  request.setDelete_conditions(tConditions);
+      201                  break;
+      202              case LOAD_V2:
+      203                  request.setBroker_scan_range(tBrokerScanRange);
+      204                  request.setDesc_tbl(tDescriptorTable);
+      205                  request.setTablet_type(tabletType);
+      206                  break;
+      207              case CANCEL_DELETE:
+      208                  request.setTransaction_id(transactionId);
+      209                  break;
+      210              default:
+      211                  LOG.warn("unknown push type. type: " + pushType.name());
+      212                  break;
+      213          }
+      214          request.setColumns_desc(columnsDesc);
+      215  
+      216          return request;
+      217      }
+      218  
+      219      public void setCountDownLatch(MarkedCountDownLatch latch) {
+      220          this.latch = latch;
+      221      }
+      222  
+      223      public void countDownLatch(long backendId, long tabletId) {
+      224          if (this.latch != null) {
+      225              if (latch.markedCountDown(backendId, tabletId)) {
+      226                  LOG.debug("pushTask current latch count: {}. backend: {}, tablet:{}",
+      227                          latch.getCount(), backendId, tabletId);
+      228              }
+      229          }
+      230      }
+      231  
+      232      public void countDownLatch(long backendId, long tabletId, String errMsg) {
+      233          if (this.latch != null) {
+      234              if (latch.markedCountDown(backendId, tabletId, new Status(TStatusCode.INTERNAL_ERROR, errMsg))) {
+      235                  LOG.debug("pushTask current latch count: {}. backend: {}, tablet:{}",
+      236                          latch.getCount(), backendId, tabletId);
+      237              }
+      238          }
+      239      }
+      240  
+      241      public long getReplicaId() {
+      242          return replicaId;
+      243      }
+      244  
+      245      public int getSchemaHash() {
+      246          return schemaHash;
+      247      }
+      248  
+      249      public long getVersion() {
+      250          return version;
+      251      }
+      252  
+      253      public long getLoadJobId() {
+      254          return loadJobId;
+      255      }
+      256  
+      257      public TPushType getPushType() {
+      258          return pushType;
+      259      }
+      260  
+      261      public TPriority getPriority() {
+      262          return priority;
+      263      }
+      264  
+      265      public boolean isSyncDelete() {
+      266          return isSyncDelete;
+      267      }
+      268  
+      269      public long getAsyncDeleteJobId() {
+      270          return asyncDeleteJobId;
+      271      }
+      272  
+      273      public long getTransactionId() {
+      274          return transactionId;
+      275      }
+      276  
+      277      public void setIsSchemaChanging(boolean isSchemaChanging) {
+      278          this.isSchemaChanging = isSchemaChanging;
+      279      }
+      280  }

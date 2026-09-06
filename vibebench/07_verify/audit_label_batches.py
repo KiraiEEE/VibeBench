@@ -40,10 +40,13 @@ import config as C  # noqa: E402
 
 PRINCIPLES = ["srp", "ocp", "lsp", "isp", "dip"]
 
-# A header plus a couple of blank lines is not source. The smallest legitimate
-# batch seen in practice is a DIP cycle listing at 18 lines, so the floor sits
-# below that and only catches genuinely empty output.
-MIN_LINES = 8
+# WHAT "NO MATERIAL" ACTUALLY MEANS (corrected 2026-09-05). This used to be a
+# TOTAL line count, which is wrong: a one-line Java record and a three-line
+# interface are perfectly judgeable classes and the whole source really is that
+# short. The check flagged four such SRP rows as empty renders. What matters is
+# whether anything follows the QUESTION line, i.e. whether the source body was
+# rendered at all -- that is the defect this is here to catch.
+MIN_BODY_LINES = 1
 
 # Column names that carry the detector's answer. If one of these values shows
 # up in the batch text the judge was anchored, which inflates agreement in the
@@ -136,7 +139,13 @@ def audit(p: str) -> None:
         except Exception:                                   # noqa: BLE001
             tiny.append(i)
             continue
-        if txt.count("\n") < MIN_LINES:
+        # everything after the last QUESTION/heading line is the rendered source
+        tail = txt.split("QUESTION:")[-1]
+        body_lines = [l for l in tail.split("\n")[1:] if l.strip()]
+        # drop the remaining prompt lines, which are indented continuations
+        body_lines = [l for l in body_lines if not l.lstrip().startswith(
+            ("QUESTION", "SHOWING", ">>>", "cases:"))]
+        if len(body_lines) < MIN_BODY_LINES:
             tiny.append(i)
         if i < len(df):
             want = str(df.iloc[i].get("full_name", ""))
@@ -149,9 +158,15 @@ def audit(p: str) -> None:
                 leaked.append((i, pat))
                 break
 
+    if unavailable:
+        warn(f"{p}: {len(unavailable)} batches are unavailable/unjudgeable stubs "
+             f"(e.g. index {unavailable[0]}); those rows CANNOT be labelled -- "
+             f"record_labels.py refuses them -- so the sample is that much smaller")
+    else:
+        ok("B  no batches are tree-unavailable stubs")
+
     for name, bad, msg in [
-        ("B", unavailable, "batches are tree-unavailable stubs"),
-        ("C", tiny, f"batches are under {MIN_LINES} lines, i.e. header only"),
+        ("C", tiny, "batches rendered no source body at all"),
         ("D", mismatched, "batches name a different PR than their CSV row"),
     ]:
         if bad:

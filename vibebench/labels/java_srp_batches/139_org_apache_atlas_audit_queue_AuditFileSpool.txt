@@ -1,0 +1,406 @@
+row 139   apache/atlas#529
+============================================================================
+CLASS org.apache.atlas.audit.queue.AuditFileSpool   loc=849 methods=23 wmc=120 lcom=0.0 c3=0.1639829644588028
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       53  public class AuditFileSpool implements Runnable {
+       54  	private static final Log logger = LogFactory.getLog(AuditFileSpool.class);
+       55  
+       56  	public enum SPOOL_FILE_STATUS {
+       57  		pending, write_inprogress, read_inprogress, done
+       58  	}
+       59  
+       60  	public static final String PROP_FILE_SPOOL_LOCAL_DIR = "filespool.dir";
+       61  	public static final String PROP_FILE_SPOOL_LOCAL_FILE_NAME = "filespool.filename.format";
+       62  	public static final String PROP_FILE_SPOOL_ARCHIVE_DIR = "filespool.archive.dir";
+       63  	public static final String PROP_FILE_SPOOL_ARCHIVE_MAX_FILES_COUNT = "filespool.archive.max.files";
+       64  	public static final String PROP_FILE_SPOOL_FILENAME_PREFIX = "filespool.file.prefix";
+       65  	public static final String PROP_FILE_SPOOL_FILE_ROLLOVER = "filespool.file.rollover.sec";
+       66  	public static final String PROP_FILE_SPOOL_INDEX_FILE = "filespool.index.filename";
+       67  	// public static final String PROP_FILE_SPOOL_INDEX_DONE_FILE =
+       68  	// "filespool.index.done_filename";
+       69  	public static final String PROP_FILE_SPOOL_DEST_RETRY_MS = "filespool.destination.retry.ms";
+       70  
+       71  	AuditQueue queueProvider = null;
+       72  	AuditHandler consumerProvider = null;
+       73  
+       74  	BlockingQueue<AuditIndexRecord> indexQueue = new LinkedBlockingQueue<AuditIndexRecord>();
+       75  
+       76  	// Folder and File attributes
+       77  	File logFolder = null;
+       78  	String logFileNameFormat = null;
+       79  	File archiveFolder = null;
+       80  	String fileNamePrefix = null;
+       81  	String indexFileName = null;
+       82  	File indexFile = null;
+       83  	String indexDoneFileName = null;
+       84  	File indexDoneFile = null;
+       85  	int retryDestinationMS = 30 * 1000; // Default 30 seconds
+       86  	int fileRolloverSec = 24 * 60 * 60; // In seconds
+       87  	int maxArchiveFiles = 100;
+       88  
+       89  	int errorLogIntervalMS = 30 * 1000; // Every 30 seconds
+       90  	long lastErrorLogMS = 0;
+       91  
+       92  	List<AuditIndexRecord> indexRecords = new ArrayList<AuditIndexRecord>();
+       93  
+       94  	boolean isPending = false;
+       95  	long lastAttemptTime = 0;
+       96  	boolean initDone = false;
+       97  
+       98  	PrintWriter logWriter = null;
+       99  	AuditIndexRecord currentWriterIndexRecord = null;
+      100  	AuditIndexRecord currentConsumerIndexRecord = null;
+      101  
+      102  	BufferedReader logReader = null;
+      103  
+      104  	Thread destinationThread = null;
+      105  
+      106  	boolean isWriting = true;
+      107  	boolean isDrain = false;
+      108  	boolean isDestDown = false;
+      109  
+      110  	public AuditFileSpool(AuditQueue queueProvider,
+      111  			AuditHandler consumerProvider) {
+      112  		this.queueProvider = queueProvider;
+      113  		this.consumerProvider = consumerProvider;
+      114  	}
+      115  
+      116  	public void init(Properties prop) {
+      117  		init(prop, null);
+      118  	}
+      119  
+      120  	public boolean init(Properties props, String basePropertyName) {
+      121  		if (initDone) {
+      122  			logger.error("init() called more than once. queueProvider="
+      123  					+ queueProvider.getName() + ", consumerProvider="
+      124  					+ consumerProvider.getName());
+      125  			return true;
+      126  		}
+      127  		String propPrefix = "xasecure.audit.filespool";
+      128  		if (basePropertyName != null) {
+      129  			propPrefix = basePropertyName;
+      130  		}
+      131  
+      132  		try {
+      133  			// Initial folder and file properties
+      134  			String logFolderProp = MiscUtil.getStringProperty(props, propPrefix
+      135  					+ "." + PROP_FILE_SPOOL_LOCAL_DIR);
+      136  			logFileNameFormat = MiscUtil.getStringProperty(props,
+      137  					basePropertyName + "." + PROP_FILE_SPOOL_LOCAL_FILE_NAME);
+      138  			String archiveFolderProp = MiscUtil.getStringProperty(props,
+      139  					propPrefix + "." + PROP_FILE_SPOOL_ARCHIVE_DIR);
+      140  			fileNamePrefix = MiscUtil.getStringProperty(props, propPrefix + "."
+      141  					+ PROP_FILE_SPOOL_FILENAME_PREFIX);
+      142  			indexFileName = MiscUtil.getStringProperty(props, propPrefix + "."
+      143  					+ PROP_FILE_SPOOL_INDEX_FILE);
+      144  			retryDestinationMS = MiscUtil.getIntProperty(props, propPrefix
+      145  					+ "." + PROP_FILE_SPOOL_DEST_RETRY_MS, retryDestinationMS);
+      146  			fileRolloverSec = MiscUtil.getIntProperty(props, propPrefix + "."
+      147  					+ PROP_FILE_SPOOL_FILE_ROLLOVER, fileRolloverSec);
+      148  			maxArchiveFiles = MiscUtil.getIntProperty(props, propPrefix + "."
+      149  					+ PROP_FILE_SPOOL_ARCHIVE_MAX_FILES_COUNT, maxArchiveFiles);
+      150  
+      151  			logger.info("retryDestinationMS=" + retryDestinationMS
+      152  					+ ", queueName=" + queueProvider.getName());
+      153  			logger.info("fileRolloverSec=" + fileRolloverSec + ", queueName="
+      154  					+ queueProvider.getName());
+      155  			logger.info("maxArchiveFiles=" + maxArchiveFiles + ", queueName="
+      156  					+ queueProvider.getName());
+      157  
+      158  			if (logFolderProp == null || logFolderProp.isEmpty()) {
+      159  				logger.fatal("Audit spool folder is not configured. Please set "
+      160  						+ propPrefix
+      161  						+ "."
+      162  						+ PROP_FILE_SPOOL_LOCAL_DIR
+      163  						+ ". queueName=" + queueProvider.getName());
+      164  				return false;
+      165  			}
+      166  			logFolder = new File(logFolderProp);
+      167  			if (!logFolder.isDirectory()) {
+      168  				logFolder.mkdirs();
+      169  				if (!logFolder.isDirectory()) {
+      170  					logger.fatal("File Spool folder not found and can't be created. folder="
+      171  							+ logFolder.getAbsolutePath()
+      172  							+ ", queueName="
+      173  							+ queueProvider.getName());
+      174  					return false;
+      175  				}
+      176  			}
+      177  			logger.info("logFolder=" + logFolder + ", queueName="
+      178  					+ queueProvider.getName());
+      179  
+      180  			if (logFileNameFormat == null || logFileNameFormat.isEmpty()) {
+      181  				logFileNameFormat = "spool_" + "%app-type%" + "_"
+      182  						+ "%time:yyyyMMdd-HHmm.ss%.log";
+      183  			}
+      184  			logger.info("logFileNameFormat=" + logFileNameFormat
+      185  					+ ", queueName=" + queueProvider.getName());
+      186  
+      187  			if (archiveFolderProp == null || archiveFolderProp.isEmpty()) {
+      188  				archiveFolder = new File(logFolder, "archive");
+      189  			} else {
+      190  				archiveFolder = new File(archiveFolderProp);
+      191  			}
+      192  			if (!archiveFolder.isDirectory()) {
+      193  				archiveFolder.mkdirs();
+      194  				if (!archiveFolder.isDirectory()) {
+      195  					logger.error("File Spool archive folder not found and can't be created. folder="
+      196  							+ archiveFolder.getAbsolutePath()
+      197  							+ ", queueName="
+      198  							+ queueProvider.getName());
+      199  					return false;
+      200  				}
+      201  			}
+      202  			logger.info("archiveFolder=" + archiveFolder + ", queueName="
+      203  					+ queueProvider.getName());
+      204  
+      205  			if (indexFileName == null || indexFileName.isEmpty()) {
+      206  				if (fileNamePrefix == null || fileNamePrefix.isEmpty()) {
+      207  					fileNamePrefix = queueProvider.getName() + "_"
+      208  							+ consumerProvider.getName();
+      209  				}
+      210  				indexFileName = "index_" + fileNamePrefix + "_" + "%app-type%"
+      211  						+ ".json";
+      212  				indexFileName = MiscUtil.replaceTokens(indexFileName,
+      213  						System.currentTimeMillis());
+      214  			}
+      215  
+      216  			indexFile = new File(logFolder, indexFileName);
+      217  			if (!indexFile.exists()) {
+      218  				boolean ret = indexFile.createNewFile();
+      219  				if (!ret) {
+      220  					logger.fatal("Error creating index file. fileName="
+      221  							+ indexDoneFile.getPath());
+      222  					return false;
+      223  				}
+      224  			}
+      225  			logger.info("indexFile=" + indexFile + ", queueName="
+      226  					+ queueProvider.getName());
+      227  
+      228  			int lastDot = indexFileName.lastIndexOf('.');
+      229  			if (lastDot < 0) {
+      230  				lastDot = indexFileName.length() - 1;
+      231  			}
+      232  			indexDoneFileName = indexFileName.substring(0, lastDot)
+      233  					+ "_closed.json";
+      234  			indexDoneFile = new File(logFolder, indexDoneFileName);
+      235  			if (!indexDoneFile.exists()) {
+      236  				boolean ret = indexDoneFile.createNewFile();
+      237  				if (!ret) {
+      238  					logger.fatal("Error creating index done file. fileName="
+      239  							+ indexDoneFile.getPath());
+      240  					return false;
+      241  				}
+      242  			}
+      243  			logger.info("indexDoneFile=" + indexDoneFile + ", queueName="
+      244  					+ queueProvider.getName());
+      245  
+      246  			// Load index file
+      247  			loadIndexFile();
+      248  			for (AuditIndexRecord auditIndexRecord : indexRecords) {
+      249  				if (!auditIndexRecord.status.equals(SPOOL_FILE_STATUS.done)) {
+      250  					isPending = true;
+      251  				}
+      252  				if (auditIndexRecord.status
+      253  						.equals(SPOOL_FILE_STATUS.write_inprogress)) {
+      254  					currentWriterIndexRecord = auditIndexRecord;
+      255  					logger.info("currentWriterIndexRecord="
+      256  							+ currentWriterIndexRecord.filePath
+      257  							+ ", queueName=" + queueProvider.getName());
+      258  				}
+      259  				if (auditIndexRecord.status
+      260  						.equals(SPOOL_FILE_STATUS.read_inprogress)) {
+      261  					indexQueue.add(auditIndexRecord);
+      262  				}
+      263  			}
+      264  			printIndex();
+      265  			for (AuditIndexRecord auditIndexRecord : indexRecords) {
+      266  				if (auditIndexRecord.status.equals(SPOOL_FILE_STATUS.pending)) {
+      267  					File consumerFile = new File(auditIndexRecord.filePath);
+      268  					if (!consumerFile.exists()) {
+      269  						logger.error("INIT: Consumer file="
+      270  								+ consumerFile.getPath() + " not found.");
+      271  					} else {
+      272  						indexQueue.add(auditIndexRecord);
+      273  					}
+      274  				}
+      275  			}
+      276  
+      277  		} catch (Throwable t) {
+      278  			logger.fatal("Error initializing File Spooler. queue="
+      279  					+ queueProvider.getName(), t);
+      280  			return false;
+      281  		}
+      282  		initDone = true;
+      283  		return true;
+      284  	}
+      285  
+      286  	/**
+      287  	 * Start looking for outstanding logs and update status according.
+      288  	 */
+      289  	public void start() {
+      290  		if (!initDone) {
+      291  			logger.error("Cannot start Audit File Spooler. Initilization not done yet. queueName="
+      292  					+ queueProvider.getName());
+      293  			return;
+      294  		}
+      295  
+      296  		logger.info("Starting writerThread, queueName="
+      297  				+ queueProvider.getName() + ", consumer="
+      298  				+ consumerProvider.getName());
+      299  
+      300  		// Let's start the thread to read
+      301  		destinationThread = new Thread(this, queueProvider.getName() + "_"
+      302  				+ consumerProvider.getName() + "_destWriter");
+      303  		destinationThread.setDaemon(true);
+      304  		destinationThread.start();
+      305  	}
+      306  
+      307  	public void stop() {
+      308  		if (!initDone) {
+      309  			logger.error("Cannot stop Audit File Spooler. Initilization not done. queueName="
+      310  					+ queueProvider.getName());
+      311  			return;
+      312  		}
+      313  		logger.info("Stop called, queueName=" + queueProvider.getName()
+      314  				+ ", consumer=" + consumerProvider.getName());
+      315  
+      316  		isDrain = true;
+      317  		flush();
+      318  
+      319  		PrintWriter out = getOpenLogFileStream();
+      320  		if (out != null) {
+      321  			// If write is still going on, then let's give it enough time to
+      322  			// complete
+      323  			for (int i = 0; i < 3; i++) {
+      324  				if (isWriting) {
+      325  					try {
+      326  						Thread.sleep(1000);
+      327  					} catch (InterruptedException e) {
+      328  						// ignore
+      329  					}
+      330  					continue;
+      331  				}
+      332  				try {
+      333  					logger.info("Closing open file, queueName="
+      334  							+ queueProvider.getName() + ", consumer="
+      335  							+ consumerProvider.getName());
+      336  
+      337  					out.flush();
+      338  					out.close();
+      339  					break;
+      340  				} catch (Throwable t) {
+      341  					logger.debug("Error closing spool out file.", t);
+      342  				}
+      343  			}
+      344  		}
+      345  		try {
+      346  			if (destinationThread != null) {
+      347  				destinationThread.interrupt();
+      348  			}
+      349  			destinationThread = null;
+      350  		} catch (Throwable e) {
+      351  			// ignore
+      352  		}
+      353  	}
+      354  
+      355  	public void flush() {
+      356  		if (!initDone) {
+      357  			logger.error("Cannot flush Audit File Spooler. Initilization not done. queueName="
+      358  					+ queueProvider.getName());
+      359  			return;
+      360  		}
+      361  		PrintWriter out = getOpenLogFileStream();
+      362  		if (out != null) {
+      363  			out.flush();
+      364  		}
+      365  	}
+      366  
+      367  	/**
+      368  	 * If any files are still not processed. Also, if the destination is not
+      369  	 * reachable
+      370  	 *
+      371  	 * @return
+      372  	 */
+      373  	public boolean isPending() {
+      374  		if (!initDone) {
+      375  			logError("isPending(): File Spooler not initialized. queueName="
+      376  					+ queueProvider.getName());
+      377  			return false;
+      378  		}
+      379  
+      380  		return isPending;
+      381  	}
+      382  
+      383  	/**
+      384  	 * Milliseconds from last attempt time
+      385  	 *
+      386  	 * @return
+      387  	 */
+      388  	public long getLastAttemptTimeDelta() {
+      389  		if (lastAttemptTime == 0) {
+      390  			return 0;
+      391  		}
+      392  		return System.currentTimeMillis() - lastAttemptTime;
+      393  	}
+      394  
+      395  	synchronized public void stashLogs(AuditEventBase event) {
+      396  		if (isDrain) {
+      397  			// Stop has been called, so this method shouldn't be called
+      398  			logger.error("stashLogs() is called after stop is called. event="
+      399  					+ event);
+      400  			return;
+      401  		}
+      402  		try {
+      403  			isWriting = true;
+      404  			PrintWriter logOut = getLogFileStream();
+      405  			// Convert event to json
+      406  			String jsonStr = MiscUtil.stringify(event);
+      407  			logOut.println(jsonStr);
+      408  			isPending = true;
+      409  		} catch (Exception ex) {
+      410  			logger.error("Error writing to file. event=" + event, ex);
+      411  		} finally {
+      412  			isWriting = false;
+      413  		}
+      414  
+      415  	}
+      416  
+      417  	synchronized public void stashLogs(Collection<AuditEventBase> events) {
+      418  		for (AuditEventBase event : events) {
+      419  			stashLogs(event);
+      420  		}
+      421  		flush();
+      422  	}
+      423  
+      424  	synchronized public void stashLogsString(String event) {
+      425  		if (isDrain) {
+      426  			// Stop has been called, so this method shouldn't be called
+      427  			logger.error("stashLogs() is called after stop is called. event="
+      428  					+ event);
+      429  			return;
+      430  		}
+      431  		try {
+      432  			isWriting = true;
+      433  			PrintWriter logOut = getLogFileStream();
+      434  			logOut.println(event);
+      435  		} catch (Exception ex) {
+      436  			logger.error("Error writing to file. event=" + event, ex);
+      437  		} finally {
+      438  			isWriting = false;
+      439  		}
+      440  
+      441  	}
+      442  
+      443  	synchronized public void stashLogsString(Collection<String> events) {
+      444  		for (String event : events) {
+      445  			stashLogsString(event);
+      446  		}
+      447  		flush();
+      448  	}
+      449  
+      450  	/**
+      451  	 * This return the current file. If there are not current open output file,
+      452  	 * then it will return null
+       ... truncated at 400 lines ...

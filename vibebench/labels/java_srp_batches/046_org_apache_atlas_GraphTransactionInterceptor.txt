@@ -1,0 +1,406 @@
+row 46   apache/atlas#529
+============================================================================
+CLASS org.apache.atlas.GraphTransactionInterceptor   loc=407 methods=21 wmc=52 lcom=0.0 c3=0.2371777234732207
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       45  @Component
+       46  public class GraphTransactionInterceptor implements MethodInterceptor {
+       47      private static final Logger LOG = LoggerFactory.getLogger(GraphTransactionInterceptor.class);
+       48  
+       49      @VisibleForTesting
+       50      private static final ObjectUpdateSynchronizer               OBJECT_UPDATE_SYNCHRONIZER = new ObjectUpdateSynchronizer();
+       51      private static final ThreadLocal<List<PostTransactionHook>> postTransactionHooks       = new ThreadLocal<>();
+       52      private static final ThreadLocal<Boolean>                   isTxnOpen                  = ThreadLocal.withInitial(() -> Boolean.FALSE);
+       53      private static final ThreadLocal<Boolean>                   innerFailure               = ThreadLocal.withInitial(() -> Boolean.FALSE);
+       54      private static final ThreadLocal<Map<String, AtlasVertex>>  guidVertexCache            = ThreadLocal.withInitial(() -> new HashMap<>());
+       55  
+       56      private final AtlasGraph     graph;
+       57  
+       58      private static final ThreadLocal<Map<Object, String>> vertexGuidCache =
+       59              new ThreadLocal<Map<Object, String>>() {
+       60                  @Override
+       61                  public Map<Object, String> initialValue() {
+       62                      return new HashMap<Object, String>();
+       63                  }
+       64              };
+       65  
+       66      private static final ThreadLocal<Map<Object, AtlasEntity.Status>> vertexStateCache =
+       67              new ThreadLocal<Map<Object, AtlasEntity.Status>>() {
+       68                  @Override
+       69                  public Map<Object, AtlasEntity.Status> initialValue() {
+       70                      return new HashMap<Object, AtlasEntity.Status>();
+       71                  }
+       72              };
+       73  
+       74      private static final ThreadLocal<Map<Object, AtlasEntity.Status>> edgeStateCache =
+       75              new ThreadLocal<Map<Object, AtlasEntity.Status>>() {
+       76                  @Override
+       77                  public Map<Object, AtlasEntity.Status> initialValue() {
+       78                      return new HashMap<Object, AtlasEntity.Status>();
+       79                  }
+       80              };
+       81  
+       82      @Inject
+       83      public GraphTransactionInterceptor(AtlasGraph graph) {
+       84          this.graph          = graph;
+       85      }
+       86  
+       87      @Override
+       88      public Object invoke(MethodInvocation invocation) throws Throwable {
+       89          Method        method            = invocation.getMethod();
+       90          String        invokingClass     = method.getDeclaringClass().getSimpleName();
+       91          String        invokedMethodName = method.getName();
+       92          boolean       logRollback       = method.getAnnotation(GraphTransaction.class) == null || method.getAnnotation(GraphTransaction.class).logRollback();
+       93  
+       94          boolean isInnerTxn = isTxnOpen.get();
+       95          // Outermost txn marks any subsequent transaction as inner
+       96          isTxnOpen.set(Boolean.TRUE);
+       97  
+       98          if (LOG.isDebugEnabled() && isInnerTxn) {
+       99              LOG.debug("Txn entry-point {}.{} is inner txn. Commit/Rollback will be ignored", invokingClass, invokedMethodName);
+      100          }
+      101  
+      102          boolean isSuccess = false;
+      103          MetricRecorder metric = null;
+      104  
+      105          try {
+      106              try {
+      107                  Object response = invocation.proceed();
+      108  
+      109                  if (isInnerTxn) {
+      110                      if (LOG.isDebugEnabled()) {
+      111                          LOG.debug("Ignoring commit for nested/inner transaction {}.{}", invokingClass, invokedMethodName);
+      112                      }
+      113                  } else {
+      114                      metric = RequestContext.get().startMetricRecord("graphCommit");
+      115  
+      116                      doCommitOrRollback(invokingClass, invokedMethodName);
+      117                  }
+      118  
+      119                  isSuccess = !innerFailure.get();
+      120  
+      121                  return response;
+      122              } catch (Throwable t) {
+      123                  if (isInnerTxn) {
+      124                      if (LOG.isDebugEnabled()) {
+      125                          LOG.debug("Ignoring rollback for nested/inner transaction {}.{}", invokingClass, invokedMethodName);
+      126                      }
+      127                      innerFailure.set(true);
+      128                  } else {
+      129                      doRollback(logRollback, t);
+      130                  }
+      131                  if (checkForBatchTooLargeError(t)) {
+      132                      throw new AtlasBaseException(AtlasErrorCode.BATCH_SIZE_TOO_LARGE, t);
+      133                  } else {
+      134                      throw t;
+      135                  }
+      136              }
+      137          } finally {
+      138              RequestContext.get().endMetricRecord(metric);
+      139  
+      140              // Only outer txn can mark as closed
+      141              if (!isInnerTxn) {
+      142                  if (LOG.isDebugEnabled()) {
+      143                      LOG.debug("Closing outer txn");
+      144                  }
+      145  
+      146                  // Reset the boolean flags
+      147                  isTxnOpen.set(Boolean.FALSE);
+      148                  innerFailure.set(Boolean.FALSE);
+      149                  clearCache();
+      150  
+      151                  List<PostTransactionHook> trxHooks = postTransactionHooks.get();
+      152  
+      153                  if (trxHooks != null) {
+      154                      if (LOG.isDebugEnabled()) {
+      155                          LOG.debug("Processing post-txn hooks");
+      156                      }
+      157  
+      158                      postTransactionHooks.remove();
+      159  
+      160                      for (PostTransactionHook trxHook : trxHooks) {
+      161                          try {
+      162                              trxHook.onComplete(isSuccess);
+      163                          } catch (Throwable t) {
+      164                              LOG.error("postTransactionHook failed", t);
+      165                          }
+      166                      }
+      167                  }
+      168              }
+      169  
+      170              OBJECT_UPDATE_SYNCHRONIZER.releaseLockedObjects();
+      171          }
+      172      }
+      173  
+      174      public boolean checkForBatchTooLargeError(Throwable t) {
+      175          Throwable currentCause = t;
+      176          while (currentCause != null) {
+      177              String message = currentCause.getMessage();
+      178              if (message != null &&
+      179                      message.contains("Batch too large") &&
+      180                      currentCause.getClass().getSimpleName().equals("InvalidQueryException")) {
+      181                  return true;
+      182              }
+      183              currentCause = currentCause.getCause();
+      184          }
+      185          return false;
+      186      }
+      187  
+      188  
+      189  
+      190      private void doCommitOrRollback(final String invokingClass, final String invokedMethodName) {
+      191          if (innerFailure.get()) {
+      192              if (LOG.isDebugEnabled()) {
+      193                  LOG.debug("Inner/Nested call threw exception. Rollback on txn entry-point, {}.{}", invokingClass, invokedMethodName);
+      194              }
+      195              graph.rollback();
+      196          } else {
+      197              doCommit(invokingClass, invokedMethodName);
+      198          }
+      199      }
+      200  
+      201      private void doCommit(final String invokingClass, final String invokedMethodName) {
+      202          graph.commit();
+      203  
+      204          if (LOG.isDebugEnabled()) {
+      205              LOG.debug("Graph commit txn {}.{}", invokingClass, invokedMethodName);
+      206          }
+      207      }
+      208  
+      209      private void doRollback(boolean logRollback, final Throwable t) {
+      210          if (logRollback) {
+      211              if (logException(t)) {
+      212                  LOG.error("graph rollback due to exception ", t);
+      213              } else {
+      214                  LOG.error("graph rollback due to exception {}:{}", t.getClass().getSimpleName(), t.getMessage());
+      215              }
+      216          }
+      217  
+      218          graph.rollback();
+      219      }
+      220  
+      221      public static void lockObjectAndReleasePostCommit(final String guid) {
+      222          OBJECT_UPDATE_SYNCHRONIZER.lockObject(guid);
+      223      }
+      224  
+      225      public static void lockObjectAndReleasePostCommit(final List<String> guids) {
+      226          OBJECT_UPDATE_SYNCHRONIZER.lockObject(guids);
+      227      }
+      228  
+      229      public static void addToVertexCache(String guid, AtlasVertex vertex) {
+      230          Map<String, AtlasVertex> cache = guidVertexCache.get();
+      231  
+      232          cache.put(guid, vertex);
+      233      }
+      234  
+      235      public static void removeFromVertexCache(String guid) {
+      236          Map<String, AtlasVertex> cache = guidVertexCache.get();
+      237  
+      238          cache.remove(guid);
+      239      }
+      240  
+      241      public static AtlasVertex getVertexFromCache(String guid) {
+      242          Map<String, AtlasVertex> cache = guidVertexCache.get();
+      243  
+      244          return cache.get(guid);
+      245      }
+      246  
+      247      public static void clearCache() {
+      248          guidVertexCache.get().clear();
+      249          vertexGuidCache.get().clear();
+      250          vertexStateCache.get().clear();
+      251          edgeStateCache.get().clear();
+      252      }
+      253  
+      254      boolean logException(Throwable t) {
+      255          if (t instanceof AtlasBaseException) {
+      256              Response.Status httpCode = ((AtlasBaseException) t).getAtlasErrorCode().getHttpCode();
+      257              if (AtlasErrorCode.TYPE_NAME_NOT_FOUND.equals(((AtlasBaseException) t).getAtlasErrorCode())) {
+      258                  return true;
+      259              }
+      260              return httpCode != Response.Status.NOT_FOUND && httpCode != Response.Status.NO_CONTENT;
+      261          } else if (t instanceof NotFoundException) {
+      262              return false;
+      263          } else {
+      264              return true;
+      265          }
+      266      }
+      267  
+      268      public static void addToVertexGuidCache(Object vertexId, String guid) {
+      269  
+      270          if (guid == null) {
+      271              removeFromVertexGuidCache(vertexId);
+      272          } else {
+      273              Map<Object, String> cache = vertexGuidCache.get();
+      274              cache.put(vertexId, guid);
+      275          }
+      276      }
+      277  
+      278      public static void removeFromVertexGuidCache(Object vertexId) {
+      279          Map<Object, String> cache = vertexGuidCache.get();
+      280  
+      281          cache.remove(vertexId);
+      282      }
+      283  
+      284      public static String getVertexGuidFromCache(Object vertexId) {
+      285          Map<Object, String> cache = vertexGuidCache.get();
+      286  
+      287          return cache.get(vertexId);
+      288      }
+      289  
+      290      public static void addToVertexStateCache(Object vertexId, AtlasEntity.Status status) {
+      291  
+      292          if (status == null) {
+      293              removeFromVertexStateCache(vertexId);
+      294          } else {
+      295              Map<Object, AtlasEntity.Status> cache = vertexStateCache.get();
+      296              cache.put(vertexId, status);
+      297          }
+      298      }
+      299  
+      300      public static void removeFromVertexStateCache(Object vertexId) {
+      301          Map<Object, AtlasEntity.Status> cache = vertexStateCache.get();
+      302  
+      303          cache.remove(vertexId);
+      304      }
+      305  
+      306      public static AtlasEntity.Status getVertexStateFromCache(Object vertexId) {
+      307          Map<Object, AtlasEntity.Status> cache = vertexStateCache.get();
+      308  
+      309          return cache.get(vertexId);
+      310      }
+      311  
+      312      public static void addToEdgeStateCache(Object edgeId, AtlasEntity.Status status) {
+      313  
+      314          if (status == null) {
+      315              removeFromEdgeStateCache(edgeId);
+      316          } else {
+      317              Map<Object, AtlasEntity.Status> cache = edgeStateCache.get();
+      318              cache.put(edgeId, status);
+      319          }
+      320      }
+      321  
+      322      public static void removeFromEdgeStateCache(Object edgeId) {
+      323          Map<Object, AtlasEntity.Status> cache = edgeStateCache.get();
+      324  
+      325          cache.remove(edgeId);
+      326      }
+      327  
+      328      public static AtlasEntity.Status getEdgeStateFromCache(Object edgeId) {
+      329          Map<Object, AtlasEntity.Status> cache = edgeStateCache.get();
+      330  
+      331          return cache.get(edgeId);
+      332      }
+      333  
+      334      public static abstract class PostTransactionHook {
+      335          protected PostTransactionHook() {
+      336              List<PostTransactionHook> trxHooks = postTransactionHooks.get();
+      337  
+      338              if (trxHooks == null) {
+      339                  trxHooks = new ArrayList<>();
+      340                  postTransactionHooks.set(trxHooks);
+      341              }
+      342  
+      343              trxHooks.add(this);
+      344          }
+      345  
+      346          public abstract void onComplete(boolean isSuccess);
+      347      }
+      348  
+      349      private static class RefCountedReentrantLock extends ReentrantLock {
+      350          private int refCount;
+      351  
+      352          public RefCountedReentrantLock() {
+      353              this.refCount = 0;
+      354          }
+      355  
+      356          public int increment() {
+      357              return ++refCount;
+      358          }
+      359  
+      360          public int decrement() {
+      361              return --refCount;
+      362          }
+      363  
+      364          public int getRefCount() { return refCount; }
+      365      }
+      366  
+      367  
+      368      public static class ObjectUpdateSynchronizer {
+      369          private final Map<String, RefCountedReentrantLock> guidLockMap = new ConcurrentHashMap<>();
+      370          private final ThreadLocal<List<String>>  lockedGuids = new ThreadLocal<List<String>>() {
+      371              @Override
+      372              protected List<String> initialValue() {
+      373                  return new ArrayList<>();
+      374              }
+      375          };
+      376  
+      377          public void lockObject(final List<?> guids) {
+      378              if (LOG.isDebugEnabled()) {
+      379                  LOG.debug("==> lockObject(): guids: {}", guids);
+      380              }
+      381  
+      382              Collections.sort((List<String>) guids);
+      383              for (String g : (List<String>) guids) {
+      384                  lockObject(g);
+      385              }
+      386          }
+      387  
+      388          private void lockObject(final String guid) {
+      389              if (LOG.isDebugEnabled()) {
+      390                  LOG.debug("==> lockObject(): guid: {}, guidLockMap.size: {}", guid, guidLockMap.size());
+      391              }
+      392  
+      393              ReentrantLock lock = getOrCreateObjectLock(guid);
+      394              lock.lock();
+      395  
+      396              lockedGuids.get().add(guid);
+      397  
+      398              if (LOG.isDebugEnabled()) {
+      399                  LOG.debug("<== lockObject(): guid: {}, guidLockMap.size: {}", guid, guidLockMap.size());
+      400              }
+      401          }
+      402  
+      403          public void releaseLockedObjects() {
+      404              if (LOG.isDebugEnabled()) {
+      405                  LOG.debug("==> releaseLockedObjects(): lockedGuids.size: {}", lockedGuids.get().size());
+      406              }
+      407  
+      408              for (String guid : lockedGuids.get()) {
+      409                  releaseObjectLock(guid);
+      410              }
+      411  
+      412              lockedGuids.get().clear();
+      413  
+      414              if (LOG.isDebugEnabled()) {
+      415                  LOG.debug("<== releaseLockedObjects(): lockedGuids.size: {}", lockedGuids.get().size());
+      416              }
+      417          }
+      418  
+      419          private RefCountedReentrantLock getOrCreateObjectLock(String guid) {
+      420              synchronized (guidLockMap) {
+      421                  RefCountedReentrantLock ret = guidLockMap.get(guid);
+      422                  if (ret == null) {
+      423                      ret = new RefCountedReentrantLock();
+      424                      guidLockMap.put(guid, ret);
+      425                  }
+      426  
+      427                  ret.increment();
+      428                  return ret;
+      429              }
+      430          }
+      431  
+      432          private RefCountedReentrantLock releaseObjectLock(String guid) {
+      433              synchronized (guidLockMap) {
+      434                  RefCountedReentrantLock lock = guidLockMap.get(guid);
+      435                  if (lock != null && lock.isHeldByCurrentThread()) {
+      436                      int refCount = lock.decrement();
+      437  
+      438                      if (refCount == 0) {
+      439                          guidLockMap.remove(guid);
+      440                      }
+      441  
+      442                      lock.unlock();
+      443                  } else {
+      444                      LOG.warn("releaseLockedObjects: {} Attempting to release a lock not held by current thread.", guid);
+       ... truncated at 400 lines ...

@@ -1,0 +1,406 @@
+row 131   operaton/operaton#1935
+============================================================================
+CLASS org.operaton.bpm.engine.impl.persistence.entity.JobEntity   loc=688 methods=78 wmc=122 lcom=0.1038961038961039 c3=0.0886391190064057
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       55  public abstract class JobEntity extends AcquirableJobEntity
+       56    implements Serializable, Job, DbEntity,
+       57      HasDbRevision, HasDbReferences, DbEntityLifecycleAware {
+       58  
+       59    private static final EnginePersistenceLogger LOG = ProcessEngineLogger.PERSISTENCE_LOGGER;
+       60  
+       61    public static final int DEFAULT_RETRIES = 3;
+       62  
+       63    @Serial private static final long serialVersionUID = 1L;
+       64  
+       65    protected String executionId;
+       66  
+       67    protected String processDefinitionId;
+       68    protected String processDefinitionKey;
+       69  
+       70    protected int retries = DEFAULT_RETRIES;
+       71  
+       72    // entity is active by default
+       73    protected int suspensionState = SuspensionState.ACTIVE.getStateCode();
+       74  
+       75    protected String jobHandlerType;
+       76    protected String jobHandlerConfiguration;
+       77  
+       78    protected ByteArrayEntity exceptionByteArray;
+       79    protected String exceptionByteArrayId;
+       80  
+       81    protected String exceptionMessage;
+       82  
+       83    protected String deploymentId;
+       84  
+       85    protected String jobDefinitionId;
+       86  
+       87    protected long priority = DEFAULT_PRIORITY;
+       88  
+       89    protected String tenantId;
+       90  
+       91    protected Date createTime;
+       92  
+       93    // runtime state /////////////////////////////
+       94    protected String activityId;
+       95    protected JobDefinition jobDefinition;
+       96    protected ExecutionEntity execution;
+       97  
+       98    // sequence counter //////////////////////////
+       99    protected long sequenceCounter = 1;
+      100  
+      101    // last failure log id ///////////////////////
+      102    protected String lastFailureLogId;
+      103  
+      104    // last failing activity id ///////////////////////
+      105    protected String failedActivityId;
+      106  
+      107    protected Map<String, Class> persistedDependentEntities;
+      108  
+      109    protected String batchId;
+      110  
+      111    public void execute(CommandContext commandContext) {
+      112      if (executionId != null) {
+      113        ensureNotNull("Cannot find execution with id '%s' referenced from job '%s'".formatted(executionId, this), "execution", getExecution());
+      114      }
+      115  
+      116      // initialize activity id
+      117      getActivityId();
+      118  
+      119      // increment sequence counter before job execution
+      120      incrementSequenceCounter();
+      121  
+      122      preExecute(commandContext);
+      123      JobHandler jobHandler = getJobHandler();
+      124      JobHandlerConfiguration configuration = getJobHandlerConfiguration();
+      125      ensureNotNull("Cannot find job handler '%s' from job '%s'".formatted(jobHandlerType, this), "jobHandler", jobHandler);
+      126      jobHandler.execute(configuration, execution, commandContext, tenantId);
+      127      postExecute(commandContext);
+      128    }
+      129  
+      130    protected void preExecute(CommandContext commandContext) {
+      131      // nothing to do
+      132    }
+      133  
+      134    protected void postExecute(CommandContext commandContext) {
+      135      LOG.debugJobExecuted(this);
+      136      delete(true);
+      137      commandContext.getHistoricJobLogManager().fireJobSuccessfulEvent(this);
+      138    }
+      139  
+      140    public void init(CommandContext commandContext) {
+      141      // nothing to do
+      142    }
+      143  
+      144    @SuppressWarnings("unused")
+      145    public void init(CommandContext commandContext, boolean shouldResetLock, boolean shouldCallDeleteHandler) {
+      146      if (shouldCallDeleteHandler) {
+      147        // clean additional data related to this job
+      148        JobHandler jobHandler = getJobHandler();
+      149        if (jobHandler != null) {
+      150          jobHandler.onDelete(getJobHandlerConfiguration(), this);
+      151        }
+      152      }
+      153  
+      154      // cancel the retries -> will resolve job incident if present
+      155      int maxRetries = HistoryCleanupHelper.getMaxRetries();
+      156      setRetries(maxRetries);
+      157  
+      158      // delete the job's exception byte array and exception message
+      159      if (exceptionByteArrayId != null) {
+      160        clearFailedJobException();
+      161      }
+      162  
+      163      // clean the lock information
+      164      if (shouldResetLock) {
+      165        setLockOwner(null);
+      166        setLockExpirationTime(null);
+      167      }
+      168    }
+      169  
+      170    public void insert() {
+      171      CommandContext commandContext = Context.getCommandContext();
+      172  
+      173      // add link to execution and deployment
+      174      ExecutionEntity exec = getExecution();
+      175      if (exec != null) {
+      176        exec.addJob(this);
+      177  
+      178        ProcessDefinitionImpl processDefinition = exec.getProcessDefinition();
+      179        this.deploymentId = processDefinition.getDeploymentId();
+      180      }
+      181  
+      182      commandContext
+      183        .getJobManager()
+      184        .insertJob(this);
+      185    }
+      186  
+      187    public void delete() {
+      188      delete(false);
+      189    }
+      190  
+      191    public void delete(boolean incidentResolved) {
+      192      CommandContext commandContext = Context.getCommandContext();
+      193  
+      194      incrementSequenceCounter();
+      195  
+      196      // clean additional data related to this job
+      197      JobHandler jobHandler = getJobHandler();
+      198      if (jobHandler != null) {
+      199        jobHandler.onDelete(getJobHandlerConfiguration(), this);
+      200      }
+      201  
+      202      // fire delete event if this job is not being executed
+      203      boolean executingJob = this.equals(commandContext.getCurrentJob());
+      204      commandContext.getJobManager().deleteJob(this, !executingJob);
+      205  
+      206      // Also delete the job's exception byte array
+      207      if (exceptionByteArrayId != null) {
+      208        commandContext.getByteArrayManager().deleteByteArrayById(exceptionByteArrayId);
+      209      }
+      210  
+      211      // remove link to execution
+      212      ExecutionEntity exec = getExecution();
+      213      if (exec != null) {
+      214        exec.removeJob(this);
+      215      }
+      216  
+      217      removeFailedJobIncident(incidentResolved);
+      218    }
+      219  
+      220    @Override
+      221    public Object getPersistentState() {
+      222      Map<String, Object> persistentState = (HashMap) super.getPersistentState();
+      223      persistentState.put("executionId", executionId);
+      224      persistentState.put("retries", retries);
+      225      persistentState.put("exceptionMessage", exceptionMessage);
+      226      persistentState.put("suspensionState", suspensionState);
+      227      persistentState.put("processDefinitionId", processDefinitionId);
+      228      persistentState.put("jobDefinitionId", jobDefinitionId);
+      229      persistentState.put("deploymentId", deploymentId);
+      230      persistentState.put("jobHandlerConfiguration", jobHandlerConfiguration);
+      231      persistentState.put("priority", priority);
+      232      persistentState.put("tenantId", tenantId);
+      233      if(exceptionByteArrayId != null) {
+      234        persistentState.put("exceptionByteArrayId", exceptionByteArrayId);
+      235      }
+      236      return persistentState;
+      237    }
+      238  
+      239    public void setExecution(ExecutionEntity execution) {
+      240      if (execution != null) {
+      241        this.execution = execution;
+      242        executionId = execution.getId();
+      243        processInstanceId = execution.getProcessInstanceId();
+      244        rootProcessInstanceId = execution.getRootProcessInstanceId();
+      245        // if the execution is suspended, suspend the job entity as well to prevent unwanted job execution
+      246        if(execution.isSuspended()) {
+      247          suspensionState = execution.getSuspensionState();
+      248        }
+      249        this.execution.addJob(this);
+      250      }
+      251      else {
+      252        this.execution.removeJob(this);
+      253        this.execution = execution;
+      254        processInstanceId = null;
+      255        rootProcessInstanceId = null;
+      256        executionId = null;
+      257      }
+      258    }
+      259  
+      260    // sequence counter /////////////////////////////////////////////////////////
+      261  
+      262    public long getSequenceCounter() {
+      263      return sequenceCounter;
+      264    }
+      265  
+      266    public void setSequenceCounter(long sequenceCounter) {
+      267      this.sequenceCounter = sequenceCounter;
+      268    }
+      269  
+      270    public void incrementSequenceCounter() {
+      271      sequenceCounter++;
+      272    }
+      273  
+      274    // getters and setters //////////////////////////////////////////////////////
+      275  
+      276    @Override
+      277    public String getExecutionId() {
+      278      return executionId;
+      279    }
+      280  
+      281    public void setExecutionId(String executionId) {
+      282      this.executionId = executionId;
+      283    }
+      284  
+      285    public ExecutionEntity getExecution() {
+      286      ensureExecutionInitialized();
+      287      return execution;
+      288    }
+      289  
+      290    protected void ensureExecutionInitialized() {
+      291      if (execution == null && executionId != null) {
+      292        execution = Context
+      293            .getCommandContext()
+      294            .getExecutionManager()
+      295            .findExecutionById(executionId);
+      296      }
+      297    }
+      298  
+      299    @Override
+      300    public int getRetries() {
+      301      return retries;
+      302    }
+      303  
+      304    public void setRetries(int retries) {
+      305      // if retries should be set to a negative value set it to 0
+      306      if (retries < 0) {
+      307        retries = 0;
+      308      }
+      309  
+      310      // Assuming: if the number of retries will
+      311      // be changed from 0 to x (x >= 1), means
+      312      // that the corresponding incident is resolved.
+      313      if (this.retries == 0 && retries > 0) {
+      314        removeFailedJobIncident(true);
+      315      }
+      316  
+      317      // If the retries will be set to 0, an
+      318      // incident has to be created.
+      319      if(retries == 0 && this.retries > 0) {
+      320        createFailedJobIncident();
+      321      }
+      322      this.retries = retries;
+      323    }
+      324  
+      325    // special setter for MyBatis which does not influence incidents
+      326    public void setRetriesFromPersistence(int retries) {
+      327      this.retries = retries;
+      328    }
+      329  
+      330    protected void createFailedJobIncident() {
+      331      final ProcessEngineConfigurationImpl processEngineConfiguration = Context.getProcessEngineConfiguration();
+      332  
+      333      if (processEngineConfiguration
+      334          .isCreateIncidentOnFailedJobEnabled()) {
+      335  
+      336        String incidentHandlerType = Incident.FAILED_JOB_HANDLER_TYPE;
+      337  
+      338        // make sure job has an ID set:
+      339        if(id == null) {
+      340          id = processEngineConfiguration
+      341              .getIdGenerator()
+      342              .getNextId();
+      343  
+      344        } else {
+      345          // check whether there exists already an incident
+      346          // for this job
+      347          List<Incident> failedJobIncidents = Context
+      348              .getCommandContext()
+      349              .getIncidentManager()
+      350              .findIncidentByConfigurationAndIncidentType(id, incidentHandlerType);
+      351  
+      352          if (!failedJobIncidents.isEmpty()) {
+      353            // update the historic job log id in the historic incidents (if available)
+      354            for (Incident incident : failedJobIncidents) {
+      355              HistoricIncidentEntity historicIncidentEvent = Context
+      356                  .getCommandContext()
+      357                  .getHistoricIncidentManager()
+      358                  .findHistoricIncidentById(incident.getId());
+      359              if (historicIncidentEvent != null) {
+      360                historicIncidentEvent.setHistoryConfiguration(getLastFailureLogId());
+      361                Context.getCommandContext().getDbEntityManager().merge(historicIncidentEvent);
+      362              }
+      363            }
+      364            return;
+      365          }
+      366  
+      367        }
+      368  
+      369  
+      370        IncidentContext incidentContext = createIncidentContext();
+      371        incidentContext.setActivityId(getActivityId());
+      372        incidentContext.setHistoryConfiguration(getLastFailureLogId());
+      373        incidentContext.setFailedActivityId(getFailedActivityId());
+      374  
+      375        IncidentHandling.createIncident(incidentHandlerType, incidentContext, exceptionMessage);
+      376  
+      377      }
+      378    }
+      379  
+      380    protected void removeFailedJobIncident(boolean incidentResolved) {
+      381      IncidentContext incidentContext = createIncidentContext();
+      382      IncidentHandling.removeIncidents(Incident.FAILED_JOB_HANDLER_TYPE, incidentContext, incidentResolved);
+      383    }
+      384  
+      385    protected IncidentContext createIncidentContext() {
+      386      IncidentContext incidentContext = new IncidentContext();
+      387      incidentContext.setProcessDefinitionId(processDefinitionId);
+      388      incidentContext.setExecutionId(executionId);
+      389      incidentContext.setTenantId(tenantId);
+      390      incidentContext.setConfiguration(id);
+      391      incidentContext.setJobDefinitionId(jobDefinitionId);
+      392  
+      393      return incidentContext;
+      394    }
+      395  
+      396    public String getExceptionStacktrace() {
+      397      ByteArrayEntity byteArray = getExceptionByteArray();
+      398      return ExceptionUtil.getExceptionStacktrace(byteArray);
+      399    }
+      400  
+      401    public void setSuspensionState(int state) {
+      402      this.suspensionState = state;
+      403    }
+      404  
+      405    public int getSuspensionState() {
+      406      return suspensionState;
+      407    }
+      408  
+      409    @Override
+      410    public boolean isSuspended() {
+      411      return suspensionState == SuspensionState.SUSPENDED.getStateCode();
+      412    }
+      413  
+      414    @Override
+      415    public String getProcessDefinitionId() {
+      416      return processDefinitionId;
+      417    }
+      418  
+      419    public void setProcessDefinitionId(String processDefinitionId) {
+      420      this.processDefinitionId = processDefinitionId;
+      421    }
+      422  
+      423    @Override
+      424    public String getProcessDefinitionKey() {
+      425      return processDefinitionKey;
+      426    }
+      427  
+      428    public void setProcessDefinitionKey(String processDefinitionKey) {
+      429      this.processDefinitionKey = processDefinitionKey;
+      430    }
+      431  
+      432    public void setExceptionStacktrace(String exception) {
+      433      byte[] exceptionBytes = toByteArray(exception);
+      434  
+      435      ByteArrayEntity byteArray = getExceptionByteArray();
+      436  
+      437      if(byteArray == null) {
+      438        byteArray = createJobExceptionByteArray(exceptionBytes, ResourceTypes.RUNTIME);
+      439        exceptionByteArrayId = byteArray.getId();
+      440        exceptionByteArray = byteArray;
+      441      }
+      442      else {
+      443        byteArray.setBytes(exceptionBytes);
+      444      }
+      445    }
+      446  
+      447    protected JobHandler getJobHandler() {
+      448      Map<String, JobHandler> jobHandlers = Context.getProcessEngineConfiguration().getJobHandlers();
+      449      return jobHandlers.get(jobHandlerType);
+      450    }
+      451  
+      452    public JobHandlerConfiguration getJobHandlerConfiguration() {
+      453      return getJobHandler().newConfiguration(jobHandlerConfiguration);
+      454    }
+       ... truncated at 400 lines ...

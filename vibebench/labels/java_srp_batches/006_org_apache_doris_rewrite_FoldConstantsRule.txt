@@ -1,0 +1,370 @@
+row 6   apache/doris#61565
+============================================================================
+CLASS org.apache.doris.rewrite.FoldConstantsRule   loc=365 methods=10 wmc=77 lcom=0.1111111111111111 c3=0.4260698101057714
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       86  public class FoldConstantsRule implements ExprRewriteRule {
+       87      private static final Logger LOG = LogManager.getLogger(FoldConstantsRule.class);
+       88  
+       89      public static ExprRewriteRule INSTANCE = new FoldConstantsRule();
+       90  
+       91      @Override
+       92      public Expr apply(Expr expr, Analyzer analyzer, ExprRewriter.ClauseType clauseType) throws AnalysisException {
+       93          // evaluate `case when expr` when possible
+       94          if (expr instanceof CaseExpr) {
+       95              return CaseExpr.computeCaseExpr((CaseExpr) expr);
+       96          }
+       97  
+       98          // Avoid calling Expr.isConstant() because that would lead to repeated traversals
+       99          // of the Expr tree. Assumes the bottom-up application of this rule. Constant
+      100          // children should have been folded at this point.
+      101          for (Expr child : expr.getChildren()) {
+      102              if (!child.isLiteral() && !(child instanceof CastExpr) && !((child instanceof FunctionCallExpr
+      103                      || child instanceof ArithmeticExpr || child instanceof TimestampArithmeticExpr
+      104                      || child instanceof VariableExpr))) {
+      105                  return expr;
+      106              }
+      107          }
+      108  
+      109          if (expr.isLiteral() || !expr.isConstant()) {
+      110              return expr;
+      111          }
+      112  
+      113          // Do not constant fold cast(null as dataType) because we cannot preserve the
+      114          // cast-to-types and that can lead to query failures, e.g., CTAS
+      115          if (expr instanceof CastExpr) {
+      116              CastExpr castExpr = (CastExpr) expr;
+      117              if (castExpr.isNotFold()) {
+      118                  return castExpr;
+      119              }
+      120              if (castExpr.getChild(0) instanceof NullLiteral) {
+      121                  return castExpr.getChild(0);
+      122              }
+      123          }
+      124  
+      125          // Analyze constant exprs, if necessary. Note that the 'expr' may become non-constant
+      126          // after analysis (e.g., aggregate functions).
+      127          if (!expr.isAnalyzed()) {
+      128              expr.analyze(analyzer);
+      129              if (!expr.isConstant()) {
+      130                  return expr;
+      131              }
+      132          }
+      133          // it may be wrong to fold constant value in inline view
+      134          // so pass the info to getResultValue method to let predicate itself
+      135          // to decide if it can fold constant value safely
+      136          return expr.getResultValue(expr instanceof SlotRef ? false : analyzer.isInlineViewAnalyzer());
+      137      }
+      138  
+      139      /**
+      140       * fold constant expr by BE
+      141       * SysVariableDesc and InformationFunction need handling specially
+      142       * @param exprMap
+      143       * @param analyzer
+      144       * @return
+      145       * @throws AnalysisException
+      146       */
+      147      public boolean apply(Map<String, Expr> exprMap, Analyzer analyzer, boolean changed, TQueryOptions tQueryOptions)
+      148              throws AnalysisException {
+      149          // root_expr_id_string:
+      150          //     child_expr_id_string : texpr
+      151          //     child_expr_id_string : texpr
+      152          Map<String, Map<String, TExpr>> paramMap = new HashMap<>();
+      153          Map<String, Expr> allConstMap = new HashMap<>();
+      154          // map to collect SysVariableDesc
+      155          Map<String, Map<String, Expr>> sysVarsMap = new HashMap<>();
+      156          // map to collect InformationFunction
+      157          Map<String, Map<String, Expr>> infoFnsMap = new HashMap<>();
+      158          for (Map.Entry<String, Expr> entry : exprMap.entrySet()) {
+      159              Map<String, TExpr> constMap = new HashMap<>();
+      160              Map<String, Expr> oriConstMap = new HashMap<>();
+      161              Map<String, Expr> sysVarMap = new HashMap<>();
+      162              Map<String, Expr> infoFnMap = new HashMap<>();
+      163              getConstExpr(entry.getValue(), constMap, oriConstMap, analyzer, sysVarMap, infoFnMap);
+      164  
+      165              if (!constMap.isEmpty()) {
+      166                  paramMap.put(entry.getKey(), constMap);
+      167                  allConstMap.putAll(oriConstMap);
+      168              }
+      169              if (!sysVarMap.isEmpty()) {
+      170                  sysVarsMap.put(entry.getKey(), sysVarMap);
+      171              }
+      172              if (!infoFnMap.isEmpty()) {
+      173                  infoFnsMap.put(entry.getKey(), infoFnMap);
+      174              }
+      175          }
+      176  
+      177          if (!sysVarsMap.isEmpty()) {
+      178              putBackConstExpr(exprMap, sysVarsMap);
+      179              changed = true;
+      180          }
+      181  
+      182          if (!infoFnsMap.isEmpty()) {
+      183              putBackConstExpr(exprMap, infoFnsMap);
+      184              changed = true;
+      185          }
+      186  
+      187          if (!paramMap.isEmpty()) {
+      188              Map<String, Map<String, Expr>> resultMap = calcConstExpr(paramMap, allConstMap, analyzer.getContext(),
+      189                      tQueryOptions);
+      190  
+      191              if (!resultMap.isEmpty()) {
+      192                  putBackConstExpr(exprMap, resultMap);
+      193                  changed = true;
+      194  
+      195              }
+      196  
+      197          }
+      198          return changed;
+      199      }
+      200  
+      201      /**
+      202       * get all constant children expr from a expr
+      203       * @param expr
+      204       * @param constExprMap
+      205       * @param analyzer
+      206       * @throws AnalysisException
+      207       */
+      208      // public only for unit test
+      209      public void getConstExpr(Expr expr, Map<String, TExpr> constExprMap, Map<String, Expr> oriConstMap,
+      210              Analyzer analyzer, Map<String, Expr> sysVarMap, Map<String, Expr> infoFnMap)
+      211              throws AnalysisException {
+      212          if (expr.isConstant()) {
+      213              // Do not constant fold cast(null as dataType) because we cannot preserve the
+      214              // cast-to-types and that can lead to query failures, e.g., CTAS
+      215              if (expr instanceof CastExpr) {
+      216                  CastExpr castExpr = (CastExpr) expr;
+      217                  if (castExpr.getChild(0) instanceof NullLiteral) {
+      218                      return;
+      219                  }
+      220              }
+      221              // skip literal expr
+      222              if (expr instanceof LiteralExpr) {
+      223                  return;
+      224              }
+      225              // skip BetweenPredicate need to be rewrite to CompoundPredicate
+      226              if (expr instanceof BetweenPredicate) {
+      227                  return;
+      228              }
+      229              // collect sysVariableDesc expr
+      230              if (expr.contains(Predicates.instanceOf(VariableExpr.class))) {
+      231                  getSysVarDescExpr(expr, sysVarMap);
+      232                  return;
+      233              }
+      234              // collect InformationFunction
+      235              if (expr.contains(Predicates.instanceOf(InformationFunction.class))) {
+      236                  getInfoFnExpr(expr, infoFnMap);
+      237                  return;
+      238              }
+      239              constExprMap.put(expr.getId().toString(), expr.treeToThrift());
+      240              oriConstMap.put(expr.getId().toString(), expr);
+      241          } else {
+      242              recursiveGetChildrenConstExpr(expr, constExprMap, oriConstMap, analyzer, sysVarMap, infoFnMap);
+      243  
+      244          }
+      245      }
+      246  
+      247      private void recursiveGetChildrenConstExpr(Expr expr, Map<String, TExpr> constExprMap,
+      248              Map<String, Expr> oriConstMap, Analyzer analyzer, Map<String, Expr> sysVarMap, Map<String, Expr> infoFnMap)
+      249              throws AnalysisException {
+      250          for (int i = 0; i < expr.getChildren().size(); i++) {
+      251              final Expr child = expr.getChildren().get(i);
+      252              getConstExpr(child, constExprMap, oriConstMap, analyzer, sysVarMap, infoFnMap);
+      253          }
+      254  
+      255      }
+      256  
+      257      private void getSysVarDescExpr(Expr expr, Map<String, Expr> sysVarMap) {
+      258          if (expr instanceof VariableExpr) {
+      259              Expr literalExpr = ((VariableExpr) expr).getLiteralExpr();
+      260              if (literalExpr == null) {
+      261                  try {
+      262                      VariableMgr.fillValue(ConnectContext.get().getSessionVariable(), (VariableExpr) expr);
+      263                      literalExpr = ((VariableExpr) expr).getLiteralExpr();
+      264                  } catch (AnalysisException e) {
+      265                      if (ConnectContext.get() != null) {
+      266                          ConnectContext.get().getState().reset();
+      267                      }
+      268                      LOG.warn("failed to get session variable value: " + ((VariableExpr) expr).getName());
+      269                  }
+      270              }
+      271              sysVarMap.put(expr.getId().toString(), literalExpr);
+      272          } else {
+      273              for (Expr child : expr.getChildren()) {
+      274                  getSysVarDescExpr(child, sysVarMap);
+      275              }
+      276          }
+      277      }
+      278  
+      279      private void getInfoFnExpr(Expr expr, Map<String, Expr> infoFnMap) {
+      280          if (expr instanceof InformationFunction) {
+      281              Type type = expr.getType();
+      282              LiteralExpr literalExpr = null;
+      283              try {
+      284                  String str = null;
+      285                  if (type.equals(Type.VARCHAR)) {
+      286                      str = ((InformationFunction) expr).getStrValue();
+      287                  } else if (type.equals(Type.BIGINT)) {
+      288                      str = ((InformationFunction) expr).getIntValue();
+      289                  }
+      290                  Preconditions.checkNotNull(str);
+      291                  literalExpr = LiteralExpr.create(str, type);
+      292                  infoFnMap.put(expr.getId().toString(), literalExpr);
+      293              } catch (AnalysisException e) {
+      294                  if (ConnectContext.get() != null) {
+      295                      ConnectContext.get().getState().reset();
+      296                  }
+      297                  LOG.warn("failed to get const expr value from InformationFunction: {}", e.getMessage());
+      298              }
+      299  
+      300          } else {
+      301              for (Expr child : expr.getChildren()) {
+      302                  getInfoFnExpr(child, infoFnMap);
+      303              }
+      304          }
+      305      }
+      306  
+      307      /**
+      308       * put all rewritten expr back to ori expr map
+      309       * @param exprMap
+      310       * @param resultMap
+      311       */
+      312      private void putBackConstExpr(Map<String, Expr> exprMap, Map<String, Map<String, Expr>> resultMap) {
+      313          for (Map.Entry<String, Map<String, Expr>> entry : resultMap.entrySet()) {
+      314              Expr rewrittenExpr = putBackConstExpr(exprMap.get(entry.getKey()), entry.getValue());
+      315              exprMap.put(entry.getKey(), rewrittenExpr);
+      316          }
+      317      }
+      318  
+      319      private Expr putBackConstExpr(Expr expr, Map<String, Expr> resultMap) {
+      320          for (Map.Entry<String, Expr> entry : resultMap.entrySet()) {
+      321              if (entry.getValue() instanceof LiteralExpr) {
+      322                  expr = replaceExpr(expr, entry.getKey(), (LiteralExpr) entry.getValue());
+      323  
+      324              }
+      325          }
+      326          return expr;
+      327      }
+      328  
+      329      /**
+      330       * find and replace constant child expr of a expr by literal expr
+      331       * @param expr
+      332       * @param key
+      333       * @param literalExpr
+      334       * @return
+      335       */
+      336      private Expr replaceExpr(Expr expr, String key, LiteralExpr literalExpr) {
+      337          if (expr.getId().toString().equals(key)) {
+      338              return literalExpr;
+      339          }
+      340          // ATTN: make sure the child order of expr keep unchanged
+      341          for (int i = 0; i < expr.getChildren().size(); i++) {
+      342              Expr child = expr.getChild(i);
+      343              if (!(child instanceof LiteralExpr) && literalExpr.equals(replaceExpr(child, key, literalExpr))) {
+      344                  literalExpr.setId(child.getId());
+      345                  expr.setChild(i, literalExpr);
+      346                  break;
+      347              }
+      348          }
+      349          return expr;
+      350      }
+      351  
+      352      /**
+      353       * calc all constant exprs by BE
+      354       * @param map
+      355       * @param context
+      356       * @return
+      357       */
+      358      private Map<String, Map<String, Expr>> calcConstExpr(Map<String, Map<String, TExpr>> map,
+      359              Map<String, Expr> allConstMap,
+      360              ConnectContext context, TQueryOptions tQueryOptions) {
+      361          TNetworkAddress brpcAddress = null;
+      362          Map<String, Map<String, Expr>> resultMap = new HashMap<>();
+      363          try {
+      364              List<Long> backendIds = Env.getCurrentSystemInfo().getAllBackendByCurrentCluster(true);
+      365              if (backendIds.isEmpty()) {
+      366                  throw new LoadException("Failed to get all partitions. No alive backends");
+      367              }
+      368              Collections.shuffle(backendIds);
+      369              Backend be = Env.getCurrentSystemInfo().getBackend(backendIds.get(0));
+      370              brpcAddress = new TNetworkAddress(be.getHost(), be.getBrpcPort());
+      371  
+      372              TQueryGlobals queryGlobals = new TQueryGlobals();
+      373              queryGlobals.setNowString(TimeUtils.getDatetimeFormatWithTimeZone().format(LocalDateTime.now()));
+      374              queryGlobals.setTimestampMs(System.currentTimeMillis());
+      375              queryGlobals.setNanoSeconds(LocalDateTime.now().getNano());
+      376              queryGlobals.setTimeZone(TimeUtils.DEFAULT_TIME_ZONE);
+      377              if (context.getSessionVariable().getTimeZone().equals("CST")) {
+      378                  queryGlobals.setTimeZone(TimeUtils.DEFAULT_TIME_ZONE);
+      379              } else {
+      380                  queryGlobals.setTimeZone(context.getSessionVariable().getTimeZone());
+      381              }
+      382  
+      383              TFoldConstantParams tParams = new TFoldConstantParams(map, queryGlobals);
+      384              tParams.setVecExec(true);
+      385              tParams.setQueryOptions(tQueryOptions);
+      386              tParams.setQueryId(context.queryId());
+      387              tParams.setIsNereids(false);
+      388  
+      389              Future<InternalService.PConstantExprResult> future
+      390                      = BackendServiceProxy.getInstance().foldConstantExpr(brpcAddress, tParams);
+      391              InternalService.PConstantExprResult result = future.get(5, TimeUnit.SECONDS);
+      392  
+      393              if (result.getStatus().getStatusCode() == 0) {
+      394                  for (Map.Entry<String, InternalService.PExprResultMap> entry
+      395                          : result.getExprResultMapMap().entrySet()) {
+      396                      Map<String, Expr> tmp = new HashMap<>();
+      397                      for (Map.Entry<String, InternalService.PExprResult> entry1
+      398                              : entry.getValue().getMapMap().entrySet()) {
+      399                          PScalarType scalarType = entry1.getValue().getType();
+      400                          TPrimitiveType ttype = TPrimitiveType.findByValue(scalarType.getType());
+      401                          Expr retExpr = null;
+      402                          if (entry1.getValue().getSuccess()) {
+      403                              Type type = null;
+      404                              if (ttype == TPrimitiveType.CHAR) {
+      405                                  Preconditions.checkState(scalarType.hasLen());
+      406                                  type = ScalarType.createCharType(scalarType.getLen());
+      407                              } else if (ttype == TPrimitiveType.VARCHAR) {
+      408                                  Preconditions.checkState(scalarType.hasLen());
+      409                                  type = ScalarType.createVarcharType(scalarType.getLen());
+      410                              } else if (ttype == TPrimitiveType.DECIMALV2) {
+      411                                  type = ScalarType.createDecimalType(scalarType.getPrecision(),
+      412                                          scalarType.getScale());
+      413                              } else if (ttype == TPrimitiveType.DATETIMEV2) {
+      414                                  type = ScalarType.createDatetimeV2Type(scalarType.getScale());
+      415                              } else if (ttype == TPrimitiveType.DECIMAL32
+      416                                      || ttype == TPrimitiveType.DECIMAL64
+      417                                      || ttype == TPrimitiveType.DECIMAL128I
+      418                                      || ttype == TPrimitiveType.DECIMAL256) {
+      419                                  type = ScalarType.createDecimalV3Type(scalarType.getPrecision(),
+      420                                          scalarType.getScale());
+      421                              } else {
+      422                                  type = ScalarType.createType(
+      423                                          PrimitiveType.fromThrift(ttype));
+      424                              }
+      425                              retExpr = LiteralExpr.create(entry1.getValue().getContent(),
+      426                                      type);
+      427                          } else {
+      428                              retExpr = allConstMap.get(entry1.getKey());
+      429                          }
+      430                          if (LOG.isDebugEnabled()) {
+      431                              LOG.debug("retExpr: " + retExpr.toString());
+      432                          }
+      433                          tmp.put(entry1.getKey(), retExpr);
+      434                      }
+      435                      if (!tmp.isEmpty()) {
+      436                          resultMap.put(entry.getKey(), tmp);
+      437                      }
+      438                  }
+      439  
+      440              } else {
+      441                  LOG.warn("failed_fold_context.queryId(): " + DebugUtil.printId(context.queryId()));
+      442                  LOG.warn("failed to get const expr value from be: {}", result.getStatus().getErrorMsgsList());
+      443              }
+      444          } catch (Exception e) {
+      445              LOG.warn("failed_fold_context.queryId(): " + DebugUtil.printId(context.queryId()));
+      446              LOG.warn("failed to get const expr value from be: {}", e.getMessage());
+      447          }
+      448          return resultMap;
+      449      }
+      450  }

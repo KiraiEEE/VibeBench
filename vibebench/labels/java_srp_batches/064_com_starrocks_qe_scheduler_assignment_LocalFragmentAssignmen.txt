@@ -1,0 +1,349 @@
+row 64   StarRocks/starrocks#70342
+============================================================================
+CLASS com.starrocks.qe.scheduler.assignment.LocalFragmentAssignmentStrategy   loc=344 methods=11 wmc=62 lcom=0.0 c3=0.2659542709385569
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       48  public class LocalFragmentAssignmentStrategy implements FragmentAssignmentStrategy {
+       49      private static final Logger LOG = LogManager.getLogger(LocalFragmentAssignmentStrategy.class);
+       50  
+       51      private final ConnectContext connectContext;
+       52      private final WorkerProvider workerProvider;
+       53      private final boolean usePipeline;
+       54      private final boolean isLoadType;
+       55  
+       56      private final Set<Integer> replicatedScanIds = Sets.newHashSet();
+       57  
+       58      private final boolean useIncrementalScanRanges;
+       59  
+       60      public LocalFragmentAssignmentStrategy(ConnectContext connectContext, WorkerProvider workerProvider,
+       61                                             boolean usePipeline,
+       62                                             boolean isLoadType,
+       63                                             boolean useIncrementalScanRanges) {
+       64          this.connectContext = connectContext;
+       65          this.workerProvider = workerProvider;
+       66          this.usePipeline = usePipeline;
+       67          this.isLoadType = isLoadType;
+       68          this.useIncrementalScanRanges = useIncrementalScanRanges;
+       69      }
+       70  
+       71      @Override
+       72      public void assignFragmentToWorker(ExecutionFragment execFragment) throws StarRocksException {
+       73          for (ScanNode scanNode : execFragment.getScanNodes()) {
+       74              assignScanRangesToWorker(execFragment, scanNode);
+       75          }
+       76  
+       77          assignScanRangesToFragmentInstancePerWorker(execFragment);
+       78  
+       79          // The fragment which only contains scan nodes without scan ranges,
+       80          // such as SchemaScanNode, is assigned to an arbitrary worker.
+       81          if (execFragment.getInstances().isEmpty()) {
+       82              long workerId = workerProvider.selectNextWorker();
+       83              ComputeNode worker = workerProvider.getWorkerById(workerId);
+       84              FragmentInstance instance = new FragmentInstance(worker, execFragment);
+       85              execFragment.addInstance(instance);
+       86          }
+       87      }
+       88  
+       89      private void assignScanRangesToWorker(ExecutionFragment execFragment, ScanNode scanNode) throws StarRocksException {
+       90          BackendSelector backendSelector = BackendSelectorFactory.create(
+       91                  scanNode, isLoadType, execFragment, workerProvider, connectContext, replicatedScanIds, useIncrementalScanRanges);
+       92  
+       93          backendSelector.computeScanRangeAssignment();
+       94  
+       95          if (LOG.isDebugEnabled()) {
+       96              LOG.debug(execFragment.getScanRangeAssignment().toDebugString());
+       97          }
+       98      }
+       99  
+      100      private void assignScanRangesToFragmentInstancePerWorker(ExecutionFragment execFragment) {
+      101          ColocatedBackendSelector.Assignment colocatedAssignment = execFragment.getColocatedAssignment();
+      102          boolean hasColocate = execFragment.isColocated()
+      103                  && colocatedAssignment != null && !colocatedAssignment.getSeqToWorkerId().isEmpty();
+      104          boolean hasBucketShuffle = execFragment.isLocalBucketShuffleJoin() && colocatedAssignment != null;
+      105  
+      106          if (hasColocate || hasBucketShuffle) {
+      107              assignScanRangesToColocateFragmentInstancePerWorker(execFragment,
+      108                      colocatedAssignment.getSeqToWorkerId(),
+      109                      colocatedAssignment.getSeqToScanRange());
+      110          } else {
+      111              assignScanRangesToNormalFragmentInstancePerWorker(execFragment);
+      112          }
+      113      }
+      114  
+      115      /**
+      116       * This strategy assigns buckets to each driver sequence to avoid local shuffle.
+      117       * If the number of buckets assigned to a fragment instance is less than pipelineDop,
+      118       * pipelineDop will be set to num_buckets, which will reduce the degree of operator parallelism.
+      119       * Therefore, when there are few buckets (<=pipeline_dop/2), insert local shuffle instead of using this strategy
+      120       * to improve the degree of parallelism.
+      121       *
+      122       * @param scanRanges  The buckets assigned to a fragment instance.
+      123       * @param pipelineDop The expected pipelineDop.
+      124       * @return Whether using the strategy of assigning scanRanges to each driver sequence.
+      125       */
+      126      private <T> boolean enableAssignScanRangesPerDriverSeq(List<T> scanRanges, int pipelineDop) {
+      127          boolean enableTabletInternalParallel =
+      128                  connectContext != null && connectContext.getSessionVariable().isEnableTabletInternalParallel();
+      129          return !enableTabletInternalParallel || scanRanges.size() > pipelineDop / 2;
+      130      }
+      131  
+      132      private boolean enableAssignScanRangesPerDriverSeq(PlanFragment fragment, List<TScanRangeParams> scanRanges) {
+      133          if (!usePipeline) {
+      134              return false;
+      135          }
+      136  
+      137          if (fragment.isForceAssignScanRangesPerDriverSeq()) {
+      138              return true;
+      139          }
+      140  
+      141          return fragment.isAssignScanRangesPerDriverSeq() &&
+      142                  enableAssignScanRangesPerDriverSeq(scanRanges, fragment.getPipelineDop());
+      143      }
+      144  
+      145      private boolean needAddScanRanges(Set<Integer> visitedReplicatedScanIds, Integer scanId) {
+      146          if (!replicatedScanIds.contains(scanId)) {
+      147              return true;
+      148          }
+      149          return visitedReplicatedScanIds.add(scanId);
+      150      }
+      151  
+      152      private void assignScanRangesToColocateFragmentInstancePerWorker(
+      153              ExecutionFragment execFragment,
+      154              Map<Integer, Long> bucketSeqToWorkerId,
+      155              ColocatedBackendSelector.BucketSeqToScanRange bucketSeqToScanRange) {
+      156          final PlanFragment fragment = execFragment.getPlanFragment();
+      157          final int parallelExecInstanceNum = fragment.getParallelExecNum();
+      158          final int pipelineDop = fragment.getPipelineDop();
+      159  
+      160          // 1. count each node in one fragment should scan how many tablet, gather them in one list
+      161          Map<Long, List<Integer>> workerIdToBucketSeqs = bucketSeqToWorkerId.entrySet().stream()
+      162                  .collect(Collectors.groupingBy(
+      163                          Map.Entry::getValue,
+      164                          Collectors.mapping(Map.Entry::getKey, Collectors.toList())
+      165                  ));
+      166          boolean isNative = execFragment.getColocatedAssignment().isNative();
+      167  
+      168          // bucket-aware execution on lake doesn't support assign to pipeline driver
+      169          // TODO, checking shall we support it
+      170          boolean assignPerDriverSeq = usePipeline && workerIdToBucketSeqs.values().stream()
+      171                  .allMatch(bucketSeqs -> enableAssignScanRangesPerDriverSeq(bucketSeqs, pipelineDop)) && isNative;
+      172  
+      173          if (!assignPerDriverSeq) {
+      174              // these optimize depend on assignPerDriverSeq.
+      175              fragment.disablePhysicalPropertyOptimize();
+      176          }
+      177  
+      178          long bucketScanRows = isNative ? bucketScanRows(bucketSeqToScanRange) : 0;
+      179          int expectedInstanceNum = Math.max(1, parallelExecInstanceNum);
+      180          long instanceAvgScanRows = bucketScanRows / Math.max(1, workerIdToBucketSeqs.size() * expectedInstanceNum);
+      181  
+      182          final Map<Long, FragmentInstance> fragmentInstanceMap = new HashMap<>();
+      183          if (!execFragment.getInstances().isEmpty()) {
+      184              for (FragmentInstance fragmentInstance : execFragment.getInstances()) {
+      185                  fragmentInstanceMap.put(fragmentInstance.getWorkerId(), fragmentInstance);
+      186              }
+      187          }
+      188          
+      189          workerIdToBucketSeqs.forEach((workerId, bucketSeqsOfWorker) -> {
+      190              ComputeNode worker = workerProvider.getWorkerById(workerId);
+      191  
+      192              // 2. split how many scanRange one instance should scan
+      193              List<List<Integer>> bucketSeqsPerInstance = ListUtil.splitBySize(bucketSeqsOfWorker, expectedInstanceNum);
+      194  
+      195              // 3.construct instanceExecParam add the scanRange should be scanned by instance
+      196              bucketSeqsPerInstance.forEach(bucketSeqsOfInstance -> {
+      197                  final boolean reuse = useIncrementalScanRanges && !fragmentInstanceMap.isEmpty();
+      198                  final FragmentInstance instance = reuse
+      199                          ? fragmentInstanceMap.get(workerId)
+      200                          : new FragmentInstance(workerProvider.getWorkerById(workerId), execFragment);
+      201                  if (!reuse) {
+      202                      execFragment.addInstance(instance);
+      203                  }
+      204  
+      205                  // record each instance replicate scan id in set, to avoid add replicate scan range repeatedly
+      206                  // when they are in different buckets
+      207                  Set<Integer> instanceReplicatedScanIds = new HashSet<>();
+      208  
+      209                  if (!assignPerDriverSeq) {
+      210                      bucketSeqsOfInstance.forEach(bucketSeq -> {
+      211                          instance.addBucketSeq(bucketSeq);
+      212                          bucketSeqToScanRange.get(bucketSeq).forEach((scanId, scanRanges) -> {
+      213                              if (needAddScanRanges(instanceReplicatedScanIds, scanId)) {
+      214                                  instance.addScanRanges(scanId, scanRanges);
+      215                              }
+      216                          });
+      217                      });
+      218                  } else {
+      219                      int expectedDop = Math.max(1, pipelineDop);
+      220                      int expectedPhysicalDop = Math.min(expectedDop, bucketSeqsOfInstance.size());
+      221                      // For disable group execution logical dop == physical dop
+      222                      // For enable group execution logical dop >= physical dop
+      223                      int logicalDop = expectedPhysicalDop;
+      224                      if (fragment.isUseGroupExecution()) {
+      225                          // if fragment using group execution
+      226                          SessionVariable sv = ConnectContext.get().getSessionVariable();
+      227                          int maxDop = Math.min(sv.getGroupExecutionGroupScale() * expectedDop,
+      228                                  sv.getGroupExecutionMaxGroups());
+      229                          maxDop = (int) Math.min(instanceAvgScanRows / sv.getGroupExecutionMinScanRows(), maxDop);
+      230                          maxDop = Math.max(maxDop, expectedDop);
+      231                          logicalDop = Math.min(bucketSeqsOfInstance.size(), maxDop);
+      232                          // Align logical dop to physical dop integer multiplier
+      233                          // For a bucket shuffle join, the hash table corresponding to 
+      234                          // the i-th probe is i % build_dop (physical dop).
+      235                          logicalDop = (logicalDop / expectedPhysicalDop) * expectedPhysicalDop;
+      236                      }
+      237                      List<List<Integer>> bucketSeqsPerDriverSeq = ListUtil.splitBySize(bucketSeqsOfInstance, logicalDop);
+      238                      instance.setPipelineDop(expectedPhysicalDop);
+      239                      instance.setGroupExecutionScanDop(logicalDop);
+      240  
+      241                      for (int driverSeq = 0; driverSeq < bucketSeqsPerDriverSeq.size(); driverSeq++) {
+      242                          int finalDriverSeq = driverSeq;
+      243                          bucketSeqsPerDriverSeq.get(driverSeq).forEach(bucketSeq -> {
+      244                              instance.addBucketSeqAndDriverSeq(bucketSeq, finalDriverSeq);
+      245                              bucketSeqToScanRange.get(bucketSeq).forEach((scanId, scanRanges) -> {
+      246                                  if (needAddScanRanges(instanceReplicatedScanIds, scanId)) {
+      247                                      instance.addScanRanges(scanId, finalDriverSeq, scanRanges);
+      248                                  }
+      249                              });
+      250                          });
+      251                      }
+      252  
+      253                      instance.paddingScanRanges();
+      254                  }
+      255              });
+      256          });
+      257      }
+      258  
+      259      private void assignScanRangesToNormalFragmentInstancePerWorker(ExecutionFragment execFragment) {
+      260          final PlanFragment fragment = execFragment.getPlanFragment();
+      261          final int parallelExecInstanceNum = fragment.getParallelExecNum();
+      262          final int pipelineDop = fragment.getPipelineDop();
+      263  
+      264          FragmentScanRangeAssignment assignment = execFragment.getScanRangeAssignment();
+      265          final Map<Long, FragmentInstance> fragmentInstanceMap = new HashMap<>();
+      266          if (!execFragment.getInstances().isEmpty()) {
+      267              for (FragmentInstance fragmentInstance : execFragment.getInstances()) {
+      268                  fragmentInstanceMap.put(fragmentInstance.getWorkerId(), fragmentInstance);
+      269              }
+      270          }
+      271          assignment.forEach((workerId, scanRangesPerWorker) -> {
+      272              // 1. Handle normal scan node firstly
+      273              scanRangesPerWorker.forEach((scanId, scanRangesOfNode) -> {
+      274                  if (replicatedScanIds.contains(scanId)) {
+      275                      return;
+      276                  }
+      277  
+      278                  int expectedInstanceNum = Math.max(1, parallelExecInstanceNum);
+      279                  List<List<TScanRangeParams>> scanRangesPerInstance =
+      280                          ListUtil.splitBySize(scanRangesOfNode, expectedInstanceNum);
+      281                  for (List<TScanRangeParams> scanRanges : scanRangesPerInstance) {
+      282                      FragmentInstance instance = null;
+      283                      if (useIncrementalScanRanges && !fragmentInstanceMap.isEmpty()) {
+      284                          instance = fragmentInstanceMap.get(workerId);
+      285                      } else {
+      286                          instance =
+      287                                  new FragmentInstance(workerProvider.getWorkerById(workerId), execFragment);
+      288                          execFragment.addInstance(instance);
+      289                      }
+      290                      if (!enableAssignScanRangesPerDriverSeq(fragment, scanRanges)) {
+      291                          instance.addScanRanges(scanId, scanRanges);
+      292                          fragment.disablePhysicalPropertyOptimize();
+      293                      } else {
+      294                          int expectedPhysicalDop = Math.max(1, Math.min(pipelineDop, scanRanges.size()));
+      295                          int logicalDop = expectedPhysicalDop;
+      296                          if (fragment.isUseGroupExecution()) {
+      297                              // if fragment using group execution
+      298                              SessionVariable sv = ConnectContext.get().getSessionVariable();
+      299                              int maxDop = Math.min(sv.getGroupExecutionGroupScale() * expectedPhysicalDop,
+      300                                      sv.getGroupExecutionMaxGroups());
+      301                              maxDop = (int) Math.min(totalScanRows(scanRanges) / sv.getGroupExecutionMinScanRows(),
+      302                                      maxDop);
+      303                              maxDop = Math.max(maxDop, expectedPhysicalDop);
+      304                              logicalDop = Math.min(scanRanges.size(), maxDop);
+      305                          }
+      306                          List<List<TScanRangeParams>> scanRangesPerDriverSeq;
+      307                          if (Config.enable_schedule_insert_query_by_row_count && isLoadType
+      308                                  && !scanRanges.isEmpty()
+      309                                  && scanRanges.get(0).getScan_range().isSetInternal_scan_range()) {
+      310                              scanRangesPerDriverSeq = splitScanRangeParamByRowCount(scanRanges, logicalDop);
+      311                          } else {
+      312                              scanRangesPerDriverSeq = ListUtil.splitBySize(scanRanges, logicalDop);
+      313                          }
+      314                          // Make pipeline input dop == sink dop to avoid extra local-shuffle.
+      315                          // TODO: Make XXXSink support group execution to further improve performance.
+      316                          if (fragment.isForceAssignScanRangesPerDriverSeq() &&
+      317                                  expectedPhysicalDop != pipelineDop) {
+      318                              fragment.setPipelineDop(expectedPhysicalDop);
+      319                          }
+      320                          instance.setPipelineDop(expectedPhysicalDop);
+      321                          instance.setGroupExecutionScanDop(logicalDop);
+      322  
+      323                          for (int driverSeq = 0; driverSeq < scanRangesPerDriverSeq.size(); ++driverSeq) {
+      324                              instance.addScanRanges(scanId, driverSeq, scanRangesPerDriverSeq.get(driverSeq));
+      325                          }
+      326                          instance.paddingScanRanges();
+      327                      }
+      328                  }
+      329              });
+      330  
+      331              // 2. Handle replicated scan node, if needed
+      332              boolean isReplicated = execFragment.isReplicated();
+      333              if (isReplicated) {
+      334                  scanRangesPerWorker.forEach((scanId, scanRangesPerNode) -> {
+      335                      if (!replicatedScanIds.contains(scanId)) {
+      336                          return;
+      337                      }
+      338  
+      339                      for (FragmentInstance instance : execFragment.getInstances()) {
+      340                          instance.addScanRanges(scanId, scanRangesPerNode);
+      341                      }
+      342                  });
+      343              }
+      344          });
+      345      }
+      346  
+      347      /**
+      348       * Split scan range params into groupNum groups by each group's row count.
+      349       */
+      350      private static List<List<TScanRangeParams>> splitScanRangeParamByRowCount(List<TScanRangeParams> scanRangeParams,
+      351                                                                                int groupNum) {
+      352          List<List<TScanRangeParams>> result = new ArrayList<>(groupNum);
+      353          for (int i = 0; i < groupNum; i++) {
+      354              result.add(new ArrayList<>());
+      355          }
+      356          long[] dataSizePerGroup = new long[groupNum];
+      357          for (TScanRangeParams scanRangeParam : scanRangeParams) {
+      358              int minIndex = 0;
+      359              long minDataSize = dataSizePerGroup[0];
+      360              for (int i = 1; i < groupNum; i++) {
+      361                  if (dataSizePerGroup[i] < minDataSize) {
+      362                      minIndex = i;
+      363                      minDataSize = dataSizePerGroup[i];
+      364                  }
+      365              }
+      366              dataSizePerGroup[minIndex] +=
+      367                      Math.max(1, scanRangeParam.getScan_range().getInternal_scan_range().getRow_count());
+      368              result.get(minIndex).add(scanRangeParam);
+      369          }
+      370  
+      371          if (LOG.isDebugEnabled()) {
+      372              LOG.debug("dataSizePerGroup: {}", dataSizePerGroup);
+      373          }
+      374  
+      375          return result;
+      376      }
+      377  
+      378      // collect total size for each scan range
+      379      private static long bucketScanRows(ColocatedBackendSelector.BucketSeqToScanRange bucketSeqToScanRange) {
+      380          return bucketSeqToScanRange.entrySet().stream().flatMap(entry -> entry.getValue().entrySet().stream())
+      381                  .flatMap(item -> item.getValue().stream())
+      382                  .map(scanRange -> scanRange.getScan_range().internal_scan_range.getRow_count())
+      383                  .reduce(0L, Long::sum);
+      384      }
+      385  
+      386      private static long totalScanRows(List<TScanRangeParams> scanRangeParams) {
+      387          return scanRangeParams.stream()
+      388                  .map(scanRange -> scanRange.getScan_range().getInternal_scan_range().getRow_count())
+      389                  .reduce(0L, Long::sum);
+      390      }
+      391  }

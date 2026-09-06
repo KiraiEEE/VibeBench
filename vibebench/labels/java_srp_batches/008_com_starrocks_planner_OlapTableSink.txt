@@ -1,0 +1,406 @@
+row 8   StarRocks/starrocks#70342
+============================================================================
+CLASS com.starrocks.planner.OlapTableSink   loc=889 methods=41 wmc=165 lcom=0.1 c3=0.0883359131734358
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      132  public class OlapTableSink extends DataSink {
+      133      private static final Logger LOG = LogManager.getLogger(OlapTableSink.class);
+      134  
+      135      // input variables
+      136      private OlapTable dstTable;
+      137      private final TupleDescriptor tupleDescriptor;
+      138      // specified partition ids. this list should not be empty and should contains all related partition ids
+      139      private List<Long> partitionIds;
+      140  
+      141      // set after init called
+      142      private TDataSink tDataSink;
+      143  
+      144      private final TWriteQuorumType writeQuorum;
+      145      private final boolean enableReplicatedStorage;
+      146  
+      147      private boolean nullExprInAutoIncrement;
+      148      private boolean missAutoIncrementColumn;
+      149      private int autoIncrementSlotId;
+      150      private boolean enableAutomaticPartition;
+      151      private TPartialUpdateMode partialUpdateMode;
+      152      private ComputeResource computeResource = WarehouseManager.DEFAULT_RESOURCE;
+      153      private long automaticBucketSize = 0;
+      154      private boolean enableDynamicOverwrite = false;
+      155      private boolean isFromOverwrite = false;
+      156      private boolean isMultiStatementTxn = false;
+      157  
+      158      public OlapTableSink(OlapTable dstTable, TupleDescriptor tupleDescriptor, List<Long> partitionIds,
+      159                           TWriteQuorumType writeQuorum, boolean enableReplicatedStorage,
+      160                           boolean nullExprInAutoIncrement, boolean enableAutomaticPartition) {
+      161          this.dstTable = dstTable;
+      162          this.tupleDescriptor = tupleDescriptor;
+      163          this.partitionIds = partitionIds;
+      164          this.writeQuorum = writeQuorum;
+      165          this.enableReplicatedStorage = enableReplicatedStorage;
+      166          this.nullExprInAutoIncrement = nullExprInAutoIncrement;
+      167          this.missAutoIncrementColumn = false;
+      168          this.enableAutomaticPartition = enableAutomaticPartition;
+      169          this.autoIncrementSlotId = -1;
+      170          if (tupleDescriptor != null) {
+      171              for (int i = 0; i < this.tupleDescriptor.getSlots().size(); ++i) {
+      172                  SlotDescriptor slot = this.tupleDescriptor.getSlots().get(i);
+      173                  if (slot.getColumn().isAutoIncrement()) {
+      174                      this.autoIncrementSlotId = slot.getId().asInt();
+      175                      break;
+      176                  }
+      177              }
+      178          }
+      179          this.partialUpdateMode = TPartialUpdateMode.UNKNOWN_MODE;
+      180      }
+      181  
+      182      public OlapTableSink(OlapTable dstTable, TupleDescriptor tupleDescriptor, List<Long> partitionIds,
+      183                           TWriteQuorumType writeQuorum, boolean enableReplicatedStorage,
+      184                           boolean nullExprInAutoIncrement, boolean enableAutomaticPartition, ComputeResource computeResource) {
+      185          this(dstTable, tupleDescriptor, partitionIds, writeQuorum, enableReplicatedStorage,
+      186                  nullExprInAutoIncrement, enableAutomaticPartition);
+      187          this.computeResource = computeResource;
+      188      }
+      189  
+      190      public void init(TUniqueId loadId, long txnId, long dbId, long loadChannelTimeoutS)
+      191              throws AnalysisException {
+      192          TOlapTableSink tSink = new TOlapTableSink();
+      193          tSink.setLoad_id(loadId);
+      194          tSink.setTxn_id(txnId);
+      195          tSink.setNull_expr_in_auto_increment(nullExprInAutoIncrement);
+      196          tSink.setMiss_auto_increment_column(missAutoIncrementColumn);
+      197          tSink.setAuto_increment_slot_id(autoIncrementSlotId);
+      198          TransactionState txnState =
+      199                  GlobalStateMgr.getCurrentState().getGlobalTransactionMgr()
+      200                          .getTransactionState(dbId, txnId);
+      201          if (txnState != null) {
+      202              tSink.setTxn_trace_parent(txnState.getTraceParent());
+      203              tSink.setLabel(txnState.getLabel());
+      204              tSink.setWrite_txn_log(txnState.isUseCombinedTxnLog());
+      205          }
+      206          tSink.setDb_id(dbId);
+      207          tSink.setLoad_channel_timeout_s(loadChannelTimeoutS);
+      208          tSink.setIs_lake_table(dstTable.isCloudNativeTableOrMaterializedView() ||
+      209                  dstTable.isOlapExternalTable() && ((ExternalOlapTable) dstTable).isSourceTableCloudNativeTableOrMaterializedView());
+      210          tSink.setKeys_type(dstTable.getKeysType().toThrift());
+      211          tSink.setWrite_quorum_type(writeQuorum);
+      212          // If table has Gin index, do not allow replicated storage
+      213          boolean hasGin = dstTable.getIndexes().stream()
+      214                  .anyMatch(index -> index.getIndexType() == IndexType.GIN);
+      215          tSink.setEnable_replicated_storage(enableReplicatedStorage && !hasGin);
+      216          tSink.setAutomatic_bucket_size(automaticBucketSize);
+      217          tSink.setEncryption_meta(GlobalStateMgr.getCurrentState().getKeyMgr().getCurrentKEKAsEncryptionMeta());
+      218          tSink.setEnable_data_file_bundling(dstTable.isFileBundling());
+      219          Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbId);
+      220          if (db != null) {
+      221              tSink.setDb_name(db.getFullName());
+      222          }
+      223          tDataSink = new TDataSink(TDataSinkType.DATA_SPLIT_SINK);
+      224          tDataSink.setType(TDataSinkType.OLAP_TABLE_SINK);
+      225          tDataSink.setOlap_table_sink(tSink);
+      226  
+      227          for (Long partitionId : partitionIds) {
+      228              Partition part = dstTable.getPartition(partitionId);
+      229              if (part == null) {
+      230                  ErrorReport.reportAnalysisException(ErrorCode.ERR_UNKNOWN_PARTITION, partitionId, dstTable.getName());
+      231              }
+      232          }
+      233      }
+      234  
+      235      public void setMissAutoIncrementColumn() {
+      236          this.missAutoIncrementColumn = true;
+      237      }
+      238  
+      239      public TPartialUpdateMode getPartialUpdateMode() {
+      240          return partialUpdateMode;
+      241      }
+      242  
+      243      public void updateLoadId(TUniqueId newLoadId) {
+      244          tDataSink.getOlap_table_sink().setLoad_id(newLoadId);
+      245      }
+      246  
+      247      public void setPartialUpdateMode(TPartialUpdateMode mode) {
+      248          this.partialUpdateMode = mode;
+      249      }
+      250  
+      251      public void setDynamicOverwrite(boolean enableDynamicOverwrite) {
+      252          this.enableDynamicOverwrite = enableDynamicOverwrite;
+      253      }
+      254  
+      255      public void setIsFromOverwrite(boolean isFromOverwrite) {
+      256          this.isFromOverwrite = isFromOverwrite;
+      257      }
+      258  
+      259      public void setIsMultiStatementsTxn(boolean isMultiStatementTxn) {
+      260          this.isMultiStatementTxn = isMultiStatementTxn;
+      261      }
+      262  
+      263      public void complete(String mergeCondition) throws StarRocksException {
+      264          TOlapTableSink tSink = tDataSink.getOlap_table_sink();
+      265          if (mergeCondition != null && !mergeCondition.isEmpty()) {
+      266              tSink.setMerge_condition(mergeCondition);
+      267          }
+      268          complete();
+      269      }
+      270  
+      271      public List<Long> getOpenPartitions() {
+      272          // if load start after shema change, we should open all of the partitions to avoid different schema during schema change
+      273          // if load start before schema change, it will be finished in waiting_txn state
+      274          if (dstTable.getState() != OlapTable.OlapTableState.NORMAL) {
+      275              return partitionIds;
+      276          }
+      277          if (enableAutomaticPartition && enableDynamicOverwrite) {
+      278              return new ArrayList<>(Collections.singletonList(
+      279                      dstTable.getPartition(ExpressionRangePartitionInfo.AUTOMATIC_SHADOW_PARTITION_NAME).getId()));
+      280          }
+      281          if (isFromOverwrite || !enableAutomaticPartition || Config.max_load_initial_open_partition_number <= 0
+      282                  || partitionIds.size() < Config.max_load_initial_open_partition_number) {
+      283              return partitionIds;
+      284          }
+      285          // bigger partition id means newer partition
+      286          // open last max_load_initial_open_partition_number partitions
+      287          Set<Long> openPartitionIds = partitionIds.stream().collect(
+      288                  Collectors.toCollection(() -> new TreeSet<>(Collections.reverseOrder())))
+      289                  .stream().limit(Config.max_load_initial_open_partition_number).collect(Collectors.toSet());;
+      290          if (!dstTable.getDoubleWritePartitions().isEmpty()) {
+      291              openPartitionIds.addAll(dstTable.getDoubleWritePartitions().keySet());
+      292          }
+      293  
+      294          return openPartitionIds.stream().collect(Collectors.toList());
+      295      }
+      296  
+      297      // must called after tupleDescriptor is computed
+      298      public void complete() throws StarRocksException {
+      299          TOlapTableSink tSink = tDataSink.getOlap_table_sink();
+      300  
+      301          tSink.setTable_id(dstTable.getId());
+      302          tSink.setTable_name(dstTable.getName());
+      303          tSink.setTuple_id(tupleDescriptor.getId().asInt());
+      304          tSink.setIs_multi_statements_txn(isMultiStatementTxn);
+      305  
+      306          // Acquire read lock to protect partition data access.
+      307          // During planning, the PlannerMetaLocker may release locks for performance,
+      308          // so we need to acquire lock here to ensure consistent reads of partition info.
+      309          // Only lock when accessing partition-related data structures (HashMap not thread-safe).
+      310          long dbId = tSink.getDb_id();
+      311          long tableId = dstTable.getId();
+      312          Locker locker = new Locker();
+      313          locker.lockTableWithIntensiveDbLock(dbId, tableId, LockType.READ);
+      314          try {
+      315              int numReplicas = 1;
+      316              Optional<Partition> optionalPartition = dstTable.getPartitions().stream().findFirst();
+      317              if (optionalPartition.isPresent()) {
+      318                  long partitionId = optionalPartition.get().getId();
+      319                  numReplicas = dstTable.getPartitionInfo().getReplicationNum(partitionId);
+      320              }
+      321              if (enableAutomaticPartition && enableDynamicOverwrite) {
+      322                  tSink.setDynamic_overwrite(true);
+      323              }
+      324              tSink.setNum_replicas(numReplicas);
+      325              tSink.setNeed_gen_rollup(dstTable.shouldLoadToNewRollup());
+      326              tSink.setSchema(createSchema(tSink.getDb_id(), dstTable, tupleDescriptor));
+      327              TOlapTablePartitionParam partitionParam = createPartition(tSink.getDb_id(), dstTable, tupleDescriptor,
+      328                      enableAutomaticPartition, automaticBucketSize, getOpenPartitions());
+      329              tSink.setPartition(partitionParam);
+      330              tSink.setLocation(createLocation(dstTable, partitionParam, enableReplicatedStorage, computeResource));
+      331              tSink.setNodes_info(GlobalStateMgr.getCurrentState().createNodesInfo(computeResource,
+      332                      getSystemInfoService(dstTable)));
+      333              tSink.setPartial_update_mode(this.partialUpdateMode);
+      334              tSink.setAutomatic_bucket_size(automaticBucketSize);
+      335              if (canUseColocateMVIndex(dstTable)) {
+      336                  tSink.setEnable_colocate_mv_index(true);
+      337              }
+      338  
+      339              Map<Long, Long> doubleWritePartitions = dstTable.getDoubleWritePartitions();
+      340              if (!doubleWritePartitions.isEmpty()) {
+      341                  List<Long> doubleWritePartitionIds = new ArrayList<>();
+      342                  for (Long partitionId : partitionIds) {
+      343                      if (doubleWritePartitions.containsKey(partitionId)) {
+      344                          doubleWritePartitionIds.add(doubleWritePartitions.get(partitionId));
+      345                      }
+      346                  }
+      347  
+      348                  if (!doubleWritePartitionIds.isEmpty()) {
+      349                      TOlapTableSink tSink2 = new TOlapTableSink(tSink);
+      350                      tSink2.unsetPartition();
+      351                      tSink2.unsetLocation();
+      352                      TOlapTablePartitionParam partitionParam2 = createPartition(tSink2.getDb_id(), dstTable,
+      353                              tupleDescriptor, false, automaticBucketSize, doubleWritePartitionIds);
+      354                      tSink2.setPartition(partitionParam2);
+      355                      tSink2.setLocation(createLocation(dstTable, partitionParam2, enableReplicatedStorage,
+      356                              computeResource));
+      357                      tSink2.setIgnore_out_of_partition(true);
+      358  
+      359                      TDataSink tDataSink2 = new TDataSink();
+      360                      tDataSink2.setType(TDataSinkType.OLAP_TABLE_SINK);
+      361                      tDataSink2.setOlap_table_sink(tSink2);
+      362  
+      363                      TDataSink newDataSink = new TDataSink(TDataSinkType.MULTI_OLAP_TABLE_SINK);
+      364                      tDataSink.setSink_id(0);
+      365                      newDataSink.addToMulti_olap_table_sinks(tDataSink);
+      366                      tDataSink2.setSink_id(1);
+      367                      newDataSink.addToMulti_olap_table_sinks(tDataSink2);
+      368                      tDataSink = newDataSink;
+      369                  }
+      370              }
+      371          } finally {
+      372              locker.unLockTableWithIntensiveDbLock(dbId, tableId, LockType.READ);
+      373          }
+      374  
+      375          LOG.debug("tDataSink: {}", tDataSink);
+      376      }
+      377  
+      378      @Override
+      379      public String getExplainString(String prefix, TExplainLevel explainLevel) {
+      380          StringBuilder strBuilder = new StringBuilder();
+      381          strBuilder.append(prefix + "OLAP TABLE SINK\n");
+      382          strBuilder.append(prefix + "  TABLE: " + dstTable.getName() + "\n");
+      383          strBuilder.append(prefix + "  TUPLE ID: " + tupleDescriptor.getId() + "\n");
+      384          strBuilder.append(prefix + "  " + DataPartition.RANDOM.getExplainString(explainLevel));
+      385          return strBuilder.toString();
+      386      }
+      387  
+      388      @Override
+      389      public PlanNodeId getExchNodeId() {
+      390          return null;
+      391      }
+      392  
+      393      @Override
+      394      public DataPartition getOutputPartition() {
+      395          return DataPartition.RANDOM;
+      396      }
+      397  
+      398      @Override
+      399      public TDataSink toThrift() {
+      400          return tDataSink;
+      401      }
+      402  
+      403      public static TOlapTableSchemaParam createSchema(long dbId, OlapTable table, TupleDescriptor tupleDescriptor) {
+      404          TOlapTableSchemaParam schemaParam = new TOlapTableSchemaParam();
+      405          schemaParam.setDb_id(dbId);
+      406          schemaParam.setTable_id(table.getId());
+      407          schemaParam.setVersion(table.getIndexMetaByIndexId(table.getBaseIndexId()).getSchemaVersion());
+      408  
+      409          schemaParam.tuple_desc = tupleDescriptor.toThrift();
+      410          for (SlotDescriptor slotDesc : tupleDescriptor.getSlots()) {
+      411              schemaParam.addToSlot_descs(slotDesc.toThrift());
+      412          }
+      413  
+      414          for (Map.Entry<Long, MaterializedIndexMeta> pair : table.getIndexIdToMeta().entrySet()) {
+      415              MaterializedIndexMeta indexMeta = pair.getValue();
+      416              List<String> columns = Lists.newArrayList();
+      417              List<TColumn> columnsDesc = Lists.newArrayList();
+      418              List<Integer> columnSortKeyUids = Lists.newArrayList();
+      419              Map<String, String> columnToExprValue = new HashMap<>();
+      420              columns.addAll(indexMeta
+      421                      .getSchema()
+      422                      .stream()
+      423                      .map(column -> column.isShadowColumn() ? column.getName() : column.getColumnId().getId())
+      424                      .collect(Collectors.toList()));
+      425              boolean isShadow = indexMeta.getSchema().stream().anyMatch(column -> column.isShadowColumn());
+      426              for (Column column : indexMeta.getSchema()) {
+      427                  TColumn tColumn = column.toThrift();
+      428                  tColumn.setColumn_name(column.getColumnId().getId());
+      429                  column.setIndexFlag(tColumn, table.getIndexes(), table.getBfColumnIds());
+      430                  columnsDesc.add(tColumn);
+      431                  if (column.getDefaultExpr() != null && column.calculatedDefaultValue() != null) {
+      432                      columnToExprValue.put(column.getColumnId().getId(), column.calculatedDefaultValue());
+      433                  }
+      434              }
+      435              if (indexMeta.getSortKeyUniqueIds() != null) {
+      436                  columnSortKeyUids.addAll(indexMeta.getSortKeyUniqueIds());
+      437              }
+      438  
+      439              if (table.getKeysType() == KeysType.PRIMARY_KEYS) {
+      440                  columns.add(Load.LOAD_OP_COLUMN);
+      441              }
+      442  
+      443              TOlapTableColumnParam columnParam = new TOlapTableColumnParam(columnsDesc, columnSortKeyUids,
+      444                      indexMeta.getShortKeyColumnCount());
+      445              TOlapTableIndexSchema indexSchema = new TOlapTableIndexSchema(pair.getKey(), columns,
+      446                      indexMeta.getSchemaHash());
+      447              indexSchema.setColumn_param(columnParam);
+      448              indexSchema.setSchema_id(indexMeta.getSchemaId());
+      449              indexSchema.setColumn_to_expr_value(columnToExprValue);
+      450              indexSchema.setIs_shadow(isShadow);
+      451              schemaParam.addToIndexes(indexSchema);
+      452              if (indexMeta.getWhereClause() != null) {
+      453                  Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbId);
+      454                  if (db == null) {
+      455                      throw new SemanticException("Database %s is not found", dbId);
+      456                  }
+      457                  String dbName = db.getFullName();
+      458  
+      459                  Map<String, SlotDescriptor> descMap = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+      460                  for (SlotDescriptor slot : tupleDescriptor.getSlots()) {
+      461                      descMap.put(slot.getColumn().getName(), slot);
+      462                  }
+      463  
+      464                  Expr whereClause = indexMeta.getWhereClause().clone();
+      465                  List<SlotRef> slots = Lists.newArrayList();
+      466                  whereClause.collect(SlotRef.class, slots);
+      467  
+      468                  ExprSubstitutionMap smap = new ExprSubstitutionMap();
+      469                  for (SlotRef slot : slots) {
+      470                      SlotDescriptor slotDesc = descMap.get(slot.getColumnName());
+      471                      Preconditions.checkNotNull(slotDesc);
+      472                      smap.getLhs().add(slot);
+      473                      SlotRef slotRef = new SlotRef(slotDesc);
+      474                      slotRef.setColumnName(slot.getColumnName());
+      475                      smap.getRhs().add(slotRef);
+      476                  }
+      477                  whereClause = whereClause.clone(smap);
+      478  
+      479                  // sourceScope must be set null tableName for its Field in RelationFields
+      480                  // because we hope slotRef can not be resolved in sourceScope but can be
+      481                  // resolved in outputScope to force to replace the node using outputExprs.
+      482                  List<Expr> outputExprs = Lists.newArrayList();
+      483                  for (Column col : table.getBaseSchema()) {
+      484                      SlotDescriptor slotDesc = descMap.get(col.getName());
+      485                      Preconditions.checkState(slotDesc != null);
+      486                      SlotRef slotRef = new SlotRef(slotDesc);
+      487                      slotRef.setColumnName(col.getName());
+      488                      outputExprs.add(slotRef);
+      489                  }
+      490                  ConnectContext connectContext = new ConnectContext();
+      491                  Scope sourceScope = new Scope(RelationId.anonymous(),
+      492                          new RelationFields(table.getBaseSchema().stream().map(col ->
+      493                                          new Field(col.getName(), col.getType(), null, null))
+      494                                  .collect(Collectors.toList())));
+      495                  Scope outputScope = new Scope(RelationId.anonymous(),
+      496                          new RelationFields(table.getBaseSchema().stream().map(col ->
+      497                                          new Field(col.getName(), col.getType(), new TableName(dbName, table.getName()), null))
+      498                                  .collect(Collectors.toList())));
+      499                  SelectAnalyzer.RewriteAliasVisitor visitor =
+      500                          new SelectAnalyzer.RewriteAliasVisitor(sourceScope, outputScope,
+      501                                  outputExprs, connectContext);
+      502  
+      503                  whereClause = whereClause.accept(visitor, null);
+      504                  whereClause = Expr.analyzeAndCastFold(whereClause);
+      505  
+      506                  indexSchema.setWhere_clause(whereClause.treeToThrift());
+      507                  if (LOG.isDebugEnabled()) {
+      508                      LOG.debug("OlapTableSink Where clause: {}", whereClause.explain());
+      509                  }
+      510              }
+      511          }
+      512          return schemaParam;
+      513      }
+      514  
+      515      private static List<String> getDistColumns(DistributionInfo distInfo, OlapTable table) throws StarRocksException {
+      516          List<String> distColumns = Lists.newArrayList();
+      517          switch (distInfo.getType()) {
+      518              case HASH: {
+      519                  HashDistributionInfo hashDistributionInfo = (HashDistributionInfo) distInfo;
+      520                  for (ColumnId columnId : hashDistributionInfo.getDistributionColumns()) {
+      521                      distColumns.add(columnId.getId());
+      522                  }
+      523                  break;
+      524              }
+      525              case RANDOM: {
+      526                  break;
+      527              }
+      528              default:
+      529                  throw new StarRocksException("unsupported distributed type, type=" + distInfo.getType());
+      530          }
+      531          return distColumns;
+       ... truncated at 400 lines ...

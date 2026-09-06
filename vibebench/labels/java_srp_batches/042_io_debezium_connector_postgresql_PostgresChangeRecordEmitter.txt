@@ -1,0 +1,337 @@
+row 42   debezium/debezium#7130
+============================================================================
+CLASS io.debezium.connector.postgresql.PostgresChangeRecordEmitter   loc=332 methods=15 wmc=55 lcom=0.1428571428571428 c3=0.1813194803258629
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       50  public class PostgresChangeRecordEmitter extends RelationalChangeRecordEmitter<PostgresPartition> {
+       51  
+       52      private static final Logger LOGGER = LoggerFactory.getLogger(PostgresChangeRecordEmitter.class);
+       53  
+       54      private final ReplicationMessage message;
+       55      private final PostgresSchema schema;
+       56      private final PostgresConnectorConfig connectorConfig;
+       57      private final PostgresConnection connection;
+       58      private final TableId tableId;
+       59      private final Map<String, Object> cachedOldToastedValues = new HashMap<>();
+       60  
+       61      public PostgresChangeRecordEmitter(PostgresPartition partition, OffsetContext offset, Clock clock, PostgresConnectorConfig connectorConfig, PostgresSchema schema,
+       62                                         PostgresConnection connection, TableId tableId,
+       63                                         ReplicationMessage message) {
+       64          super(partition, offset, clock, connectorConfig);
+       65  
+       66          this.schema = schema;
+       67          this.message = message;
+       68          this.connectorConfig = connectorConfig;
+       69          this.connection = connection;
+       70  
+       71          this.tableId = tableId;
+       72          Objects.requireNonNull(this.tableId);
+       73      }
+       74  
+       75      @Override
+       76      public Operation getOperation() {
+       77          switch (message.getOperation()) {
+       78              case INSERT:
+       79                  return Operation.CREATE;
+       80              case UPDATE:
+       81                  return Operation.UPDATE;
+       82              case DELETE:
+       83                  return Operation.DELETE;
+       84              case TRUNCATE:
+       85                  return Operation.TRUNCATE;
+       86              default:
+       87                  throw new IllegalArgumentException("Received event of unexpected command type: " + message.getOperation());
+       88          }
+       89      }
+       90  
+       91      @Override
+       92      public void emitChangeRecords(DataCollectionSchema schema, Receiver<PostgresPartition> receiver) throws InterruptedException {
+       93          schema = synchronizeTableSchema(schema);
+       94          super.emitChangeRecords(schema, receiver);
+       95      }
+       96  
+       97      @Override
+       98      protected void emitTruncateRecord(Receiver receiver, TableSchema tableSchema) throws InterruptedException {
+       99          Struct envelope = tableSchema.getEnvelopeSchema().truncate(getOffset().getSourceInfo(), getClock().currentTimeAsInstant());
+      100          receiver.changeRecord(getPartition(), tableSchema, Operation.TRUNCATE, null, envelope, getOffset(), null);
+      101      }
+      102  
+      103      @Override
+      104      protected Object[] getOldColumnValues() {
+      105          try {
+      106              switch (getOperation()) {
+      107                  case CREATE:
+      108                      return null;
+      109                  case UPDATE:
+      110                      return columnValues(message.getOldTupleList(), tableId, true, true, true);
+      111                  default:
+      112                      return columnValues(message.getOldTupleList(), tableId, true, false, true);
+      113              }
+      114          }
+      115          catch (SQLException e) {
+      116              throw new ConnectException(e);
+      117          }
+      118      }
+      119  
+      120      @Override
+      121      protected Object[] getNewColumnValues() {
+      122          try {
+      123              switch (getOperation()) {
+      124                  case CREATE:
+      125                      return columnValues(message.getNewTupleList(), tableId, true, false, false);
+      126                  case UPDATE:
+      127                      return columnValues(message.getNewTupleList(), tableId, true, false, false);
+      128                  default:
+      129                      return null;
+      130              }
+      131          }
+      132          catch (SQLException e) {
+      133              throw new ConnectException(e);
+      134          }
+      135      }
+      136  
+      137      private DataCollectionSchema synchronizeTableSchema(DataCollectionSchema tableSchema) {
+      138          if (getOperation() == Operation.DELETE || !message.shouldSchemaBeSynchronized()) {
+      139              return tableSchema;
+      140          }
+      141          final TableId tableId = (TableId) tableSchema.id();
+      142          final Table table = schema.tableFor(tableId);
+      143          final List<ReplicationMessage.Column> columns = message.getNewTupleList();
+      144          // check if we need to refresh our local schema due to DB schema changes for this table
+      145          if (schemaChanged(columns, table)) {
+      146              // Refresh the schema so we get information about primary keys
+      147              refreshTableFromDatabase(tableId);
+      148              // Update the schema with metadata coming from decoder message
+      149              schema.refresh(tableFromFromMessage(columns, schema.tableFor(tableId)));
+      150          }
+      151          return schema.schemaFor(tableId);
+      152      }
+      153  
+      154      private Object[] columnValues(List<ReplicationMessage.Column> columns, TableId tableId, boolean refreshSchemaIfChanged,
+      155                                    boolean sourceOfToasted, boolean oldValues)
+      156              throws SQLException {
+      157          if (columns == null || columns.isEmpty()) {
+      158              return null;
+      159          }
+      160          final Table table = schema.tableFor(tableId);
+      161          Objects.requireNonNull(table);
+      162  
+      163          // based on the schema columns, create the values on the same position as the columns
+      164          List<Column> schemaColumns = table.columns();
+      165          // based on the replication message without toasted columns for now
+      166          List<ReplicationMessage.Column> columnsWithoutToasted = columns.stream().filter(Predicates.not(ReplicationMessage.Column::isToastedColumn))
+      167                  .collect(Collectors.toList());
+      168          // JSON does not deliver a list of all columns for REPLICA IDENTITY DEFAULT
+      169          Object[] values = new Object[columnsWithoutToasted.size() < schemaColumns.size() ? schemaColumns.size() : columnsWithoutToasted.size()];
+      170  
+      171          final Set<String> undeliveredToastableColumns = new HashSet<>(schema.getToastableColumnsForTableId(table.id()));
+      172          for (ReplicationMessage.Column column : columns) {
+      173              // DBZ-298 Quoted column names will be sent like that in messages, but stored unquoted in the column names
+      174              final String columnName = Strings.unquoteIdentifierPart(column.getName());
+      175              undeliveredToastableColumns.remove(columnName);
+      176  
+      177              int position = getPosition(columnName, table, values);
+      178              if (position != -1) {
+      179                  Object value = column.getValue(() -> (BaseConnection) connection.connection(), connectorConfig.includeUnknownDatatypes());
+      180                  if (sourceOfToasted) {
+      181                      cachedOldToastedValues.put(columnName, value);
+      182                  }
+      183                  else {
+      184                      if (UnchangedToastedReplicationMessageColumn.isUnchangedToastedValue(value)) {
+      185                          final Object candidate = cachedOldToastedValues.get(columnName);
+      186                          if (candidate != null) {
+      187                              value = candidate;
+      188                          }
+      189                      }
+      190                  }
+      191                  values[position] = value;
+      192              }
+      193          }
+      194          return values;
+      195      }
+      196  
+      197      private int getPosition(String columnName, Table table, Object[] values) {
+      198          final Column tableColumn = table.columnWithName(columnName);
+      199  
+      200          if (tableColumn == null) {
+      201              LOGGER.warn(
+      202                      "Internal schema is out-of-sync with incoming decoder events; column {} will be omitted from the change event.",
+      203                      columnName);
+      204              return -1;
+      205          }
+      206          int position = tableColumn.position() - 1;
+      207          if (position < 0 || position >= values.length) {
+      208              LOGGER.warn(
+      209                      "Internal schema is out-of-sync with incoming decoder events; column {} will be omitted from the change event.",
+      210                      columnName);
+      211              return -1;
+      212          }
+      213          return position;
+      214      }
+      215  
+      216      private Optional<DataCollectionSchema> newTable(TableId tableId) {
+      217          LOGGER.debug("Schema for table '{}' is missing", tableId);
+      218          refreshTableFromDatabase(tableId);
+      219          final TableSchema tableSchema = schema.schemaFor(tableId);
+      220          if (tableSchema == null) {
+      221              LOGGER.warn("cannot load schema for table '{}'", tableId);
+      222              return Optional.empty();
+      223          }
+      224          else {
+      225              LOGGER.debug("refreshed DB schema to include table '{}'", tableId);
+      226              return Optional.of(tableSchema);
+      227          }
+      228      }
+      229  
+      230      private void refreshTableFromDatabase(TableId tableId) {
+      231          try {
+      232              schema.refresh(connection, tableId, connectorConfig.skipRefreshSchemaOnMissingToastableData());
+      233          }
+      234          catch (SQLException e) {
+      235              throw new ConnectException("Database error while refresing table schema", e);
+      236          }
+      237      }
+      238  
+      239      static Optional<DataCollectionSchema> updateSchema(Partition partition, DataCollectionId tableId, ChangeRecordEmitter<PostgresPartition> changeRecordEmitter) {
+      240          return ((PostgresChangeRecordEmitter) changeRecordEmitter).newTable((TableId) tableId);
+      241      }
+      242  
+      243      private boolean schemaChanged(List<ReplicationMessage.Column> columns, Table table) {
+      244          int tableColumnCount = table.columns().size();
+      245          int replicationColumnCount = columns.size();
+      246  
+      247          boolean msgHasMissingColumns = tableColumnCount > replicationColumnCount;
+      248  
+      249          if (msgHasMissingColumns && connectorConfig.skipRefreshSchemaOnMissingToastableData()) {
+      250              // if we are ignoring missing toastable data for the purpose of schema sync, we need to modify the
+      251              // hasMissingColumns boolean to account for this. If there are untoasted columns missing from the replication
+      252              // message, we'll still have missing columns and thus require a schema refresh. However, we can /possibly/
+      253              // avoid the refresh if there are only toastable columns missing from the message.
+      254              msgHasMissingColumns = hasMissingUntoastedColumns(table, columns);
+      255          }
+      256  
+      257          boolean msgHasAdditionalColumns = tableColumnCount < replicationColumnCount;
+      258  
+      259          if (msgHasMissingColumns || msgHasAdditionalColumns) {
+      260              // the table metadata has less or more columns than the event, which means the table structure has changed,
+      261              // so we need to trigger a refresh...
+      262              LOGGER.info("Different column count {} present in the server message as schema in memory contains {}; refreshing table schema",
+      263                      replicationColumnCount,
+      264                      tableColumnCount);
+      265              return true;
+      266          }
+      267  
+      268          // go through the list of columns from the message to figure out if any of them are new or have changed their type based
+      269          // on what we have in the table metadata....
+      270          return columns.stream().anyMatch(message -> {
+      271              String columnName = message.getName();
+      272              Column column = table.columnWithName(columnName);
+      273              if (column == null) {
+      274                  LOGGER.info("found new column '{}' present in the server message which is not part of the table metadata; refreshing table schema", columnName);
+      275                  return true;
+      276              }
+      277              else {
+      278                  final int localType = column.nativeType();
+      279                  final int incomingType = message.getType().getOid();
+      280                  if (localType != incomingType) {
+      281                      final int incomingRootType = message.getType().getRootType().getOid();
+      282                      if (localType != incomingRootType) {
+      283                          LOGGER.info("detected new type for column '{}', old type was {} ({}), new type is {} ({}); refreshing table schema", columnName, localType,
+      284                                  column.typeName(),
+      285                                  incomingType, message.getType().getName());
+      286                          return true;
+      287                      }
+      288                  }
+      289                  final int localLength = column.length();
+      290                  final int incomingLength = message.getTypeMetadata().getLength();
+      291                  if (localLength != incomingLength) {
+      292                      LOGGER.info("detected new length for column '{}', old length was {}, new length is {}; refreshing table schema", columnName, localLength,
+      293                              incomingLength);
+      294                      return true;
+      295                  }
+      296                  final int localScale = column.scale().orElseGet(() -> 0);
+      297                  final int incomingScale = message.getTypeMetadata().getScale();
+      298                  if (localScale != incomingScale) {
+      299                      LOGGER.info("detected new scale for column '{}', old scale was {}, new scale is {}; refreshing table schema", columnName, localScale,
+      300                              incomingScale);
+      301                      return true;
+      302                  }
+      303                  final boolean localOptional = column.isOptional();
+      304                  final boolean incomingOptional = message.isOptional();
+      305                  if (localOptional != incomingOptional) {
+      306                      LOGGER.info("detected new optional status for column '{}', old value was {}, new value is {}; refreshing table schema", columnName, localOptional,
+      307                              incomingOptional);
+      308                      return true;
+      309                  }
+      310              }
+      311              return false;
+      312          });
+      313      }
+      314  
+      315      private boolean hasMissingUntoastedColumns(Table table, List<ReplicationMessage.Column> columns) {
+      316          List<String> msgColumnNames = columns.stream()
+      317                  .map(ReplicationMessage.Column::getName)
+      318                  .collect(Collectors.toList());
+      319  
+      320          // Compute list of table columns not present in the replication message
+      321          List<String> missingColumnNames = table.columns()
+      322                  .stream()
+      323                  .filter(c -> !msgColumnNames.contains(c.name()))
+      324                  .map(Column::name)
+      325                  .collect(Collectors.toList());
+      326  
+      327          List<String> toastableColumns = schema.getToastableColumnsForTableId(table.id());
+      328  
+      329          if (LOGGER.isDebugEnabled()) {
+      330              LOGGER.debug("msg columns: '{}' --- missing columns: '{}' --- toastableColumns: '{}",
+      331                      String.join(",", msgColumnNames),
+      332                      String.join(",", missingColumnNames),
+      333                      String.join(",", toastableColumns));
+      334          }
+      335          // Return `true` if we have some columns not in the replication message that are not toastable or that we do
+      336          // not recognize
+      337          return !toastableColumns.containsAll(missingColumnNames);
+      338      }
+      339  
+      340      private Table tableFromFromMessage(List<ReplicationMessage.Column> columns, Table table) {
+      341          final TableEditor combinedTable = table.edit()
+      342                  .setColumns(columns.stream()
+      343                          .map(column -> {
+      344                              final PostgresType type = column.getType();
+      345                              final ColumnEditor columnEditor = Column.editor()
+      346                                      .name(column.getName())
+      347                                      .jdbcType(type.getRootType().getJdbcId())
+      348                                      .type(type.getName())
+      349                                      .optional(column.isOptional())
+      350                                      .nativeType(type.getRootType().getOid());
+      351                              columnEditor.length(column.getTypeMetadata().getLength());
+      352                              columnEditor.scale(column.getTypeMetadata().getScale());
+      353  
+      354                              // as long as default value is not added to the decoded message metadata, we must apply
+      355                              // the current default read from the database
+      356                              Optional.ofNullable(table.columnWithName(column.getName()))
+      357                                      .flatMap(Column::defaultValueExpression)
+      358                                      .ifPresent(columnEditor::defaultValueExpression);
+      359  
+      360                              return columnEditor.create();
+      361                          })
+      362                          .collect(Collectors.toList()));
+      363          final List<String> pkCandidates = new ArrayList<>(table.primaryKeyColumnNames());
+      364          final Iterator<String> itPkCandidates = pkCandidates.iterator();
+      365          while (itPkCandidates.hasNext()) {
+      366              final String candidateName = itPkCandidates.next();
+      367              if (!combinedTable.hasUniqueValues() && combinedTable.columnWithName(candidateName) == null) {
+      368                  LOGGER.error("Potentional inconsistency in key for candidate {}", candidateName);
+      369                  itPkCandidates.remove();
+      370              }
+      371          }
+      372          combinedTable.setPrimaryKeyNames(pkCandidates);
+      373          return combinedTable.create();
+      374      }
+      375  
+      376      @Override
+      377      protected boolean skipEmptyMessages() {
+      378          return true;
+      379      }
+      380  
+      381  }

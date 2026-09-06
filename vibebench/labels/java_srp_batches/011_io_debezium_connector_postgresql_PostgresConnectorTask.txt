@@ -1,0 +1,404 @@
+row 11   debezium/debezium#7130
+============================================================================
+CLASS io.debezium.connector.postgresql.PostgresConnectorTask   loc=399 methods=14 wmc=45 lcom=0.3076923076923077 c3=0.0899587187631634
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       67  public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, PostgresOffsetContext> {
+       68  
+       69      private static final Logger LOGGER = LoggerFactory.getLogger(PostgresConnectorTask.class);
+       70      private static final String CONTEXT_NAME = "postgres-connector-task";
+       71  
+       72      private volatile PostgresTaskContext taskContext;
+       73      private volatile ChangeEventQueue<DataChangeEvent> queue;
+       74      private volatile PostgresConnection jdbcConnection;
+       75      private volatile PostgresConnection beanRegistryJdbcConnection;
+       76      private volatile ReplicationConnection replicationConnection = null;
+       77  
+       78      private volatile ErrorHandler errorHandler;
+       79      private volatile PostgresSchema schema;
+       80  
+       81      private Partition.Provider<PostgresPartition> partitionProvider = null;
+       82      private OffsetContext.Loader<PostgresOffsetContext> offsetContextLoader = null;
+       83  
+       84      private final ReentrantLock commitLock = new ReentrantLock();
+       85  
+       86      @Override
+       87      public ChangeEventSourceCoordinator<PostgresPartition, PostgresOffsetContext> start(Configuration config) {
+       88          final PostgresConnectorConfig connectorConfig = new PostgresConnectorConfig(config);
+       89          final TopicNamingStrategy<TableId> topicNamingStrategy = connectorConfig.getTopicNamingStrategy(CommonConnectorConfig.TOPIC_NAMING_STRATEGY);
+       90          final SchemaNameAdjuster schemaNameAdjuster = connectorConfig.schemaNameAdjuster();
+       91          ThreadNameContext threadNameContext = ThreadNameContext.from(connectorConfig);
+       92  
+       93          final Charset databaseCharset;
+       94          try (PostgresConnection tempConnection = new PostgresConnection(connectorConfig.getJdbcConfig(), PostgresConnection.CONNECTION_GENERAL,
+       95                  threadNameContext)) {
+       96              databaseCharset = tempConnection.getDatabaseCharset();
+       97          }
+       98  
+       99          final PostgresValueConverterBuilder valueConverterBuilder = (typeRegistry) -> PostgresValueConverter.of(
+      100                  connectorConfig,
+      101                  databaseCharset,
+      102                  typeRegistry);
+      103  
+      104          MainConnectionProvidingConnectionFactory<PostgresConnection> connectionFactory = new DefaultMainConnectionProvidingConnectionFactory<>(
+      105                  () -> new PostgresConnection(connectorConfig.getJdbcConfig(), valueConverterBuilder, PostgresConnection.CONNECTION_GENERAL,
+      106                          threadNameContext));
+      107          // Global JDBC connection used both for snapshotting and streaming.
+      108          // Must be able to resolve datatypes.
+      109          jdbcConnection = connectionFactory.mainConnection();
+      110          try {
+      111              jdbcConnection.setAutoCommit(false);
+      112          }
+      113          catch (SQLException e) {
+      114              throw new DebeziumException(e);
+      115          }
+      116  
+      117          final TypeRegistry typeRegistry = jdbcConnection.getTypeRegistry();
+      118          final PostgresDefaultValueConverter defaultValueConverter = jdbcConnection.getDefaultValueConverter();
+      119          final PostgresValueConverter valueConverter = valueConverterBuilder.build(typeRegistry);
+      120  
+      121          schema = new PostgresSchema(connectorConfig, defaultValueConverter, topicNamingStrategy, valueConverter);
+      122          this.taskContext = new PostgresTaskContext(connectorConfig, schema, topicNamingStrategy);
+      123          this.partitionProvider = new PostgresPartition.Provider(connectorConfig, config);
+      124          this.offsetContextLoader = new PostgresOffsetContext.Loader(connectorConfig);
+      125          final Offsets<PostgresPartition, PostgresOffsetContext> previousOffsets = getPreviousOffsets(
+      126                  this.partitionProvider, this.offsetContextLoader);
+      127          final Clock clock = Clock.system();
+      128          final PostgresOffsetContext previousOffset = previousOffsets.getTheOnlyOffset();
+      129  
+      130          // Manual Bean Registration
+      131          beanRegistryJdbcConnection = connectionFactory.newConnection();
+      132          connectorConfig.getBeanRegistry().add(StandardBeanNames.CONFIGURATION, config);
+      133          connectorConfig.getBeanRegistry().add(StandardBeanNames.CONNECTOR_CONFIG, connectorConfig);
+      134          connectorConfig.getBeanRegistry().add(StandardBeanNames.DATABASE_SCHEMA, schema);
+      135          connectorConfig.getBeanRegistry().add(StandardBeanNames.JDBC_CONNECTION, beanRegistryJdbcConnection);
+      136          connectorConfig.getBeanRegistry().add(StandardBeanNames.VALUE_CONVERTER, valueConverter);
+      137          connectorConfig.getBeanRegistry().add(StandardBeanNames.OFFSETS, previousOffsets);
+      138  
+      139          // Service providers
+      140          registerServiceProviders(connectorConfig.getServiceRegistry());
+      141  
+      142          final SnapshotterService snapshotterService = connectorConfig.getServiceRegistry().tryGetService(SnapshotterService.class);
+      143          final Snapshotter snapshotter = snapshotterService.getSnapshotter();
+      144  
+      145          try {
+      146              checkWalLevel(beanRegistryJdbcConnection, snapshotterService);
+      147          }
+      148          catch (SQLException e) {
+      149  
+      150              LOGGER.error("Failed testing connection for {} with user '{}'", beanRegistryJdbcConnection.connectionString(),
+      151                      beanRegistryJdbcConnection.username(), e);
+      152          }
+      153  
+      154          // Validate guardrail limits for captured tables to prevent loading excessive table schemas into memory
+      155          if (connectorConfig.getGuardrailCollectionsMax() <= 0) {
+      156              LOGGER.info("Guardrail validation skipped");
+      157          }
+      158          else {
+      159              validateGuardrailLimits(connectorConfig, jdbcConnection);
+      160          }
+      161  
+      162          validateSchemaHistory(connectorConfig, jdbcConnection::validateLogPosition, previousOffsets, schema, snapshotter);
+      163  
+      164          LoggingContext.PreviousContext previousContext = taskContext.configureLoggingContext(CONTEXT_NAME);
+      165  
+      166          if (previousOffset == null) {
+      167              LOGGER.info("No previous offset found");
+      168          }
+      169          else {
+      170              LOGGER.info("Found previous offset {}", previousOffset);
+      171          }
+      172  
+      173          try {
+      174              SlotState slotInfo = getSlotState(connectorConfig);
+      175  
+      176              SlotCreationResult slotCreatedInfo = tryToCreateSlot(snapshotter, connectorConfig, slotInfo);
+      177  
+      178              try {
+      179                  jdbcConnection.commit();
+      180              }
+      181              catch (SQLException e) {
+      182                  throw new DebeziumException(e);
+      183              }
+      184  
+      185              queue = new ChangeEventQueue.Builder<DataChangeEvent>()
+      186                      .pollInterval(connectorConfig.getPollInterval())
+      187                      .maxBatchSize(connectorConfig.getMaxBatchSize())
+      188                      .maxQueueSize(connectorConfig.getMaxQueueSize())
+      189                      .maxQueueSizeInBytes(connectorConfig.getMaxQueueSizeInBytes())
+      190                      .loggingContextSupplier(() -> taskContext.configureLoggingContext(CONTEXT_NAME))
+      191                      .build();
+      192  
+      193              errorHandler = new PostgresErrorHandler(connectorConfig, queue, errorHandler);
+      194  
+      195              final PostgresEventMetadataProvider metadataProvider = new PostgresEventMetadataProvider();
+      196  
+      197              SignalProcessor<PostgresPartition, PostgresOffsetContext> signalProcessor = new SignalProcessor<>(
+      198                      PostgresConnector.class, connectorConfig, Map.of(),
+      199                      getAvailableSignalChannels(),
+      200                      DocumentReader.defaultReader(),
+      201                      previousOffsets);
+      202  
+      203              final PostgresEventDispatcher<TableId> dispatcher = new PostgresEventDispatcher<>(
+      204                      connectorConfig,
+      205                      topicNamingStrategy,
+      206                      schema,
+      207                      queue,
+      208                      connectorConfig.getTableFilters().dataCollectionFilter(),
+      209                      DataChangeEvent::new,
+      210                      PostgresChangeRecordEmitter::updateSchema,
+      211                      metadataProvider,
+      212                      connectorConfig.createHeartbeat(
+      213                              topicNamingStrategy,
+      214                              schemaNameAdjuster,
+      215                              () -> new PostgresConnection(connectorConfig.getJdbcConfig(), PostgresConnection.CONNECTION_GENERAL, threadNameContext),
+      216                              exception -> {
+      217                                  String sqlErrorId = exception.getSQLState();
+      218                                  switch (sqlErrorId) {
+      219                                      case "57P01":
+      220                                          // Postgres error admin_shutdown, see https://www.postgresql.org/docs/12/errcodes-appendix.html
+      221                                          throw new DebeziumException("Could not execute heartbeat action query (Error: " + sqlErrorId + ")", exception);
+      222                                      case "57P03":
+      223                                          // Postgres error cannot_connect_now, see https://www.postgresql.org/docs/12/errcodes-appendix.html
+      224                                          throw new RetriableException("Could not execute heartbeat action query (Error: " + sqlErrorId + ")", exception);
+      225                                      default:
+      226                                          break;
+      227                                  }
+      228                              }),
+      229                      schemaNameAdjuster,
+      230                      signalProcessor);
+      231  
+      232              NotificationService<PostgresPartition, PostgresOffsetContext> notificationService = new NotificationService<>(getNotificationChannels(),
+      233                      connectorConfig, SchemaFactory.get(), dispatcher::enqueueNotification);
+      234  
+      235              ChangeEventSourceCoordinator<PostgresPartition, PostgresOffsetContext> coordinator = new PostgresChangeEventSourceCoordinator(
+      236                      previousOffsets,
+      237                      errorHandler,
+      238                      PostgresConnector.class,
+      239                      connectorConfig,
+      240                      new PostgresChangeEventSourceFactory(
+      241                              connectorConfig,
+      242                              snapshotterService,
+      243                              connectionFactory,
+      244                              errorHandler,
+      245                              dispatcher,
+      246                              clock,
+      247                              schema,
+      248                              taskContext,
+      249                              replicationConnection,
+      250                              slotCreatedInfo,
+      251                              slotInfo),
+      252                      new DefaultChangeEventSourceMetricsFactory<>(),
+      253                      dispatcher,
+      254                      schema,
+      255                      snapshotterService,
+      256                      slotInfo,
+      257                      signalProcessor,
+      258                      notificationService);
+      259  
+      260              coordinator.start(taskContext, this.queue, metadataProvider);
+      261  
+      262              return coordinator;
+      263          }
+      264          finally {
+      265              previousContext.restore();
+      266          }
+      267      }
+      268  
+      269      private SlotCreationResult tryToCreateSlot(Snapshotter snapshotter, PostgresConnectorConfig connectorConfig, SlotState slotInfo) {
+      270  
+      271          SlotCreationResult slotCreatedInfo = null;
+      272          if (snapshotter.shouldStream()) {
+      273              replicationConnection = createReplicationConnection(this.taskContext,
+      274                      connectorConfig.maxRetries(), connectorConfig.retryDelay());
+      275  
+      276              // we need to create the slot before we start streaming if it doesn't exist
+      277              // otherwise we can't stream back changes happening while the snapshot is taking place
+      278              if (slotInfo == null) {
+      279                  if (connectorConfig.isReadOnlyConnection()) {
+      280                      LOGGER.warn("Connector is configured to be in read-only mode but replication slot was not found.\n" +
+      281                              "The attempt to create it can fail. Please check you configuration in case.");
+      282                  }
+      283                  try {
+      284                      slotCreatedInfo = replicationConnection.createReplicationSlot().orElse(null);
+      285                  }
+      286                  catch (SQLException ex) {
+      287                      String message = "Creation of replication slot failed";
+      288                      if (ex.getMessage().contains("already exists")) {
+      289                          message += "; when setting up multiple connectors for the same database host, please make sure to use a distinct replication slot name for each.";
+      290                      }
+      291                      throw new DebeziumException(message, ex);
+      292                  }
+      293              }
+      294          }
+      295          return slotCreatedInfo;
+      296      }
+      297  
+      298      private SlotState getSlotState(PostgresConnectorConfig connectorConfig) {
+      299          SlotState slotInfo = null;
+      300          try {
+      301              if (LOGGER.isInfoEnabled()) {
+      302                  LOGGER.info(jdbcConnection.serverInfo().toString());
+      303              }
+      304              slotInfo = jdbcConnection.getReplicationSlotState(connectorConfig.slotName(), connectorConfig.plugin().getPostgresPluginName());
+      305          }
+      306          catch (SQLException e) {
+      307              LOGGER.warn("unable to load info of replication slot, Debezium will try to create the slot");
+      308          }
+      309          return slotInfo;
+      310      }
+      311  
+      312      public ReplicationConnection createReplicationConnection(PostgresTaskContext taskContext, int maxRetries, Duration retryDelay)
+      313              throws ConnectException {
+      314          final Metronome metronome = Metronome.parker(retryDelay, Clock.SYSTEM);
+      315          short retryCount = 0;
+      316          ReplicationConnection replicationConnection = null;
+      317          while (retryCount <= maxRetries) {
+      318              try {
+      319                  return taskContext.createReplicationConnection(jdbcConnection);
+      320              }
+      321              catch (SQLException ex) {
+      322                  retryCount++;
+      323                  if (retryCount > maxRetries) {
+      324                      LOGGER.error("Too many errors connecting to server. All {} retries failed.", maxRetries);
+      325                      throw new ConnectException(ex);
+      326                  }
+      327  
+      328                  LOGGER.warn("Error connecting to server; will attempt retry {} of {} after {} " +
+      329                          "seconds. Exception message: {}", retryCount, maxRetries, retryDelay.getSeconds(), ex.getMessage());
+      330                  try {
+      331                      metronome.pause();
+      332                  }
+      333                  catch (InterruptedException e) {
+      334                      LOGGER.warn("Connection retry sleep interrupted by exception: " + e);
+      335                      Thread.currentThread().interrupt();
+      336                  }
+      337              }
+      338          }
+      339          return replicationConnection;
+      340      }
+      341  
+      342      @Override
+      343      public List<SourceRecord> doPoll() throws InterruptedException {
+      344          final List<DataChangeEvent> records = queue.poll();
+      345  
+      346          return records.stream()
+      347                  .map(DataChangeEvent::getRecord)
+      348                  .collect(Collectors.toList());
+      349      }
+      350  
+      351      @Override
+      352      protected void doStop() {
+      353          // The replication connection is regularly closed at the end of streaming phase
+      354          // in case of error it can happen that the connector is terminated before the stremaing
+      355          // phase is started. It can lead to a leaked connection.
+      356          // This is guard to make sure the connection is closed.
+      357          try {
+      358              if (replicationConnection != null) {
+      359                  replicationConnection.close();
+      360              }
+      361          }
+      362          catch (Exception e) {
+      363              LOGGER.trace("Error while closing replication connection", e);
+      364          }
+      365  
+      366          try {
+      367              if (beanRegistryJdbcConnection != null) {
+      368                  beanRegistryJdbcConnection.close();
+      369              }
+      370          }
+      371          catch (Exception e) {
+      372              LOGGER.trace("Error while closing JDBC bean registry connection", e);
+      373          }
+      374  
+      375          if (jdbcConnection != null) {
+      376              jdbcConnection.close();
+      377          }
+      378  
+      379          if (schema != null) {
+      380              schema.close();
+      381          }
+      382      }
+      383  
+      384      @Override
+      385      public String version() {
+      386          return Module.version();
+      387      }
+      388  
+      389      @Override
+      390      protected Iterable<Field> getAllConfigurationFields() {
+      391          return PostgresConnectorConfig.ALL_FIELDS;
+      392      }
+      393  
+      394      @Override
+      395      public void commitRecord(SourceRecord record, RecordMetadata metadata) throws InterruptedException {
+      396          // Do nothing
+      397      }
+      398  
+      399      @Override
+      400      public void commit() throws InterruptedException {
+      401          shouldPerformCommit.set(true);
+      402      }
+      403  
+      404      @Override
+      405      public void performCommit() {
+      406          boolean locked = commitLock.tryLock();
+      407  
+      408          if (locked) {
+      409              try {
+      410                  if (coordinator != null) {
+      411                      Offsets<PostgresPartition, PostgresOffsetContext> offsets = this.getPreviousOffsets(this.partitionProvider, this.offsetContextLoader);
+      412                      if (offsets.getOffsets() != null) {
+      413                          offsets.getOffsets()
+      414                                  .entrySet()
+      415                                  .stream()
+      416                                  .filter(e -> e.getValue() != null)
+      417                                  .forEach(entry -> {
+      418                                      Map<String, String> partition = entry.getKey().getSourcePartition();
+      419                                      Map<String, ?> lastOffset = entry.getValue().getOffset();
+      420                                      LOGGER.debug("Committing offset '{}' for partition '{}'", partition, lastOffset);
+      421                                      coordinator.commitOffset(partition, lastOffset);
+      422                                  });
+      423                      }
+      424                  }
+      425              }
+      426              finally {
+      427                  commitLock.unlock();
+      428              }
+      429          }
+      430          else {
+      431              LOGGER.warn("Couldn't commit processed log positions with the source database due to a concurrent connector shutdown or restart");
+      432          }
+      433      }
+      434  
+      435      public PostgresTaskContext getTaskContext() {
+      436          return taskContext;
+      437      }
+      438  
+      439      private void validateGuardrailLimits(PostgresConnectorConfig connectorConfig, PostgresConnection connection) {
+      440          try {
+      441              Set<TableId> allTableIds = connection.getAllTableIds(connectorConfig.databaseName());
+      442              GuardrailValidator validator = new GuardrailValidator(connectorConfig, schema);
+      443              validator.validate(allTableIds);
+      444          }
+      445          catch (SQLException e) {
+      446              throw new DebeziumException("Failed to validate guardrail limits", e);
+      447          }
+      448      }
+      449  
+      450      private static void checkWalLevel(PostgresConnection connection, SnapshotterService snapshotterService) throws SQLException {
+      451          final String walLevel = connection.queryAndMap(
+      452                  "SHOW wal_level",
+      453                  connection.singleResultMapper(rs -> rs.getString("wal_level"), "Could not fetch wal_level"));
+      454          if (!"logical".equals(walLevel)) {
+      455  
+      456              if (snapshotterService.getSnapshotter() != null && snapshotterService.getSnapshotter().shouldStream()) {
+      457                  // Logical WAL_LEVEL is only necessary for CDC snapshotting
+      458                  throw new SQLException("Postgres server wal_level property must be 'logical' but is: '" + walLevel + "'");
+      459              }
+      460              else {
+      461                  LOGGER.warn("WAL_LEVEL check failed but this is ignored as CDC was not requested");
+      462              }
+      463          }
+      464      }
+      465  }

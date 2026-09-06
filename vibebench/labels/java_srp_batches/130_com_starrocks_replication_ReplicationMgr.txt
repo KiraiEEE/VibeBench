@@ -1,0 +1,211 @@
+row 130   StarRocks/starrocks#70342
+============================================================================
+CLASS com.starrocks.replication.ReplicationMgr   loc=206 methods=17 wmc=40 lcom=0.0625 c3=0.1820411663975103
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       44  public class ReplicationMgr extends FrontendDaemon {
+       45      private static final Logger LOG = LogManager.getLogger(ReplicationMgr.class);
+       46  
+       47      @SerializedName(value = "runningJobs")
+       48      private final Map<Long, ReplicationJob> runningJobs = Maps.newConcurrentMap(); // Running jobs
+       49  
+       50      @SerializedName(value = "committedJobs")
+       51      private final Map<Long, ReplicationJob> committedJobs = Maps.newConcurrentMap(); // Committed jobs
+       52  
+       53      @SerializedName(value = "abortedJobs")
+       54      private final Map<Long, ReplicationJob> abortedJobs = Maps.newConcurrentMap(); // Aborted jobs, will retry later
+       55  
+       56      public ReplicationMgr() {
+       57          super("ReplicationMgr", Config.replication_interval_ms);
+       58      }
+       59  
+       60      @Override
+       61      protected void runAfterCatalogReady() {
+       62          runRunningJobs();
+       63          clearExpiredJobs();
+       64      }
+       65  
+       66      public void addReplicationJob(TTableReplicationRequest request) throws StarRocksException {
+       67          ReplicationJob job = new ReplicationJob(request);
+       68          addReplicationJob(job);
+       69      }
+       70  
+       71      public void addReplicationJob(ReplicationJob job) throws AlreadyExistsException {
+       72          // Limit replication job size
+       73          if (runningJobs.size() >= Config.replication_max_parallel_table_count) {
+       74              throw new RuntimeException(
+       75                      "The replication jobs exceeds the replication_max_parallel_table_count: "
+       76                              + Config.replication_max_parallel_table_count);
+       77          }
+       78  
+       79          // Limit replication replica count
+       80          long replicationReplicaCount = getReplicatingReplicaCount();
+       81          if (replicationReplicaCount >= Config.replication_max_parallel_replica_count) {
+       82              throw new RuntimeException("The replicating replica count in all running replication jobs "
+       83                      + replicationReplicaCount
+       84                      + " exceeds replication_max_parallel_replica_count: "
+       85                      + Config.replication_max_parallel_replica_count);
+       86          }
+       87  
+       88          // Limit replication data size
+       89          long replicatingDataSizeMB = getReplicatingDataSize() / 1048576;
+       90          if (replicatingDataSizeMB >= Config.replication_max_parallel_data_size_mb) {
+       91              throw new RuntimeException("The replicating data size in all running replication jobs "
+       92                      + replicatingDataSizeMB
+       93                      + "(MB) exceeds replication_max_parallel_data_size_mb: "
+       94                      + Config.replication_max_parallel_data_size_mb);
+       95          }
+       96  
+       97          if (runningJobs.putIfAbsent(job.getTableId(), job) != null) {
+       98              throw new AlreadyExistsException("Replication job of table " + job.getTableId() + " is already running");
+       99          }
+      100  
+      101          committedJobs.remove(job.getTableId()); // If the job is committed before, remove it from committed jobs
+      102          abortedJobs.remove(job.getTableId()); // If the job is aborted before, remove it from aborted jobs
+      103  
+      104          LOG.info("Added replication job, database id: {}, table id: {}, "
+      105                  + "replication data size: {}, current replicating data size: {}(MB)",
+      106                  job.getDatabaseId(), job.getTableId(), job.getReplicationDataSize(), replicatingDataSizeMB);
+      107      }
+      108  
+      109      public Collection<ReplicationJob> getRunningJobs() {
+      110          return runningJobs.values();
+      111      }
+      112  
+      113      public Collection<ReplicationJob> getCommittedJobs() {
+      114          return committedJobs.values();
+      115      }
+      116  
+      117      public Collection<ReplicationJob> getAbortedJobs() {
+      118          return abortedJobs.values();
+      119      }
+      120  
+      121      public void cancelRunningJobs() {
+      122          List<ReplicationJob> toRemovedJobs = Lists.newArrayList();
+      123          for (ReplicationJob job : runningJobs.values()) {
+      124              job.cancel();
+      125  
+      126              if (job.getState().equals(ReplicationJobState.ABORTED)) {
+      127                  toRemovedJobs.add(job);
+      128                  abortedJobs.put(job.getTableId(), job);
+      129              }
+      130          }
+      131  
+      132          for (ReplicationJob job : toRemovedJobs) {
+      133              runningJobs.remove(job.getTableId(), job);
+      134          }
+      135      }
+      136  
+      137      public void finishRemoteSnapshotTask(RemoteSnapshotTask task, TFinishTaskRequest request) {
+      138          ReplicationJob job = runningJobs.get(task.getTableId());
+      139          if (job == null) {
+      140              LOG.warn("Remote snapshot task {} is finished, but cannot find it in replication jobs", task);
+      141              return;
+      142          }
+      143  
+      144          job.finishRemoteSnapshotTask(task, request);
+      145      }
+      146  
+      147      public void finishReplicateSnapshotTask(ReplicateSnapshotTask task, TFinishTaskRequest request) {
+      148          ReplicationJob job = runningJobs.get(task.getTableId());
+      149          if (job == null) {
+      150              LOG.warn("Replicate snapshot task {} is finished, but cannot find it in replication jobs", task);
+      151              return;
+      152          }
+      153  
+      154          job.finishReplicateSnapshotTask(task, request);
+      155      }
+      156  
+      157      public void replayReplicationJob(ReplicationJob replicationJob) {
+      158          if (replicationJob.getState().equals(ReplicationJobState.COMMITTED)) {
+      159              committedJobs.put(replicationJob.getTableId(), replicationJob);
+      160              runningJobs.remove(replicationJob.getTableId());
+      161          } else if (replicationJob.getState().equals(ReplicationJobState.ABORTED)) {
+      162              abortedJobs.put(replicationJob.getTableId(), replicationJob);
+      163              runningJobs.remove(replicationJob.getTableId());
+      164          } else {
+      165              runningJobs.put(replicationJob.getTableId(), replicationJob);
+      166          }
+      167      }
+      168  
+      169      public void replayDeleteReplicationJob(ReplicationJob replicationJob) {
+      170          if (replicationJob.getState().equals(ReplicationJobState.COMMITTED)) {
+      171              committedJobs.remove(replicationJob.getTableId());
+      172          } else if (replicationJob.getState().equals(ReplicationJobState.ABORTED)) {
+      173              abortedJobs.remove(replicationJob.getTableId());
+      174          } else {
+      175              runningJobs.remove(replicationJob.getTableId());
+      176          }
+      177      }
+      178  
+      179      private long getReplicatingReplicaCount() {
+      180          long replicatingReplicaCount = 0;
+      181          for (ReplicationJob job : runningJobs.values()) {
+      182              replicatingReplicaCount += job.getReplicationReplicaCount();
+      183          }
+      184          return replicatingReplicaCount;
+      185      }
+      186  
+      187      private long getReplicatingDataSize() {
+      188          long replicatingDataSize = 0;
+      189          for (ReplicationJob job : runningJobs.values()) {
+      190              replicatingDataSize += job.getReplicationDataSize();
+      191          }
+      192          return replicatingDataSize;
+      193      }
+      194  
+      195      private void runRunningJobs() {
+      196          List<ReplicationJob> toRemovedJobs = Lists.newArrayList();
+      197          for (ReplicationJob job : runningJobs.values()) {
+      198              job.run();
+      199  
+      200              ReplicationJobState state = job.getState();
+      201              if (state.equals(ReplicationJobState.COMMITTED)) {
+      202                  toRemovedJobs.add(job);
+      203                  committedJobs.put(job.getTableId(), job);
+      204              } else if (state.equals(ReplicationJobState.ABORTED)) {
+      205                  toRemovedJobs.add(job);
+      206                  abortedJobs.put(job.getTableId(), job);
+      207              }
+      208          }
+      209  
+      210          for (ReplicationJob job : toRemovedJobs) {
+      211              runningJobs.remove(job.getTableId(), job);
+      212          }
+      213      }
+      214  
+      215      private void clearExpiredJobs() {
+      216          for (Iterator<Map.Entry<Long, ReplicationJob>> it = committedJobs.entrySet().iterator(); it.hasNext();) {
+      217              ReplicationJob job = it.next().getValue();
+      218              if (!job.isExpired()) {
+      219                  continue;
+      220              }
+      221  
+      222              GlobalStateMgr.getServingState().getEditLog().logDeleteReplicationJob(job);
+      223              it.remove();
+      224          }
+      225  
+      226          for (Iterator<Map.Entry<Long, ReplicationJob>> it = abortedJobs.entrySet().iterator(); it.hasNext();) {
+      227              ReplicationJob job = it.next().getValue();
+      228              if (!job.isExpired()) {
+      229                  continue;
+      230              }
+      231  
+      232              GlobalStateMgr.getServingState().getEditLog().logDeleteReplicationJob(job);
+      233              it.remove();
+      234          }
+      235      }
+      236  
+      237      public void save(ImageWriter imageWriter) throws IOException, SRMetaBlockException {
+      238          SRMetaBlockWriter writer = imageWriter.getBlockWriter(SRMetaBlockID.REPLICATION_MGR, 1);
+      239          writer.writeJson(this);
+      240          writer.close();
+      241      }
+      242  
+      243      public void load(SRMetaBlockReader reader) throws SRMetaBlockEOFException, IOException, SRMetaBlockException {
+      244          ReplicationMgr replicationMgr = reader.readJson(ReplicationMgr.class);
+      245          runningJobs.putAll(replicationMgr.runningJobs);
+      246          committedJobs.putAll(replicationMgr.committedJobs);
+      247          abortedJobs.putAll(replicationMgr.abortedJobs);
+      248      }
+      249  }

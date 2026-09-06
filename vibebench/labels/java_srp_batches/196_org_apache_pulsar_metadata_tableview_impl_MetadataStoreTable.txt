@@ -1,0 +1,406 @@
+row 196   apache/pulsar#24592
+============================================================================
+CLASS org.apache.pulsar.metadata.tableview.impl.MetadataStoreTableViewImpl   loc=403 methods=25 wmc=58 lcom=0.0416666666666666 c3=0.119478005635287
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       59  @Slf4j
+       60  public class MetadataStoreTableViewImpl<T> implements MetadataStoreTableView<T> {
+       61  
+       62      private static final int FILL_TIMEOUT_IN_MILLIS = 300_000;
+       63      private static final long CACHE_REFRESH_FREQUENCY_IN_MILLIS = 600_000;
+       64      private final ConcurrentMap<String, T> data;
+       65      private final Map<String, T> immutableData;
+       66      private final String name;
+       67      private final MetadataStore store;
+       68      private final MetadataCache<T> cache;
+       69      private final Predicate<String> listenPathValidator;
+       70      private final BiPredicate<T, T> conflictResolver;
+       71      private final List<BiConsumer<String, T>> tailItemListeners;
+       72      private final List<BiConsumer<String, T>> existingItemListeners;
+       73      private final List<BiConsumer<String, T>> outdatedItemListeners;
+       74      private final boolean clearUntrustedData;
+       75      private final long timeoutInMillis;
+       76      private final String pathPrefix;
+       77      private final Consumer<Throwable> tableViewShutDownListener;
+       78  
+       79      @Deprecated
+       80      @Builder
+       81      public MetadataStoreTableViewImpl(@NonNull Class<T> clazz,
+       82                                        @NonNull String name,
+       83                                        @NonNull MetadataStore store,
+       84                                        @NonNull String pathPrefix,
+       85                                        @NonNull BiPredicate<T, T> conflictResolver,
+       86                                        Predicate<String> listenPathValidator,
+       87                                        List<BiConsumer<String, T>> tailItemListeners,
+       88                                        List<BiConsumer<String, T>> existingItemListeners,
+       89                                        long timeoutInMillis) {
+       90          this(clazz, name, store, pathPrefix, conflictResolver, listenPathValidator, tailItemListeners,
+       91                  existingItemListeners, null, false, timeoutInMillis, null);
+       92      }
+       93  
+       94      /**
+       95       * Construct MetadataStoreTableViewImpl.
+       96       *
+       97       * @param clazz                 clazz of the value type
+       98       * @param name                  metadata store tableview name
+       99       * @param store                 metadata store
+      100       * @param pathPrefix            metadata store path prefix
+      101       * @param listenPathValidator   path validator to listen
+      102       * @param conflictResolver      resolve conflicts for concurrent puts
+      103       * @param tailItemListeners     listener for tail item(recently updated) notifications
+      104       * @param existingItemListeners listener for existing items in metadata store
+      105       * @param timeoutInMillis       timeout duration for each sync operation.
+      106       * @param outdatedItemListeners Let's introduce how to ensure the correct element values: 1. The table
+      107       *        view will try its best to ensure that the data is always the latest. When it cannot be guaranteed, see
+      108       *        the next Article 2. If you get an old value, you will receive an update event later, ultimately ensuring
+      109       *        the accuracy of the data. 3. You will receive this notification when the first two cannot be guaranteed
+      110       *        due to the expiration of the metadata store session of the table view。After that, you also received
+      111       *        notifications {@param tailItemListeners} and {@param existingItemListeners}, indicating that the table
+      112       *        view can once again ensure that the first two can work properly.
+      113       * @param clearUntrustedData clear the items that have received the event {@param itemStateOutdatedListeners}. Which
+      114       *        means that rather that to get an untrusted value, to clear the untrusted values. You will not get a
+      115       *        {@param tailItemListeners} for this change, which changed the value cached to null.
+      116       * @param tableViewShutDownListener When the table view still cannot guarantee the real-time performance of the
+      117       *        data after making its best efforts, you will receive this event. It is recommended to restart the table
+      118       *        view at this time. This event will happen after {@param itemStateOutdatedListeners}, which mean it will be
+      119       *        disabled if {@param itemStateOutdatedListeners} is null.
+      120       */
+      121      @Builder
+      122      public MetadataStoreTableViewImpl(@NonNull Class<T> clazz,
+      123                                        @NonNull String name,
+      124                                        @NonNull MetadataStore store,
+      125                                        @NonNull String pathPrefix,
+      126                                        @NonNull BiPredicate<T, T> conflictResolver,
+      127                                        Predicate<String> listenPathValidator,
+      128                                        List<BiConsumer<String, T>> tailItemListeners,
+      129                                        List<BiConsumer<String, T>> existingItemListeners,
+      130                                        @Nullable List<BiConsumer<String, T>> outdatedItemListeners,
+      131                                        boolean clearUntrustedData,
+      132                                        long timeoutInMillis,
+      133                                        @Nullable Consumer<Throwable> tableViewShutDownListener) {
+      134          this.name = name;
+      135          this.data = new ConcurrentHashMap<>();
+      136          this.immutableData = Collections.unmodifiableMap(data);
+      137          this.pathPrefix = pathPrefix;
+      138          this.conflictResolver = conflictResolver;
+      139          this.listenPathValidator = listenPathValidator;
+      140          this.tailItemListeners = new ArrayList<>();
+      141          if (tailItemListeners != null) {
+      142              this.tailItemListeners.addAll(tailItemListeners);
+      143          }
+      144          this.existingItemListeners = new ArrayList<>();
+      145          if (existingItemListeners != null) {
+      146              this.existingItemListeners.addAll(existingItemListeners);
+      147          }
+      148          this.outdatedItemListeners = new ArrayList<>();
+      149          if (outdatedItemListeners != null) {
+      150              this.outdatedItemListeners.addAll(outdatedItemListeners);
+      151          }
+      152          this.clearUntrustedData = clearUntrustedData;
+      153          this.timeoutInMillis = timeoutInMillis;
+      154          this.store = store;
+      155          this.tableViewShutDownListener = tableViewShutDownListener;
+      156          this.cache = store.getMetadataCache(clazz,
+      157                  MetadataCacheConfig.<T>builder()
+      158                          .expireAfterWriteMillis(-1)
+      159                          .refreshAfterWriteMillis(CACHE_REFRESH_FREQUENCY_IN_MILLIS)
+      160                          .retryBackoff(MetadataCacheConfig.NO_RETRY_BACKOFF_BUILDER)
+      161                          .asyncReloadConsumer(this::consumeAsyncReload)
+      162                          .build());
+      163          store.registerListener(this::handleNotification);
+      164          if (store instanceof AbstractMetadataStore abstractMetadataStore) {
+      165              abstractMetadataStore.registerSessionListener(this::handleSessionEvent);
+      166          } else {
+      167              // Since ServiceUnitStateMetadataStoreTableViewImpl has checked the configuration that named
+      168              // "zookeeperSessionExpiredPolicy", skip to print the duplicated log here.
+      169          }
+      170      }
+      171  
+      172      public void start() throws MetadataStoreException {
+      173          fill();
+      174      }
+      175  
+      176      private void consumeAsyncReload(String path, Optional<CacheGetResult<T>> cached) {
+      177          if (!isValidPath(path)) {
+      178              return;
+      179          }
+      180          String key = getKey(path);
+      181          var val = getValue(cached);
+      182          handleTailItem(key, val);
+      183      }
+      184  
+      185      private boolean isValidPath(String path) {
+      186          if (listenPathValidator != null && !listenPathValidator.test(path)) {
+      187              return false;
+      188          }
+      189          return true;
+      190      }
+      191  
+      192      private T getValue(Optional<CacheGetResult<T>> cached) {
+      193          return cached.map(CacheGetResult::getValue).orElse(null);
+      194      }
+      195  
+      196      boolean updateData(String key, T cur) {
+      197          MutableBoolean updated = new MutableBoolean();
+      198          data.compute(key, (k, prev) -> {
+      199              if (Objects.equals(prev, cur)) {
+      200                  if (log.isDebugEnabled()) {
+      201                      log.debug("{} skipped item key={} value={} prev={}",
+      202                              name, key, cur, prev);
+      203                  }
+      204                  updated.setValue(false);
+      205                  return prev;
+      206              } else {
+      207                  updated.setValue(true);
+      208                  return cur;
+      209              }
+      210          });
+      211          return updated.booleanValue();
+      212      }
+      213  
+      214      public void handleSessionEvent(SessionEvent sessionEvent) {
+      215          if (CollectionUtils.isEmpty(outdatedItemListeners)) {
+      216              log.warn("{} Skipped handle metadata store session event {} because does not set itemOutdatedListeners",
+      217                  name, sessionEvent);
+      218              return;
+      219          }
+      220          if (sessionEvent == SessionEvent.SessionLost) {
+      221              Map<String, T> snapshot = new HashMap<>(data);
+      222              log.warn("{} clearing owned bundles because metadata store session lost {}",  name, snapshot);
+      223              for (Map.Entry<String, T> entry : snapshot.entrySet()) {
+      224                  for (var listener : outdatedItemListeners) {
+      225                      try {
+      226                          listener.accept(entry.getKey(), entry.getValue());
+      227                          if (clearUntrustedData) {
+      228                              data.remove(entry.getKey());
+      229                          }
+      230                      } catch (Throwable e) {
+      231                          if (tableViewShutDownListener == null) {
+      232                              log.warn("{} failed to listen item whose state is unknown because of metadata store"
+      233                                      + " session lost. key:{}, val:{}", name, entry.getKey(), entry.getValue(), e);
+      234                          } else {
+      235                              log.warn("{} Shutdown table view, because failed to listen item whose state is unknown due"
+      236                                      + " to metadata store session lost. key:{}, val:{}", name, entry.getKey(),
+      237                                      entry.getValue(), e);
+      238                              tableViewShutDownListener.accept(e);
+      239                          }
+      240                          break;
+      241                      }
+      242                  }
+      243              }
+      244          } else if (sessionEvent == SessionEvent.SessionReestablished) {
+      245              log.info("{} Refilling bundle owner list after metadata store session reestablished",  name);
+      246              // Since just get a session expired issue, we'd better to print the initialize detail logs.
+      247              fillAsync(null, true).exceptionally(ex -> {
+      248                  if (tableViewShutDownListener == null) {
+      249                      log.warn("{} failed to fill existing items after session reestablished", name, ex);
+      250                  } else {
+      251                      log.error("{} Shutdown table view because failed to fill existing items after session"
+      252                          + " reestablished", name, ex);
+      253                      tableViewShutDownListener.accept(ex);
+      254                  }
+      255                  return null;
+      256              });
+      257          }
+      258      }
+      259  
+      260      private void handleTailItem(String key, T val) {
+      261          if (updateData(key, val)) {
+      262              if (log.isDebugEnabled()) {
+      263                  log.debug("{} applying item key={} value={}",
+      264                          name,
+      265                          key,
+      266                          val);
+      267              }
+      268              for (var listener : tailItemListeners) {
+      269                  try {
+      270                      listener.accept(key, val);
+      271                  } catch (Throwable e) {
+      272                      log.error("{} failed to listen tail item key:{}, val:{}",
+      273                              name,
+      274                              key, val, e);
+      275                  }
+      276              }
+      277          }
+      278  
+      279      }
+      280  
+      281      private CompletableFuture<Void> doHandleNotification(String path) {
+      282          if (!isValidPath(path)) {
+      283              return CompletableFuture.completedFuture(null);
+      284          }
+      285          return cache.get(path).thenAccept(valOpt -> {
+      286              String key = getKey(path);
+      287              var val = valOpt.orElse(null);
+      288              handleTailItem(key, val);
+      289          }).exceptionally(e -> {
+      290              log.error("{} failed to handle notification for path:{}", name, path, e);
+      291              return null;
+      292          });
+      293      }
+      294  
+      295      private void handleNotification(org.apache.pulsar.metadata.api.Notification notification) {
+      296  
+      297          if (notification.getType() == NotificationType.ChildrenChanged) {
+      298              return;
+      299          }
+      300  
+      301          String path = notification.getPath();
+      302  
+      303          doHandleNotification(path);
+      304      }
+      305  
+      306  
+      307      private CompletableFuture<Void> handleExisting(String path) {
+      308          if (!isValidPath(path)) {
+      309              return CompletableFuture.completedFuture(null);
+      310          }
+      311          return cache.get(path)
+      312                  .thenAccept(valOpt -> {
+      313                      valOpt.ifPresent(val -> {
+      314                          String key = getKey(path);
+      315                          updateData(key, val);
+      316                          if (log.isDebugEnabled()) {
+      317                              log.debug("{} applying existing item key={} value={}",
+      318                                      name,
+      319                                      key,
+      320                                      val);
+      321                          }
+      322                          for (var listener : existingItemListeners) {
+      323                              try {
+      324                                  listener.accept(key, val);
+      325                              } catch (Throwable e) {
+      326                                  log.error("{} failed to listen existing item key:{}, val:{}", name, key, val,
+      327                                          e);
+      328                                  throw e;
+      329                              }
+      330                          }
+      331                      });
+      332                  });
+      333      }
+      334  
+      335      /**
+      336       * Note: this method only be called when a broker is starting, please call {@link #fillAsync(AtomicLong, boolean)}
+      337       * for other use-case, otherwise, you may get a thread deadlock error.
+      338       */
+      339      private void fill() throws MetadataStoreException {
+      340          AtomicLong loadedCounter = new AtomicLong();
+      341          long maxWaitTime = Math.min(timeoutInMillis, FILL_TIMEOUT_IN_MILLIS);
+      342          try {
+      343              fillAsync(loadedCounter, false).get(maxWaitTime, TimeUnit.MILLISECONDS);
+      344              log.info("{} completed filling existing items with size:{}", name, loadedCounter.get());
+      345          } catch (InterruptedException | ExecutionException | TimeoutException e) {
+      346              String err = name + " failed to fill existing items in "
+      347                      + TimeUnit.MILLISECONDS.toSeconds(maxWaitTime) + " secs. Filled count:"
+      348                      + loadedCounter.get();
+      349              log.error(err);
+      350              throw new MetadataStoreException(err, FutureUtil.unwrapCompletionException(e));
+      351          }
+      352      }
+      353  
+      354      private CompletableFuture<Void> handleExistingLeafs(String rootPath, String path, @Nullable AtomicLong count,
+      355                                                          boolean printDetails) {
+      356          return store.getChildren(path).thenCompose(children -> {
+      357              if (children.isEmpty()) {
+      358                  // Skip root path.
+      359                  if (rootPath.equals(path)) {
+      360                      return CompletableFuture.completedFuture(null);
+      361                  }
+      362                  // Leaf node.
+      363                  if (count != null) {
+      364                      count.incrementAndGet();
+      365                  }
+      366                  if (printDetails) {
+      367                      log.info("handling exist leaf {}", path);
+      368                  }
+      369                  return handleExisting(path);
+      370              } else {
+      371                  // Dir node.
+      372                  // The limitation of max quantity of concurrency reading is not needed, because the metadata store
+      373                  // client works in a single thread, and all OPs will be packaged into a batch, the more the faster.
+      374                  // If metadata store receives too many requests, it will split them into multi requests itself.
+      375                  if (printDetails) {
+      376                      log.info("handling exist dir {}", path);
+      377                  }
+      378                  List<CompletableFuture<Void>> futureList = new ArrayList<>();
+      379                  for (var child : children) {
+      380                      futureList.add(handleExistingLeafs(rootPath, path + "/" + child, count, printDetails));
+      381                  }
+      382                  return FutureUtil.waitForAll(futureList);
+      383              }
+      384          });
+      385      }
+      386  
+      387      /**
+      388       * @param loadedCounter a metric value, to know how many value has been loaded, which is an internal value.
+      389       */
+      390      private CompletableFuture<Void> fillAsync(@Nullable AtomicLong loadedCounter, boolean printDetails) {
+      391          return handleExistingLeafs(pathPrefix, pathPrefix, loadedCounter, printDetails);
+      392      }
+      393  
+      394  
+      395      private String getPath(String key) {
+      396          return pathPrefix + "/" + key;
+      397      }
+      398  
+      399      private String getKey(String path) {
+      400          return path.replaceFirst(pathPrefix + "/", "");
+      401      }
+      402  
+      403      public boolean exists(String key) {
+      404          return immutableData.containsKey(key);
+      405      }
+      406  
+      407      public T get(String key) {
+      408          return data.get(key);
+      409      }
+      410  
+      411      public CompletableFuture<Void> put(String key, T value) {
+      412          String path = getPath(key);
+      413          return cache.readModifyUpdateOrCreate(path, (old) -> {
+      414              if (conflictResolver.test(old.orElse(null), value)) {
+      415                  return value;
+      416              } else {
+      417                  throw new ConflictException(
+      418                          String.format("Failed to update from old:%s to value:%s", old, value));
+      419              }
+      420          }).thenCompose(__ -> doHandleNotification(path)) // immediately notify local tableview
+      421          .exceptionally(e -> {
+      422              if (e.getCause() instanceof MetadataStoreException.BadVersionException) {
+      423                  throw FutureUtil.wrapToCompletionException(new ConflictException(
+      424                          String.format("Failed to update to value:%s", value)));
+      425              }
+      426  
+      427              throw FutureUtil.wrapToCompletionException(e.getCause());
+      428          });
+      429      }
+      430  
+      431      public CompletableFuture<Void> delete(String key) {
+      432          String path = getPath(key);
+      433          return cache.delete(path)
+      434                  .thenCompose(__ -> doHandleNotification(path)); // immediately notify local tableview
+      435      }
+      436  
+      437      public int size() {
+      438          return immutableData.size();
+      439      }
+      440  
+      441      public boolean isEmpty() {
+      442          return immutableData.isEmpty();
+      443      }
+      444  
+      445      public Set<Map.Entry<String, T>> entrySet() {
+      446          return immutableData.entrySet();
+      447      }
+      448  
+      449      public Set<String> keySet() {
+      450          return immutableData.keySet();
+      451      }
+      452  
+      453      public Collection<T> values() {
+      454          return immutableData.values();
+      455      }
+      456  
+      457      public void forEach(BiConsumer<String, T> action) {
+      458          immutableData.forEach(action);
+       ... truncated at 400 lines ...

@@ -1,0 +1,716 @@
+row 162   apache/solr#4193
+============================================================================
+CONTRACT org.apache.solr.common.SpecProvider   members=1.0 implementers=18.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       24  public interface SpecProvider {
+       25    ValidatingJsonMap getSpec();
+       26  }
+
+---------- IMPLEMENTER org.apache.solr.api.Api  stubs=0/1 ----------
+       31  public abstract class Api implements SpecProvider {
+       32    protected SpecProvider spec;
+       33    protected volatile Map<String, JsonSchemaValidator> commandSchema;
+       34  
+       35    protected Api(SpecProvider spec) {
+       36      this.spec = spec;
+       37    }
+       38  
+       39    /** This method helps to cache the schema validator object */
+       40    public Map<String, JsonSchemaValidator> getCommandSchema() {
+       41      if (commandSchema == null) {
+       42        synchronized (this) {
+       43          if (commandSchema == null) {
+       44            ValidatingJsonMap commands = spec != null ? getSpec().getMap("commands", null) : null;
+       45            commandSchema =
+       46                commands != null ? Map.copyOf(ApiBag.getParsedSchema(commands)) : Map.of();
+       47          }
+       48        }
+       49      }
+       50      return commandSchema;
+       51    }
+       52  
+       53    /** The method that gets called for each request */
+       54    public abstract void call(SolrQueryRequest req, SolrQueryResponse rsp);
+       55  
+       56    /** Get the specification of the API as a Map */
+       57    @Override
+       58    public ValidatingJsonMap getSpec() {
+       59      return spec.getSpec();
+       60    }
+       61  }
+
+---------- IMPLEMENTER org.apache.solr.api.ApiBag.CommandAggregatingAnnotatedApi  stubs=0/1 ----------
+      144    static class CommandAggregatingAnnotatedApi extends AnnotatedApi {
+      145  
+      146      private Collection<AnnotatedApi> combinedApis;
+      147  
+      148      protected CommandAggregatingAnnotatedApi(AnnotatedApi api) {
+      149        super(api.spec, api.getEndPoint(), new HashMap<>(api.getCommands()), null);
+      150        combinedApis = new ArrayList<>();
+      151      }
+      152  
+      153      public void combineWith(AnnotatedApi api) {
+      154        // Merge in new 'command' entries
+      155        boolean newCommandsAdded = false;
+      156        for (Map.Entry<String, AnnotatedApi.Cmd> entry : api.getCommands().entrySet()) {
+      157          // Skip registering command if it's identical to an already registered command.
+      158          if (getCommands().containsKey(entry.getKey())
+      159              && getCommands().get(entry.getKey()).equals(entry.getValue())) {
+      160            continue;
+      161          }
+      162  
+      163          newCommandsAdded = true;
+      164          getCommands().put(entry.getKey(), entry.getValue());
+      165        }
+      166  
+      167        // Reference to Api must be saved to merge uncached values (i.e. 'spec') lazily
+      168        if (newCommandsAdded) {
+      169          combinedApis.add(api);
+      170        }
+      171      }
+      172  
+      173      @Override
+      174      public ValidatingJsonMap getSpec() {
+      175        final ValidatingJsonMap aggregatedSpec = spec.getSpec();
+      176  
+      177        for (AnnotatedApi combinedApi : combinedApis) {
+      178          final ValidatingJsonMap specToCombine = combinedApi.getSpec();
+      179          aggregatedSpec.getMap("commands").putAll(specToCombine.getMap("commands"));
+      180        }
+      181  
+      182        return aggregatedSpec;
+      183      }
+      184    }
+
+---------- IMPLEMENTER org.apache.solr.security.BasicAuthPlugin  stubs=0/1 ----------
+       48  public class BasicAuthPlugin extends AuthenticationPlugin
+       49      implements ConfigEditablePlugin, SpecProvider {
+       50    private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+       51    private AuthenticationProvider authenticationProvider;
+       52    private static final ThreadLocal<HttpField> authHeader = new ThreadLocal<>();
+       53    private static final String X_REQUESTED_WITH_HEADER = "X-Requested-With";
+       54    private boolean blockUnknown = true;
+       55    private boolean forwardCredentials = false;
+       56  
+       57    public boolean authenticate(String username, String pwd) {
+       58      return authenticationProvider.authenticate(username, pwd);
+       59    }
+       60  
+       61    @Override
+       62    public void init(Map<String, Object> pluginConfig) {
+       63      Object o = pluginConfig.get(PROPERTY_BLOCK_UNKNOWN);
+       64      if (o != null) {
+       65        try {
+       66          blockUnknown = Boolean.parseBoolean(o.toString());
+       67        } catch (Exception e) {
+       68          throw new SolrException(
+       69              ErrorCode.BAD_REQUEST, "Invalid value for parameter " + PROPERTY_BLOCK_UNKNOWN);
+       70        }
+       71      }
+       72      o = pluginConfig.get(FORWARD_CREDENTIALS);
+       73      if (o != null) {
+       74        try {
+       75          forwardCredentials = Boolean.parseBoolean(o.toString());
+       76        } catch (Exception e) {
+       77          throw new SolrException(
+       78              ErrorCode.BAD_REQUEST, "Invalid value for parameter " + FORWARD_CREDENTIALS);
+       79        }
+       80      }
+       81      authenticationProvider = getAuthenticationProvider(pluginConfig);
+       82    }
+       83  
+       84    @Override
+       85    public Map<String, Object> edit(Map<String, Object> latestConf, List<CommandOperation> commands) {
+       86      for (CommandOperation command : commands) {
+       87        if (command.name.equals("set-property")) {
+       88          for (Map.Entry<String, Object> e : command.getDataMap().entrySet()) {
+       89            if (PROPS.contains(e.getKey())) {
+       90              latestConf.put(e.getKey(), e.getValue());
+       91              return latestConf;
+       92            } else {
+       93              command.addError("Unknown property " + e.getKey());
+       94            }
+       95          }
+       96        }
+       97      }
+       98      if (!CommandOperation.captureErrors(commands).isEmpty()) return null;
+       99      if (authenticationProvider instanceof ConfigEditablePlugin editablePlugin) {
+      100        return editablePlugin.edit(latestConf, commands);
+      101      }
+      102      throw new SolrException(ErrorCode.BAD_REQUEST, "This cannot be edited");
+      103    }
+      104  
+      105    protected AuthenticationProvider getAuthenticationProvider(Map<String, Object> pluginConfig) {
+      106      Sha256AuthenticationProvider provider = new Sha256AuthenticationProvider();
+      107      provider.init(pluginConfig);
+      108      return provider;
+      109    }
+      110  
+      111    private void authenticationFailure(
+      112        HttpServletResponse response, boolean isAjaxRequest, String message) throws IOException {
+      113      getPromptHeaders(isAjaxRequest).forEach(response::setHeader);
+      114      response.sendError(401, message);
+      115    }
+      116  
+      117    @Override
+      118    public boolean doAuthenticate(
+      119        HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
+      120        throws Exception {
+      121      String authHeader = request.getHeader("Authorization");
+      122      boolean isAjaxRequest = isAjaxRequest(request);
+      123  
+      124      if (authHeader != null) {
+      125        BasicAuthPlugin.authHeader.set(new HttpField("Authorization", authHeader));
+      126        StringTokenizer st = new StringTokenizer(authHeader);
+      127        if (st.hasMoreTokens()) {
+      128          String basic = st.nextToken();
+      129          if (basic.equalsIgnoreCase("Basic")) {
+      130            if (st.hasMoreTokens()) {
+      131              try {
+      132                String credentials =
+      133                    new String(Base64.getDecoder().decode(st.nextToken()), StandardCharsets.UTF_8);
+      134                int p = credentials.indexOf(':');
+      135                if (p != -1) {
+      136                  final String username = credentials.substring(0, p).trim();
+      137                  String pwd = credentials.substring(p + 1).trim();
+      138                  if (!authenticate(username, pwd)) {
+      139                    numWrongCredentials.inc();
+      140                    log.debug("Bad auth credentials supplied in Authorization header");
+      141                    authenticationFailure(response, isAjaxRequest, "Bad credentials");
+      142                    return false;
+      143                  } else {
+      144                    Principal principal = new BasicAuthUserPrincipal(username, pwd);
+      145                    request = wrapWithPrincipal(request, principal, username);
+      146                    numAuthenticated.inc();
+      147                    filterChain.doFilter(request, response);
+      148                    return true;
+      149                  }
+      150                } else {
+      151                  numErrors.inc();
+      152                  authenticationFailure(response, isAjaxRequest, "Invalid authentication token");
+      153                  return false;
+      154                }
+      155              } catch (UnsupportedEncodingException e) {
+      156                throw new Error("Couldn't retrieve authentication", e);
+      157              }
+      158            } else {
+      159              numErrors.inc();
+      160              authenticationFailure(response, isAjaxRequest, "Malformed Basic Auth header");
+      161              return false;
+      162            }
+      163          }
+      164        }
+      165      }
+      166  
+      167      // No auth header OR header empty OR Authorization header not of type Basic, i.e. "unknown" user
+      168      if (blockUnknown) {
+      169        numMissingCredentials.inc();
+      170        authenticationFailure(response, isAjaxRequest, "require authentication");
+      171        return false;
+      172      } else {
+      173        numPassThrough.inc();
+      174        request.setAttribute(AuthenticationPlugin.class.getName(), getPromptHeaders(isAjaxRequest));
+      175        filterChain.doFilter(request, response);
+      176        return true;
+      177      }
+      178    }
+      179  
+      180    /**
+      181     * Get the prompt headers, and replace Basic with xBasic if ajax request to avoid browser
+      182     * intercepting the authentication
+      183     *
+      184     * @param isAjaxRequest set to true if the request is an ajax request
+      185     * @return map of headers
+      186     */
+      187    private Map<String, String> getPromptHeaders(boolean isAjaxRequest) {
+      188      Map<String, String> headers = new HashMap<>(authenticationProvider.getPromptHeaders());
+      189      String WWW_AUTH = HttpHeader.WWW_AUTHENTICATE.asString();
+      190      if (isAjaxRequest
+      191          && headers.containsKey(WWW_AUTH)
+      192          && headers.get(WWW_AUTH).startsWith("Basic ")) {
+      193        headers.put(WWW_AUTH, "x" + headers.get(WWW_AUTH));
+      194        log.debug(
+      195            "Prefixing {} header for Basic Auth with 'x' to prevent browser basic auth popup",
+      196            WWW_AUTH);
+      197      }
+      198      return headers;
+      199    }
+      200  
+      201    @Override
+      202    public void close() throws IOException {}
+      203  
+      204    @Override
+      205    public void closeRequest() {
+      206      authHeader.remove();
+      207    }
+
+---------- IMPLEMENTER org.apache.solr.security.MultiAuthPlugin  stubs=0/1 ----------
+       53  public class MultiAuthPlugin extends AuthenticationPlugin
+       54      implements ConfigEditablePlugin, SpecProvider {
+       55    public static final String PROPERTY_SCHEMES = "schemes";
+       56    public static final String PROPERTY_SCHEME = "scheme";
+       57    public static final String AUTHORIZATION_HEADER = "Authorization";
+       58  
+       59    private static final ThreadLocal<AuthenticationPlugin> pluginInRequest = new ThreadLocal<>();
+       60    private static final String UNKNOWN_SCHEME = "";
+       61  
+       62    private final Map<String, AuthenticationPlugin> pluginMap = new LinkedHashMap<>();
+       63    private final Map<String, String> realms = new LinkedHashMap<>();
+       64    private final List<String> WWWAuthenticateHeaders = new ArrayList<>();
+       65    private final ResourceLoader loader;
+       66    // the first of our plugins that allows anonymous requests
+       67    private AuthenticationPlugin allowsUnknown = null;
+       68  
+       69    // Get the loader from the CoreContainer so we can load the sub-plugins, such as the
+       70    // BasicAuthPlugin for Basic
+       71    public MultiAuthPlugin(CoreContainer cc) {
+       72      this.loader = cc.getResourceLoader();
+       73    }
+       74  
+       75    @SuppressWarnings({"unchecked"})
+       76    static boolean applyEditCommandToSchemePlugin(
+       77        String scheme,
+       78        ConfigEditablePlugin plugin,
+       79        CommandOperation c,
+       80        Map<String, Object> latestConf) {
+       81      boolean madeChanges = false;
+       82      // Send in the config for the plugin only
+       83      Map<String, Object> latestPluginConf = null;
+       84      int updateAt = -1;
+       85      List<Map<String, Object>> schemes =
+       86          (List<Map<String, Object>>) latestConf.get(PROPERTY_SCHEMES);
+       87      for (int i = 0; i < schemes.size(); i++) {
+       88        Map<String, Object> schemeConfig = schemes.get(i);
+       89        if (scheme.equals(schemeConfig.get(PROPERTY_SCHEME))) {
+       90          latestPluginConf = withoutScheme(schemeConfig);
+       91          updateAt = i; // for updating
+       92          break;
+       93        }
+       94      }
+       95  
+       96      // shouldn't happen
+       97      if (latestPluginConf == null) {
+       98        throw new SolrException(
+       99            ErrorCode.BAD_REQUEST, "Config for scheme '" + scheme + "' not found!");
+      100      }
+      101  
+      102      Map<String, Object> updated = plugin.edit(latestPluginConf, Collections.singletonList(c));
+      103      if (updated != null) {
+      104        madeChanges = true;
+      105        schemes.set(updateAt, withScheme(scheme, updated));
+      106      }
+      107  
+      108      return madeChanges;
+      109    }
+      110  
+      111    private static Map<String, Object> withoutScheme(final Map<String, Object> data) {
+      112      Map<String, Object> updatedData = new HashMap<>(data);
+      113      updatedData.remove(PROPERTY_SCHEME);
+      114      return updatedData;
+      115    }
+      116  
+      117    private static Map<String, Object> withScheme(
+      118        final String scheme, final Map<String, Object> data) {
+      119      Map<String, Object> updatedData = new HashMap<>(data);
+      120      updatedData.put(PROPERTY_SCHEME, scheme);
+      121      return updatedData;
+      122    }
+      123  
+      124    @Override
+      125    @SuppressWarnings({"unchecked"})
+      126    public void init(Map<String, Object> pluginConfig) {
+      127      Object o = pluginConfig.get(PROPERTY_SCHEMES);
+      128      if (!(o instanceof List)) {
+      129        throw new SolrException(
+      130            ErrorCode.SERVER_ERROR, "Invalid config: MultiAuthPlugin requires a list of schemes!");
+      131      }
+      132  
+      133      List<Object> schemeList = (List<Object>) o;
+      134  
+      135      for (Object s : schemeList) {
+      136        if (!(s instanceof Map)) {
+      137          throw new SolrException(
+      138              ErrorCode.SERVER_ERROR, "Invalid scheme config, expected JSON object but found: " + s);
+      139        }
+      140        initPluginForScheme((Map<String, Object>) s);
+      141      }
+      142      initWWWAuthenticateHeaders();
+      143    }
+      144  
+      145    protected void initPluginForScheme(Map<String, Object> schemeMap) {
+      146      Map<String, Object> schemeConfig = new HashMap<>(schemeMap);
+      147  
+      148      String scheme = (String) schemeConfig.remove(PROPERTY_SCHEME);
+      149      if (StrUtils.isNullOrEmpty(scheme)) {
+      150        throw new SolrException(
+      151            ErrorCode.SERVER_ERROR, "'scheme' is a required attribute: " + schemeMap);
+      152      }
+      153  
+      154      String clazz = (String) schemeConfig.remove("class");
+      155      if (StrUtils.isNullOrEmpty(clazz)) {
+      156        throw new SolrException(
+      157            ErrorCode.SERVER_ERROR, "'class' is a required attribute: " + schemeMap);
+      158      }
+      159  
+      160      String realm = (String) schemeConfig.remove("realm");
+      161      if (!StrUtils.isNullOrEmpty(realm)) {
+      162        realms.put(scheme, realm);
+      163      }
+      164  
+      165      AuthenticationPlugin pluginForScheme = loader.newInstance(clazz, AuthenticationPlugin.class);
+      166      pluginForScheme.init(schemeConfig);
+      167      pluginMap.put(scheme.toLowerCase(Locale.ROOT), pluginForScheme);
+      168  
+      169      if (allowsUnknown == null) {
+      170        if (!Boolean.parseBoolean(String.valueOf(schemeConfig.getOrDefault("blockUnknown", true)))) {
+      171          // plugin allows anonymous requests, so we'll send any non-AJAX requests without an
+      172          // authorization header to it
+      173          allowsUnknown = pluginForScheme;
+      174        }
+      175      }
+      176    }
+      177  
+      178    private void initWWWAuthenticateHeaders() {
+      179      for (String scheme : pluginMap.keySet()) {
+      180        String realm = realms.get(scheme);
+      181        String realmStr = realm == null ? "" : " realm=\"" + realm + "\"";
+      182        WWWAuthenticateHeaders.add(scheme + realmStr);
+      183      }
+      184    }
+      185  
+      186    private void addWWWAuthenticateHeaders(HttpServletResponse response) {
+      187      for (String wwwAuthHeader : WWWAuthenticateHeaders) {
+      188        response.addHeader(HttpHeader.WWW_AUTHENTICATE.asString(), wwwAuthHeader);
+      189      }
+      190    }
+      191  
+      192    @Override
+      193    public void initializeMetrics(SolrMetricsContext parentContext, Attributes attributes) {
+      194      for (AuthenticationPlugin plugin : pluginMap.values()) {
+      195        plugin.initializeMetrics(parentContext, Attributes.empty());
+      196      }
+      197      super.initializeMetrics(parentContext, attributes);
+      198    }
+      199  
+      200    private String getSchemeFromAuthHeader(final String authHeader) {
+      201      final int firstSpace = authHeader.indexOf(' ');
+      202      return (firstSpace != -1)
+      203          ? authHeader.substring(0, firstSpace).toLowerCase(Locale.ROOT)
+      204          : UNKNOWN_SCHEME;
+      205    }
+      206  
+      207    @Override
+      208    public boolean doAuthenticate(
+      209        HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
+      210        throws Exception {
+      211      final String authHeader = request.getHeader(AUTHORIZATION_HEADER);
+      212      if (authHeader == null) {
+
+---------- IMPLEMENTER org.apache.solr.security.RuleBasedAuthorizationPluginBase  stubs=0/1 ----------
+       49  public abstract class RuleBasedAuthorizationPluginBase
+       50      implements AuthorizationPlugin, ConfigEditablePlugin, SpecProvider {
+       51    private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+       52  
+       53    private final Map<String, WildCardSupportMap> mapping = new HashMap<>();
+       54    private final Map<String, Set<Permission>> roleToPermissionsMap = new HashMap<>();
+       55  
+       56    // Doesn't implement Map because we violate the contracts of put() and get()
+       57    private static class WildCardSupportMap {
+       58      final Set<String> wildcardPrefixes = new HashSet<>();
+       59      final Map<String, List<Permission>> delegate = new HashMap<>();
+       60  
+       61      public List<Permission> put(String key, List<Permission> value) {
+       62        if (key != null && key.endsWith("/*")) {
+       63          key = key.substring(0, key.length() - 2);
+       64          wildcardPrefixes.add(key);
+       65        }
+       66        return delegate.put(key, value);
+       67      }
+       68  
+       69      public List<Permission> get(String key) {
+       70        List<Permission> result = delegate.get(key);
+       71        if (key == null || result != null) return result;
+       72  
+       73        for (String s : wildcardPrefixes) {
+       74          if (key.startsWith(s)) {
+       75            List<Permission> wildcardPermissions = delegate.get(s);
+       76            if (wildcardPermissions != null) {
+       77              if (result == null) result = new ArrayList<>();
+       78              result.addAll(wildcardPermissions);
+       79            }
+       80          }
+       81        }
+       82  
+       83        return result;
+       84      }
+       85  
+       86      public Set<String> keySet() {
+       87        return delegate.keySet();
+       88      }
+       89    }
+       90  
+       91    @Override
+       92    public AuthorizationResponse authorize(AuthorizationContext context) {
+       93      List<AuthorizationContext.CollectionRequest> collectionRequests =
+       94          context.getCollectionRequests();
+       95      if (log.isDebugEnabled()) {
+       96        log.debug(
+       97            "Attempting to authorize request to [{}] of type: [{}], associated with collections [{}]",
+       98            context.getResource(),
+       99            context.getRequestType(),
+      100            collectionRequests);
+      101      }
+      102  
+      103      if (context.getRequestType() == AuthorizationContext.RequestType.ADMIN) {
+      104        log.debug("Authorizing an ADMIN request, checking admin permissions");
+      105        MatchStatus flag = checkCollPerm(mapping.get(null), context);
+      106        return flag.rsp;
+      107      }
+      108  
+      109      for (AuthorizationContext.CollectionRequest collreq : collectionRequests) {
+      110        // check permissions for each collection
+      111        log.debug(
+      112            "Authorizing collection-aware request, checking perms applicable to specific collection [{}]",
+      113            collreq.collectionName);
+      114        MatchStatus flag = checkCollPerm(mapping.get(collreq.collectionName), context);
+      115        if (flag != MatchStatus.NO_PERMISSIONS_FOUND) return flag.rsp;
+      116      }
+      117  
+      118      log.debug(
+      119          "Authorizing collection-aware request, checking perms applicable to all (*) collections");
+      120      // check wildcard (all=*) permissions.
+      121      MatchStatus flag = checkCollPerm(mapping.get("*"), context);
+      122      return flag.rsp;
+      123    }
+      124  
+      125    /**
+      126     * Retrieves permission names for a given set of roles.
+      127     *
+      128     * <p>There are two special role names that can be used in the roles list:
+      129     *
+      130     * <ul>
+      131     *   <li><code>null</code> meaning permission granted for all requests, even without a role
+      132     *   <li><code>"*"</code> meaning any role will grant the permission
+      133     * </ul>
+      134     *
+      135     * In order to obtain all permissions a user has based on the user's roles, you also need to
+      136     * include these two special roles to get the full list.
+      137     *
+      138     * @param roles a collection of role names.
+      139     */
+      140    public Set<String> getPermissionNamesForRoles(Collection<String> roles) {
+      141      if (roles == null) {
+      142        return Set.of();
+      143      }
+      144      return roles.stream()
+      145          .filter(roleToPermissionsMap::containsKey)
+      146          .flatMap(r -> roleToPermissionsMap.get(r).stream())
+      147          .map(p -> p.name)
+      148          .collect(Collectors.toSet());
+      149    }
+      150  
+      151    private MatchStatus checkCollPerm(WildCardSupportMap pathVsPerms, AuthorizationContext context) {
+      152      if (pathVsPerms == null) return MatchStatus.NO_PERMISSIONS_FOUND;
+      153  
+      154      if (log.isTraceEnabled()) {
+      155        log.trace("Following perms are associated with collection");
+      156        for (String pathKey : pathVsPerms.keySet()) {
+      157          final List<Permission> permsAssociatedWithPath = pathVsPerms.get(pathKey);
+      158          log.trace("Path: [{}], Perms: [{}]", pathKey, permsAssociatedWithPath);
+      159        }
+      160      }
+      161  
+      162      String path = context.getResource();
+      163      MatchStatus flag = checkPathPerm(pathVsPerms.get(path), context);
+      164      if (flag != MatchStatus.NO_PERMISSIONS_FOUND) return flag;
+      165      return checkPathPerm(pathVsPerms.get(null), context);
+      166    }
+      167  
+      168    private MatchStatus checkPathPerm(List<Permission> permissions, AuthorizationContext context) {
+      169      if (permissions == null || permissions.isEmpty()) {
+      170        return MatchStatus.NO_PERMISSIONS_FOUND;
+      171      }
+      172  
+      173      log.trace("Following perms are associated with this collection and path: [{}]", permissions);
+      174      final Permission governingPermission = findFirstGoverningPermission(permissions, context);
+      175      if (governingPermission == null) {
+      176        if (log.isDebugEnabled()) {
+      177          log.debug(
+      178              "No perms configured for the resource {} . So allowed to access",
+      179              context.getResource());
+      180        }
+      181        return MatchStatus.NO_PERMISSIONS_FOUND;
+      182      }
+      183      if (log.isDebugEnabled()) {
+      184        log.debug(
+      185            "Found perm [{}] to govern resource [{}]", governingPermission, context.getResource());
+      186      }
+      187  
+      188      return determineIfPermissionPermitsPrincipal(context, governingPermission);
+      189    }
+      190  
+      191    private Permission findFirstGoverningPermission(
+      192        List<Permission> permissions, AuthorizationContext context) {
+      193      for (int i = 0; i < permissions.size(); i++) {
+      194        Permission permission = permissions.get(i);
+      195        if (permissionAppliesToRequest(permission, context)) return permission;
+      196      }
+      197  
+      198      return null;
+      199    }
+      200  
+      201    private boolean permissionAppliesToRequest(Permission permission, AuthorizationContext context) {
+      202      if (log.isTraceEnabled()) {
+      203        log.trace(
+      204            "Testing whether permission [{}] applies to request [{}]",
+      205            permission,
+      206            context.getResource());
+      207      }
+      208      if (PermissionNameProvider.values.containsKey(permission.name)) {
+
+---------- IMPLEMENTER org.apache.solr.security.Sha256AuthenticationProvider  stubs=0/1 ----------
+       41  public class Sha256AuthenticationProvider
+       42      implements ConfigEditablePlugin, BasicAuthPlugin.AuthenticationProvider {
+       43  
+       44    static String CANNOT_DELETE_LAST_USER_ERROR =
+       45        "You cannot delete the last user. At least one user must be configured at all times.";
+       46    private Map<String, String> credentials;
+       47    private String realm;
+       48    private Map<String, String> promptHeader;
+       49  
+       50    private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+       51  
+       52    static void putUser(String user, String pwd, Map<? super String, ? super String> credentials) {
+       53      if (user == null || pwd == null) return;
+       54      String val = getSaltedHashedValue(pwd);
+       55      credentials.put(user, val);
+       56    }
+       57  
+       58    public static String getSaltedHashedValue(String pwd) {
+       59      final Random r = new SecureRandom();
+       60      byte[] salt = new byte[32];
+       61      r.nextBytes(salt);
+       62      String saltBase64 = Base64.getEncoder().encodeToString(salt);
+       63      String val = sha256(pwd, saltBase64) + " " + saltBase64;
+       64      return val;
+       65    }
+       66  
+       67    @Override
+       68    public void init(Map<String, Object> pluginConfig) {
+       69      if (pluginConfig.containsKey(BasicAuthPlugin.PROPERTY_REALM)) {
+       70        this.realm = (String) pluginConfig.get(BasicAuthPlugin.PROPERTY_REALM);
+       71      } else {
+       72        this.realm = "solr";
+       73      }
+       74  
+       75      promptHeader =
+       76          Collections.unmodifiableMap(
+       77              Collections.singletonMap("WWW-Authenticate", "Basic realm=\"" + realm + "\""));
+       78      credentials = new LinkedHashMap<>();
+       79      @SuppressWarnings({"unchecked"})
+       80      Map<String, String> users = (Map<String, String>) pluginConfig.get("credentials");
+       81      if (users == null || users.isEmpty()) {
+       82        throw new IllegalStateException(
+       83            "No users configured yet. At least one user must be configured in security.json");
+       84      }
+       85      for (Map.Entry<String, String> e : users.entrySet()) {
+       86        String v = e.getValue();
+       87        if (v == null) {
+       88          log.warn("user has no password {}", e.getKey());
+       89          continue;
+       90        }
+       91        credentials.put(e.getKey(), v);
+       92      }
+       93    }
+       94  
+       95    @Override
+       96    public boolean authenticate(String username, String password) {
+       97      String cred = credentials.get(username);
+       98      if (cred == null || cred.isEmpty()) return false;
+       99      cred = cred.trim();
+      100      String salt = null;
+      101      if (cred.contains(" ")) {
+      102        String[] ss = cred.split(" ");
+      103        if (ss.length > 1 && !ss[1].isEmpty()) {
+      104          salt = ss[1];
+      105          cred = ss[0];
+      106        }
+      107      }
+      108      return cred.equals(sha256(password, salt));
+      109    }
+      110  
+      111    @Override
+      112    public Map<String, String> getPromptHeaders() {
+      113      return promptHeader;
+      114    }
+      115  
+      116    public static String sha256(String password, String saltKey) {
+      117      MessageDigest digest;
+      118      try {
+      119        digest = MessageDigest.getInstance("SHA-256");
+      120      } catch (NoSuchAlgorithmException e) {
+      121        log.error("Cannot find algorithm ", e);
+      122        return null; // should not happen
+      123      }
+      124      if (saltKey != null) {
+      125        digest.reset();
+      126        digest.update(Base64.getDecoder().decode(saltKey));
+      127      }
+      128  
+      129      byte[] btPass = digest.digest(password.getBytes(StandardCharsets.UTF_8));
+      130      digest.reset();
+      131      btPass = digest.digest(btPass);
+      132      return Base64.getEncoder().encodeToString(btPass);
+      133    }
+      134  
+      135    @Override
+      136    public Map<String, Object> edit(Map<String, Object> latestConf, List<CommandOperation> commands) {
+      137      for (CommandOperation cmd : commands) {
+      138        if (!supported_ops.contains(cmd.name)) {
+      139          cmd.unknownOperation();
+      140          return null;
+      141        }
+      142        if (cmd.hasError()) return null;
+      143        if ("delete-user".equals(cmd.name)) {
+      144          List<String> names = cmd.getStrs("");
+      145          Map<?, ?> map = (Map<?, ?>) latestConf.get("credentials");
+      146          if (map == null || !map.keySet().containsAll(names)) {
+      147            cmd.addError("No such user(s) " + names);
+      148            return null;
+      149          }
+      150          for (String name : names) {
+      151            if (map.containsKey(name)) {
+      152              if (map.size() == 1) {
+      153                cmd.addError(CANNOT_DELETE_LAST_USER_ERROR);
+      154                return null;
+      155              }
+      156            }
+      157            map.remove(name);
+      158          }
+      159          return latestConf;
+      160        }
+      161        if ("set-user".equals(cmd.name)) {
+      162          Map<String, Object> map = getMapValue(latestConf, "credentials");
+      163          Map<String, Object> kv = cmd.getDataMap();
+      164          for (Map.Entry<String, Object> e : kv.entrySet()) {
+      165            if (e.getKey() == null || e.getValue() == null) {
+      166              cmd.addError("name and password must be non-null");
+      167              return null;
+      168            }
+      169            putUser(e.getKey(), String.valueOf(e.getValue()), map);
+      170          }
+      171        }
+      172      }
+      173      return latestConf;
+      174    }
+      175  
+      176    @Override
+      177    public ValidatingJsonMap getSpec() {
+      178      final List<Api> apis = AnnotatedApi.getApis(new ModifyBasicAuthConfigAPI());
+      179      return apis.get(0).getSpec();
+      180    }
+      181  
+      182    // TODO make private?
+      183    static final Set<String> supported_ops = Set.of("set-user", "delete-user");
+      184  }

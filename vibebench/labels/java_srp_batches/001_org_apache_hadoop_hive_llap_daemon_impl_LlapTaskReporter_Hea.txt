@@ -1,0 +1,336 @@
+row 1   mr3project/hive-mr3#78
+============================================================================
+CLASS org.apache.hadoop.hive.llap.daemon.impl.LlapTaskReporter.HeartbeatCallable   loc=331 methods=8 wmc=49 lcom=0.0 c3=0.2167709385736438
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      151    @VisibleForTesting
+      152    static class HeartbeatCallable implements Callable<Boolean> {
+      153  
+      154      private static final int LOG_COUNTER_START_INTERVAL = 5000; // 5 seconds
+      155      private static final float LOG_COUNTER_BACKOFF = 1.3f;
+      156  
+      157      private final RuntimeTask task;
+      158      private final EventMetaData updateEventMetadata;
+      159      private final SchedulerFragmentCompletingListener completionListener;
+      160      private final String fragmentRequestId;
+      161  
+      162      private final LlapTaskUmbilicalProtocol umbilical;
+      163  
+      164      private final long pollInterval;
+      165      private final long sendCounterInterval;
+      166      private final int maxEventsToGet;
+      167      private final String containerIdStr;
+      168  
+      169      private final AtomicLong requestCounter;
+      170  
+      171      private final AtomicBoolean finalEventQueued = new AtomicBoolean(false);
+      172      private final AtomicBoolean askedToDie = new AtomicBoolean(false);
+      173  
+      174      private LinkedBlockingQueue<TezEvent> eventsToSend = new LinkedBlockingQueue<TezEvent>();
+      175  
+      176      private final ReentrantLock lock = new ReentrantLock();
+      177      private final Condition condition = lock.newCondition();
+      178      private final WmFragmentCounters wmCounters;
+      179  
+      180      /*
+      181       * Keeps track of regular timed heartbeats. Is primarily used as a timing mechanism to send /
+      182       * log counters.
+      183       */
+      184      private AtomicInteger nonOobHeartbeatCounter = new AtomicInteger(0);
+      185      private int nextHeartbeatNumToLog = 0;
+      186      /*
+      187       * Tracks the last non-OOB heartbeat number at which counters were sent to the AM. 
+      188       */
+      189      private int prevCounterSendHeartbeatNum = 0;
+      190      private TezEvent initialEvent;
+      191  
+      192      public HeartbeatCallable(
+      193          SchedulerFragmentCompletingListener completionListener,
+      194          RuntimeTask task, LlapTaskUmbilicalProtocol umbilical,
+      195          long amPollInterval, long sendCounterInterval, int maxEventsToGet,
+      196          AtomicLong requestCounter, String containerIdStr,
+      197          TezEvent initialEvent, String fragmentRequestId, WmFragmentCounters wmCounters) {
+      198  
+      199        this.pollInterval = amPollInterval;
+      200        this.sendCounterInterval = sendCounterInterval;
+      201        this.maxEventsToGet = maxEventsToGet;
+      202        this.requestCounter = requestCounter;
+      203        this.containerIdStr = containerIdStr;
+      204        this.initialEvent = initialEvent;
+      205        this.completionListener = completionListener;
+      206        this.fragmentRequestId = fragmentRequestId;
+      207        this.wmCounters = wmCounters;
+      208  
+      209        this.task = task;
+      210        this.umbilical = umbilical;
+      211        this.updateEventMetadata = new EventMetaData(EventProducerConsumerType.SYSTEM,
+      212            task.getVertexName(), "", task.getTaskAttemptID());
+      213  
+      214        nextHeartbeatNumToLog = (Math.max(1,
+      215            (int) (LOG_COUNTER_START_INTERVAL / (amPollInterval == 0 ? 0.000001f
+      216                : (float) amPollInterval))));
+      217      }
+      218  
+      219      @Override
+      220      public Boolean call() throws Exception {
+      221        // Heartbeat only for active tasks. Errors, etc will be reported directly.
+      222        while (!task.isTaskDone() && !task.wasErrorReported()) {
+      223          ResponseWrapper response = heartbeat(null);
+      224  
+      225          if (response.shouldDie) {
+      226            // AM sent a shouldDie=true
+      227            LOG.info("Asked to die via task heartbeat: {}", task.getTaskAttemptID());
+      228            return false;
+      229          } else {
+      230            if (response.numEvents < maxEventsToGet) {
+      231              // Wait before sending another heartbeat. Otherwise consider as an OOB heartbeat
+      232              lock.lock();
+      233              try {
+      234                boolean interrupted = condition.await(pollInterval, TimeUnit.MILLISECONDS);
+      235                if (!interrupted) {
+      236                  nonOobHeartbeatCounter.incrementAndGet();
+      237                }
+      238              } finally {
+      239                lock.unlock();
+      240              }
+      241            }
+      242          }
+      243        }
+      244        int pendingEventCount = eventsToSend.size();
+      245        if (pendingEventCount > 0) {
+      246          // This is OK because the pending events will be sent via the succeeded/failed messages.
+      247          // TaskDone is set before taskSucceeded/taskTerminated are sent out - which is what causes the
+      248          // thread to exit
+      249          LOG.warn("Exiting TaskReporter thread with pending queue size=" + pendingEventCount);
+      250        }
+      251        return true;
+      252      }
+      253  
+      254      /**
+      255       * @param eventsArg
+      256       * @return
+      257       * @throws IOException
+      258       *           indicates an RPC communication failure.
+      259       * @throws TezException
+      260       *           indicates an exception somewhere in the AM.
+      261       */
+      262      private synchronized ResponseWrapper heartbeat(Collection<TezEvent> eventsArg) throws IOException,
+      263          TezException {
+      264  
+      265        if (eventsArg != null) {
+      266          eventsToSend.addAll(eventsArg);
+      267        }
+      268  
+      269        TezEvent updateEvent = null;
+      270        List<TezEvent> events = new ArrayList<TezEvent>();
+      271        eventsToSend.drainTo(events);
+      272  
+      273        if (!task.isTaskDone() && !task.wasErrorReported()) {
+      274          boolean sendCounters = false;
+      275          /**
+      276           * Increasing the heartbeat interval can delay the delivery of events. Sending just updated
+      277           * records would save CPU in DAG AM, but certain counters are updated very frequently. Until
+      278           * real time decisions are made based on these counters, it can be sent once per second.
+      279           */
+      280          // Not completely accurate, since OOB heartbeats could go out.
+      281          if ((nonOobHeartbeatCounter.get() - prevCounterSendHeartbeatNum) * pollInterval >= sendCounterInterval) {
+      282            sendCounters = true;
+      283            prevCounterSendHeartbeatNum = nonOobHeartbeatCounter.get();
+      284          }
+      285          updateEvent = new TezEvent(getStatusUpdateEvent(sendCounters, false), updateEventMetadata);
+      286          events.add(updateEvent);
+      287        }
+      288  
+      289        long requestId = requestCounter.incrementAndGet();
+      290        int fromEventId = task.getNextFromEventId();
+      291        int fromPreRoutedEventId = task.getNextPreRoutedEventId();
+      292        int maxEvents = Math.min(maxEventsToGet, task.getMaxEventsToHandle());
+      293        TezHeartbeatRequest request = new TezHeartbeatRequest(requestId, events, fromPreRoutedEventId,
+      294            containerIdStr, task.getTaskAttemptID(), fromEventId, maxEvents);
+      295        LOG.debug("Sending heartbeat to AM, request={}", request);
+      296  
+      297        maybeLogCounters();
+      298  
+      299        TezHeartbeatResponse response = umbilical.heartbeat(request);
+      300        LOG.debug("Received heartbeat response from AM, response={}", response);
+      301  
+      302        if (response.shouldDie()) {
+      303          LOG.info("Received should die response from AM: {}", task.getTaskAttemptID());
+      304          askedToDie.set(true);
+      305          return new ResponseWrapper(true, 1);
+      306        }
+      307        if (response.getLastRequestId() != requestId) {
+      308          throw new TezException("AM and Task out of sync" + ", responseReqId="
+      309              + response.getLastRequestId() + ", expectedReqId=" + requestId);
+      310        }
+      311  
+      312        // The same umbilical is used by multiple tasks. Problematic in the case where multiple tasks
+      313        // are running using the same umbilical.
+      314        int numEventsReceived = 0;
+      315        if (task.isTaskDone() || task.wasErrorReported()) {
+      316          if (response.getEvents() != null && !response.getEvents().isEmpty()) {
+      317            LOG.warn("Current task already complete, Ignoring all event in"
+      318                + " heartbeat response, eventCount=" + response.getEvents().size());
+      319          }
+      320        } else {
+      321          task.setNextFromEventId(response.getNextFromEventId());
+      322          task.setNextPreRoutedEventId(response.getNextPreRoutedEventId());
+      323          List<TezEvent> taskEvents = null;
+      324          if (response.getEvents() != null && !response.getEvents().isEmpty()) {
+      325            if (LOG.isInfoEnabled()) {
+      326              LOG.info("Routing events from heartbeat response to task" + ", currentTaskAttemptId="
+      327                  + task.getTaskAttemptID() + ", eventCount=" + response.getEvents().size()
+      328                  + " fromEventId=" + fromEventId
+      329                  + " nextFromEventId=" + response.getNextFromEventId());
+      330            }
+      331            // This should ideally happen in a separate thread
+      332            numEventsReceived = response.getEvents().size();
+      333            taskEvents = response.getEvents();
+      334          }
+      335          if (initialEvent != null) {
+      336            // We currently only give the initial event to the task on the first heartbeat. Given
+      337            // that the split is ready, it seems pointless to wait, but that's how Tez works.
+      338            List<TezEvent> oldEvents = taskEvents;
+      339            taskEvents = new ArrayList<>(1 + (taskEvents == null ? 0 : taskEvents.size()));
+      340            taskEvents.add(initialEvent);
+      341            initialEvent = null;
+      342            if (oldEvents != null) {
+      343              taskEvents.addAll(oldEvents);
+      344            }
+      345          }
+      346          if (taskEvents != null) {
+      347            task.handleEvents(taskEvents);
+      348          }
+      349        }
+      350        return new ResponseWrapper(false, numEventsReceived);
+      351      }
+      352  
+      353      public void markComplete() {
+      354        // Notify to clear pending events, if any.
+      355        lock.lock();
+      356        try {
+      357          condition.signal();
+      358        } finally {
+      359          lock.unlock();
+      360        }
+      361      }
+      362  
+      363      private void maybeLogCounters() {
+      364        if (LOG.isDebugEnabled()) {
+      365          if (nonOobHeartbeatCounter.get() == nextHeartbeatNumToLog) {
+      366            LOG.debug("Counters: " + task.getCounters().toShortString());
+      367            nextHeartbeatNumToLog = (int) (nextHeartbeatNumToLog * (LOG_COUNTER_BACKOFF));
+      368          }
+      369        }
+      370      }
+      371  
+      372      /**
+      373       * Sends out final events for task success.
+      374       * @param taskAttemptID
+      375       * @return
+      376       * @throws IOException
+      377       *           indicates an RPC communication failure.
+      378       * @throws TezException
+      379       *           indicates an exception somewhere in the AM.
+      380       */
+      381      private boolean taskSucceeded(TezTaskAttemptID taskAttemptID) throws IOException, TezException {
+      382        // Ensure only one final event is ever sent.
+      383        if (!finalEventQueued.getAndSet(true)) {
+      384          TezEvent statusUpdateEvent = new TezEvent(
+      385              getStatusUpdateEvent(true, true), updateEventMetadata);
+      386          TezEvent taskCompletedEvent = new TezEvent(new TaskAttemptCompletedEvent(),
+      387              updateEventMetadata);
+      388          if (LOG.isDebugEnabled()) {
+      389            LOG.debug("Invoking OOB heartbeat for successful attempt: {}, isTaskDone={}", taskAttemptID, task.isTaskDone());
+      390          }
+      391          completionListener.fragmentCompleting(fragmentRequestId, SchedulerFragmentCompletingListener.State.SUCCESS);
+      392          return !heartbeat(Lists.newArrayList(statusUpdateEvent, taskCompletedEvent)).shouldDie;
+      393        } else {
+      394          LOG.warn("A final task state event has already been sent. Not sending again");
+      395          return askedToDie.get();
+      396        }
+      397      }
+      398  
+      399      private TaskStatusUpdateEvent getStatusUpdateEvent(boolean sendCounters, boolean isLast) {
+      400        TezCounters counters = null;
+      401        TaskStatistics stats = null;
+      402        float progress = 0;
+      403        if (task.hasInitialized()) {
+      404          progress = task.getProgress();
+      405          // TODO HIVE-12449. Make use of progress notifications once Hive starts sending them out.
+      406          // progressNotified = task.getAndClearProgressNotification();
+      407          if (sendCounters) {
+      408            // send these potentially large objects at longer intervals to avoid overloading the AM
+      409            counters = task.getCounters();
+      410            if (wmCounters != null && counters != null) {
+      411              wmCounters.dumpToTezCounters(counters, isLast);
+      412            }
+      413            stats = task.getTaskStatistics();
+      414          }
+      415        }
+      416        return new TaskStatusUpdateEvent(counters, progress, stats, true);
+      417      }
+      418  
+      419      /**
+      420       * Sends out final events for task failure.
+      421       * @param taskAttemptID
+      422       * @param isKilled
+      423       * @param taskFailureType
+      424       * @param t
+      425       * @param diagnostics
+      426       * @param srcMeta
+      427       * @return
+      428       * @throws IOException
+      429       *           indicates an RPC communication failure.
+      430       * @throws TezException
+      431       *           indicates an exception somewhere in the AM.
+      432       */
+      433      private boolean taskTerminated(TezTaskAttemptID taskAttemptID, boolean isKilled,
+      434                                 TaskFailureType taskFailureType, Throwable t, String diagnostics,
+      435                                 EventMetaData srcMeta) throws IOException, TezException {
+      436        // Ensure only one final event is ever sent.
+      437        if (!finalEventQueued.getAndSet(true)) {
+      438          List<TezEvent> tezEvents = new ArrayList<>();
+      439          if (diagnostics == null) {
+      440            diagnostics = ExceptionUtils.getStackTrace(t);
+      441          } else {
+      442            diagnostics = diagnostics + ":" + ExceptionUtils.getStackTrace(t);
+      443          }
+      444  
+      445          if (isKilled) {
+      446            tezEvents.add(new TezEvent(new TaskAttemptKilledEvent(diagnostics),
+      447                srcMeta == null ? updateEventMetadata : srcMeta));
+      448          } else {
+      449            tezEvents.add(new TezEvent(new TaskAttemptFailedEvent(diagnostics,
+      450                taskFailureType),
+      451                srcMeta == null ? updateEventMetadata : srcMeta));
+      452          }
+      453          try {
+      454            tezEvents.add(new TezEvent(
+      455                getStatusUpdateEvent(true, true), updateEventMetadata));
+      456          } catch (Exception e) {
+      457            // Counter may exceed limitation
+      458            LOG.warn("Error when get constructing TaskStatusUpdateEvent. Not sending it out");
+      459          }
+      460          if (LOG.isDebugEnabled()) {
+      461            LOG.debug(
+      462                "Invoking OOB heartbeat for failed/killed attempt: {}, isTaskDone={}, isKilled={}",
+      463                taskAttemptID, task.isTaskDone(), isKilled);
+      464          }
+      465          completionListener.fragmentCompleting(fragmentRequestId,
+      466              isKilled ? SchedulerFragmentCompletingListener.State.KILLED :
+      467                  SchedulerFragmentCompletingListener.State.FAILED);
+      468          return !heartbeat(tezEvents).shouldDie;
+      469        } else {
+      470          LOG.warn("A final task state event has already been sent. Not sending again");
+      471          return askedToDie.get();
+      472        }
+      473  
+      474      }
+      475  
+      476      private void addEvents(TezTaskAttemptID taskAttemptID, Collection<TezEvent> events) {
+      477        if (events != null && !events.isEmpty()) {
+      478          eventsToSend.addAll(events);
+      479        }
+      480      }
+      481    }

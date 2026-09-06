@@ -1,0 +1,406 @@
+row 132   spring-projects/spring-ai#5549
+============================================================================
+CLASS org.springframework.ai.vectorstore.cassandra.CassandraVectorStore   loc=864 methods=23 wmc=68 lcom=0.0909090909090909 c3=0.1019343563553575
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      176  public class CassandraVectorStore extends AbstractObservationVectorStore implements AutoCloseable {
+      177  
+      178  	public static final String DEFAULT_KEYSPACE_NAME = "springframework";
+      179  
+      180  	public static final String DEFAULT_TABLE_NAME = "ai_vector_store";
+      181  
+      182  	public static final String DEFAULT_ID_NAME = "id";
+      183  
+      184  	public static final String DEFAULT_INDEX_SUFFIX = "idx";
+      185  
+      186  	public static final String DEFAULT_CONTENT_COLUMN_NAME = "content";
+      187  
+      188  	public static final String DEFAULT_EMBEDDING_COLUMN_NAME = "embedding";
+      189  
+      190  	public static final int DEFAULT_ADD_CONCURRENCY = 16;
+      191  
+      192  	public static final String DRIVER_PROFILE_UPDATES = "spring-ai-updates";
+      193  
+      194  	public static final String DRIVER_PROFILE_SEARCH = "spring-ai-search";
+      195  
+      196  	private static final Logger logger = LoggerFactory.getLogger(CassandraVectorStore.class);
+      197  
+      198  	private static final Map<Similarity, VectorStoreSimilarityMetric> SIMILARITY_TYPE_MAPPING = Map.of(
+      199  			Similarity.COSINE, VectorStoreSimilarityMetric.COSINE, Similarity.EUCLIDEAN,
+      200  			VectorStoreSimilarityMetric.EUCLIDEAN, Similarity.DOT_PRODUCT, VectorStoreSimilarityMetric.DOT);
+      201  
+      202  	private final CqlSession session;
+      203  
+      204  	private final Schema schema;
+      205  
+      206  	private final boolean initializeSchema;
+      207  
+      208  	private final FilterExpressionConverter filterExpressionConverter;
+      209  
+      210  	private final DocumentIdTranslator documentIdTranslator;
+      211  
+      212  	private final PrimaryKeyTranslator primaryKeyTranslator;
+      213  
+      214  	private final Executor executor;
+      215  
+      216  	private final boolean closeSessionOnClose;
+      217  
+      218  	private final ConcurrentMap<Set<String>, PreparedStatement> addStmts = new ConcurrentHashMap<>();
+      219  
+      220  	private final PreparedStatement deleteStmt;
+      221  
+      222  	private final Similarity similarity;
+      223  
+      224  	protected CassandraVectorStore(Builder builder) {
+      225  		super(builder);
+      226  
+      227  		Assert.notNull(builder.session, "Session must not be null");
+      228  
+      229  		this.session = builder.session;
+      230  		this.schema = builder.buildSchema();
+      231  		this.initializeSchema = builder.initializeSchema;
+      232  		this.documentIdTranslator = builder.documentIdTranslator;
+      233  		this.primaryKeyTranslator = builder.primaryKeyTranslator;
+      234  		this.executor = Executors.newFixedThreadPool(builder.fixedThreadPoolExecutorSize);
+      235  		this.closeSessionOnClose = builder.closeSessionOnClose;
+      236  
+      237  		ensureSchemaExists(this.embeddingModel.dimensions());
+      238  		prepareAddStatement(Set.of());
+      239  		this.deleteStmt = prepareDeleteStatement();
+      240  
+      241  		TableMetadata cassandraMetadata = this.session.getMetadata()
+      242  			.getKeyspace(this.schema.keyspace())
+      243  			.get()
+      244  			.getTable(this.schema.table())
+      245  			.get();
+      246  
+      247  		this.similarity = getIndexSimilarity(cassandraMetadata);
+      248  
+      249  		this.filterExpressionConverter = builder.filterExpressionConverter != null ? builder.filterExpressionConverter
+      250  				: new CassandraFilterExpressionConverter(cassandraMetadata.getColumns().values());
+      251  	}
+      252  
+      253  	public static Builder builder(EmbeddingModel embeddingModel) {
+      254  		return new Builder(embeddingModel);
+      255  	}
+      256  
+      257  	private static Float[] toFloatArray(float[] embedding) {
+      258  		Float[] embeddingFloat = new Float[embedding.length];
+      259  		int i = 0;
+      260  		for (Float d : embedding) {
+      261  			embeddingFloat[i++] = d.floatValue();
+      262  		}
+      263  		return embeddingFloat;
+      264  	}
+      265  
+      266  	@Override
+      267  	public void doAdd(List<Document> documents) {
+      268  		var futures = new CompletableFuture[documents.size()];
+      269  
+      270  		List<float[]> embeddings = this.embeddingModel.embed(documents, EmbeddingOptions.builder().build(),
+      271  				this.batchingStrategy);
+      272  
+      273  		int i = 0;
+      274  		for (Document d : documents) {
+      275  			futures[i++] = CompletableFuture.runAsync(() -> {
+      276  				List<Object> primaryKeyValues = this.documentIdTranslator.apply(d.getId());
+      277  
+      278  				BoundStatementBuilder builder = prepareAddStatement(d.getMetadata().keySet()).boundStatementBuilder();
+      279  				for (int k = 0; k < primaryKeyValues.size(); ++k) {
+      280  					SchemaColumn keyColumn = this.getPrimaryKeyColumn(k);
+      281  					builder = builder.set(keyColumn.name(), primaryKeyValues.get(k), keyColumn.javaType());
+      282  				}
+      283  
+      284  				builder = builder.setString(this.schema.content(), d.getText())
+      285  					.setVector(this.schema.embedding(),
+      286  							CqlVector.newInstance(EmbeddingUtils.toList(embeddings.get(documents.indexOf(d)))),
+      287  							Float.class);
+      288  
+      289  				for (var metadataColumn : this.schema.metadataColumns()
+      290  					.stream()
+      291  					.filter(mc -> d.getMetadata().containsKey(mc.name()))
+      292  					.toList()) {
+      293  
+      294  					builder = builder.set(metadataColumn.name(), d.getMetadata().get(metadataColumn.name()),
+      295  							metadataColumn.javaType());
+      296  				}
+      297  				BoundStatement s = builder.build().setExecutionProfileName(DRIVER_PROFILE_UPDATES);
+      298  				this.session.execute(s);
+      299  			}, this.executor);
+      300  		}
+      301  		CompletableFuture.allOf(futures).join();
+      302  	}
+      303  
+      304  	@Override
+      305  	public void doDelete(List<String> idList) {
+      306  		CompletableFuture[] futures = new CompletableFuture[idList.size()];
+      307  		int i = 0;
+      308  		for (String id : idList) {
+      309  			List<Object> primaryKeyValues = this.documentIdTranslator.apply(id);
+      310  			BoundStatement s = this.deleteStmt.bind(primaryKeyValues.toArray());
+      311  			futures[i++] = this.session.executeAsync(s).toCompletableFuture();
+      312  		}
+      313  		CompletableFuture.allOf(futures).join();
+      314  	}
+      315  
+      316  	@Override
+      317  	protected void doDelete(Filter.Expression filterExpression) {
+      318  		Assert.notNull(filterExpression, "Filter expression must not be null");
+      319  
+      320  		try {
+      321  			// TODO - Investigate why we can't do a direct filter based delete in
+      322  			// Cassandra
+      323  			// This SO thread seems to indicate that this is not possible in Cassandra
+      324  			// https://stackoverflow.com/questions/70953262/unable-to-delete-multiple-rows-getting-some-partition-key-parts-are-missing-i
+      325  			// Needs more research into this matter.
+      326  			SearchRequest searchRequest = SearchRequest.builder()
+      327  				.query("") // empty query since we only want filter matches
+      328  				.filterExpression(filterExpression)
+      329  				.topK(1000) // large enough to get all matches
+      330  				.similarityThresholdAll()
+      331  				.build();
+      332  
+      333  			List<Document> matchingDocs = similaritySearch(searchRequest);
+      334  
+      335  			if (!matchingDocs.isEmpty()) {
+      336  				// Then delete those documents by ID
+      337  				List<String> idsToDelete = matchingDocs.stream().map(Document::getId).collect(Collectors.toList());
+      338  				delete(idsToDelete);
+      339  				logger.debug("Deleted {} documents matching filter expression", idsToDelete.size());
+      340  			}
+      341  		}
+      342  		catch (Exception e) {
+      343  			logger.error("Failed to delete documents by filter", e);
+      344  			throw new IllegalStateException("Failed to delete documents by filter", e);
+      345  		}
+      346  	}
+      347  
+      348  	@Override
+      349  	public List<Document> doSimilaritySearch(SearchRequest request) {
+      350  		Preconditions.checkArgument(request.getTopK() <= 1000);
+      351  		var embedding = toFloatArray(this.embeddingModel.embed(request.getQuery()));
+      352  		CqlVector<Float> cqlVector = CqlVector.newInstance(embedding);
+      353  		String cql = createSimilaritySearchCql(request, cqlVector, request.getTopK());
+      354  
+      355  		List<Document> documents = new ArrayList<>();
+      356  		ResultSet result = this.session
+      357  			.execute(SimpleStatement.newInstance(cql).setExecutionProfileName(DRIVER_PROFILE_SEARCH));
+      358  
+      359  		for (Row row : result) {
+      360  			float score = row.getFloat(0);
+      361  			if (score < request.getSimilarityThreshold()) {
+      362  				break;
+      363  			}
+      364  			Map<String, Object> docFields = new HashMap<>();
+      365  			docFields.put(DocumentMetadata.DISTANCE.value(), 1 - score);
+      366  			for (var metadata : this.schema.metadataColumns()) {
+      367  				var value = row.get(metadata.name(), metadata.javaType());
+      368  				if (null != value) {
+      369  					docFields.put(metadata.name(), value);
+      370  				}
+      371  			}
+      372  			Document doc = Document.builder()
+      373  				.id(getDocumentId(row))
+      374  				.text(row.getString(this.schema.content()))
+      375  				.metadata(docFields)
+      376  				.score((double) score)
+      377  				.build();
+      378  
+      379  			documents.add(doc);
+      380  		}
+      381  		return documents;
+      382  	}
+      383  
+      384  	void checkSchemaValid() {
+      385  		this.checkSchemaValid(this.embeddingModel.dimensions());
+      386  	}
+      387  
+      388  	private Similarity getIndexSimilarity(TableMetadata metadata) {
+      389  
+      390  		Optional<IndexMetadata> indexMetadata = metadata.getIndex(this.schema.index());
+      391  
+      392  		if (indexMetadata.isEmpty()) {
+      393  			throw new IllegalStateException(
+      394  					String.format("Index %s does not exist in table %s", this.schema.index(), this.schema.table));
+      395  		}
+      396  
+      397  		return Similarity
+      398  			.valueOf(indexMetadata.get().getOptions().getOrDefault("similarity_function", "COSINE").toUpperCase());
+      399  
+      400  	}
+      401  
+      402  	private PreparedStatement prepareDeleteStatement() {
+      403  		Delete stmt = null;
+      404  		DeleteSelection stmtStart = QueryBuilder.deleteFrom(this.schema.keyspace(), this.schema.table());
+      405  
+      406  		for (var c : this.schema.partitionKeys()) {
+      407  			stmt = (null != stmt ? stmt : stmtStart).whereColumn(c.name()).isEqualTo(QueryBuilder.bindMarker(c.name()));
+      408  		}
+      409  		for (var c : this.schema.clusteringKeys()) {
+      410  			stmt = stmt.whereColumn(c.name()).isEqualTo(QueryBuilder.bindMarker(c.name()));
+      411  		}
+      412  
+      413  		return this.session.prepare(stmt.build());
+      414  	}
+      415  
+      416  	private PreparedStatement prepareAddStatement(Set<String> metadataFields) {
+      417  
+      418  		// metadata fields that are not configured as metadata columns are not added
+      419  		Set<String> fieldsThatAreColumns = new HashSet<>(this.schema.metadataColumns()
+      420  			.stream()
+      421  			.map(mc -> mc.name())
+      422  			.filter(mc -> metadataFields.contains(mc))
+      423  			.toList());
+      424  
+      425  		return this.addStmts.computeIfAbsent(fieldsThatAreColumns, fields -> {
+      426  
+      427  			RegularInsert stmt = null;
+      428  			InsertInto stmtStart = QueryBuilder.insertInto(this.schema.keyspace(), this.schema.table());
+      429  
+      430  			for (var c : this.schema.partitionKeys()) {
+      431  				stmt = (null != stmt ? stmt : stmtStart).value(c.name(), QueryBuilder.bindMarker(c.name()));
+      432  			}
+      433  			for (var c : this.schema.clusteringKeys()) {
+      434  				stmt = stmt.value(c.name(), QueryBuilder.bindMarker(c.name()));
+      435  			}
+      436  
+      437  			stmt = stmt.value(this.schema.content(), QueryBuilder.bindMarker(this.schema.content()))
+      438  				.value(this.schema.embedding(), QueryBuilder.bindMarker(this.schema.embedding()));
+      439  
+      440  			for (String metadataField : fields) {
+      441  				stmt = stmt.value(metadataField, QueryBuilder.bindMarker(metadataField));
+      442  			}
+      443  			return this.session.prepare(stmt.build());
+      444  		});
+      445  	}
+      446  
+      447  	private String createSimilaritySearchCql(SearchRequest request, CqlVector<Float> cqlVector, int topK) {
+      448  
+      449  		Select stmt = QueryBuilder.selectFrom(this.schema.keyspace(), this.schema.table())
+      450  			.function("similarity_" + this.similarity.toString().toLowerCase(),
+      451  					Selector.column(this.schema.embedding()), QueryBuilder.literal(cqlVector));
+      452  
+      453  		for (var c : this.schema.partitionKeys()) {
+      454  			stmt = stmt.column(c.name());
+      455  		}
+      456  		for (var c : this.schema.clusteringKeys()) {
+      457  			stmt = stmt.column(c.name());
+      458  		}
+      459  		stmt = stmt.column(this.schema.content());
+      460  		for (var m : this.schema.metadataColumns()) {
+      461  			stmt = stmt.column(m.name());
+      462  		}
+      463  		stmt = stmt.column(this.schema.embedding());
+      464  
+      465  		// the filterExpression is a string so we go back to building a CQL string
+      466  		String whereClause = "";
+      467  		if (request.hasFilterExpression()) {
+      468  			String expression = this.filterExpressionConverter.convertExpression(request.getFilterExpression());
+      469  			if (!expression.isBlank()) {
+      470  				whereClause = String.format(" WHERE %s", expression);
+      471  			}
+      472  		}
+      473  		String cql = stmt.orderByAnnOf(this.schema.embedding(), cqlVector).limit(topK).asCql();
+      474  		return cql.replace(" ORDER ", whereClause + " ORDER ");
+      475  	}
+      476  
+      477  	private String getDocumentId(Row row) {
+      478  		List<Object> primaryKeyValues = new ArrayList<>();
+      479  		for (var m : this.schema.partitionKeys()) {
+      480  			primaryKeyValues.add(row.get(m.name(), m.javaType()));
+      481  		}
+      482  		for (var m : this.schema.clusteringKeys()) {
+      483  			primaryKeyValues.add(row.get(m.name(), m.javaType()));
+      484  		}
+      485  		return this.primaryKeyTranslator.apply(primaryKeyValues);
+      486  	}
+      487  
+      488  	@Override
+      489  	public VectorStoreObservationContext.Builder createObservationContextBuilder(String operationName) {
+      490  		return VectorStoreObservationContext.builder(VectorStoreProvider.CASSANDRA.value(), operationName)
+      491  			.collectionName(this.schema.table())
+      492  			.dimensions(this.embeddingModel.dimensions())
+      493  			.namespace(this.schema.keyspace())
+      494  			.similarityMetric(getSimilarityMetric());
+      495  	}
+      496  
+      497  	private String getSimilarityMetric() {
+      498  		if (!SIMILARITY_TYPE_MAPPING.containsKey(this.similarity)) {
+      499  			return this.similarity.name();
+      500  		}
+      501  		return SIMILARITY_TYPE_MAPPING.get(this.similarity).value();
+      502  	}
+      503  
+      504  	@Override
+      505  	public void close() throws Exception {
+      506  		if (this.closeSessionOnClose) {
+      507  			this.session.close();
+      508  		}
+      509  	}
+      510  
+      511  	SchemaColumn getPrimaryKeyColumn(int index) {
+      512  		return index < this.schema.partitionKeys().size() ? this.schema.partitionKeys().get(index)
+      513  				: this.schema.clusteringKeys().get(index - this.schema.partitionKeys().size());
+      514  	}
+      515  
+      516  	@VisibleForTesting
+      517  	static void dropKeyspace(Builder builder) {
+      518  		Preconditions.checkState(builder.keyspace.startsWith("test_"), "Only test keyspaces can be dropped");
+      519  		builder.session.execute(SchemaBuilder.dropKeyspace(builder.keyspace).ifExists().build());
+      520  	}
+      521  
+      522  	void ensureSchemaExists(int vectorDimension) {
+      523  		if (this.initializeSchema) {
+      524  			SchemaUtil.ensureKeyspaceExists(this.session, this.schema.keyspace);
+      525  			ensureTableExists(vectorDimension);
+      526  			ensureTableColumnsExist(vectorDimension);
+      527  			ensureIndexesExists();
+      528  			SchemaUtil.checkSchemaAgreement(this.session);
+      529  		}
+      530  		else {
+      531  			checkSchemaValid(vectorDimension);
+      532  		}
+      533  	}
+      534  
+      535  	void checkSchemaValid(int vectorDimension) {
+      536  
+      537  		Preconditions.checkState(this.session.getMetadata().getKeyspace(this.schema.keyspace).isPresent(),
+      538  				"keyspace %s does not exist", this.schema.keyspace);
+      539  
+      540  		Preconditions.checkState(this.session.getMetadata()
+      541  			.getKeyspace(this.schema.keyspace)
+      542  			.get()
+      543  			.getTable(this.schema.table)
+      544  			.isPresent(), "table %s does not exist", this.schema.table);
+      545  
+      546  		TableMetadata tableMetadata = this.session.getMetadata()
+      547  			.getKeyspace(this.schema.keyspace)
+      548  			.get()
+      549  			.getTable(this.schema.table)
+      550  			.get();
+      551  
+      552  		Preconditions.checkState(tableMetadata.getIndex(this.schema.index()).isPresent(), "index %s does not exist",
+      553  				this.schema.index());
+      554  
+      555  		Preconditions.checkState(tableMetadata.getColumn(this.schema.content).isPresent(), "column %s does not exist",
+      556  				this.schema.content);
+      557  
+      558  		Preconditions.checkState(tableMetadata.getColumn(this.schema.embedding).isPresent(), "column %s does not exist",
+      559  				this.schema.embedding);
+      560  
+      561  		for (SchemaColumn m : this.schema.metadataColumns) {
+      562  			Optional<ColumnMetadata> column = tableMetadata.getColumn(m.name());
+      563  			Preconditions.checkState(column.isPresent(), "column %s does not exist", m.name());
+      564  
+      565  			Preconditions.checkArgument(column.get().getType().equals(m.type()),
+      566  					"Mismatching type on metadata column %s of %s vs %s", m.name(), column.get().getType(), m.type());
+      567  
+      568  			if (m.indexed()) {
+      569  				Preconditions.checkState(
+      570  						tableMetadata.getIndexes().values().stream().anyMatch(i -> i.getTarget().equals(m.name())),
+      571  						"index %s does not exist", m.name());
+      572  			}
+      573  		}
+      574  
+      575  	}
+       ... truncated at 400 lines ...

@@ -1,0 +1,406 @@
+row 154   apache/doris#61565
+============================================================================
+CLASS org.apache.doris.analysis.CreateFunctionStmt   loc=836 methods=29 wmc=166 lcom=0.1071428571428571 c3=0.1432875944301464
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       75  public class CreateFunctionStmt extends DdlStmt implements NotFallbackInParser {
+       76      @Deprecated
+       77      public static final String OBJECT_FILE_KEY = "object_file";
+       78      public static final String FILE_KEY = "file";
+       79      public static final String SYMBOL_KEY = "symbol";
+       80      public static final String PREPARE_SYMBOL_KEY = "prepare_fn";
+       81      public static final String CLOSE_SYMBOL_KEY = "close_fn";
+       82      public static final String MD5_CHECKSUM = "md5";
+       83      public static final String INIT_KEY = "init_fn";
+       84      public static final String UPDATE_KEY = "update_fn";
+       85      public static final String MERGE_KEY = "merge_fn";
+       86      public static final String SERIALIZE_KEY = "serialize_fn";
+       87      public static final String FINALIZE_KEY = "finalize_fn";
+       88      public static final String GET_VALUE_KEY = "get_value_fn";
+       89      public static final String REMOVE_KEY = "remove_fn";
+       90      public static final String BINARY_TYPE = "type";
+       91      public static final String EVAL_METHOD_KEY = "evaluate";
+       92      public static final String CREATE_METHOD_NAME = "create";
+       93      public static final String DESTROY_METHOD_NAME = "destroy";
+       94      public static final String ADD_METHOD_NAME = "add";
+       95      public static final String SERIALIZE_METHOD_NAME = "serialize";
+       96      public static final String MERGE_METHOD_NAME = "merge";
+       97      public static final String GETVALUE_METHOD_NAME = "getValue";
+       98      public static final String STATE_CLASS_NAME = "State";
+       99      // add for java udf check return type nullable mode, always_nullable or always_not_nullable
+      100      public static final String IS_RETURN_NULL = "always_nullable";
+      101      // iff is static load, BE will be cache the udf class load, so only need load once
+      102      public static final String IS_STATIC_LOAD = "static_load";
+      103      public static final String EXPIRATION_TIME = "expiration_time";
+      104      private static final Logger LOG = LogManager.getLogger(CreateFunctionStmt.class);
+      105  
+      106      private SetType type = SetType.DEFAULT;
+      107      private final boolean ifNotExists;
+      108      private final FunctionName functionName;
+      109      private final boolean isAggregate;
+      110      private final boolean isAlias;
+      111      private boolean isTableFunction;
+      112      private final FunctionArgsDef argsDef;
+      113      private final TypeDef returnType;
+      114      private TypeDef intermediateType;
+      115      private final Map<String, String> properties;
+      116      private final List<String> parameters;
+      117      private final Expr originFunction;
+      118      TFunctionBinaryType binaryType = TFunctionBinaryType.JAVA_UDF;
+      119  
+      120      // needed item set after analyzed
+      121      private String userFile;
+      122      private Function function;
+      123      private String checksum = "";
+      124      private boolean isStaticLoad = false;
+      125      private long expirationTime = 360; // default 6 hours = 360 minutes
+      126      // now set udf default NullableMode is ALWAYS_NULLABLE
+      127      // if not, will core dump when input is not null column, but need return null
+      128      // like https://github.com/apache/doris/pull/14002/files
+      129      private NullableMode returnNullMode = NullableMode.ALWAYS_NULLABLE;
+      130  
+      131      // timeout for both connection and read. 10 seconds is long enough.
+      132      private static final int HTTP_TIMEOUT_MS = 10000;
+      133  
+      134      public CreateFunctionStmt(SetType type, boolean ifNotExists, boolean isAggregate, FunctionName functionName,
+      135                                FunctionArgsDef argsDef,
+      136                                TypeDef returnType, TypeDef intermediateType, Map<String, String> properties) {
+      137          this.type = type;
+      138          this.ifNotExists = ifNotExists;
+      139          this.functionName = functionName;
+      140          this.isAggregate = isAggregate;
+      141          this.argsDef = argsDef;
+      142          this.returnType = returnType;
+      143          this.intermediateType = intermediateType;
+      144          if (properties == null) {
+      145              this.properties = ImmutableSortedMap.of();
+      146          } else {
+      147              this.properties = ImmutableSortedMap.copyOf(properties, String.CASE_INSENSITIVE_ORDER);
+      148          }
+      149          this.isAlias = false;
+      150          this.isTableFunction = false;
+      151          this.parameters = ImmutableList.of();
+      152          this.originFunction = null;
+      153      }
+      154  
+      155      public CreateFunctionStmt(SetType type, boolean ifNotExists, FunctionName functionName,
+      156              FunctionArgsDef argsDef,
+      157              TypeDef returnType, TypeDef intermediateType, Map<String, String> properties) {
+      158          this(type, ifNotExists, false, functionName, argsDef, returnType, intermediateType, properties);
+      159          this.isTableFunction = true;
+      160      }
+      161  
+      162      public CreateFunctionStmt(SetType type, boolean ifNotExists, FunctionName functionName, FunctionArgsDef argsDef,
+      163              List<String> parameters, Expr originFunction) {
+      164          this.type = type;
+      165          this.ifNotExists = ifNotExists;
+      166          this.functionName = functionName;
+      167          this.isAlias = true;
+      168          this.argsDef = argsDef;
+      169          if (parameters == null) {
+      170              this.parameters = ImmutableList.of();
+      171          } else {
+      172              this.parameters = ImmutableList.copyOf(parameters);
+      173          }
+      174          this.originFunction = originFunction;
+      175          this.isAggregate = false;
+      176          this.isTableFunction = false;
+      177          this.returnType = new TypeDef(Type.VARCHAR);
+      178          this.properties = ImmutableSortedMap.of();
+      179      }
+      180  
+      181      public SetType getType() {
+      182          return type;
+      183      }
+      184  
+      185      public boolean isIfNotExists() {
+      186          return ifNotExists;
+      187      }
+      188  
+      189      public FunctionName getFunctionName() {
+      190          return functionName;
+      191      }
+      192  
+      193      public Function getFunction() {
+      194          return function;
+      195      }
+      196  
+      197      public Expr getOriginFunction() {
+      198          return originFunction;
+      199      }
+      200  
+      201      @Override
+      202      public void analyze(Analyzer analyzer) throws UserException {
+      203          super.analyze(analyzer);
+      204  
+      205          // https://github.com/apache/doris/issues/17810
+      206          // this error report in P0 test, so we suspect that it is related to concurrency
+      207          // add this change to test it.
+      208          if (Config.use_fuzzy_session_variable) {
+      209              synchronized (CreateFunctionStmt.class) {
+      210                  analyzeCommon(analyzer);
+      211                  // check
+      212                  if (isAggregate) {
+      213                      analyzeUda();
+      214                  } else if (isAlias) {
+      215                      analyzeAliasFunction();
+      216                  } else if (isTableFunction) {
+      217                      analyzeTableFunction();
+      218                  } else {
+      219                      analyzeUdf();
+      220                  }
+      221              }
+      222          } else {
+      223              analyzeCommon(analyzer);
+      224              // check
+      225              if (isAggregate) {
+      226                  analyzeUda();
+      227              } else if (isAlias) {
+      228                  analyzeAliasFunction();
+      229              } else if (isTableFunction) {
+      230                  analyzeTableFunction();
+      231              } else {
+      232                  analyzeUdf();
+      233              }
+      234          }
+      235      }
+      236  
+      237      private void analyzeCommon(Analyzer analyzer) throws AnalysisException {
+      238          // check function name
+      239          functionName.analyze(analyzer, this.type);
+      240  
+      241          // check operation privilege
+      242          if (!Env.getCurrentEnv().getAccessManager().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
+      243              ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "ADMIN");
+      244          }
+      245          // check argument
+      246          argsDef.analyze(analyzer);
+      247  
+      248          // alias function does not need analyze following params
+      249          if (isAlias) {
+      250              return;
+      251          }
+      252  
+      253          returnType.analyze(analyzer);
+      254          if (intermediateType != null) {
+      255              intermediateType.analyze(analyzer);
+      256          } else {
+      257              intermediateType = returnType;
+      258          }
+      259  
+      260          String type = properties.getOrDefault(BINARY_TYPE, "JAVA_UDF");
+      261          binaryType = getFunctionBinaryType(type);
+      262          if (binaryType == null) {
+      263              throw new AnalysisException("unknown function type");
+      264          }
+      265          if (type.equals("NATIVE")) {
+      266              throw new AnalysisException("do not support 'NATIVE' udf type after doris version 1.2.0,"
+      267                                      + "please use JAVA_UDF or RPC instead");
+      268          }
+      269  
+      270          userFile = properties.getOrDefault(FILE_KEY, properties.get(OBJECT_FILE_KEY));
+      271          //        if (Strings.isNullOrEmpty(userFile)) {
+      272          //            throw new AnalysisException("No 'file' or 'object_file' in properties");
+      273          //        }
+      274          if (!Strings.isNullOrEmpty(userFile) && binaryType != TFunctionBinaryType.RPC) {
+      275              try {
+      276                  computeObjectChecksum();
+      277              } catch (IOException | NoSuchAlgorithmException e) {
+      278                  throw new AnalysisException("cannot to compute object's checksum. err: " + e.getMessage());
+      279              }
+      280              String md5sum = properties.get(MD5_CHECKSUM);
+      281              if (md5sum != null && !md5sum.equalsIgnoreCase(checksum)) {
+      282                  throw new AnalysisException("library's checksum is not equal with input, checksum=" + checksum);
+      283              }
+      284          }
+      285          if (binaryType == TFunctionBinaryType.JAVA_UDF) {
+      286              FunctionUtil.checkEnableJavaUdf();
+      287  
+      288              // always_nullable the default value is true, equal null means true
+      289              Boolean isReturnNull = parseBooleanFromProperties(IS_RETURN_NULL);
+      290              if (isReturnNull != null && !isReturnNull) {
+      291                  returnNullMode = NullableMode.ALWAYS_NOT_NULLABLE;
+      292              }
+      293              // static_load the default value is false, equal null means false
+      294              Boolean staticLoad = parseBooleanFromProperties(IS_STATIC_LOAD);
+      295              if (staticLoad != null && staticLoad) {
+      296                  isStaticLoad = true;
+      297              }
+      298              String expirationTimeString = properties.get(EXPIRATION_TIME);
+      299              if (expirationTimeString != null) {
+      300                  long timeMinutes = Long.parseLong(expirationTimeString);
+      301                  if (timeMinutes <= 0) {
+      302                      throw new AnalysisException("expirationTime should greater than zero: ");
+      303                  }
+      304                  this.expirationTime = timeMinutes;
+      305              }
+      306          }
+      307      }
+      308  
+      309      private Boolean parseBooleanFromProperties(String propertyString) throws AnalysisException {
+      310          String valueOfString = properties.get(propertyString);
+      311          if (valueOfString == null) {
+      312              return null;
+      313          }
+      314          if (!valueOfString.equalsIgnoreCase("false") && !valueOfString.equalsIgnoreCase("true")) {
+      315              throw new AnalysisException(propertyString + " in properties, you should set it false or true");
+      316          }
+      317          return Boolean.parseBoolean(valueOfString);
+      318      }
+      319  
+      320      private void computeObjectChecksum() throws IOException, NoSuchAlgorithmException {
+      321          if (FeConstants.runningUnitTest) {
+      322              // skip checking checksum when running ut
+      323              return;
+      324          }
+      325  
+      326          try (InputStream inputStream = Util.getInputStreamFromUrl(userFile, null, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS)) {
+      327              MessageDigest digest = MessageDigest.getInstance("MD5");
+      328              byte[] buf = new byte[4096];
+      329              int bytesRead = 0;
+      330              do {
+      331                  bytesRead = inputStream.read(buf);
+      332                  if (bytesRead < 0) {
+      333                      break;
+      334                  }
+      335                  digest.update(buf, 0, bytesRead);
+      336              } while (true);
+      337  
+      338              checksum = Hex.encodeHexString(digest.digest());
+      339          }
+      340      }
+      341  
+      342      private void analyzeTableFunction() throws AnalysisException {
+      343          String symbol = properties.get(SYMBOL_KEY);
+      344          if (Strings.isNullOrEmpty(symbol)) {
+      345              throw new AnalysisException("No 'symbol' in properties");
+      346          }
+      347          if (!returnType.getType().isArrayType()) {
+      348              throw new AnalysisException("JAVA_UDF OF UDTF return type must be array type");
+      349          }
+      350          analyzeJavaUdf(symbol);
+      351          URI location;
+      352          if (!Strings.isNullOrEmpty(userFile)) {
+      353              location = URI.create(userFile);
+      354          } else {
+      355              location = null;
+      356          }
+      357          function = ScalarFunction.createUdf(binaryType,
+      358                  functionName, argsDef.getArgTypes(),
+      359                  ((ArrayType) (returnType.getType())).getItemType(), argsDef.isVariadic(),
+      360                  location, symbol, null, null);
+      361          function.setChecksum(checksum);
+      362          function.setNullableMode(returnNullMode);
+      363          function.setUDTFunction(true);
+      364          // Todo: maybe in create tables function, need register two function, one is
+      365          // normal and one is outer as those have different result when result is NULL.
+      366      }
+      367  
+      368      private void analyzeUda() throws AnalysisException {
+      369          AggregateFunction.AggregateFunctionBuilder builder
+      370                  = AggregateFunction.AggregateFunctionBuilder.createUdfBuilder();
+      371          URI location;
+      372          if (!Strings.isNullOrEmpty(userFile)) {
+      373              location = URI.create(userFile);
+      374          } else {
+      375              location = null;
+      376          }
+      377          builder.name(functionName).argsType(argsDef.getArgTypes()).retType(returnType.getType())
+      378                  .hasVarArgs(argsDef.isVariadic()).intermediateType(intermediateType.getType())
+      379                  .location(location);
+      380          String initFnSymbol = properties.get(INIT_KEY);
+      381          if (initFnSymbol == null && !(binaryType == TFunctionBinaryType.JAVA_UDF
+      382                  || binaryType == TFunctionBinaryType.RPC)) {
+      383              throw new AnalysisException("No 'init_fn' in properties");
+      384          }
+      385          String updateFnSymbol = properties.get(UPDATE_KEY);
+      386          if (updateFnSymbol == null && !(binaryType == TFunctionBinaryType.JAVA_UDF)) {
+      387              throw new AnalysisException("No 'update_fn' in properties");
+      388          }
+      389          String mergeFnSymbol = properties.get(MERGE_KEY);
+      390          if (mergeFnSymbol == null && !(binaryType == TFunctionBinaryType.JAVA_UDF)) {
+      391              throw new AnalysisException("No 'merge_fn' in properties");
+      392          }
+      393          String serializeFnSymbol = properties.get(SERIALIZE_KEY);
+      394          String finalizeFnSymbol = properties.get(FINALIZE_KEY);
+      395          String getValueFnSymbol = properties.get(GET_VALUE_KEY);
+      396          String removeFnSymbol = properties.get(REMOVE_KEY);
+      397          String symbol = properties.get(SYMBOL_KEY);
+      398          if (binaryType == TFunctionBinaryType.RPC && !userFile.contains("://")) {
+      399              if (initFnSymbol != null) {
+      400                  checkRPCUdf(initFnSymbol);
+      401              }
+      402              checkRPCUdf(updateFnSymbol);
+      403              checkRPCUdf(mergeFnSymbol);
+      404              if (serializeFnSymbol != null) {
+      405                  checkRPCUdf(serializeFnSymbol);
+      406              }
+      407              if (finalizeFnSymbol != null) {
+      408                  checkRPCUdf(finalizeFnSymbol);
+      409              }
+      410              if (getValueFnSymbol != null) {
+      411                  checkRPCUdf(getValueFnSymbol);
+      412              }
+      413              if (removeFnSymbol != null) {
+      414                  checkRPCUdf(removeFnSymbol);
+      415              }
+      416          } else if (binaryType == TFunctionBinaryType.JAVA_UDF) {
+      417              if (Strings.isNullOrEmpty(symbol)) {
+      418                  throw new AnalysisException("No 'symbol' in properties of java-udaf");
+      419              }
+      420              analyzeJavaUdaf(symbol);
+      421          }
+      422          function = builder.initFnSymbol(initFnSymbol).updateFnSymbol(updateFnSymbol).mergeFnSymbol(mergeFnSymbol)
+      423                  .serializeFnSymbol(serializeFnSymbol).finalizeFnSymbol(finalizeFnSymbol)
+      424                  .getValueFnSymbol(getValueFnSymbol).removeFnSymbol(removeFnSymbol).symbolName(symbol).build();
+      425          function.setLocation(location);
+      426          function.setBinaryType(binaryType);
+      427          function.setChecksum(checksum);
+      428          function.setNullableMode(returnNullMode);
+      429      }
+      430  
+      431      private void analyzeUdf() throws AnalysisException {
+      432          String symbol = properties.get(SYMBOL_KEY);
+      433          if (Strings.isNullOrEmpty(symbol)) {
+      434              throw new AnalysisException("No 'symbol' in properties");
+      435          }
+      436          String prepareFnSymbol = properties.get(PREPARE_SYMBOL_KEY);
+      437          String closeFnSymbol = properties.get(CLOSE_SYMBOL_KEY);
+      438          // TODO(yangzhg) support check function in FE when function service behind load balancer
+      439          // the format for load balance can ref https://github.com/apache/incubator-brpc/blob/master/docs/en/client.md#connect-to-a-cluster
+      440          if (binaryType == TFunctionBinaryType.RPC && !userFile.contains("://")) {
+      441              if (StringUtils.isNotBlank(prepareFnSymbol) || StringUtils.isNotBlank(closeFnSymbol)) {
+      442                  throw new AnalysisException("prepare and close in RPC UDF are not supported.");
+      443              }
+      444              checkRPCUdf(symbol);
+      445          } else if (binaryType == TFunctionBinaryType.JAVA_UDF) {
+      446              analyzeJavaUdf(symbol);
+      447          }
+      448          URI location;
+      449          if (!Strings.isNullOrEmpty(userFile)) {
+      450              location = URI.create(userFile);
+      451          } else {
+      452              location = null;
+      453          }
+      454          function = ScalarFunction.createUdf(binaryType,
+      455                  functionName, argsDef.getArgTypes(),
+      456                  returnType.getType(), argsDef.isVariadic(),
+      457                  location, symbol, prepareFnSymbol, closeFnSymbol);
+      458          function.setChecksum(checksum);
+      459          function.setNullableMode(returnNullMode);
+      460          function.setStaticLoad(isStaticLoad);
+      461          function.setExpirationTime(expirationTime);
+      462      }
+      463  
+      464      private void analyzeJavaUdaf(String clazz) throws AnalysisException {
+      465          HashMap<String, Method> allMethods = new HashMap<>();
+      466  
+      467          try {
+      468              if (Strings.isNullOrEmpty(userFile)) {
+      469                  try {
+      470                      ClassLoader cl = this.getClass().getClassLoader();
+      471                      checkUdafClass(clazz, cl, allMethods);
+      472                      return;
+      473                  } catch (ClassNotFoundException e) {
+      474                      throw new AnalysisException("Class [" + clazz + "] not found in classpath");
+       ... truncated at 400 lines ...

@@ -1,0 +1,406 @@
+row 159   StarRocks/starrocks#70342
+============================================================================
+CLASS com.starrocks.sql.optimizer.rule.transformation.materialization.AggregatedTimeSeriesRewriter   loc=651 methods=17 wmc=98 lcom=0.0625 c3=0.1965973494681283
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      105  public class AggregatedTimeSeriesRewriter extends MaterializedViewRewriter {
+      106      private static final Logger LOG = LogManager.getLogger(AggregatedTimeSeriesRewriter.class);
+      107  
+      108      private final Rule rule;
+      109      private final ColumnRefFactory queryColumnRefFactory;
+      110      private final Map<ColumnRefOperator, ScalarOperator> remapping = Maps.newHashMap();
+      111  
+      112      public AggregatedTimeSeriesRewriter(MvRewriteContext mvRewriteContext,
+      113                                          Rule rule) {
+      114          super(mvRewriteContext);
+      115          this.rule = rule;
+      116          queryColumnRefFactory = mvRewriteContext.getMaterializationContext().getQueryRefFactory();
+      117      }
+      118  
+      119      @Override
+      120      public boolean isValidPlan(OptExpression expression) {
+      121          return MvUtils.isLogicalSPJG(expression);
+      122      }
+      123  
+      124      private boolean isEnableTimeGranularityRollup(Table refBaseTable,
+      125                                                    MaterializedView mv,
+      126                                                    OptExpression queryExpression) {
+      127          // if mv rewrite generates the table, skip it
+      128          if (refBaseTable instanceof MaterializedView && mv.equals(refBaseTable)) {
+      129              return false;
+      130          }
+      131  
+      132          // check mv is partitioned table
+      133          PartitionInfo partitionInfo = mv.getPartitionInfo();
+      134          if (!partitionInfo.isRangePartition()) {
+      135              return false;
+      136          }
+      137          Optional<Expr> mvPartitionExprOpt = mv.getRangePartitionFirstExpr();
+      138          if (mvPartitionExprOpt.isEmpty()) {
+      139              return false;
+      140          }
+      141          Expr mvPartitionExpr = mvPartitionExprOpt.get();
+      142          if (mvPartitionExpr == null || !(mvPartitionExpr instanceof FunctionCallExpr)) {
+      143              return false;
+      144          }
+      145          FunctionCallExpr functionCallExpr = (FunctionCallExpr) mvPartitionExpr;
+      146          if (!functionCallExpr.getFnName().getFunction().equalsIgnoreCase(FunctionSet.DATE_TRUNC)) {
+      147              return false;
+      148          }
+      149  
+      150          // check ref base table is partitioned or not
+      151          if (refBaseTable instanceof OlapTable) {
+      152              OlapTable refBaseOlapTable = (OlapTable) refBaseTable;
+      153              if (!refBaseOlapTable.getPartitionInfo().isRangePartition()) {
+      154                  return false;
+      155              }
+      156          } else {
+      157              // external table should be partitioned table.
+      158              if (!ConnectorPartitionTraits.isSupportPCTRefresh(refBaseTable.getType())) {
+      159                  return false;
+      160              }
+      161              try {
+      162                  List<Column> partitionCols = refBaseTable.getPartitionColumns();
+      163                  if (partitionCols.isEmpty()) {
+      164                      return false;
+      165                  }
+      166              } catch (Exception e) {
+      167                  return false;
+      168              }
+      169          }
+      170  
+      171          // check input query expression
+      172          if (!(queryExpression.getOp() instanceof LogicalAggregationOperator)) {
+      173              return false;
+      174          }
+      175          LogicalAggregationOperator origAggOperator = (LogicalAggregationOperator) queryExpression.getOp();
+      176          // ensure all aggregate functions can be rolled up
+      177          if (origAggOperator.getAggregations().values().stream()
+      178                  .anyMatch(x -> !isSupportedAggFunctionPushDown(x))) {
+      179              return false;
+      180          }
+      181          List<LogicalScanOperator> scanOperators = MvUtils.getScanOperator(queryExpression);
+      182          if (scanOperators.size() != 1 || !scanOperators.get(0).getTable().equals(refBaseTable)) {
+      183              return false;
+      184          }
+      185          return true;
+      186      }
+      187  
+      188      @Override
+      189      public OptExpression doRewrite(MvRewriteContext mvRewriteContext) {
+      190          MaterializationContext mvContext = mvRewriteContext.getMaterializationContext();
+      191          // check mv's base table
+      192          List<Table> baseTables = mvContext.getBaseTables();
+      193          if (baseTables.size() != 1) {
+      194              logMVRewrite(mvRewriteContext, "AggTimeSeriesRewriter: base table size is not 1, size=" + baseTables.size());
+      195              return null;
+      196          }
+      197          Table refBaseTable = baseTables.get(0);
+      198          MaterializedView mv = mvContext.getMv();
+      199          FunctionCallExpr mvPartitionExpr = getMVPartitionExpr(mv);
+      200          if (mvPartitionExpr == null) {
+      201              return null;
+      202          }
+      203          OptExpression queryExpression = mvRewriteContext.getQueryExpression();
+      204          if (!isEnableTimeGranularityRollup(refBaseTable, mv, queryExpression)) {
+      205              logMVRewrite(mvRewriteContext,
+      206                      "AggTimeSeriesRewriter: cannot enable time granularity rollup for mv: " + mv.getName());
+      207              return null;
+      208          }
+      209          // split predicates for mv rewritten and non-mv-rewritten
+      210          List<LogicalScanOperator> scanOperators = MvUtils.getScanOperator(queryExpression);
+      211          Map<Table, List<Column>> refBaseTablePartitionCols = mv.getRefBaseTablePartitionColumns();
+      212          if (refBaseTablePartitionCols == null || !refBaseTablePartitionCols.containsKey(refBaseTable)) {
+      213              logMVRewrite(mvRewriteContext, "AggTimeSeriesRewriter: cannot find partition column for ref base table");
+      214              return null;
+      215          }
+      216          List<Column> refPartitionCols = refBaseTablePartitionCols.get(refBaseTable);
+      217          Preconditions.checkArgument(refPartitionCols.size() == 1);
+      218          Column refPartitionCol = refPartitionCols.get(0);
+      219          LogicalScanOperator scanOp = scanOperators.get(0);
+      220          // get ref partition column ref from query's scan operator
+      221          Optional<ColumnRefOperator> refPartitionColRefOpt = scanOp.getColRefToColumnMetaMap().keySet().stream()
+      222                  .filter(columnRefOperator -> columnRefOperator.getName().equalsIgnoreCase(refPartitionCol.getName()))
+      223                  .findFirst();
+      224          // compensate nothing if there is no partition column predicate in the scan node.
+      225          if (!refPartitionColRefOpt.isPresent()) {
+      226              logMVRewrite(mvRewriteContext, "AggTimeSeriesRewriter: cannot find partition column ref in scan node");
+      227              return null;
+      228          }
+      229          ColumnRefOperator refPartitionColRef = refPartitionColRefOpt.get();
+      230  
+      231          // split partition predicates into mv-rewritten predicates and non-rewritten predicates
+      232          ScalarOperator queryCompensatePedicate = MvPartitionCompensator.compensateQueryPartitionPredicate(
+      233                  mvContext, rule, optimizerContext.getColumnRefFactory(), queryExpression);
+      234          ScalarOperator queryScanPredicate = Utils.compoundAnd(queryCompensatePedicate, scanOp.getPredicate());
+      235          Pair<ScalarOperator, ScalarOperator> splitPartitionPredicates = getSplitPartitionPredicates(mvContext,
+      236                  mvPartitionExpr, queryScanPredicate, refPartitionColRef);
+      237          if (splitPartitionPredicates == null) {
+      238              logMVRewrite(mvRewriteContext, "AggTimeSeriesRewriter: cannot split partition predicates");
+      239              return null;
+      240          }
+      241  
+      242          // why generate push-down aggregate opt rather to use the original aggregate operator?
+      243          // 1. aggregate's predicates/projects cannot be pushed down.
+      244          // 2. if the original aggregate doesn't contain group by keys, add it into projection to be used in the final stage
+      245          AggregatePushDownContext ctx = new AggregatePushDownContext();
+      246          LogicalAggregationOperator aggOp = (LogicalAggregationOperator) queryExpression.getOp();
+      247          OptExpression pdOptExpression = buildPushDownOptAggregate(ctx, queryExpression);
+      248          ctx.setAggregator(aggOp);
+      249          OptExpression pdAggOptExpression = doPushDownAggregateRewrite(pdOptExpression, ctx, splitPartitionPredicates);
+      250          if (pdAggOptExpression == null) {
+      251              logMVRewrite(mvRewriteContext, "AggTimeSeriesRewriter: cannot rewrite push-down aggregate");
+      252              return null;
+      253          }
+      254  
+      255          // add final state aggregation above union opt
+      256          OptExpression result = getPushDownRollupFinalAggregateOpt(mvRewriteContext, ctx, remapping,
+      257                  queryExpression, Lists.newArrayList(pdAggOptExpression));
+      258  
+      259          return result;
+      260      }
+      261  
+      262      @Override
+      263      public OptExpression postRewrite(OptimizerContext optimizerContext,
+      264                                       MvRewriteContext mvRewriteContext,
+      265                                       OptExpression candidate) {
+      266          OptExpression result = super.postRewrite(optimizerContext, mvRewriteContext, candidate);
+      267          MvUtils.getScanOperator(result)
+      268                  .stream()
+      269                  .forEach(op -> op.resetOpRuleBit(OpRuleBit.OP_PARTITION_PRUNED));
+      270          return result;
+      271      }
+      272  
+      273      private OptExpression doPushDownAggregateRewrite(OptExpression pdOptExpression,
+      274                                                       AggregatePushDownContext ctx,
+      275                                                       Pair<ScalarOperator, ScalarOperator> splitPartitionPredicates) {
+      276          List<ColumnRefOperator> origOutputColumns = getOutputColumns(pdOptExpression);
+      277          // get push down mv expression of an input query opt
+      278          Pair<OptExpression, List<ColumnRefOperator>> mvRewrittenResult = getPushDownMVOptExpression(mvRewriteContext, ctx,
+      279                  pdOptExpression, splitPartitionPredicates.first, origOutputColumns);
+      280          if (mvRewrittenResult == null) {
+      281              return null;
+      282          }
+      283          OptExpression mvRewrittenOptExpression = mvRewrittenResult.first;
+      284          List<ColumnRefOperator> mvRewrittenOutputCols = mvRewrittenResult.second;
+      285  
+      286          // get push down query expression of left query opt
+      287          Pair<OptExpression, List<ColumnRefOperator>> queryLeftResult = getPushDownQueryOptExpression(mvRewriteContext, ctx,
+      288                  pdOptExpression, splitPartitionPredicates.second, origOutputColumns);
+      289          if (queryLeftResult == null) {
+      290              return null;
+      291          }
+      292          OptExpression queryLeftOptExpression = queryLeftResult.first;
+      293          List<ColumnRefOperator> queryLeftOutputCols = queryLeftResult.second;
+      294  
+      295          // union all: mv rewritten push-down expression and query left push-down expression
+      296          OptExpression unionQueryMVOptExpression = getPushDownUnionOptExpression(mvRewrittenOptExpression,
+      297                  mvRewrittenOutputCols, queryLeftOptExpression, queryLeftOutputCols, origOutputColumns);
+      298          if (unionQueryMVOptExpression == null) {
+      299              return null;
+      300          }
+      301  
+      302          return unionQueryMVOptExpression;
+      303      }
+      304  
+      305      /**
+      306       * Build push-down aggregate opt expression which only contains aggregate+scan operators and aggregate operator only
+      307       * contains the necessary group by keys and aggregates.
+      308       */
+      309      private OptExpression buildPushDownOptAggregate(AggregatePushDownContext ctx,
+      310                                                      OptExpression queryExpression) {
+      311          LogicalAggregationOperator aggOperator = (LogicalAggregationOperator) queryExpression.getOp();
+      312          Map<ColumnRefOperator, CallOperator>  aggregations = aggOperator.getAggregations();
+      313          Map<CallOperator, ColumnRefOperator> uniqueAggregations = Maps.newHashMap();
+      314          for (Map.Entry<ColumnRefOperator, CallOperator> entry : aggregations.entrySet()) {
+      315              ColumnRefOperator aggColRef = entry.getKey();
+      316              CallOperator aggCall = entry.getValue();
+      317              Preconditions.checkArgument(aggCall.getChildren().size() >= 1);
+      318              if (uniqueAggregations.containsKey(aggCall)) {
+      319                  ctx.aggColRefToPushDownAggMap.put(aggColRef, aggCall);
+      320                  continue;
+      321              }
+      322              // NOTE: This new aggregate type is final stage's type, not the immediate/partial stage type.
+      323              ColumnRefOperator newColRef = queryColumnRefFactory.create(aggCall, aggCall.getType(), aggCall.isNullable());
+      324              uniqueAggregations.put(aggCall, newColRef);
+      325  
+      326              // record all aggregate in remapping, original (query) agg col ref -> new(query) agg col ref
+      327              remapping.put(aggColRef, newColRef);
+      328  
+      329              ctx.aggColRefToPushDownAggMap.put(aggColRef, aggCall);
+      330          }
+      331          Map<ColumnRefOperator, CallOperator> newAggregations = Maps.newHashMap();
+      332          uniqueAggregations.forEach((k, v) -> newAggregations.put(v, k));
+      333          List<ColumnRefOperator> groupBys = aggOperator.getGroupingKeys();
+      334          LogicalAggregationOperator newAggOp = LogicalAggregationOperator.builder()
+      335                  .setAggregations(newAggregations)
+      336                  .setType(AggType.GLOBAL)
+      337                  .setGroupingKeys(groupBys)
+      338                  .setPartitionByColumns(groupBys)
+      339                  .build();
+      340          // copy scan operator to avoid polluting the original query expression
+      341          LogicalScanOperator scanOperator = (LogicalScanOperator) queryExpression.inputAt(0).getOp();
+      342          LogicalScanOperator newScanOperator = buildLogicalScanOperator(scanOperator);
+      343          if (newScanOperator == null) {
+      344              return null;
+      345          }
+      346          OptExpression optAggOp = OptExpression.create(newAggOp, OptExpression.create(newScanOperator));
+      347          return optAggOp;
+      348      }
+      349  
+      350      private LogicalScanOperator buildLogicalScanOperator(LogicalScanOperator scanOperator) {
+      351          LogicalScanOperator newScanOperator;
+      352          if (scanOperator instanceof LogicalOlapScanOperator) {
+      353              newScanOperator = new LogicalOlapScanOperator.Builder()
+      354                      .withOperator((LogicalOlapScanOperator) scanOperator)
+      355                      .setPrunedPartitionPredicates(Lists.newArrayList())
+      356                      .build();
+      357          } else if (scanOperator instanceof LogicalHiveScanOperator) {
+      358              newScanOperator = new LogicalHiveScanOperator.Builder()
+      359                      .withOperator((LogicalHiveScanOperator) scanOperator)
+      360                      .build();
+      361          } else if (scanOperator instanceof LogicalIcebergScanOperator) {
+      362              newScanOperator = new LogicalIcebergScanOperator.Builder()
+      363                      .withOperator((LogicalIcebergScanOperator) scanOperator)
+      364                      .build();
+      365          } else if (scanOperator instanceof LogicalPaimonScanOperator) {
+      366              newScanOperator = new LogicalPaimonScanOperator.Builder()
+      367                      .withOperator((LogicalPaimonScanOperator) scanOperator)
+      368                      .build();
+      369          } else if (scanOperator instanceof LogicalJDBCScanOperator) {
+      370              newScanOperator = new LogicalJDBCScanOperator.Builder()
+      371                      .withOperator((LogicalJDBCScanOperator) scanOperator)
+      372                      .build();
+      373          } else if (scanOperator instanceof LogicalHudiScanOperator) {
+      374              newScanOperator = new LogicalHudiScanOperator.Builder()
+      375                      .withOperator((LogicalHudiScanOperator) scanOperator)
+      376                      .build();
+      377          } else {
+      378              return null;
+      379          }
+      380  
+      381          // reset scan operator predicates
+      382          if (!(newScanOperator instanceof LogicalOlapScanOperator)) {
+      383              try {
+      384                  newScanOperator.setScanOperatorPredicates(new ScanOperatorPredicates());
+      385              } catch (Exception e) {
+      386                  logMVRewrite(mvRewriteContext, "AggTimeSeriesRewriter: cannot set scan operator predicates");
+      387                  return null;
+      388              }
+      389          }
+      390          return newScanOperator;
+      391      }
+      392  
+      393      /**
+      394       * Get push-down mv opt expression which handles predicates that the specific mv can handle.
+      395       */
+      396      public Pair<OptExpression, List<ColumnRefOperator>> getPushDownMVOptExpression(MvRewriteContext mvRewriteContext,
+      397                                                                                     AggregatePushDownContext ctx,
+      398                                                                                     OptExpression queryExpression,
+      399                                                                                     ScalarOperator newPredicate,
+      400                                                                                     List<ColumnRefOperator> origOutputColumns) {
+      401          MaterializationContext mvContext = mvRewriteContext.getMaterializationContext();
+      402          // remove partition column related predicates
+      403          List<LogicalScanOperator> scanOperators = MvUtils.getScanOperator(queryExpression);
+      404          LogicalScanOperator scanOp = scanOperators.get(0);
+      405          // reset scan operator's predicate
+      406          scanOp.setPredicate(newPredicate);
+      407  
+      408          // rewrite the input query by the mv context
+      409          OptExpression rewritten = doRewritePushDownAgg(mvRewriteContext, ctx, queryExpression, rule);
+      410          if (rewritten == null) {
+      411              logMVRewrite(mvRewriteContext, "Rewrite table scan node by mv failed");
+      412              return null;
+      413          }
+      414          // if mv contains no rows after rewrite, return it directly.
+      415          rewritten = postRewrite(optimizerContext, mvRewriteContext, rewritten);
+      416          if (rewritten == null) {
+      417              return null;
+      418          }
+      419          List<LogicalScanOperator> rewrittenScanOperators = MvUtils.getScanOperator(rewritten);
+      420          if (rewrittenScanOperators.size() == 1 && rewrittenScanOperators.get(0).isEmptyOutputRows()) {
+      421              logMVRewrite(mvRewriteContext, "AggTimeSeriesRewriter: mv contains no rows after rewrite");
+      422              return null;
+      423          }
+      424  
+      425          // refresh remapping & output column refs after mv rewrite
+      426          Map<ColumnRefOperator, ColumnRefOperator> aggColRefMapping = Maps.newHashMap();
+      427          LogicalAggregationOperator rewrittenAggOp = (LogicalAggregationOperator) rewritten.getOp();
+      428          Projection project = rewrittenAggOp.getProjection();
+      429          Map<ColumnRefOperator, ScalarOperator> rewrittenProjectMapping = project == null ? Maps.newHashMap()
+      430                  : project.getColumnRefMap();
+      431          for (Map.Entry<ColumnRefOperator, ScalarOperator> e : remapping.entrySet()) {
+      432              ColumnRefOperator origAggColRef = e.getKey();
+      433              CallOperator aggCall = ctx.aggregations.get(origAggColRef);
+      434              if (ctx.aggToFinalAggMap.containsKey(aggCall)) {
+      435                  CallOperator partialFn = ctx.aggToPartialAggMap.get(aggCall);
+      436                  ColumnRefOperator newAggColRef = (ColumnRefOperator) e.getValue();
+      437                  ColumnRefOperator realPartialColRef = new ColumnRefOperator(newAggColRef.getId(), partialFn.getType(),
+      438                          newAggColRef.getName(), partialFn.isNullable());
+      439                  remapping.put(origAggColRef, realPartialColRef);
+      440                  aggColRefMapping.put(newAggColRef, realPartialColRef);
+      441  
+      442                  if (rewrittenProjectMapping.containsKey(newAggColRef)) {
+      443                      ScalarOperator oldVal = rewrittenProjectMapping.get(newAggColRef);
+      444                      rewrittenProjectMapping.remove(newAggColRef);
+      445                      rewrittenProjectMapping.put(realPartialColRef, oldVal);
+      446                  }
+      447              }
+      448          }
+      449          if (!rewrittenProjectMapping.isEmpty()) {
+      450              rewrittenAggOp.setProjection(new Projection(rewrittenProjectMapping));
+      451          }
+      452  
+      453          // duplicate query left opt expression to void input query opt duplicating
+      454          OptExpressionDuplicator duplicator = new OptExpressionDuplicator(mvContext);
+      455          OptExpression dupRewritten = duplicator.duplicate(rewritten);
+      456          deriveLogicalProperty(dupRewritten);
+      457          List<ColumnRefOperator> newOrigOutputColumns = origOutputColumns.stream()
+      458                  .map(col -> aggColRefMapping.getOrDefault(col, col))
+      459                  .collect(Collectors.toList());
+      460          List<ColumnRefOperator> newOutputColRefs = duplicator.getMappedColumns(newOrigOutputColumns);
+      461  
+      462          // refresh remapping since after duplication, the column ref id has been changed
+      463          Map<ColumnRefOperator, ColumnRefOperator> aggColMapping = duplicator.getColumnMapping();
+      464          for (Map.Entry<ColumnRefOperator, ScalarOperator> e : remapping.entrySet()) {
+      465              remapping.put(e.getKey(), aggColMapping.get(e.getValue()));
+      466          }
+      467          return  Pair.create(dupRewritten, newOutputColRefs);
+      468      }
+      469  
+      470      /**
+      471       * Get push-down query opt expression which handles predicates that the specific mv cannot handle.
+      472       */
+      473      public Pair<OptExpression, List<ColumnRefOperator>> getPushDownQueryOptExpression(MvRewriteContext mvRewriteContext,
+      474                                                                                        AggregatePushDownContext ctx,
+      475                                                                                        OptExpression queryExpression,
+      476                                                                                        ScalarOperator newPredicate,
+      477                                                                                        List<ColumnRefOperator> origOutputColumns) {
+      478          MaterializationContext mvContext = mvRewriteContext.getMaterializationContext();
+      479          List<LogicalScanOperator> scanOperators = MvUtils.getScanOperator(queryExpression);
+      480          LogicalScanOperator logicalOlapScanOp = scanOperators.get(0);
+      481          logicalOlapScanOp.setPredicate(newPredicate);
+      482          LogicalAggregationOperator aggregateOp = (LogicalAggregationOperator) queryExpression.getOp();
+      483          Map<ColumnRefOperator, CallOperator> newAggregations = Maps.newHashMap();
+      484          Map<ColumnRefOperator, ColumnRefOperator> aggColRefMapping = Maps.newHashMap();
+      485          for (Map.Entry<ColumnRefOperator, CallOperator> e : aggregateOp.getAggregations().entrySet()) {
+      486              ColumnRefOperator aggColRef = e.getKey();
+      487              CallOperator aggCall = e.getValue();
+      488              // use aggregate push down context to generate related push-down aggregation functions
+      489              CallOperator newAggCall = getRollupPartialAggregate(mvRewriteContext, ctx, aggCall);
+      490              if (newAggCall == null) {
+      491                  logMVRewrite(mvRewriteContext, "AggTimeSeriesRewriter: cannot find partial agg remapping for " + aggCall);
+      492                  return null;
+      493              }
+      494              ColumnRefOperator newAggColRef = queryColumnRefFactory.create(newAggCall,
+      495                      newAggCall.getType(), newAggCall.isNullable());
+      496              newAggregations.put(newAggColRef, newAggCall);
+      497              aggColRefMapping.put(aggColRef, newAggColRef);
+      498          }
+      499          LogicalAggregationOperator.Builder builder = LogicalAggregationOperator.builder()
+      500                  .withOperator(aggregateOp)
+      501                  .setAggregations(newAggregations);
+      502          OptExpression newQueryOptExpression = OptExpression.create(builder.build(),
+      503                  queryExpression.inputAt(0));
+      504  
+       ... truncated at 400 lines ...

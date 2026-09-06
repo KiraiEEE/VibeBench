@@ -1,0 +1,406 @@
+row 91   operaton/operaton#2180
+============================================================================
+CLASS org.operaton.bpm.identity.impl.ldap.LdapIdentityProviderSession   loc=724 methods=54 wmc=146 lcom=0.1132075471698113 c3=0.1312902211361347
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       70  public class LdapIdentityProviderSession implements ReadOnlyIdentityProvider {
+       71  
+       72    protected LdapConfiguration ldapConfiguration;
+       73  
+       74    protected LdapClient ldapClient;
+       75  
+       76    public LdapIdentityProviderSession(LdapConfiguration ldapConfiguration) {
+       77      this.ldapConfiguration = ldapConfiguration;
+       78      this.ldapClient = new LdapClient(ldapConfiguration);
+       79    }
+       80  
+       81    // Session Lifecycle //////////////////////////////////
+       82  
+       83    @Override
+       84    public void flush() {
+       85      // nothing to do
+       86    }
+       87  
+       88    @Override
+       89    public void close() {
+       90      ldapClient.closeLdapCtx();
+       91    }
+       92  
+       93    // Users /////////////////////////////////////////////////
+       94  
+       95    @Override
+       96    public User findUserById(String userId) {
+       97      return createUserQuery(getCommandContext()).userId(userId).singleResult();
+       98    }
+       99  
+      100    @Override
+      101    public UserQuery createUserQuery() {
+      102      return new LdapUserQueryImpl(getProcessEngineConfiguration().getCommandExecutorTxRequired(), ldapConfiguration);
+      103    }
+      104  
+      105    @Override
+      106    public UserQueryImpl createUserQuery(CommandContext commandContext) {
+      107      return new LdapUserQueryImpl(ldapConfiguration);
+      108    }
+      109  
+      110    @Override
+      111    public NativeUserQuery createNativeUserQuery() {
+      112      throw new BadUserRequestException("Native user queries are not supported for LDAP identity service provider.");
+      113    }
+      114  
+      115    public long findUserCountByQueryCriteria(LdapUserQueryImpl query) {
+      116      ldapClient.ensureContextInitialized();
+      117      return findUserByQueryCriteria(query).size();
+      118    }
+      119  
+      120    public List<User> findUserByQueryCriteria(LdapUserQueryImpl query) {
+      121      ldapClient.ensureContextInitialized();
+      122  
+      123      // convert DB wildcards to LDAP wildcards if necessary
+      124      if (query.getEmailLike() != null) {
+      125        query.userEmailLike(query.getEmailLike().replaceAll(DB_QUERY_WILDCARD, LDAP_QUERY_WILDCARD));
+      126      }
+      127      if (query.getFirstNameLike() != null) {
+      128        query.userFirstNameLike(query.getFirstNameLike().replaceAll(DB_QUERY_WILDCARD, LDAP_QUERY_WILDCARD));
+      129      }
+      130      if (query.getLastNameLike() != null) {
+      131        query.userLastNameLike(query.getLastNameLike().replaceAll(DB_QUERY_WILDCARD, LDAP_QUERY_WILDCARD));
+      132      }
+      133  
+      134      if (query.getGroupId() != null) {
+      135        // if restriction on groupId is provided, we need to search in group tree first, look for the group and then further restrict on the members
+      136        return findUsersByGroupId(query);
+      137      } else {
+      138        String userBaseDn = composeDn(ldapConfiguration.getUserSearchBase(), ldapConfiguration.getBaseDn());
+      139        return findUsersWithoutGroupId(query, userBaseDn, false);
+      140      }
+      141    }
+      142  
+      143    protected boolean paginationContinues(int currentSize, int maxResults) {
+      144      return nextPageDetected() && currentSize < maxResults;
+      145    }
+      146  
+      147    protected List<User> findUsersByGroupId(LdapUserQueryImpl query) {
+      148      List<String> groupMembers = collectGroupMembers(query);
+      149      return findUsersFromGroupMembers(query, groupMembers);
+      150    }
+      151  
+      152    private List<String> collectGroupMembers(LdapUserQueryImpl query) {
+      153      String baseDn = getDnForGroup(query.getGroupId());
+      154      // compose group search filter
+      155      String groupSearchFilter = "(& %s)".formatted(ldapConfiguration.getGroupSearchFilter());
+      156      initializeControls(query);
+      157      
+      158      List<String> groupMembers = new ArrayList<>();
+      159      int resultCount = 0;
+      160  
+      161      do {
+      162        resultCount = processGroupSearchResults(query, groupMembers, resultCount, baseDn, groupSearchFilter);
+      163      } while (paginationContinues(groupMembers.size(), query.getMaxResults()));
+      164  
+      165      return groupMembers;
+      166    }
+      167  
+      168    private int processGroupSearchResults(LdapUserQueryImpl query, List<String> groupMembers,
+      169                                          int resultCount, String baseDn, String groupSearchFilter) {
+      170      try (LdapSearchResults searchResults = ldapClient.search(baseDn, groupSearchFilter)) {
+      171        while (searchResults.hasMoreElements()) {
+      172          resultCount = extractGroupMembers(query, groupMembers, resultCount, searchResults);
+      173        }
+      174      }
+      175      return resultCount;
+      176    }
+      177  
+      178    private int extractGroupMembers(LdapUserQueryImpl query, List<String> groupMembers,
+      179                                    int resultCount, LdapSearchResults searchResults) {
+      180      String groupMemberAttribute = ldapConfiguration.getGroupMemberAttribute();
+      181      NamingEnumeration<String> allGroupMembers = LdapClient.getAllMembers(groupMemberAttribute, searchResults);
+      182      
+      183      if (allGroupMembers != null) {
+      184        resultCount = addMembersToList(query, groupMembers, resultCount, allGroupMembers);
+      185      }
+      186      return resultCount;
+      187    }
+      188  
+      189    private int addMembersToList(LdapUserQueryImpl query, List<String> groupMembers,
+      190                                 int resultCount, NamingEnumeration<String> allGroupMembers) {
+      191      while (allGroupMembers.hasMoreElements()) {
+      192        if (resultCount >= query.getFirstResult()) {
+      193          groupMembers.add(allGroupMembers.nextElement());
+      194        }
+      195        resultCount++;
+      196      }
+      197      return resultCount;
+      198    }
+      199  
+      200    private List<User> findUsersFromGroupMembers(LdapUserQueryImpl query, List<String> groupMembers) {
+      201      List<User> userList = new ArrayList<>();
+      202      String userBaseDn = composeDn(ldapConfiguration.getUserSearchBase(), ldapConfiguration.getBaseDn());
+      203  
+      204      for (int memberIndex = 0; memberIndex < groupMembers.size(); memberIndex++) {
+      205        String memberId = groupMembers.get(memberIndex);
+      206        findUserForMember(query, userBaseDn, memberId).ifPresent(userList::add);
+      207      }
+      208  
+      209      return userList;
+      210    }
+      211  
+      212    private boolean shouldProcessMember(LdapUserQueryImpl query, List<User> userList, int memberCount) {
+      213      return userList.size() < query.getMaxResults() && memberCount >= query.getFirstResult();
+      214    }
+      215  
+      216    private Optional<User> findUserForMember(LdapUserQueryImpl query, String userBaseDn, String memberId) {
+      217      if (ldapConfiguration.isUsePosixGroups()) {
+      218        query.userId(memberId);
+      219      }
+      220      
+      221      String searchBaseDn = ldapConfiguration.isUsePosixGroups() ? userBaseDn : memberId;
+      222      List<User> users = findUsersWithoutGroupId(query, searchBaseDn, true);
+      223      
+      224      return users.isEmpty() ? Optional.empty() : Optional.of(users.get(0));
+      225    }
+      226  
+      227    @Override
+      228    public boolean checkPassword(String userId, String password) {
+      229  
+      230      // prevent a null password
+      231      if (password == null) {
+      232        return false;
+      233      }
+      234  
+      235      // engine can't work without users
+      236      if (userId == null || userId.isEmpty()) {
+      237        return false;
+      238      }
+      239  
+      240      /*
+      241       * We only allow login with no password if anonymous login is set.
+      242       * RFC allows such a behavior but discourages the usage, so we provide it for
+      243       * user which have a ldap with anonymous login.
+      244       */
+      245      if (!ldapConfiguration.isAllowAnonymousLogin() && password.isEmpty()) {
+      246        return false;
+      247      }
+      248  
+      249      // first search for user using manager DN
+      250      LdapUserEntity user = (LdapUserEntity) findUserById(userId);
+      251      close();
+      252  
+      253      if (user == null) {
+      254        return false;
+      255      } else {
+      256  
+      257        LdapContext context = null;
+      258  
+      259        try {
+      260          // bind authenticate for user + supplied password
+      261          context = ldapClient.openContext(user.getDn(), password);
+      262          return true;
+      263  
+      264        } catch (LdapAuthenticationException e) {
+      265          if(ldapConfiguration.isPasswordCheckCatchAuthenticationException()) {
+      266            return false;
+      267          } else {
+      268            throw e;
+      269          }
+      270  
+      271        } finally {
+      272          ldapClient.closeLdapCtx(context);
+      273  
+      274        }
+      275  
+      276      }
+      277  
+      278    }
+      279  
+      280    protected String getUserSearchFilter(LdapUserQueryImpl query) {
+      281  
+      282      StringWriter search = new StringWriter();
+      283      search.write("(&");
+      284  
+      285      // restrict to users
+      286      search.write(ldapConfiguration.getUserSearchFilter());
+      287  
+      288      // add additional filters from query
+      289      if (query.getId() != null) {
+      290        addFilter(ldapConfiguration.getUserIdAttribute(), escapeLDAPSearchFilter(query.getId()), search);
+      291      }
+      292      if (query.getIds() != null && query.getIds().length > 0) {
+      293        // wrap ids in OR statement
+      294        search.write("(|");
+      295        for (String userId : query.getIds()) {
+      296          addFilter(ldapConfiguration.getUserIdAttribute(), escapeLDAPSearchFilter(userId), search);
+      297        }
+      298        search.write(")");
+      299      }
+      300      if (query.getEmail() != null) {
+      301        addFilter(ldapConfiguration.getUserEmailAttribute(), query.getEmail(), search);
+      302      }
+      303      if (query.getEmailLike() != null) {
+      304        addFilter(ldapConfiguration.getUserEmailAttribute(), query.getEmailLike(), search);
+      305      }
+      306      if (query.getFirstName() != null) {
+      307        addFilter(ldapConfiguration.getUserFirstnameAttribute(), query.getFirstName(), search);
+      308      }
+      309      if (query.getFirstNameLike() != null) {
+      310        addFilter(ldapConfiguration.getUserFirstnameAttribute(), query.getFirstNameLike(), search);
+      311      }
+      312      if (query.getLastName() != null) {
+      313        addFilter(ldapConfiguration.getUserLastnameAttribute(), query.getLastName(), search);
+      314      }
+      315      if (query.getLastNameLike() != null) {
+      316        addFilter(ldapConfiguration.getUserLastnameAttribute(), query.getLastNameLike(), search);
+      317      }
+      318  
+      319      search.write(")");
+      320  
+      321      return search.toString();
+      322    }
+      323    protected boolean isAuthenticatedAndAuthorized(String userId) {
+      324      return isAuthenticatedUser(userId) || isAuthorizedToRead(USER, userId);
+      325    }
+      326  
+      327    public List<User> findUsersWithoutGroupId(LdapUserQueryImpl query, String userBaseDn, boolean ignorePagination) {
+      328      initializeControls(query);
+      329  
+      330      return retrieveResults(userBaseDn,
+      331          getUserSearchFilter(query),
+      332          this::transformUser,
+      333          this::isAuthenticatedAndAuthorized,
+      334          query.getMaxResults(),
+      335          query.getFirstResult(),
+      336          ignorePagination);
+      337    }
+      338  
+      339    // Groups ///////////////////////////////////////////////
+      340  
+      341    @Override
+      342    public Group findGroupById(String groupId) {
+      343      return createGroupQuery(getCommandContext()).groupId(groupId).singleResult();
+      344    }
+      345  
+      346    @Override
+      347    public GroupQuery createGroupQuery() {
+      348      return new LdapGroupQuery(getProcessEngineConfiguration().getCommandExecutorTxRequired());
+      349    }
+      350  
+      351    @Override
+      352    public GroupQuery createGroupQuery(CommandContext commandContext) {
+      353      return new LdapGroupQuery();
+      354    }
+      355  
+      356    public long findGroupCountByQueryCriteria(LdapGroupQuery ldapGroupQuery) {
+      357      ldapClient.ensureContextInitialized();
+      358      return findGroupByQueryCriteria(ldapGroupQuery).size();
+      359    }
+      360  
+      361    protected boolean isAuthorizedToReadGroup(String groupId) {
+      362      return isAuthorizedToRead(GROUP, groupId);
+      363    }
+      364  
+      365    public List<Group> findGroupByQueryCriteria(LdapGroupQuery query) {
+      366  
+      367      // convert DB wildcards to LDAP wildcards if necessary
+      368      if (query.getNameLike() != null) {
+      369        query.groupNameLike(query.getNameLike().replaceAll(DB_QUERY_WILDCARD, LDAP_QUERY_WILDCARD));
+      370      }
+      371  
+      372      ldapClient.ensureContextInitialized();
+      373  
+      374      String groupBaseDn = composeDn(ldapConfiguration.getGroupSearchBase(), ldapConfiguration.getBaseDn());
+      375  
+      376      initializeControls(query);
+      377  
+      378      return retrieveResults(groupBaseDn,
+      379          getGroupSearchFilter(query),
+      380          this::transformGroup,
+      381          this::isAuthorizedToReadGroup,
+      382          query.getMaxResults(),
+      383          query.getFirstResult(),
+      384          false);
+      385    }
+      386  
+      387    protected String getGroupSearchFilter(LdapGroupQuery query) {
+      388  
+      389      StringWriter search = new StringWriter();
+      390      search.write("(&");
+      391  
+      392      // restrict to groups
+      393      search.write(ldapConfiguration.getGroupSearchFilter());
+      394  
+      395      // add additional filters from query
+      396      if (query.getId() != null) {
+      397        addFilter(ldapConfiguration.getGroupIdAttribute(), query.getId(), search);
+      398      }
+      399      if (query.getIds() != null && query.getIds().length > 0) {
+      400        search.write("(|");
+      401        for (String id : query.getIds()) {
+      402          addFilter(ldapConfiguration.getGroupIdAttribute(), id, search);
+      403        }
+      404        search.write(")");
+      405      }
+      406      if (query.getName() != null) {
+      407        addFilter(ldapConfiguration.getGroupNameAttribute(), query.getName(), search);
+      408      }
+      409      if (query.getNameLike() != null) {
+      410        addFilter(ldapConfiguration.getGroupNameAttribute(), query.getNameLike(), search);
+      411      }
+      412      if (query.getUserId() != null) {
+      413        String userDn = null;
+      414        if (ldapConfiguration.isUsePosixGroups()) {
+      415          userDn = query.getUserId();
+      416        } else {
+      417          userDn = getDnForUser(query.getUserId());
+      418        }
+      419        addFilter(ldapConfiguration.getGroupMemberAttribute(), escapeLDAPSearchFilter(userDn), search);
+      420      }
+      421      search.write(")");
+      422  
+      423      return search.toString();
+      424    }
+      425  
+      426    // Utils ////////////////////////////////////////////
+      427  
+      428    protected <E extends DbEntity, T> List<T> retrieveResults(String baseDn,
+      429                                                              String filter,
+      430                                                              Function<SearchResult, E> transformEntity,
+      431                                                              Predicate<String> resultCountPredicate,
+      432                                                              int maxResults,
+      433                                                              int firstResult,
+      434                                                              boolean ignorePagination) {
+      435      StringBuilder resultLogger = initializeResultLogger();
+      436      List<T> entities = new ArrayList<>();
+      437      int resultCount = 0;
+      438  
+      439      do {
+      440        resultCount = processSearchPage(baseDn, filter, transformEntity, resultCountPredicate, 
+      441                                        maxResults, firstResult, ignorePagination, 
+      442                                        entities, resultCount, resultLogger);
+      443      } while (paginationContinues(entities.size(), maxResults));
+      444  
+      445      logResults(resultLogger);
+      446      return entities;
+      447    }
+      448  
+      449    private <E extends DbEntity, T> int processSearchPage(String baseDn,
+      450                                                          String filter,
+      451                                                          Function<SearchResult, E> transformEntity,
+      452                                                          Predicate<String> resultCountPredicate,
+      453                                                          int maxResults,
+      454                                                          int firstResult,
+      455                                                          boolean ignorePagination,
+      456                                                          List<T> entities,
+      457                                                          int resultCount,
+      458                                                          StringBuilder resultLogger) {
+      459      try (LdapSearchResults searchResults = ldapClient.search(baseDn, filter)) {
+      460        while (searchResults.hasMoreElements() && shouldContinueProcessing(entities, maxResults, ignorePagination)) {
+      461          SearchResult result = searchResults.nextElement();
+      462          resultCount = processSearchResult(result, transformEntity, resultCountPredicate, 
+      463                                           firstResult, ignorePagination, entities, 
+      464                                           resultCount, resultLogger);
+      465        }
+      466      }
+      467      return resultCount;
+      468    }
+      469  
+       ... truncated at 400 lines ...

@@ -1,0 +1,370 @@
+row 85   spotify/sparkey-java#75
+============================================================================
+CLASS com.spotify.sparkey.extra.PooledSparkeyReader   loc=365 methods=20 wmc=34 lcom=0.0526315789473684 c3=0.1066498590587211
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       83  public class PooledSparkeyReader implements SparkeyReader {
+       84  
+       85    private static final int CAS_ATTEMPTS = 6;
+       86  
+       87    private final SparkeyReader baseReader;
+       88    private final SparkeyReader[] pool;
+       89    private final int mask;  // For fast modulo: threadId & mask == threadId % poolSize
+       90    private final AtomicIntegerArray busy;
+       91    private volatile PooledSparkeyReader overflow;  // lazily created, 2x size
+       92    private volatile boolean closed = false;
+       93  
+       94    protected PooledSparkeyReader(SparkeyReader baseReader, int requestedPoolSize) {
+       95      this.baseReader = baseReader;
+       96  
+       97      // Round up to next power of 2 for efficient bit-masking
+       98      int poolSize = nextPowerOfTwo(requestedPoolSize);
+       99      this.pool = new SparkeyReader[poolSize];
+      100      this.mask = poolSize - 1;
+      101      this.busy = new AtomicIntegerArray(poolSize);
+      102  
+      103      // Create pool of reader duplicates
+      104      try {
+      105        for (int i = 0; i < poolSize; i++) {
+      106          pool[i] = baseReader.duplicate();
+      107        }
+      108      } catch (Exception e) {
+      109        // Cleanup on failure
+      110        for (int i = 0; i < poolSize; i++) {
+      111          if (pool[i] != null) {
+      112            pool[i].close();
+      113          }
+      114        }
+      115        baseReader.close();
+      116        throw new RuntimeException("Failed to create reader pool", e);
+      117      }
+      118    }
+      119  
+      120    /**
+      121     * Open a pooled Sparkey reader with default pool size.
+      122     *
+      123     * <p>Default pool size is {@code Runtime.getRuntime().availableProcessors() * 8},
+      124     * rounded up to the next power of 2.
+      125     *
+      126     * @param indexFile the Sparkey index file (.spi)
+      127     * @return a new pooled reader
+      128     * @throws IOException if the file cannot be opened
+      129     */
+      130    public static PooledSparkeyReader open(File indexFile) throws IOException {
+      131      return open(indexFile, computeDefaultPoolSize());
+      132    }
+      133  
+      134    /**
+      135     * Open a pooled Sparkey reader with specified pool size.
+      136     *
+      137     * <p>The pool size will be rounded up to the next power of 2 for efficient
+      138     * thread-to-reader mapping.
+      139     *
+      140     * @param indexFile the Sparkey index file (.spi)
+      141     * @param poolSize number of reader instances (minimum 1)
+      142     * @return a new pooled reader
+      143     * @throws IOException if the file cannot be opened
+      144     * @throws IllegalArgumentException if poolSize &lt; 1
+      145     */
+      146    public static PooledSparkeyReader open(File indexFile, int poolSize) throws IOException {
+      147      if (poolSize < 1) {
+      148        throw new IllegalArgumentException("poolSize must be >= 1, got: " + poolSize);
+      149      }
+      150      SparkeyReader baseReader = Sparkey.openSingleThreadedReader(indexFile);
+      151      return new PooledSparkeyReader(baseReader, poolSize);
+      152    }
+      153  
+      154    /**
+      155     * Create a pooled reader from an existing SparkeyReader instance with default pool size.
+      156     * Public to allow SparkeyImplSelector (Java 22+) to use optimized reader implementations.
+      157     *
+      158     * <p>Default pool size is {@code Runtime.getRuntime().availableProcessors() * 8},
+      159     * rounded up to the next power of 2.
+      160     *
+      161     * @param baseReader the reader to pool (will be duplicated)
+      162     * @return a new pooled reader
+      163     */
+      164    public static PooledSparkeyReader fromReader(SparkeyReader baseReader) {
+      165      return new PooledSparkeyReader(baseReader, computeDefaultPoolSize());
+      166    }
+      167  
+      168    /**
+      169     * Create a pooled reader from an existing SparkeyReader instance with specified pool size.
+      170     * Public to allow SparkeyImplSelector (Java 22+) to use optimized reader implementations.
+      171     *
+      172     * <p>The pool size will be rounded up to the next power of 2 for efficient
+      173     * thread-to-reader mapping.
+      174     *
+      175     * @param baseReader the reader to pool (will be duplicated)
+      176     * @param poolSize number of reader instances (minimum 1)
+      177     * @return a new pooled reader
+      178     * @throws IllegalArgumentException if poolSize &lt; 1
+      179     */
+      180    public static PooledSparkeyReader fromReader(SparkeyReader baseReader, int poolSize) {
+      181      if (poolSize < 1) {
+      182        throw new IllegalArgumentException("poolSize must be >= 1, got: " + poolSize);
+      183      }
+      184      return new PooledSparkeyReader(baseReader, poolSize);
+      185    }
+      186  
+      187  
+      188    /**
+      189     * Hash thread ID to ensure uniform distribution across pool slots.
+      190     *
+      191     * <p>Without hashing, workloads where only even (or odd) thread IDs access Sparkey
+      192     * would use only half the pool slots, doubling contention. This hash function
+      193     * scrambles the bits to ensure full pool utilization.
+      194     *
+      195     * @param threadId the thread ID to hash
+      196     * @return hashed thread ID
+      197     */
+      198    private static int hashThreadId(long threadId) {
+      199      // MurmurHash3 finalizer - provides excellent avalanche properties
+      200      // Ensures uniform distribution even for sequential input values
+      201      long h = threadId;
+      202      h ^= (h >>> 33);
+      203      h *= 0xff51afd7ed558ccdL;
+      204      h ^= (h >>> 33);
+      205      return (int)h;
+      206    }
+      207  
+      208    // Helper method to execute operations on pooled readers with busy tracking
+      209  
+      210    /**
+      211     * Execute an operation on a pooled reader with lock-free slot acquisition.
+      212     *
+      213     * <p>Tries to acquire a slot via CAS: first the thread-affinity slot for cache
+      214     * locality, then random slots. If all attempts fail (high contention), delegates
+      215     * to a lazily-created overflow pool with 2x capacity. The overflow pool uses the
+      216     * same strategy, so capacity grows exponentially until contention resolves.
+      217     *
+      218     * <p>This approach never blocks or parks — it always makes progress by expanding
+      219     * capacity to match actual concurrent demand.
+      220     */
+      221    private <T> T executeOnPooledReader(ReaderOperation<T> operation) throws IOException {
+      222      // Best-effort closed check — a concurrent close() may race past this point.
+      223      // This is harmless: the worst case is one stale read attempt on an already-closed
+      224      // reader, which will fail with an IOException from the underlying reader.
+      225      if (closed) {
+      226        throw new IllegalStateException("Reader is closed");
+      227      }
+      228  
+      229      // Start with affinity slot based on thread ID, then try random slots
+      230      int slot = hashThreadId(Thread.currentThread().getId()) & mask;
+      231      for (int i = 0; i < CAS_ATTEMPTS; i++) {
+      232        if (busy.compareAndSet(slot, 0, 1)) {
+      233          try {
+      234            return operation.execute(pool[slot]);
+      235          } finally {
+      236            busy.set(slot, 0);
+      237          }
+      238        }
+      239        slot = ThreadLocalRandom.current().nextInt(pool.length);
+      240      }
+      241  
+      242      // All attempts failed — delegate to overflow pool (lazily created, 2x size)
+      243      return getOrCreateOverflow().executeOnPooledReader(operation);
+      244    }
+      245  
+      246    private PooledSparkeyReader getOrCreateOverflow() {
+      247      PooledSparkeyReader o = overflow;
+      248      if (o != null) {
+      249        return o;
+      250      }
+      251      synchronized (this) {
+      252        if (closed) {
+      253          throw new IllegalStateException("Reader is closed");
+      254        }
+      255        if (overflow == null) {
+      256          overflow = new PooledSparkeyReader(baseReader, pool.length * 2);
+      257        }
+      258        return overflow;
+      259      }
+      260    }
+      261  
+      262    @FunctionalInterface
+      263    private interface ReaderOperation<T> {
+      264      T execute(SparkeyReader reader) throws IOException;
+      265    }
+      266  
+      267    /**
+      268     * Immutable defensive copy of an Entry.
+      269     *
+      270     * <p>Created inside synchronized blocks to prevent data corruption when Entry objects
+      271     * escape and are accessed by multiple threads. The underlying Entry objects are mutable
+      272     * and reused by readers, so we must copy all data before leaving the synchronized block.
+      273     */
+      274    private static class ImmutableEntry implements Entry {
+      275      private final byte[] key;
+      276      private final byte[] value;
+      277      private final Type type;
+      278  
+      279      ImmutableEntry(Entry source) throws IOException {
+      280        this.key = source.getKey();
+      281        this.value = source.getValue();
+      282        this.type = source.getType();
+      283      }
+      284  
+      285      @Override
+      286      public int getKeyLength() {
+      287        return key.length;
+      288      }
+      289  
+      290      @Override
+      291      public byte[] getKey() {
+      292        return key;
+      293      }
+      294  
+      295      @Override
+      296      public String getKeyAsString() {
+      297        return new String(key, java.nio.charset.StandardCharsets.UTF_8);
+      298      }
+      299  
+      300      @Override
+      301      public long getValueLength() {
+      302        return value.length;
+      303      }
+      304  
+      305      @Override
+      306      public byte[] getValue() {
+      307        return value;
+      308      }
+      309  
+      310      @Override
+      311      public String getValueAsString() {
+      312        return new String(value, java.nio.charset.StandardCharsets.UTF_8);
+      313      }
+      314  
+      315      @Override
+      316      public java.io.InputStream getValueAsStream() {
+      317        return new java.io.ByteArrayInputStream(value);
+      318      }
+      319  
+      320      @Override
+      321      public Type getType() {
+      322        return type;
+      323      }
+      324    }
+      325  
+      326    // Override methods that need synchronization for thread safety
+      327  
+      328    @Override
+      329    public String getAsString(String key) throws IOException {
+      330      return executeOnPooledReader(reader -> reader.getAsString(key));
+      331    }
+      332  
+      333    @Override
+      334    public byte[] getAsByteArray(byte[] key) throws IOException {
+      335      return executeOnPooledReader(reader -> reader.getAsByteArray(key));
+      336    }
+      337  
+      338    @Override
+      339    public Entry getAsEntry(byte[] key) throws IOException {
+      340      return executeOnPooledReader(reader -> {
+      341        Entry entry = reader.getAsEntry(key);
+      342        if (entry == null) {
+      343          return null;
+      344        }
+      345        // Create defensive copy - Entry objects are mutable and reused by readers
+      346        return new ImmutableEntry(entry);
+      347      });
+      348    }
+      349  
+      350    // Non-critical methods that read immutable data or create isolated state
+      351    // These don't need busy tracking
+      352  
+      353    @Override
+      354    public IndexHeader getIndexHeader() {
+      355      return baseReader.getIndexHeader();
+      356    }
+      357  
+      358    @Override
+      359    public LogHeader getLogHeader() {
+      360      return baseReader.getLogHeader();
+      361    }
+      362  
+      363    @Override
+      364    public Iterator<Entry> iterator() {
+      365      // iterator() creates an isolated duplicate via index.duplicate() and
+      366      // opens its own FileInputStream, so there is no shared mutable state between threads
+      367      return baseReader.iterator();
+      368    }
+      369  
+      370    @Override
+      371    public long getLoadedBytes() {
+      372      return baseReader.getLoadedBytes();
+      373    }
+      374  
+      375    @Override
+      376    public long getTotalBytes() {
+      377      return baseReader.getTotalBytes();
+      378    }
+      379  
+      380    @Override
+      381    public SparkeyReader duplicate() {
+      382      if (closed) {
+      383        throw new IllegalStateException("Reader is closed");
+      384      }
+      385      // Return self - already thread-safe
+      386      return this;
+      387    }
+      388  
+      389    @Override
+      390    public synchronized void close() {
+      391      if (closed) {
+      392        return;
+      393      }
+      394      closed = true;
+      395  
+      396      // Mark overflow chain as closed and release references for GC
+      397      PooledSparkeyReader o = overflow;
+      398      if (o != null) {
+      399        o.close();
+      400      }
+      401      overflow = null;
+      402  
+      403      // Don't close pooled readers - they're duplicates sharing ByteBuffers with baseReader.
+      404      // Closing baseReader is sufficient as it closes the underlying resources.
+      405      // The pooled readers become invalid, which is fine since we've marked closed=true.
+      406      baseReader.close();
+      407    }
+      408  
+      409    /**
+      410     * Get the actual pool size (always a power of 2).
+      411     *
+      412     * @return number of reader instances in the pool
+      413     */
+      414    public int getPoolSize() {
+      415      return pool.length;
+      416    }
+      417  
+      418    // Helper methods
+      419  
+      420    /**
+      421     * Compute default pool size for the reader pool.
+      422     *
+      423     * Pool size multiplier choice (4x vs 8x cores):
+      424     * - Both 4x and 8x are valid choices with minimal practical difference
+      425     * - 8x provides slightly less contention (99.8% vs 99% affinity hits in testing)
+      426     * - Memory cost per reader is very low (~4 KiB) since MappedByteBuffers share
+      427     *   the underlying mapped pages - only the Java object wrappers are duplicated
+      428     * - 8x chosen as default for slightly better worst-case contention characteristics
+      429     * - Users can override via openPooledReader(file, poolSize) if needed
+      430     *
+      431     * This tradeoff may be revisited in the future if usage patterns change.
+      432     */
+      433    /**
+      434     * Package-protected to allow SparkeyImplSelector to compute pool size.
+      435     */
+      436    static int computeDefaultPoolSize() {
+      437      int cores = Runtime.getRuntime().availableProcessors();
+      438      return cores * 8;
+      439    }
+      440  
+      441    private static int nextPowerOfTwo(int n) {
+      442      if (n <= 1) return 1;
+      443      // Handle edge case: if n is already power of 2
+      444      if ((n & (n - 1)) == 0) return n;
+      445      return 1 << (32 - Integer.numberOfLeadingZeros(n - 1));
+      446    }
+      447  }

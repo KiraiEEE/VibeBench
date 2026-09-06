@@ -1,0 +1,406 @@
+row 87   apache/doris#61565
+============================================================================
+CLASS org.apache.doris.planner.JoinNodeBase   loc=551 methods=23 wmc=119 lcom=0.1818181818181818 c3=0.1439888994256307
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       53  public abstract class JoinNodeBase extends PlanNode {
+       54      private static final Logger LOG = LogManager.getLogger(JoinNodeBase.class);
+       55  
+       56      protected final TableRef innerRef;
+       57      protected final JoinOperator joinOp;
+       58      protected final boolean isMark;
+       59      protected ExprSubstitutionMap vSrcToOutputSMap;
+       60      protected List<TupleDescriptor> vIntermediateTupleDescList;
+       61  
+       62      // in thrift, every planNode denote its output tupelId and projections by output_tuple_id and projections
+       63      // but for legacy reasons, JoinNode has its specific representations: voutput_tuple_id and src_expr_list
+       64      // if useSpecificProjections true, set the output to its specific attributes.
+       65      protected boolean useSpecificProjections = true;
+       66  
+       67      public JoinNodeBase(PlanNodeId id, String planNodeName, StatisticalType statisticalType,
+       68              PlanNode outer, PlanNode inner, TableRef innerRef) {
+       69          super(id, planNodeName, statisticalType);
+       70          this.innerRef = innerRef;
+       71          tblRefIds.addAll(outer.getTblRefIds());
+       72          tblRefIds.addAll(inner.getTblRefIds());
+       73          children.add(outer);
+       74          children.add(inner);
+       75  
+       76          // Inherits all the nullable tuple from the children
+       77          // Mark tuples that form the "nullable" side of the outer join as nullable.
+       78          nullableTupleIds.addAll(outer.getNullableTupleIds());
+       79          nullableTupleIds.addAll(inner.getNullableTupleIds());
+       80  
+       81          joinOp = innerRef.getJoinOp();
+       82          if (joinOp.equals(JoinOperator.FULL_OUTER_JOIN)) {
+       83              nullableTupleIds.addAll(outer.getOutputTupleIds());
+       84              nullableTupleIds.addAll(inner.getOutputTupleIds());
+       85          } else if (joinOp.equals(JoinOperator.LEFT_OUTER_JOIN)) {
+       86              nullableTupleIds.addAll(inner.getOutputTupleIds());
+       87          } else if (joinOp.equals(JoinOperator.RIGHT_OUTER_JOIN)) {
+       88              nullableTupleIds.addAll(outer.getOutputTupleIds());
+       89          }
+       90          this.isMark = this.innerRef != null && innerRef.isMark();
+       91      }
+       92  
+       93      public boolean isMarkJoin() {
+       94          return isMark;
+       95      }
+       96  
+       97      public JoinOperator getJoinOp() {
+       98          return joinOp;
+       99      }
+      100  
+      101      protected boolean isMaterializedByChild(SlotDescriptor slotDesc, ExprSubstitutionMap smap) {
+      102          if (slotDesc.isMaterialized()) {
+      103              return true;
+      104          }
+      105          Expr child = smap.get(new SlotRef(slotDesc));
+      106          if (child == null) {
+      107              return false;
+      108          }
+      109          List<SlotRef> slotRefList = Lists.newArrayList();
+      110          child.collect(SlotRef.class, slotRefList);
+      111          for (SlotRef slotRef : slotRefList) {
+      112              if (slotRef.getDesc() != null && !slotRef.getDesc().isMaterialized()) {
+      113                  return false;
+      114              }
+      115          }
+      116          return true;
+      117      }
+      118  
+      119      protected void computeOutputTuple(Analyzer analyzer) throws UserException {
+      120          // 1. create new tuple
+      121          outputTupleDesc = analyzer.getDescTbl().createTupleDescriptor();
+      122          boolean copyLeft = false;
+      123          boolean copyRight = false;
+      124          boolean leftNullable = false;
+      125          boolean rightNullable = false;
+      126          switch (joinOp) {
+      127              case INNER_JOIN:
+      128              case CROSS_JOIN:
+      129                  copyLeft = true;
+      130                  copyRight = true;
+      131                  break;
+      132              case LEFT_OUTER_JOIN:
+      133                  copyLeft = true;
+      134                  copyRight = true;
+      135                  rightNullable = true;
+      136                  break;
+      137              case RIGHT_OUTER_JOIN:
+      138                  copyLeft = true;
+      139                  copyRight = true;
+      140                  leftNullable = true;
+      141                  break;
+      142              case FULL_OUTER_JOIN:
+      143                  copyLeft = true;
+      144                  copyRight = true;
+      145                  leftNullable = true;
+      146                  rightNullable = true;
+      147                  break;
+      148              case LEFT_ANTI_JOIN:
+      149              case LEFT_SEMI_JOIN:
+      150              case NULL_AWARE_LEFT_ANTI_JOIN:
+      151                  copyLeft = true;
+      152                  break;
+      153              case RIGHT_ANTI_JOIN:
+      154              case RIGHT_SEMI_JOIN:
+      155                  copyRight = true;
+      156                  break;
+      157              default:
+      158                  break;
+      159          }
+      160          ExprSubstitutionMap srcTblRefToOutputTupleSmap = new ExprSubstitutionMap();
+      161          int leftNullableNumber = 0;
+      162          int rightNullableNumber = 0;
+      163          if (copyLeft) {
+      164              //cross join do not have OutputTblRefIds
+      165              List<TupleId> srcTupleIds = getChild(0) instanceof JoinNodeBase ? getChild(0).getOutputTupleIds()
+      166                      : getChild(0).getOutputTblRefIds();
+      167              for (TupleDescriptor leftTupleDesc : analyzer.getDescTbl().getTupleDesc(srcTupleIds)) {
+      168                  // if the child is cross join node, the only way to get the correct nullable info of its output slots
+      169                  // is to check if the output tuple ids are outer joined or not.
+      170                  // then pass this nullable info to hash join node will be correct.
+      171                  boolean needSetToNullable =
+      172                          getChild(0) instanceof JoinNodeBase && analyzer.isOuterJoined(leftTupleDesc.getId());
+      173                  for (SlotDescriptor leftSlotDesc : leftTupleDesc.getSlots()) {
+      174                      if (!isMaterializedByChild(leftSlotDesc, getChild(0).getOutputSmap())) {
+      175                          continue;
+      176                      }
+      177                      SlotDescriptor outputSlotDesc =
+      178                              analyzer.getDescTbl().copySlotDescriptor(outputTupleDesc, leftSlotDesc);
+      179                      if (leftNullable) {
+      180                          outputSlotDesc.setIsNullable(true);
+      181                          leftNullableNumber++;
+      182                      }
+      183                      if (needSetToNullable) {
+      184                          outputSlotDesc.setIsNullable(true);
+      185                      }
+      186                      srcTblRefToOutputTupleSmap.put(new SlotRef(leftSlotDesc), new SlotRef(outputSlotDesc));
+      187                  }
+      188              }
+      189          }
+      190          if (copyRight) {
+      191              List<TupleId> srcTupleIds = getChild(1) instanceof JoinNodeBase ? getChild(1).getOutputTupleIds()
+      192                      : getChild(1).getOutputTblRefIds();
+      193              for (TupleDescriptor rightTupleDesc : analyzer.getDescTbl().getTupleDesc(srcTupleIds)) {
+      194                  boolean needSetToNullable =
+      195                          getChild(1) instanceof JoinNodeBase && analyzer.isOuterJoined(rightTupleDesc.getId());
+      196                  for (SlotDescriptor rightSlotDesc : rightTupleDesc.getSlots()) {
+      197                      if (!isMaterializedByChild(rightSlotDesc, getChild(1).getOutputSmap())) {
+      198                          continue;
+      199                      }
+      200                      SlotDescriptor outputSlotDesc =
+      201                              analyzer.getDescTbl().copySlotDescriptor(outputTupleDesc, rightSlotDesc);
+      202                      if (rightNullable) {
+      203                          outputSlotDesc.setIsNullable(true);
+      204                          rightNullableNumber++;
+      205                      }
+      206                      if (needSetToNullable) {
+      207                          outputSlotDesc.setIsNullable(true);
+      208                      }
+      209                      srcTblRefToOutputTupleSmap.put(new SlotRef(rightSlotDesc), new SlotRef(outputSlotDesc));
+      210                  }
+      211              }
+      212          }
+      213  
+      214          // add mark slot if needed
+      215          if (isMarkJoin() && analyzer.needPopUpMarkTuple(innerRef)) {
+      216              SlotDescriptor markSlot = analyzer.getMarkTuple(innerRef).getSlots().get(0);
+      217              SlotDescriptor outputSlotDesc =
+      218                      analyzer.getDescTbl().copySlotDescriptor(outputTupleDesc, markSlot);
+      219              srcTblRefToOutputTupleSmap.put(new SlotRef(markSlot), new SlotRef(outputSlotDesc));
+      220          }
+      221  
+      222          // 2. compute srcToOutputMap
+      223          vSrcToOutputSMap = ExprSubstitutionMap.subtraction(outputSmap, srcTblRefToOutputTupleSmap, analyzer);
+      224          for (int i = 0; i < vSrcToOutputSMap.size(); i++) {
+      225              Preconditions.checkState(vSrcToOutputSMap.getRhs().get(i) instanceof SlotRef);
+      226              SlotRef rSlotRef = (SlotRef) vSrcToOutputSMap.getRhs().get(i);
+      227              if (vSrcToOutputSMap.getLhs().get(i) instanceof SlotRef) {
+      228                  SlotRef lSlotRef = (SlotRef) vSrcToOutputSMap.getLhs().get(i);
+      229                  rSlotRef.getDesc().setIsMaterialized(lSlotRef.getDesc().isMaterialized());
+      230              } else {
+      231                  rSlotRef.getDesc().setIsMaterialized(true);
+      232                  rSlotRef.materializeSrcExpr();
+      233              }
+      234          }
+      235  
+      236          outputTupleDesc.computeStatAndMemLayout();
+      237          // 3. add tupleisnull in null-side
+      238          Preconditions.checkState(srcTblRefToOutputTupleSmap.getLhs().size() == vSrcToOutputSMap.getLhs().size());
+      239          // Condition1: the left child is null-side
+      240          // Condition2: the left child is a inline view
+      241          // Then: add tuple is null in left child columns
+      242          if (leftNullable && getChild(0).getTblRefIds().size() == 1
+      243                  && analyzer.isInlineView(getChild(0).getTblRefIds().get(0))) {
+      244              List<Expr> tupleIsNullLhs = TupleIsNullPredicate.wrapExprs(
+      245                      vSrcToOutputSMap.getLhs().subList(0, leftNullableNumber), new ArrayList<>(), TNullSide.LEFT,
+      246                      analyzer);
+      247              tupleIsNullLhs
+      248                      .addAll(vSrcToOutputSMap.getLhs().subList(leftNullableNumber, vSrcToOutputSMap.getLhs().size()));
+      249              vSrcToOutputSMap.updateLhsExprs(tupleIsNullLhs);
+      250          }
+      251          // Condition1: the right child is null-side
+      252          // Condition2: the right child is a inline view
+      253          // Then: add tuple is null in right child columns
+      254          if (rightNullable && getChild(1).getTblRefIds().size() == 1
+      255                  && analyzer.isInlineView(getChild(1).getTblRefIds().get(0))) {
+      256              if (rightNullableNumber != 0) {
+      257                  int rightBeginIndex = vSrcToOutputSMap.size() - rightNullableNumber;
+      258                  List<Expr> tupleIsNullLhs = TupleIsNullPredicate.wrapExprs(
+      259                          vSrcToOutputSMap.getLhs().subList(rightBeginIndex, vSrcToOutputSMap.size()), new ArrayList<>(),
+      260                          TNullSide.RIGHT, analyzer);
+      261                  List<Expr> newLhsList = Lists.newArrayList();
+      262                  if (rightBeginIndex > 0) {
+      263                      newLhsList.addAll(vSrcToOutputSMap.getLhs().subList(0, rightBeginIndex));
+      264                  }
+      265                  newLhsList.addAll(tupleIsNullLhs);
+      266                  vSrcToOutputSMap.updateLhsExprs(newLhsList);
+      267              }
+      268          }
+      269          // 4. change the outputSmap
+      270          outputSmap = ExprSubstitutionMap.composeAndReplace(outputSmap, srcTblRefToOutputTupleSmap, analyzer);
+      271      }
+      272  
+      273      @Override
+      274      public void initOutputSlotIds(Set<SlotId> requiredSlotIdSet, Analyzer analyzer) {
+      275          outputSlotIds = Lists.newArrayList();
+      276          List<TupleDescriptor> outputTupleDescList = Lists.newArrayList();
+      277          if (outputTupleDesc != null) {
+      278              outputTupleDescList.add(outputTupleDesc);
+      279          } else {
+      280              for (TupleId tupleId : tupleIds) {
+      281                  outputTupleDescList.add(analyzer.getTupleDesc(tupleId));
+      282              }
+      283          }
+      284          SlotId firstMaterializedSlotId = null;
+      285          for (TupleDescriptor tupleDescriptor : outputTupleDescList) {
+      286              for (SlotDescriptor slotDescriptor : tupleDescriptor.getSlots()) {
+      287                  if (slotDescriptor.isMaterialized()) {
+      288                      if ((requiredSlotIdSet == null || requiredSlotIdSet.contains(slotDescriptor.getId()))) {
+      289                          outputSlotIds.add(slotDescriptor.getId());
+      290                      }
+      291                      if (firstMaterializedSlotId == null) {
+      292                          firstMaterializedSlotId = slotDescriptor.getId();
+      293                      }
+      294                  }
+      295              }
+      296          }
+      297  
+      298          // be may be possible to output correct row number without any column data in future
+      299          // but for now, in order to have correct output row number, should keep at least one slot.
+      300          // use first materialized slot if outputSlotIds is empty.
+      301          if (outputSlotIds.isEmpty() && firstMaterializedSlotId != null) {
+      302              outputSlotIds.add(firstMaterializedSlotId);
+      303          }
+      304      }
+      305  
+      306      @Override
+      307      public void projectOutputTuple() {
+      308          if (outputTupleDesc == null) {
+      309              return;
+      310          }
+      311          if (outputTupleDesc.getSlots().size() == outputSlotIds.size()) {
+      312              return;
+      313          }
+      314          Iterator<SlotDescriptor> iterator = outputTupleDesc.getSlots().iterator();
+      315          while (iterator.hasNext()) {
+      316              SlotDescriptor slotDescriptor = iterator.next();
+      317              boolean keep = false;
+      318              for (SlotId outputSlotId : outputSlotIds) {
+      319                  if (slotDescriptor.getId().equals(outputSlotId)) {
+      320                      keep = true;
+      321                      break;
+      322                  }
+      323              }
+      324              if (!keep) {
+      325                  iterator.remove();
+      326                  SlotRef slotRef = new SlotRef(slotDescriptor);
+      327                  vSrcToOutputSMap.removeByRhsExpr(slotRef);
+      328              }
+      329          }
+      330          outputTupleDesc.computeStatAndMemLayout();
+      331      }
+      332  
+      333      protected abstract Pair<Boolean, Boolean> needToCopyRightAndLeft();
+      334  
+      335      protected abstract void computeOtherConjuncts(Analyzer analyzer, ExprSubstitutionMap originToIntermediateSmap);
+      336  
+      337      protected void computeIntermediateTuple(Analyzer analyzer) throws AnalysisException {
+      338          // 1. create new tuple
+      339          TupleDescriptor vIntermediateLeftTupleDesc = analyzer.getDescTbl().createTupleDescriptor();
+      340          TupleDescriptor vIntermediateRightTupleDesc = analyzer.getDescTbl().createTupleDescriptor();
+      341          vIntermediateTupleDescList = new ArrayList<>();
+      342          vIntermediateTupleDescList.add(vIntermediateLeftTupleDesc);
+      343          vIntermediateTupleDescList.add(vIntermediateRightTupleDesc);
+      344          // if join type is MARK, add mark tuple to intermediate tuple. mark slot will be generated after join.
+      345          if (isMarkJoin()) {
+      346              TupleDescriptor markTuple = analyzer.getMarkTuple(innerRef);
+      347              if (markTuple != null) {
+      348                  vIntermediateTupleDescList.add(markTuple);
+      349              }
+      350          }
+      351          boolean leftNullable = false;
+      352          boolean rightNullable = false;
+      353  
+      354          switch (joinOp) {
+      355              case LEFT_OUTER_JOIN:
+      356                  rightNullable = true;
+      357                  break;
+      358              case RIGHT_OUTER_JOIN:
+      359                  leftNullable = true;
+      360                  break;
+      361              case FULL_OUTER_JOIN:
+      362                  leftNullable = true;
+      363                  rightNullable = true;
+      364                  break;
+      365              default:
+      366                  break;
+      367          }
+      368          Pair<Boolean, Boolean> tmpPair = needToCopyRightAndLeft();
+      369          boolean copyleft = tmpPair.first;
+      370          boolean copyRight = tmpPair.second;
+      371          // 2. exprsmap: <originslot, intermediateslot>
+      372          ExprSubstitutionMap originToIntermediateSmap = new ExprSubstitutionMap();
+      373          Map<List<TupleId>, TupleId> originTidsToIntermediateTidMap = Maps.newHashMap();
+      374          // left
+      375          if (copyleft) {
+      376              originTidsToIntermediateTidMap.put(getChild(0).getOutputTupleIds(), vIntermediateLeftTupleDesc.getId());
+      377              for (TupleDescriptor tupleDescriptor : analyzer.getDescTbl()
+      378                      .getTupleDesc(getChild(0).getOutputTupleIds())) {
+      379                  for (SlotDescriptor slotDescriptor : tupleDescriptor.getMaterializedSlots()) {
+      380                      SlotDescriptor intermediateSlotDesc =
+      381                              analyzer.getDescTbl().copySlotDescriptor(vIntermediateLeftTupleDesc, slotDescriptor);
+      382                      if (leftNullable) {
+      383                          intermediateSlotDesc.setIsNullable(true);
+      384                      }
+      385                      originToIntermediateSmap.put(new SlotRef(slotDescriptor), new SlotRef(intermediateSlotDesc));
+      386                  }
+      387              }
+      388          }
+      389          vIntermediateLeftTupleDesc.computeMemLayout();
+      390          // right
+      391          if (copyRight) {
+      392              originTidsToIntermediateTidMap.put(getChild(1).getOutputTupleIds(), vIntermediateRightTupleDesc.getId());
+      393              for (TupleDescriptor tupleDescriptor : analyzer.getDescTbl()
+      394                      .getTupleDesc(getChild(1).getOutputTupleIds())) {
+      395                  for (SlotDescriptor slotDescriptor : tupleDescriptor.getMaterializedSlots()) {
+      396                      SlotDescriptor intermediateSlotDesc =
+      397                              analyzer.getDescTbl().copySlotDescriptor(vIntermediateRightTupleDesc, slotDescriptor);
+      398                      if (rightNullable) {
+      399                          intermediateSlotDesc.setIsNullable(true);
+      400                      }
+      401                      originToIntermediateSmap.put(new SlotRef(slotDescriptor), new SlotRef(intermediateSlotDesc));
+      402                  }
+      403              }
+      404          }
+      405          vIntermediateRightTupleDesc.computeMemLayout();
+      406          // 3. replace srcExpr by intermediate tuple
+      407          Preconditions.checkState(vSrcToOutputSMap != null);
+      408          // Set `preserveRootTypes` to true because we should keep the consistent for types. See Issue-11314.
+      409          vSrcToOutputSMap.substituteLhs(originToIntermediateSmap, analyzer, true);
+      410          // 4. replace other conjuncts and conjuncts
+      411          computeOtherConjuncts(analyzer, originToIntermediateSmap);
+      412          conjuncts = Expr.substituteList(conjuncts, originToIntermediateSmap, analyzer, false);
+      413          // 5. replace tuple is null expr
+      414          TupleIsNullPredicate.substitueListForTupleIsNull(vSrcToOutputSMap.getLhs(), originTidsToIntermediateTidMap);
+      415  
+      416          Preconditions.checkState(vSrcToOutputSMap.getLhs().size() == outputTupleDesc.getSlots().size());
+      417          List<Expr> exprs = vSrcToOutputSMap.getLhs();
+      418          ArrayList<SlotDescriptor> slots = outputTupleDesc.getSlots();
+      419          for (int i = 0; i < slots.size(); i++) {
+      420              slots.get(i).setIsNullable(exprs.get(i).isNullable());
+      421          }
+      422          vSrcToOutputSMap.reCalculateNullableInfoForSlotInRhs();
+      423          outputTupleDesc.computeMemLayout();
+      424      }
+      425  
+      426      protected abstract List<SlotId> computeSlotIdsForJoinConjuncts(Analyzer analyzer);
+      427  
+      428      @Override
+      429      public Set<SlotId> computeInputSlotIds(Analyzer analyzer) throws NotImplementedException {
+      430          Set<SlotId> result = Sets.newHashSet();
+      431          Preconditions.checkState(outputSlotIds != null);
+      432          // step1: change output slot id to src slot id
+      433          if (vSrcToOutputSMap != null) {
+      434              for (SlotId slotId : outputSlotIds) {
+      435                  SlotRef slotRef = new SlotRef(analyzer.getDescTbl().getSlotDesc(slotId));
+      436                  Expr srcExpr = vSrcToOutputSMap.mappingForRhsExpr(slotRef);
+      437                  if (srcExpr == null) {
+      438                      result.add(slotId);
+      439                  } else {
+      440                      List<SlotRef> srcSlotRefList = Lists.newArrayList();
+      441                      srcExpr.collect(SlotRef.class, srcSlotRefList);
+      442                      result.addAll(srcSlotRefList.stream().map(e -> e.getSlotId()).collect(Collectors.toList()));
+      443                  }
+      444              }
+      445          }
+      446          result.addAll(computeSlotIdsForJoinConjuncts(analyzer));
+      447          // conjunct
+      448          List<SlotId> conjunctSlotIds = Lists.newArrayList();
+      449          Expr.getIds(conjuncts, null, conjunctSlotIds);
+      450          result.addAll(conjunctSlotIds);
+      451          return result;
+      452      }
+       ... truncated at 400 lines ...

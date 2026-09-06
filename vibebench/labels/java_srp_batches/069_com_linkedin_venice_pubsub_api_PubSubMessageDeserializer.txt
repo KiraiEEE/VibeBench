@@ -1,0 +1,141 @@
+row 69   linkedin/venice#2593
+============================================================================
+CLASS com.linkedin.venice.pubsub.api.PubSubMessageDeserializer   loc=136 methods=6 wmc=20 lcom=0.4 c3=0.1780383981153276
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       24  public class PubSubMessageDeserializer {
+       25    private static final Logger LOGGER = LogManager.getLogger(PubSubMessageDeserializer.class);
+       26    private final KafkaKeySerializer keySerializer = new KafkaKeySerializer();
+       27    private final KafkaValueSerializer valueSerializer;
+       28    private final ObjectPool<KafkaMessageEnvelope> putEnvelopePool;
+       29    private final ObjectPool<KafkaMessageEnvelope> updateEnvelopePool;
+       30    private final boolean producerTimestampFallbackEnabled;
+       31  
+       32    public PubSubMessageDeserializer(
+       33        KafkaValueSerializer valueSerializer,
+       34        ObjectPool<KafkaMessageEnvelope> putEnvelopePool,
+       35        ObjectPool<KafkaMessageEnvelope> updateEnvelopePool) {
+       36      this(valueSerializer, putEnvelopePool, updateEnvelopePool, true);
+       37    }
+       38  
+       39    public PubSubMessageDeserializer(
+       40        KafkaValueSerializer valueSerializer,
+       41        ObjectPool<KafkaMessageEnvelope> putEnvelopePool,
+       42        ObjectPool<KafkaMessageEnvelope> updateEnvelopePool,
+       43        boolean producerTimestampFallbackEnabled) {
+       44      this.valueSerializer = valueSerializer;
+       45      this.putEnvelopePool = putEnvelopePool;
+       46      this.updateEnvelopePool = updateEnvelopePool;
+       47      this.producerTimestampFallbackEnabled = producerTimestampFallbackEnabled;
+       48    }
+       49  
+       50    /**
+       51     * Deserialize a message from the pubsub specific message format to PubSubMessage.
+       52     *
+       53     * @param topicPartition the topic partition from which the message was read
+       54     * @param keyBytes the key bytes of the message
+       55     * @param valueBytes the value bytes of the message
+       56     * @param headers the headers of the message
+       57     * @param pubSubPosition the position of the message in the topic partition
+       58     * @param timestamp the timestamp of the message
+       59     * @return the deserialized PubSubMessage
+       60     */
+       61    public DefaultPubSubMessage deserialize(
+       62        PubSubTopicPartition topicPartition,
+       63        byte[] keyBytes,
+       64        byte[] valueBytes,
+       65        PubSubMessageHeaders headers,
+       66        PubSubPosition pubSubPosition,
+       67        Long timestamp) {
+       68      // TODO: Put the key in an object pool as well
+       69      KafkaKey key = keySerializer.deserialize(null, keyBytes);
+       70      KafkaMessageEnvelope value = null;
+       71      if (key.isControlMessage()) {
+       72        for (PubSubMessageHeader header: headers) {
+       73          // only process VENICE_TRANSPORT_PROTOCOL_HEADER here. Other headers will be stored in
+       74          // ImmutablePubSubMessage and used down the ingestion path later
+       75          if (header.key().equals(VENICE_TRANSPORT_PROTOCOL_HEADER)) {
+       76            try {
+       77              Supplier<Schema> providedProtocolSchema = () -> AvroCompatibilityHelper.parse(new String(header.value()));
+       78              value =
+       79                  valueSerializer.deserialize(valueBytes, providedProtocolSchema, getEnvelope(key.getKeyHeaderByte()));
+       80            } catch (Exception e) {
+       81              // Improper header... will ignore.
+       82              LOGGER.warn(
+       83                  "Received unparsable schema or encountered schema registration issue in protocol header: "
+       84                      + VENICE_TRANSPORT_PROTOCOL_HEADER,
+       85                  e);
+       86            }
+       87            break; // We don't look at other headers
+       88          }
+       89        }
+       90      }
+       91      if (value == null) {
+       92        value = valueSerializer.deserialize(valueBytes, getEnvelope(key.getKeyHeaderByte()));
+       93      }
+       94      // When enabled, prefer Venice's own producer timestamp when the pub-sub system timestamp is
+       95      // missing or zero. Some pub-sub systems do not provide reliable per-message timestamps.
+       96      // Venice always embeds a producer timestamp in the KafkaMessageEnvelope, so we can fall back
+       97      // to it. Controlled by PUBSUB_PRODUCER_TIMESTAMP_FALLBACK_ENABLED (default: true).
+       98      long effectiveTimestamp = (producerTimestampFallbackEnabled && (timestamp == null || timestamp <= 0))
+       99          ? value.producerMetadata.messageTimestamp
+      100          : (timestamp != null ? timestamp : 0L);
+      101      // TODO: Put the message container in an object pool as well
+      102      return new ImmutablePubSubMessage(
+      103          key,
+      104          value,
+      105          topicPartition,
+      106          pubSubPosition,
+      107          effectiveTimestamp,
+      108          keyBytes.length + valueBytes.length,
+      109          headers);
+      110    }
+      111  
+      112    private KafkaMessageEnvelope getEnvelope(byte keyHeaderByte) {
+      113      switch (keyHeaderByte) {
+      114        case MessageType.Constants.PUT_KEY_HEADER_BYTE:
+      115          return putEnvelopePool.get();
+      116        // No need to pool control messages since there are so few of them, and they are varied anyway, limiting reuse.
+      117        case MessageType.Constants.CONTROL_MESSAGE_KEY_HEADER_BYTE:
+      118        case MessageType.Constants.GLOBAL_RT_DIV_KEY_HEADER_BYTE:
+      119          return new KafkaMessageEnvelope();
+      120        case MessageType.Constants.UPDATE_KEY_HEADER_BYTE:
+      121          return updateEnvelopePool.get();
+      122        default:
+      123          throw new IllegalStateException("Illegal key header byte: " + keyHeaderByte);
+      124      }
+      125    }
+      126  
+      127    public void close() {
+      128      if (valueSerializer != null) {
+      129        valueSerializer.close();
+      130      }
+      131    }
+      132  
+      133    // For testing only.
+      134    public KafkaValueSerializer getValueSerializer() {
+      135      return valueSerializer;
+      136    }
+      137  
+      138    /**
+      139     * Do not use the following default deserializer in production code as it does not support schema evolution
+      140     * properly. It is only provided for convenience in test code.
+      141     */
+      142    public static PubSubMessageDeserializer createDefaultDeserializer() {
+      143      return new PubSubMessageDeserializer(
+      144          new KafkaValueSerializer(),
+      145          new LandFillObjectPool<>(KafkaMessageEnvelope::new),
+      146          new LandFillObjectPool<>(KafkaMessageEnvelope::new));
+      147    }
+      148  
+      149    /**
+      150     * Do not use the following default deserializer in production code as it does not support schema evolution
+      151     * properly. It is only provided for convenience in test code.
+      152     */
+      153    public static PubSubMessageDeserializer createOptimizedDeserializer() {
+      154      return new PubSubMessageDeserializer(
+      155          new OptimizedKafkaValueSerializer(),
+      156          new LandFillObjectPool<>(KafkaMessageEnvelope::new),
+      157          new LandFillObjectPool<>(KafkaMessageEnvelope::new));
+      158    }
+      159  }

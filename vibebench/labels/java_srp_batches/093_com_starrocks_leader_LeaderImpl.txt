@@ -1,0 +1,406 @@
+row 93   StarRocks/starrocks#70342
+============================================================================
+CLASS com.starrocks.leader.LeaderImpl   loc=1239 methods=35 wmc=203 lcom=0.0294117647058823 c3=0.3049277555871732
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      175  public class LeaderImpl {
+      176      private static final Logger LOG = LogManager.getLogger(LeaderImpl.class);
+      177  
+      178      public TMasterResult finishTask(TFinishTaskRequest request) {
+      179          // if current node is not master, reject the request
+      180          TMasterResult result = new TMasterResult();
+      181          if (!GlobalStateMgr.getCurrentState().isLeader()) {
+      182              TStatus status;
+      183              if (GlobalStateMgr.getCurrentState().isLeaderTransferred()) {
+      184                  status = new TStatus(TStatusCode.LEADER_TRANSFERRED);
+      185              } else {
+      186                  status = new TStatus(TStatusCode.INTERNAL_ERROR);
+      187              }
+      188              status.setError_msgs(Lists.newArrayList("current fe is not master"));
+      189              result.setStatus(status);
+      190              LOG.warn("current node is not leader, finish task failed, task type: {}. task signature: {}",
+      191                      request.getTask_type(), request.getSignature());
+      192              return result;
+      193          }
+      194          TStatus tStatus = new TStatus(TStatusCode.OK);
+      195          result.setStatus(tStatus);
+      196          // check task status
+      197          // retry task by report process
+      198          TStatus taskStatus = request.getTask_status();
+      199          if (LOG.isDebugEnabled()) {
+      200              LOG.debug("get task report: {}", request.toString());
+      201          }
+      202          if (taskStatus.getStatus_code() != TStatusCode.OK) {
+      203              LOG.warn("finish task reports bad. request: {}", request.toString());
+      204          }
+      205  
+      206          // get backend
+      207          TBackend tBackend = request.getBackend();
+      208          String host = tBackend.getHost();
+      209          int bePort = tBackend.getBe_port();
+      210          long backendId;
+      211          // TODO: need to refactor after be has been split into cn + dn.
+      212          ComputeNode cn = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackendWithBePort(host, bePort);
+      213  
+      214          if (cn == null) {
+      215              if (RunMode.isSharedDataMode()) {
+      216                  cn = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getComputeNodeWithBePort(host, bePort);
+      217              }
+      218              if (cn == null) {
+      219                  tStatus.setStatus_code(TStatusCode.CANCELLED);
+      220                  List<String> errorMsgs = new ArrayList<>();
+      221                  errorMsgs.add("backend not exist.");
+      222                  tStatus.setError_msgs(errorMsgs);
+      223                  LOG.warn("backend does not found. host: {}, be port: {}. task: {}", host, bePort, request.toString());
+      224                  return result;
+      225              }
+      226          }
+      227          backendId = cn.getId();
+      228  
+      229          TTaskType taskType = request.getTask_type();
+      230          long signature = request.getSignature();
+      231          AgentTask task = AgentTaskQueue.getTask(backendId, taskType, signature);
+      232          if (task == null) {
+      233              if (taskType != TTaskType.DROP && taskType != TTaskType.STORAGE_MEDIUM_MIGRATE
+      234                      && taskType != TTaskType.RELEASE_SNAPSHOT && taskType != TTaskType.CLEAR_TRANSACTION_TASK) {
+      235                  String errMsg = "cannot find task. type: " + taskType + ", backendId: " + backendId
+      236                          + ", signature: " + signature;
+      237                  LOG.warn(errMsg);
+      238                  tStatus.setStatus_code(TStatusCode.CANCELLED);
+      239                  List<String> errorMsgs = new ArrayList<>();
+      240                  errorMsgs.add(errMsg);
+      241                  tStatus.setError_msgs(errorMsgs);
+      242              }
+      243              return result;
+      244          } else {
+      245              if (taskStatus.getStatus_code() != TStatusCode.OK) {
+      246                  task.failed();
+      247                  String taskErrMsg = taskStatus.getError_msgs() != null ? Joiner.on(",").join(taskStatus.getError_msgs()) : "";
+      248                  String errMsg = "task type: " + taskType + ", status_code: " + taskStatus.getStatus_code().toString() + ", " +
+      249                          taskErrMsg + ", backendId: " + backendId + ", signature: " + signature;
+      250                  task.setErrorMsg(errMsg);
+      251                  LOG.warn(errMsg);
+      252                  // We start to let FE perceive the task's error msg
+      253                  if (taskType != TTaskType.MAKE_SNAPSHOT && taskType != TTaskType.UPLOAD
+      254                          && taskType != TTaskType.DOWNLOAD && taskType != TTaskType.MOVE
+      255                          && taskType != TTaskType.CLONE && taskType != TTaskType.PUBLISH_VERSION
+      256                          && taskType != TTaskType.CREATE && taskType != TTaskType.UPDATE_TABLET_META_INFO
+      257                          && taskType != TTaskType.DROP_AUTO_INCREMENT_MAP
+      258                          && taskType != TTaskType.STORAGE_MEDIUM_MIGRATE
+      259                          && taskType != TTaskType.REMOTE_SNAPSHOT && taskType != TTaskType.REPLICATE_SNAPSHOT
+      260                          && taskType != TTaskType.UPDATE_SCHEMA) {
+      261                      if (taskType == TTaskType.REALTIME_PUSH) {
+      262                          PushTask pushTask = (PushTask) task;
+      263                          if (pushTask.getPushType() == TPushType.DELETE) {
+      264                              LOG.info("remove push replica. tabletId: {}, backendId: {}", task.getSignature(),
+      265                                      pushTask.getBackendId());
+      266  
+      267                              String failMsg = "Backend: " + task.getBackendId() + "Tablet: " + pushTask.getTabletId() +
+      268                                      " error msg: " + taskStatus.getError_msgs().toString();
+      269                              pushTask.countDownLatch(pushTask.getBackendId(), pushTask.getTabletId(), failMsg);
+      270                              AgentTaskQueue.removeTask(pushTask.getBackendId(), TTaskType.REALTIME_PUSH,
+      271                                      task.getSignature());
+      272                          }
+      273                      }
+      274                      return result;
+      275                  }
+      276              }
+      277          }
+      278  
+      279          try {
+      280              switch (taskType) {
+      281                  case CREATE:
+      282                      Preconditions.checkState(request.isSetReport_version());
+      283                      finishCreateReplica(task, request);
+      284                      break;
+      285                  case REALTIME_PUSH:
+      286                      checkHasTabletInfo(request);
+      287                      Preconditions.checkState(request.isSetReport_version());
+      288                      finishRealtimePush(task, request);
+      289                      break;
+      290                  case PUBLISH_VERSION:
+      291                      finishPublishVersion(task, request);
+      292                      break;
+      293                  case CLEAR_ALTER_TASK:
+      294                      finishClearAlterTask(task, request);
+      295                      break;
+      296                  case DROP:
+      297                      finishDropReplica(task);
+      298                      break;
+      299                  case SCHEMA_CHANGE:
+      300                  case ROLLUP:
+      301                      throw new RuntimeException("Old alter job is not supported.");
+      302                  case CLONE:
+      303                      finishClone(task, request);
+      304                      break;
+      305                  case STORAGE_MEDIUM_MIGRATE:
+      306                      finishStorageMigration(task, request);
+      307                      break;
+      308                  case CHECK_CONSISTENCY:
+      309                      finishConsistencyCheck(task, request);
+      310                      break;
+      311                  case MAKE_SNAPSHOT:
+      312                      finishMakeSnapshot(task, request);
+      313                      break;
+      314                  case UPLOAD:
+      315                      finishUpload(task, request);
+      316                      break;
+      317                  case DOWNLOAD:
+      318                      finishDownloadTask(task, request);
+      319                      break;
+      320                  case MOVE:
+      321                      finishMoveDirTask(task, request);
+      322                      break;
+      323                  case RECOVER_TABLET:
+      324                      finishRecoverTablet(task);
+      325                      break;
+      326                  case ALTER:
+      327                      finishAlterTask(task);
+      328                      break;
+      329                  case UPDATE_TABLET_META_INFO:
+      330                      finishUpdateTabletMeta(task, request);
+      331                      break;
+      332                  case DROP_AUTO_INCREMENT_MAP:
+      333                      finishDropAutoIncrementMapTask(task, request);
+      334                      break;
+      335                  case COMPACTION:
+      336                      finishCompactionTask(task, request);
+      337                      break;
+      338                  case COMPACTION_CONTROL:
+      339                      finishCompactionControlTask(task, request);
+      340                      break;
+      341                  case REMOTE_SNAPSHOT:
+      342                      finishRemoteSnapshotTask(task, request);
+      343                      break;
+      344                  case REPLICATE_SNAPSHOT:
+      345                      finishReplicateSnapshotTask(task, request);
+      346                      break;
+      347                  case UPDATE_SCHEMA:
+      348                      finishUpdateSchemaTask(task, request);
+      349                      break;
+      350                  default:
+      351                      break;
+      352              }
+      353          } catch (RejectedExecutionException e) {
+      354              tStatus.setStatus_code(TStatusCode.TOO_MANY_TASKS);
+      355              String errMsg = "task queue full";
+      356              List<String> errorMsgs = new ArrayList<>();
+      357              LOG.warn(errMsg, e);
+      358              errorMsgs.add(errMsg);
+      359              tStatus.setError_msgs(errorMsgs);
+      360          } catch (Exception e) {
+      361              tStatus.setStatus_code(TStatusCode.CANCELLED);
+      362              String errMsg = "finish agent task error.";
+      363              LOG.warn(errMsg, e);
+      364              List<String> errorMsgs = new ArrayList<>();
+      365              errorMsgs.add(errMsg);
+      366              tStatus.setError_msgs(errorMsgs);
+      367          }
+      368  
+      369          if (tStatus.getStatus_code() == TStatusCode.OK) {
+      370              LOG.debug("report task success. {}", request.toString());
+      371          }
+      372  
+      373          return result;
+      374      }
+      375  
+      376      private void checkHasTabletInfo(TFinishTaskRequest request) throws Exception {
+      377          if (!request.isSetFinish_tablet_infos() || request.getFinish_tablet_infos().isEmpty()) {
+      378              throw new Exception("tablet info is not set");
+      379          }
+      380      }
+      381  
+      382      private void finishCreateReplica(AgentTask task, TFinishTaskRequest request) {
+      383          // if we get here, this task will be removed from AgentTaskQueue for certain.
+      384          // because in this function, the only problem that cause failure is meta missing.
+      385          // and if meta is missing, we no longer need to resend this task
+      386          try {
+      387              CreateReplicaTask createReplicaTask = (CreateReplicaTask) task;
+      388              if (request.getTask_status().getStatus_code() != TStatusCode.OK) {
+      389                  createReplicaTask.countDownToZero(
+      390                          task.getBackendId() + ": " + request.getTask_status().getError_msgs().toString());
+      391              } else {
+      392                  long tabletId = createReplicaTask.getTabletId();
+      393                  if (request.isSetFinish_tablet_infos()) {
+      394                      Replica replica = GlobalStateMgr.getCurrentState().getTabletInvertedIndex()
+      395                              .getReplica(tabletId, createReplicaTask.getBackendId());
+      396                      if (replica != null) {
+      397                          replica.setPathHash(request.getFinish_tablet_infos().get(0).getPath_hash());
+      398                          if (createReplicaTask.getRecoverySource() == RecoverySource.REPORT) {
+      399                              /*
+      400                               * This creates replica task is created by ReportHanlder,
+      401                               * (See comment of Config.recover_with_empty_tablet)
+      402                               * So we set replica back to normal state.
+      403                               */
+      404                              replica.setBad(false);
+      405                              LOG.info(
+      406                                      "finish recover create replica task. set replica to good. tablet {}, replica {}, backend {}",
+      407                                      tabletId, task.getBackendId(), replica.getId());
+      408                          }
+      409                      }
+      410                  } else if (!RunMode.isSharedDataMode()) { // finish_tablet_infos will not be set in shared data mode
+      411                      LOG.warn("tablet_info is not set in finishTaskRequest");
+      412                  }
+      413  
+      414                  // this should be called before 'countDownLatch()'
+      415                  GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo()
+      416                          .updateBackendReportVersion(task.getBackendId(), request.getReport_version(), task.getDbId());
+      417  
+      418                  createReplicaTask.countDownLatch(task.getBackendId(), task.getSignature());
+      419                  LOG.debug("finish create replica. tablet id: {}, be: {}, report version: {}, tablet type: {}",
+      420                          tabletId, task.getBackendId(), request.getReport_version(), createReplicaTask.getTabletType());
+      421              }
+      422  
+      423              if (createReplicaTask.getRecoverySource() == RecoverySource.SCHEDULER) {
+      424                  GlobalStateMgr.getCurrentState().getTabletScheduler()
+      425                          .finishCreateReplicaTask(createReplicaTask, request);
+      426              }
+      427          } finally {
+      428              AgentTaskQueue.removeTask(task.getBackendId(), TTaskType.CREATE, task.getSignature());
+      429          }
+      430      }
+      431  
+      432      private void finishUpdateTabletMeta(AgentTask task, TFinishTaskRequest request) {
+      433          // if we get here, this task will be removed from AgentTaskQueue for certain.
+      434          // because in this function, the only problem that cause failure is meta missing.
+      435          // and if meta is missing, we no longer need to resend this task
+      436          try {
+      437              TabletMetadataUpdateAgentTask tabletTask = (TabletMetadataUpdateAgentTask) task;
+      438              if (request.getTask_status().getStatus_code() != TStatusCode.OK) {
+      439                  tabletTask.countDownToZero(
+      440                          task.getBackendId() + ": " + request.getTask_status().getError_msgs().toString());
+      441              } else {
+      442                  tabletTask.countDownLatch(task.getBackendId(), tabletTask.getTablets());
+      443                  LOG.debug("finish update tablet meta. tablet id: {}, be: {}", tabletTask.getTablets(),
+      444                          task.getBackendId());
+      445              }
+      446          } finally {
+      447              AgentTaskQueue.removeTask(task.getBackendId(), TTaskType.UPDATE_TABLET_META_INFO, task.getSignature());
+      448          }
+      449      }
+      450  
+      451      private void finishCompactionTask(AgentTask task, TFinishTaskRequest request) {
+      452          AgentTaskQueue.removeTask(task.getBackendId(), task.getTaskType(), task.getSignature());
+      453      }
+      454  
+      455      private void finishCompactionControlTask(AgentTask task, TFinishTaskRequest request) {
+      456          AgentTaskQueue.removeTask(task.getBackendId(), task.getTaskType(), task.getSignature());
+      457      }
+      458  
+      459      private void finishRemoteSnapshotTask(AgentTask task, TFinishTaskRequest request) throws MetaNotFoundException {
+      460          try {
+      461              GlobalStateMgr.getCurrentState().getReplicationMgr().finishRemoteSnapshotTask(
+      462                      (RemoteSnapshotTask) task, request);
+      463          } finally {
+      464              AgentTaskQueue.removeTask(task.getBackendId(), task.getTaskType(), task.getSignature());
+      465          }
+      466      }
+      467  
+      468      private void finishReplicateSnapshotTask(AgentTask task, TFinishTaskRequest request) throws MetaNotFoundException {
+      469          try {
+      470              GlobalStateMgr.getCurrentState().getReplicationMgr().finishReplicateSnapshotTask(
+      471                      (ReplicateSnapshotTask) task, request);
+      472          } finally {
+      473              AgentTaskQueue.removeTask(task.getBackendId(), task.getTaskType(), task.getSignature());
+      474          }
+      475      }
+      476  
+      477      private void finishUpdateSchemaTask(AgentTask task, TFinishTaskRequest request) {
+      478          try {
+      479              long dbId = task.getDbId();
+      480              long tableId = task.getTableId();
+      481              long indexId = task.getIndexId();
+      482              long backendId = task.getBackendId();
+      483              Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbId);
+      484              if (db != null) {
+      485                  Locker locker = new Locker();
+      486                  locker.lockDatabase(db.getId(), LockType.READ);
+      487                  try {
+      488                      OlapTable olapTable = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+      489                                  .getTable(db.getId(), tableId);
+      490                      if (olapTable != null) {
+      491                          MaterializedIndexMeta indexMeta = olapTable.getIndexMetaByIndexId(indexId);
+      492                          if (indexMeta != null) {
+      493                              indexMeta.removeUpdateSchemaBackend(backendId);
+      494                          }
+      495                      }
+      496                  } finally {
+      497                      locker.unLockDatabase(db.getId(), LockType.READ);
+      498                  }
+      499              }
+      500          } finally {
+      501              AgentTaskQueue.removeTask(task.getBackendId(), task.getTaskType(), task.getSignature());
+      502          }
+      503      }
+      504  
+      505      private void finishRealtimePush(AgentTask task, TFinishTaskRequest request) {
+      506          List<TTabletInfo> finishTabletInfos = request.getFinish_tablet_infos();
+      507          Preconditions.checkState(finishTabletInfos != null && !finishTabletInfos.isEmpty());
+      508  
+      509          PushTask pushTask = (PushTask) task;
+      510  
+      511          long dbId = pushTask.getDbId();
+      512          long backendId = pushTask.getBackendId();
+      513          long signature = task.getSignature();
+      514          long transactionId = ((PushTask) task).getTransactionId();
+      515          Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbId);
+      516          if (db == null) {
+      517              AgentTaskQueue.removeTask(backendId, TTaskType.REALTIME_PUSH, signature);
+      518              return;
+      519          }
+      520  
+      521          long tableId = pushTask.getTableId();
+      522          long physicalPartitionId = pushTask.getPartitionId();
+      523          long pushIndexId = pushTask.getIndexId();
+      524          long pushTabletId = pushTask.getTabletId();
+      525          // push finish type:
+      526          //                  numOfFinishTabletInfos  tabletId schemaHash
+      527          // Normal:                     1                   /          /
+      528          // SchemaChangeHandler         2                 same      diff
+      529          // RollupHandler               2                 diff      diff
+      530          // 
+      531          // reuse enum 'PartitionState' here as 'push finish type'
+      532          PartitionState pushState;
+      533          if (finishTabletInfos.size() == 1) {
+      534              pushState = PartitionState.NORMAL;
+      535          } else if (finishTabletInfos.size() == 2) {
+      536              if (finishTabletInfos.get(0).getTablet_id() == finishTabletInfos.get(1).getTablet_id()) {
+      537                  pushState = PartitionState.SCHEMA_CHANGE;
+      538              } else {
+      539                  pushState = PartitionState.ROLLUP;
+      540              }
+      541          } else {
+      542              LOG.warn("invalid push report infos. finishTabletInfos' size: " + finishTabletInfos.size());
+      543              return;
+      544          }
+      545          LOG.debug("push report state: {}", pushState.name());
+      546  
+      547          Locker locker = new Locker();
+      548          locker.lockDatabase(db.getId(), LockType.WRITE);
+      549          try {
+      550              OlapTable olapTable = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getId(), tableId);
+      551              if (olapTable == null) {
+      552                  throw new MetaNotFoundException("cannot find table[" + tableId + "] when push finished");
+      553              }
+      554  
+      555              PhysicalPartition physicalPartition = olapTable.getPhysicalPartition(physicalPartitionId);
+      556              if (physicalPartition == null) {
+      557                  throw new MetaNotFoundException("cannot find partition[" + physicalPartitionId + "] when push finished");
+      558              }
+      559  
+      560              MaterializedIndex pushIndex = physicalPartition.getIndex(pushIndexId);
+      561              if (pushIndex == null) {
+      562                  // yiguolei: if index is dropped during load, it is not a failure.
+      563                  // throw exception here and cause the job to cancel the task
+      564                  throw new MetaNotFoundException("cannot find index[" + pushIndex + "] when push finished");
+      565              }
+      566  
+      567              // should be done before addReplicaPersistInfos and countDownLatch
+      568              long reportVersion = request.getReport_version();
+      569              GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo()
+      570                      .updateBackendReportVersion(task.getBackendId(), reportVersion,
+      571                              task.getDbId());
+      572  
+      573              List<Long> tabletIds = finishTabletInfos.stream().map(
+      574                      TTabletInfo::getTablet_id).collect(Collectors.toList());
+       ... truncated at 400 lines ...

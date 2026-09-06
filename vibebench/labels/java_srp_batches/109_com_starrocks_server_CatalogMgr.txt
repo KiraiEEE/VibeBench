@@ -1,0 +1,406 @@
+row 109   StarRocks/starrocks#70342
+============================================================================
+CLASS com.starrocks.server.CatalogMgr   loc=470 methods=30 wmc=72 lcom=0.0344827586206896 c3=0.2042948721301742
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       74  public class CatalogMgr {
+       75      private static final Logger LOG = LogManager.getLogger(CatalogMgr.class);
+       76      private final Map<String, Catalog> catalogs = Maps.newConcurrentMap();
+       77      private final ConnectorMgr connectorMgr;
+       78      private final ReadWriteLock catalogLock = new ReentrantReadWriteLock();
+       79  
+       80      public static final ImmutableList<String> CATALOG_PROC_NODE_TITLE_NAMES = new ImmutableList.Builder<String>()
+       81              .add("Catalog").add("Type").add("Comment")
+       82              .build();
+       83  
+       84      private final CatalogProcNode procNode = new CatalogProcNode();
+       85  
+       86      public CatalogMgr(ConnectorMgr connectorMgr) {
+       87          Preconditions.checkNotNull(connectorMgr, "ConnectorMgr is null");
+       88          this.connectorMgr = connectorMgr;
+       89      }
+       90  
+       91      public void createCatalog(CreateCatalogStmt stmt) throws DdlException {
+       92          createCatalog(stmt.getCatalogType(), stmt.getCatalogName(), stmt.getComment(), stmt.getProperties());
+       93      }
+       94  
+       95      public void createCatalogForRestore(Catalog catalog) throws DdlException {
+       96          dropCatalogForRestore(catalog, false);
+       97          createCatalog(catalog.getType(), catalog.getName(), catalog.getComment(), catalog.getConfig());
+       98      }
+       99  
+      100      // please keep connector and catalog create together, they need keep in consistent asap.
+      101      public void createCatalog(String type, String catalogName, String comment, Map<String, String> properties)
+      102              throws DdlException {
+      103          CatalogConnector connector = null;
+      104          Catalog catalog = null;
+      105          writeLock();
+      106          try {
+      107              if (Strings.isNullOrEmpty(type)) {
+      108                  throw new DdlException("Missing properties 'type'");
+      109              }
+      110  
+      111              Preconditions.checkState(!catalogs.containsKey(catalogName), "Catalog '%s' already exists", catalogName);
+      112  
+      113              try {
+      114                  Preconditions.checkState(!catalogs.containsKey(catalogName), "Catalog '%s' already exists", catalogName);
+      115  
+      116                  connector = connectorMgr.createConnector(
+      117                          new ConnectorContext(catalogName, type, properties), false);
+      118                  if (null == connector) {
+      119                      LOG.error("{} connector [{}] create failed", type, catalogName);
+      120                      throw new DdlException("connector create failed");
+      121                  }
+      122                  long id = isResourceMappingCatalog(catalogName) ?
+      123                          ConnectorTableId.CONNECTOR_ID_GENERATOR.getNextId().asInt() :
+      124                          GlobalStateMgr.getCurrentState().getNextId();
+      125                  catalog = new ExternalCatalog(id, catalogName, comment, properties);
+      126                  catalogs.put(catalogName, catalog);
+      127  
+      128                  if (!isResourceMappingCatalog(catalogName)) {
+      129                      GlobalStateMgr.getCurrentState().getEditLog().logCreateCatalog(catalog);
+      130                  }
+      131              } catch (StarRocksConnectorException e) {
+      132                  LOG.error("connector create failed. catalog [{}] ", catalogName, e);
+      133                  throw new DdlException(String.format("connector create failed {%s}", e.getMessage()));
+      134              }
+      135          } catch (Exception e) {
+      136              if (connector != null && connectorMgr.connectorExists(catalogName)) {
+      137                  connectorMgr.removeConnector(catalogName);
+      138              }
+      139  
+      140              if (catalog != null) {
+      141                  catalogs.remove(catalogName);
+      142              }
+      143  
+      144              throw e;
+      145          } finally {
+      146              writeUnLock();
+      147          }
+      148      }
+      149  
+      150      private void reCreatCatalog(Catalog catalog, Map<String, String> alterProperties, boolean isReplay) throws DdlException {
+      151          String catalogName = catalog.getName();
+      152          String type = catalog.getType();
+      153          CatalogConnector newConnector = null;
+      154  
+      155          writeLock();
+      156          try {
+      157              Map<String, String> newProperties = new HashMap<>(catalog.getConfig().size() + alterProperties.size());
+      158              newProperties.putAll(catalog.getConfig());
+      159              newProperties.putAll(alterProperties);
+      160  
+      161              LOG.info("Recreate catalog [{}] with properties [{}]", catalogName, newProperties);
+      162  
+      163              newConnector = connectorMgr.createHiddenConnector(
+      164                      new ConnectorContext(catalogName, type, newProperties), isReplay);
+      165              if (null == newConnector) {
+      166                  throw new DdlException("Create connector failed");
+      167              }
+      168  
+      169              // drop old connector
+      170              connectorMgr.removeConnector(catalogName);
+      171  
+      172              // replace old connector with new connector
+      173              connectorMgr.addConnector(catalogName, newConnector);
+      174  
+      175              catalog.getConfig().putAll(alterProperties);
+      176          } catch (Exception e) {
+      177              LOG.error("Recreate catalog failed. catalog [{}] ", catalogName, e);
+      178  
+      179              if (newConnector != null) {
+      180                  newConnector.shutdown();
+      181              }
+      182  
+      183              throw new DdlException(String.format("Alter catalog failed, msg: [%s]", e.getMessage()), e);
+      184          } finally {
+      185              writeUnLock();
+      186          }
+      187      }
+      188  
+      189      public void dropCatalogForRestore(Catalog catalog, boolean isReplay) {
+      190          if (!isReplay && catalogExists(catalog.getName())) {
+      191              DropCatalogStmt stmt = new DropCatalogStmt(catalog.getName());
+      192              dropCatalog(stmt);
+      193          } else if (isReplay) {
+      194              DropCatalogLog dropCatalogLog = new DropCatalogLog(catalog.getName());
+      195              replayDropCatalog(dropCatalogLog);
+      196          }
+      197      }
+      198  
+      199      public void dropCatalog(DropCatalogStmt stmt) {
+      200          String catalogName = stmt.getName();
+      201          readLock();
+      202          try {
+      203              Preconditions.checkState(catalogs.containsKey(catalogName), "Catalog '%s' doesn't exist", catalogName);
+      204          } finally {
+      205              readUnlock();
+      206          }
+      207  
+      208          writeLock();
+      209          try {
+      210              connectorMgr.removeConnector(catalogName);
+      211              Authorizer.getInstance().removeAccessControl(catalogName);
+      212              catalogs.remove(catalogName);
+      213              if (!isResourceMappingCatalog(catalogName)) {
+      214                  DropCatalogLog dropCatalogLog = new DropCatalogLog(catalogName);
+      215                  GlobalStateMgr.getCurrentState().getEditLog().logDropCatalog(dropCatalogLog);
+      216              }
+      217          } finally {
+      218              writeUnLock();
+      219          }
+      220      }
+      221  
+      222      public void alterCatalog(AlterCatalogStmt stmt) throws DdlException {
+      223          String catalogName = stmt.getCatalogName();
+      224          writeLock();
+      225          try {
+      226              Catalog catalog = catalogs.get(catalogName);
+      227              if (catalog == null) {
+      228                  return;
+      229              }
+      230  
+      231              if (stmt.getAlterClause() instanceof ModifyTablePropertiesClause) {
+      232                  Map<String, String> properties = ((ModifyTablePropertiesClause) stmt.getAlterClause()).getProperties();
+      233                  alterCatalog(catalog, properties, false);
+      234  
+      235                  AlterCatalogLog alterCatalogLog = new AlterCatalogLog(catalogName, properties);
+      236                  GlobalStateMgr.getCurrentState().getEditLog().logAlterCatalog(alterCatalogLog);
+      237              }
+      238          } finally {
+      239              writeUnLock();
+      240          }
+      241      }
+      242  
+      243      private void alterCatalog(Catalog catalog, Map<String, String> properties, boolean isReplay) throws DdlException {
+      244          Map<String, String> alterProperties = new HashMap<>(properties.size());
+      245          Map<String, String> oldProperties = catalog.getConfig();
+      246  
+      247          for (String confName : properties.keySet()) {
+      248              String oldVal = oldProperties.get(confName);
+      249              String newVal = properties.get(confName);
+      250              if (!oldProperties.containsKey(confName) || !Objects.equals(oldVal, newVal)) {
+      251                  alterProperties.put(confName, newVal);
+      252              }
+      253          }
+      254  
+      255          if (alterProperties.isEmpty()) {
+      256              return;
+      257          }
+      258  
+      259          reCreatCatalog(catalog, alterProperties, isReplay);
+      260      }
+      261  
+      262      // TODO @caneGuy we should put internal catalog into catalogmgr
+      263      public boolean catalogExists(String catalogName) {
+      264          if (catalogName.equalsIgnoreCase(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)) {
+      265              return true;
+      266          }
+      267  
+      268          readLock();
+      269          try {
+      270              if (catalogs.containsKey(catalogName)) {
+      271                  return true;
+      272              }
+      273  
+      274              // TODO: Used for replay query dump which only supports `hive` catalog for now.
+      275              if (FeConstants.isReplayFromQueryDump &&
+      276                      catalogs.containsKey(getResourceMappingCatalogName(catalogName, "hive"))) {
+      277                  return true;
+      278              }
+      279  
+      280              return false;
+      281          } finally {
+      282              readUnlock();
+      283          }
+      284      }
+      285  
+      286      public static boolean isInternalCatalog(String name) {
+      287          return name.equalsIgnoreCase(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME);
+      288      }
+      289  
+      290      public static boolean isInternalCatalog(long catalogId) {
+      291          return catalogId == InternalCatalog.DEFAULT_INTERNAL_CATALOG_ID;
+      292      }
+      293  
+      294      public static boolean isExternalCatalog(String name) {
+      295          return !Strings.isNullOrEmpty(name) && !isInternalCatalog(name) && !isResourceMappingCatalog(name);
+      296      }
+      297  
+      298      // please keep connector and catalog create together, they need keep in consistent asap.
+      299      public void replayCreateCatalog(Catalog catalog) throws DdlException {
+      300          String type = catalog.getType();
+      301          String catalogName = catalog.getName();
+      302          Map<String, String> config = catalog.getConfig();
+      303          CatalogConnector catalogConnector = null;
+      304  
+      305          try {
+      306              if (Strings.isNullOrEmpty(type)) {
+      307                  throw new DdlException("Missing properties 'type'");
+      308              }
+      309  
+      310              // skip unsupported connector type
+      311              if (!ConnectorType.isSupport(type)) {
+      312                  LOG.error("Replay catalog [{}] encounter unknown catalog type [{}], ignore it", catalogName, type);
+      313                  return;
+      314              }
+      315  
+      316              readLock();
+      317              try {
+      318                  Preconditions.checkState(!catalogs.containsKey(catalogName), "Catalog '%s' already exists", catalogName);
+      319              } finally {
+      320                  readUnlock();
+      321              }
+      322  
+      323              try {
+      324                  catalogConnector = connectorMgr.createConnector(
+      325                          new ConnectorContext(catalogName, type, config), true);
+      326                  if (catalogConnector == null) {
+      327                      LOG.error("{} connector [{}] create failed.", type, catalogName);
+      328                      throw new DdlException("connector create failed");
+      329                  }
+      330              } catch (StarRocksConnectorException e) {
+      331                  LOG.error("connector create failed [{}], reason {}", catalogName, e.getMessage());
+      332                  throw new DdlException(String.format("connector create failed: %s", e.getMessage()));
+      333              }
+      334  
+      335              writeLock();
+      336              try {
+      337                  catalogs.put(catalogName, catalog);
+      338              } finally {
+      339                  writeUnLock();
+      340              }
+      341          } catch (Exception e) {
+      342              if (catalogConnector != null && connectorMgr.connectorExists(catalogName)) {
+      343                  connectorMgr.removeConnector(catalogName);
+      344              }
+      345  
+      346              catalogs.remove(catalogName);
+      347              throw e;
+      348          }
+      349      }
+      350  
+      351      public void replayDropCatalog(DropCatalogLog log) {
+      352          String catalogName = log.getCatalogName();
+      353          readLock();
+      354          try {
+      355              if (!catalogs.containsKey(catalogName)) {
+      356                  LOG.error("Catalog [{}] doesn't exist, unsupport this catalog type, ignore it", catalogName);
+      357                  return;
+      358              }
+      359          } finally {
+      360              readUnlock();
+      361          }
+      362          connectorMgr.removeConnector(catalogName);
+      363  
+      364          writeLock();
+      365          try {
+      366              Authorizer.getInstance().removeAccessControl(catalogName);
+      367              catalogs.remove(catalogName);
+      368          } finally {
+      369              writeUnLock();
+      370          }
+      371      }
+      372  
+      373      public void replayAlterCatalog(AlterCatalogLog log) throws DdlException {
+      374          writeLock();
+      375          try {
+      376              String catalogName = log.getCatalogName();
+      377              Map<String, String> properties = log.getProperties();
+      378              Catalog catalog = catalogs.get(catalogName);
+      379  
+      380              alterCatalog(catalog, properties, true);
+      381          } finally {
+      382              writeUnLock();
+      383          }
+      384      }
+      385  
+      386      public void loadResourceMappingCatalog() {
+      387          LOG.info("start to replay resource mapping catalog");
+      388  
+      389          List<Resource> resources = GlobalStateMgr.getCurrentState().getResourceMgr().getNeedMappingCatalogResources();
+      390          for (Resource resource : resources) {
+      391              Map<String, String> properties = Maps.newHashMap(resource.getProperties());
+      392              String type = resource.getType().name().toLowerCase(Locale.ROOT);
+      393              if (!NEED_MAPPING_CATALOG_RESOURCES.contains(type)) {
+      394                  return;
+      395              }
+      396  
+      397              String catalogName = getResourceMappingCatalogName(resource.getName(), type);
+      398              properties.put("type", type);
+      399              properties.put(HIVE_METASTORE_URIS, resource.getHiveMetastoreURIs());
+      400              try {
+      401                  createCatalog(type, catalogName, "mapping " + type + " catalog", properties);
+      402              } catch (Exception e) {
+      403                  LOG.error("Failed to load resource mapping inside catalog {}", catalogName, e);
+      404              }
+      405          }
+      406          LOG.info("finished replaying resource mapping catalogs from resources");
+      407      }
+      408  
+      409      public List<List<String>> getCatalogsInfo() {
+      410          return procNode.fetchResult().getRows();
+      411      }
+      412  
+      413      public String getCatalogType(String catalogName) {
+      414          if (isInternalCatalog(catalogName)) {
+      415              return "internal";
+      416          } else {
+      417              return catalogs.get(catalogName).getType();
+      418          }
+      419      }
+      420  
+      421      public Catalog getCatalogByName(String name) {
+      422          return catalogs.get(name);
+      423      }
+      424  
+      425      public Optional<Catalog> getCatalogById(long id) {
+      426          return catalogs.values().stream().filter(catalog -> catalog.getId() == id).findFirst();
+      427      }
+      428  
+      429      public Map<String, Catalog> getCatalogs() {
+      430          return new HashMap<>(catalogs);
+      431      }
+      432  
+      433      public boolean checkCatalogExistsById(long id) {
+      434          return catalogs.entrySet().stream().anyMatch(entry -> entry.getValue().getId() == id);
+      435      }
+      436  
+      437      public CatalogProcNode getProcNode() {
+      438          return procNode;
+      439      }
+      440  
+      441      private void readLock() {
+      442          this.catalogLock.readLock().lock();
+      443      }
+      444  
+      445      private void readUnlock() {
+      446          this.catalogLock.readLock().unlock();
+      447      }
+      448  
+      449      private void writeLock() {
+      450          this.catalogLock.writeLock().lock();
+      451      }
+      452  
+      453      private void writeUnLock() {
+      454          this.catalogLock.writeLock().unlock();
+      455      }
+      456  
+      457      public long getCatalogCount() {
+      458          return catalogs.size();
+      459      }
+      460  
+      461      public class CatalogProcNode implements ProcDirInterface {
+      462          private static final String DEFAULT_CATALOG_COMMENT =
+      463                  "An internal catalog contains this cluster's self-managed tables.";
+      464  
+      465          @Override
+      466          public boolean register(String name, ProcNodeInterface node) {
+      467              return false;
+      468          }
+      469  
+      470          @Override
+      471          public ProcNodeInterface lookup(String catalogName) throws AnalysisException {
+      472              if (CatalogMgr.isInternalCatalog(catalogName)) {
+      473                  return new DbsProcDir(GlobalStateMgr.getCurrentState());
+       ... truncated at 400 lines ...

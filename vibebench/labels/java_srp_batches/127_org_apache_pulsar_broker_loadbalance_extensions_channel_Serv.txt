@@ -1,0 +1,406 @@
+row 127   apache/pulsar#24592
+============================================================================
+CLASS org.apache.pulsar.broker.loadbalance.extensions.channel.ServiceUnitStateChannelImpl   loc=1890 methods=82 wmc=328 lcom=0.0 c3=0.1265391835276932
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      104  @Slf4j
+      105  public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
+      106  
+      107      private static final int OWNERSHIP_CLEAN_UP_MAX_WAIT_TIME_IN_MILLIS = 5000;
+      108      private static final int OWNERSHIP_CLEAN_UP_WAIT_RETRY_DELAY_IN_MILLIS = 100;
+      109      public static final long VERSION_ID_INIT = 1; // initial versionId
+      110      public static final long MAX_CLEAN_UP_DELAY_TIME_IN_SECS = 3 * 60; // 3 mins
+      111      private static final long MIN_CLEAN_UP_DELAY_TIME_IN_SECS = 0; // 0 secs to clean immediately
+      112      private static final long MAX_CHANNEL_OWNER_ELECTION_WAITING_TIME_IN_SECS = 10;
+      113      private static final long MAX_OWNED_BUNDLE_COUNT_DELAY_TIME_IN_MILLIS = 10 * 60 * 1000;
+      114      private static final long MAX_BROKER_HEALTH_CHECK_RETRY = 3;
+      115      private static final long MAX_BROKER_HEALTH_CHECK_DELAY_IN_MILLIS = 1000;
+      116  
+      117      private final PulsarService pulsar;
+      118      private final ServiceConfiguration config;
+      119      private final Schema<ServiceUnitStateData> schema;
+      120      private final Map<String, CompletableFuture<String>> getOwnerRequests;
+      121      private final String brokerId;
+      122      private final Map<String, CompletableFuture<Void>> cleanupJobs;
+      123      private final StateChangeListeners stateChangeListeners;
+      124  
+      125      private BrokerRegistry brokerRegistry;
+      126      private LeaderElectionService leaderElectionService;
+      127  
+      128      private ServiceUnitStateTableView tableview;
+      129      private ScheduledFuture<?> monitorTask;
+      130      private SessionEvent lastMetadataSessionEvent = SessionReestablished;
+      131      private long lastMetadataSessionEventTimestamp = 0;
+      132      private long inFlightStateWaitingTimeInMillis;
+      133  
+      134      private long ownershipMonitorDelayTimeInSecs;
+      135      private long stateTombstoneDelayTimeInMillis;
+      136      private long maxCleanupDelayTimeInSecs;
+      137      private long minCleanupDelayTimeInSecs;
+      138      // cleanup metrics
+      139      private long totalInactiveBrokerCleanupCnt = 0;
+      140      private long totalServiceUnitTombstoneCleanupCnt = 0;
+      141  
+      142      private long totalOrphanServiceUnitCleanupCnt = 0;
+      143      private AtomicLong totalCleanupErrorCnt = new AtomicLong();
+      144      private long totalInactiveBrokerCleanupScheduledCnt = 0;
+      145      private long totalInactiveBrokerCleanupIgnoredCnt = 0;
+      146      private long totalInactiveBrokerCleanupCancelledCnt = 0;
+      147      private volatile ChannelState channelState;
+      148      private volatile long lastOwnEventHandledAt = 0;
+      149      private long lastOwnedServiceUnitCountAt = 0;
+      150      private int totalOwnedServiceUnitCnt = 0;
+      151  
+      152      public enum EventType {
+      153          Assign,
+      154          Split,
+      155          Unload,
+      156          Override
+      157      }
+      158  
+      159      @Getter
+      160      @AllArgsConstructor
+      161      public static class Counters {
+      162          private final AtomicLong total;
+      163          private final AtomicLong failure;
+      164  
+      165          public Counters() {
+      166              total = new AtomicLong();
+      167              failure = new AtomicLong();
+      168          }
+      169      }
+      170  
+      171      // operation metrics
+      172      final Map<ServiceUnitState, Counters> ownerLookUpCounters;
+      173      final Map<EventType, Counters> eventCounters;
+      174      final Map<ServiceUnitState, Counters> handlerCounters;
+      175  
+      176      enum ChannelState {
+      177          Closed(0),
+      178          Constructed(1),
+      179          LeaderElectionServiceStarted(2),
+      180          Started(3),
+      181          Disabled(4);
+      182  
+      183          ChannelState(int id) {
+      184              this.id = id;
+      185          }
+      186  
+      187          int id;
+      188      }
+      189  
+      190      enum MetadataState {
+      191          Stable,
+      192          Jittery,
+      193          Unstable
+      194      }
+      195  
+      196      @VisibleForTesting
+      197      public ServiceUnitStateChannelImpl(PulsarService pulsar) {
+      198          this.pulsar = pulsar;
+      199          this.config = pulsar.getConfig();
+      200          this.brokerId = pulsar.getBrokerId();
+      201          this.schema = Schema.JSON(ServiceUnitStateData.class);
+      202          this.getOwnerRequests = new ConcurrentHashMap<>();
+      203          this.cleanupJobs = new ConcurrentHashMap<>();
+      204          this.stateChangeListeners = new StateChangeListeners();
+      205          this.stateTombstoneDelayTimeInMillis = config.getLoadBalancerServiceUnitStateTombstoneDelayTimeInSeconds()
+      206                  * 1000;
+      207          this.inFlightStateWaitingTimeInMillis = config.getLoadBalancerInFlightServiceUnitStateWaitingTimeInMillis();
+      208          this.ownershipMonitorDelayTimeInSecs = config.getLoadBalancerServiceUnitStateMonitorIntervalInSeconds();
+      209          if (stateTombstoneDelayTimeInMillis < inFlightStateWaitingTimeInMillis) {
+      210              throw new IllegalArgumentException(
+      211                      "Invalid Config: loadBalancerServiceUnitStateTombstoneDelayTimeInSeconds"
+      212                              + stateTombstoneDelayTimeInMillis / 1000 + " secs"
+      213                              + "< loadBalancerInFlightServiceUnitStateWaitingTimeInMillis"
+      214                              + inFlightStateWaitingTimeInMillis + " millis");
+      215          }
+      216          this.maxCleanupDelayTimeInSecs = MAX_CLEAN_UP_DELAY_TIME_IN_SECS;
+      217          this.minCleanupDelayTimeInSecs = MIN_CLEAN_UP_DELAY_TIME_IN_SECS;
+      218  
+      219          Map<ServiceUnitState, Counters> tmpOwnerLookUpCounters = new HashMap<>();
+      220          Map<ServiceUnitState, Counters> tmpHandlerCounters = new HashMap<>();
+      221          Map<EventType, Counters> tmpEventCounters = new HashMap<>();
+      222          for (var state : ServiceUnitState.values()) {
+      223              tmpOwnerLookUpCounters.put(state, new Counters());
+      224              tmpHandlerCounters.put(state, new Counters());
+      225          }
+      226          for (var event : EventType.values()) {
+      227              tmpEventCounters.put(event, new Counters());
+      228          }
+      229          ownerLookUpCounters = Map.copyOf(tmpOwnerLookUpCounters);
+      230          handlerCounters = Map.copyOf(tmpHandlerCounters);
+      231          eventCounters = Map.copyOf(tmpEventCounters);
+      232          this.channelState = Constructed;
+      233      }
+      234  
+      235      @Override
+      236      public void scheduleOwnershipMonitor() {
+      237          if (monitorTask == null) {
+      238              this.monitorTask = this.pulsar.getLoadManagerExecutor()
+      239                      .scheduleWithFixedDelay(() -> {
+      240                                  try {
+      241                                      monitorOwnerships(brokerRegistry.getAvailableBrokersAsync()
+      242                                              .get(inFlightStateWaitingTimeInMillis, MILLISECONDS));
+      243                                  } catch (Exception e) {
+      244                                      log.info("Failed to monitor the ownerships. will retry..", e);
+      245                                  }
+      246                              },
+      247                              0, ownershipMonitorDelayTimeInSecs, SECONDS);
+      248              log.info("This leader broker:{} started the ownership monitor.",
+      249                      brokerId);
+      250          }
+      251      }
+      252  
+      253      @Override
+      254      public void cancelOwnershipMonitor() {
+      255          if (monitorTask != null) {
+      256              monitorTask.cancel(false);
+      257              monitorTask = null;
+      258              log.info("This previous leader broker:{} stopped the ownership monitor.",
+      259                      brokerId);
+      260          }
+      261      }
+      262  
+      263      @Override
+      264      public void cleanOwnerships() {
+      265          disable();
+      266          doCleanup(brokerId, true);
+      267      }
+      268  
+      269      @Override
+      270      public synchronized boolean started() {
+      271          return validateChannelState(Started, true);
+      272      }
+      273  
+      274      private ServiceUnitStateTableView createServiceUnitStateTableView() {
+      275          ServiceConfiguration conf = pulsar.getConfiguration();
+      276          try {
+      277              ServiceUnitStateTableView tableview =
+      278                      Reflections.createInstance(conf.getLoadManagerServiceUnitStateTableViewClassName(),
+      279                              ServiceUnitStateTableView.class, Thread.currentThread().getContextClassLoader());
+      280              log.info("Created service unit state tableview: {}", tableview.getClass().getCanonicalName());
+      281              return tableview;
+      282          } catch (Throwable e) {
+      283              log.error("Error when trying to create service unit state tableview: {}.",
+      284                      conf.getLoadManagerServiceUnitStateTableViewClassName(), e);
+      285              throw e;
+      286          }
+      287      }
+      288  
+      289      @Override
+      290      public synchronized void start() throws PulsarServerException {
+      291          if (!validateChannelState(LeaderElectionServiceStarted, false)) {
+      292              throw new IllegalStateException("Invalid channel state:" + channelState.name());
+      293          }
+      294  
+      295          boolean debug = debug();
+      296          try {
+      297              this.brokerRegistry = getBrokerRegistry();
+      298              this.brokerRegistry.addListener(this::handleBrokerRegistrationEvent);
+      299              this.leaderElectionService = getLeaderElectionService();
+      300              var leader = leaderElectionService.readCurrentLeader().get(
+      301                      MAX_CHANNEL_OWNER_ELECTION_WAITING_TIME_IN_SECS, TimeUnit.SECONDS);
+      302              if (leader.isPresent()) {
+      303                  log.info("Successfully found the channel leader:{}.", leader.get());
+      304              } else {
+      305                  log.warn("Failed to find the channel leader.");
+      306              }
+      307              this.channelState = LeaderElectionServiceStarted;
+      308  
+      309              PulsarClusterMetadataSetup.createTenantIfAbsent
+      310                      (pulsar.getPulsarResources(), SYSTEM_NAMESPACE.getTenant(),
+      311                              pulsar.getConfiguration().getClusterName());
+      312  
+      313              PulsarClusterMetadataSetup.createNamespaceIfAbsent
+      314                      (pulsar.getPulsarResources(), SYSTEM_NAMESPACE, pulsar.getConfiguration().getClusterName(),
+      315                              pulsar.getConfiguration().getDefaultNumberOfNamespaceBundles());
+      316  
+      317              tableview = createServiceUnitStateTableView();
+      318              tableview.start(pulsar, this::handleEvent, this::handleExisting, this::handleInvalidate);
+      319  
+      320              if (debug) {
+      321                  log.info("Successfully started the channel tableview.");
+      322              }
+      323              pulsar.getLocalMetadataStore().registerSessionListener(this::handleMetadataSessionEvent);
+      324              if (debug) {
+      325                  log.info("Successfully registered the handleMetadataSessionEvent");
+      326              }
+      327  
+      328              channelState = Started;
+      329              log.info("Successfully started the channel.");
+      330          } catch (Exception e) {
+      331              String msg = "Failed to start the channel.";
+      332              log.error(msg, e);
+      333              throw new PulsarServerException(msg, e);
+      334          }
+      335      }
+      336  
+      337      @VisibleForTesting
+      338      protected BrokerRegistry getBrokerRegistry() {
+      339          return ((ExtensibleLoadManagerWrapper) pulsar.getLoadManager().get())
+      340                  .get().getBrokerRegistry();
+      341      }
+      342  
+      343      @VisibleForTesting
+      344      protected LoadManagerContext getContext() {
+      345          return ((ExtensibleLoadManagerWrapper) pulsar.getLoadManager().get())
+      346                  .get().getContext();
+      347      }
+      348  
+      349      @VisibleForTesting
+      350      protected ExtensibleLoadManagerImpl getLoadManager() {
+      351          return ExtensibleLoadManagerImpl.get(pulsar.getLoadManager().get());
+      352      }
+      353  
+      354      @VisibleForTesting
+      355      protected LeaderElectionService getLeaderElectionService() {
+      356          return ((ExtensibleLoadManagerWrapper) pulsar.getLoadManager().get())
+      357                  .get().getLeaderElectionService();
+      358      }
+      359  
+      360      @VisibleForTesting
+      361      protected PulsarAdmin getPulsarAdmin() throws PulsarServerException {
+      362          return pulsar.getAdminClient();
+      363      }
+      364  
+      365      @Override
+      366      public synchronized void close() throws PulsarServerException {
+      367          channelState = Closed;
+      368          try {
+      369              leaderElectionService = null;
+      370  
+      371              if (tableview != null) {
+      372                  tableview.close();
+      373                  tableview = null;
+      374              }
+      375  
+      376              if (brokerRegistry != null) {
+      377                  brokerRegistry = null;
+      378              }
+      379  
+      380              if (monitorTask != null) {
+      381                  monitorTask.cancel(true);
+      382                  monitorTask = null;
+      383                  log.info("Successfully cancelled the cleanup tasks");
+      384              }
+      385  
+      386              if (stateChangeListeners != null) {
+      387                  stateChangeListeners.close();
+      388              }
+      389  
+      390              log.info("Successfully closed the channel.");
+      391  
+      392          } catch (Exception e) {
+      393              String msg = "Failed to close the channel.";
+      394              log.error(msg, e);
+      395              throw new PulsarServerException(msg, e);
+      396          }
+      397      }
+      398  
+      399      private boolean validateChannelState(ChannelState targetState, boolean checkLowerIds) {
+      400          int order = checkLowerIds ? -1 : 1;
+      401          if (Integer.compare(channelState.id, targetState.id) * order > 0) {
+      402              return false;
+      403          }
+      404          return true;
+      405      }
+      406  
+      407      private boolean debug() {
+      408          return ExtensibleLoadManagerImpl.debug(config, log);
+      409      }
+      410  
+      411      @Override
+      412      public CompletableFuture<Optional<String>> getChannelOwnerAsync() {
+      413          if (!validateChannelState(LeaderElectionServiceStarted, true)) {
+      414              return CompletableFuture.failedFuture(
+      415                      new IllegalStateException("Invalid channel state:" + channelState.name()));
+      416          }
+      417  
+      418          return leaderElectionService.readCurrentLeader()
+      419                  .thenApply(leader -> leader.map(LeaderBroker::getBrokerId));
+      420      }
+      421  
+      422      @Override
+      423      public CompletableFuture<Boolean> isChannelOwnerAsync() {
+      424          return getChannelOwnerAsync().thenApply(owner -> {
+      425              if (owner.isPresent()) {
+      426                  return isTargetBroker(owner.get());
+      427              } else {
+      428                  throw new IllegalStateException("There is no channel owner now.");
+      429              }
+      430          });
+      431      }
+      432      @Override
+      433      public boolean isChannelOwner() throws ExecutionException, InterruptedException, TimeoutException {
+      434          return isChannelOwnerAsync().get(
+      435                  MAX_CHANNEL_OWNER_ELECTION_WAITING_TIME_IN_SECS, TimeUnit.SECONDS);
+      436      }
+      437  
+      438      @Override
+      439      public boolean isOwner(String serviceUnit, String targetBrokerId) {
+      440          if (!validateChannelState(Started, true)) {
+      441              throw new IllegalStateException("Invalid channel state:" + channelState.name());
+      442          }
+      443          var ownerFuture = getOwnerAsync(serviceUnit);
+      444          if (!ownerFuture.isDone() || ownerFuture.isCompletedExceptionally() || ownerFuture.isCancelled()) {
+      445              return false;
+      446          }
+      447          var owner = ownerFuture.join();
+      448          if (owner.isPresent() && StringUtils.equals(targetBrokerId, owner.get())) {
+      449              return true;
+      450          }
+      451          return false;
+      452      }
+      453  
+      454      @Override
+      455      public boolean isOwner(String serviceUnit) {
+      456          return isOwner(serviceUnit, brokerId);
+      457      }
+      458  
+      459      private CompletableFuture<Optional<String>> getActiveOwnerAsync(
+      460              String serviceUnit,
+      461              ServiceUnitState state,
+      462              Optional<String> owner) {
+      463  
+      464          // If this broker's registry does not exist(possibly suffering from connecting to the metadata store),
+      465          // we return the owner without its activeness check.
+      466          // This broker tries to serve lookups on a best efforts basis when metadata store connection is unstable.
+      467          if (!brokerRegistry.isRegistered()) {
+      468              if (tableview.isMetadataStoreBased()) {
+      469                  return FutureUtil.failedFuture(new MetadataStoreException("broker is unavailable so far because it is"
+      470                      + " in the state that tries to reconnect to the metadata store."));
+      471              } else {
+      472                  return CompletableFuture.completedFuture(owner);
+      473              }
+      474          }
+      475  
+      476          return dedupeGetOwnerRequest(serviceUnit)
+      477                  .thenCompose(newOwner -> {
+      478                      if (newOwner == null) {
+      479                          return CompletableFuture.completedFuture(null);
+      480                      }
+      481  
+      482                      return brokerRegistry.lookupAsync(newOwner)
+      483                              .thenApply(lookupData -> {
+      484                                  if (lookupData.isPresent()) {
+      485                                      return newOwner;
+      486                                  } else {
+      487                                      throw new IllegalStateException(
+      488                                              "The new owner " + newOwner + " is inactive.");
+      489                                  }
+      490                              });
+      491                  }).whenComplete((__, e) -> {
+      492                      if (e != null) {
+      493                          log.error("{} failed to get active owner broker. serviceUnit:{}, state:{}, owner:{}",
+      494                                  brokerId, serviceUnit, state, owner, e);
+      495                          ownerLookUpCounters.get(state).getFailure().incrementAndGet();
+      496                      }
+      497                  }).thenApply(Optional::ofNullable);
+      498      }
+      499  
+      500      /**
+      501       * Case 1: If the service unit is owned, it returns the completed future object with the current owner.
+      502       * Case 2: If the service unit's assignment is ongoing, it returns the non-completed future object.
+      503       *      Sub-case1: If the assigned broker is available and finally takes the ownership,
+       ... truncated at 400 lines ...
