@@ -113,18 +113,30 @@ def main() -> None:
 
     d["row_key"] = d[keys].astype(str).agg("||".join, axis=1)
     if a.holdout:
-        if not tuning.exists():
-            sys.exit(f"--holdout needs the tuning sample first: {tuning}")
-        t = pd.read_csv(tuning)
-        shared = [k for k in keys if k in t.columns]
-        if len(shared) != len(keys):
-            sys.exit(f"cannot build a comparable row_key: tuning CSV lacks "
-                     f"{set(keys) - set(shared)}. Refusing to draw a holdout that "
-                     f"might overlap the tuning set.")
-        burned = set(t[shared].astype(str).agg("||".join, axis=1))
+        # EVERY round that has already been judged is burned, not just the most
+        # recent one. The first version of this looked only at the current
+        # sample file, which would have re-drawn rows judged in an earlier round
+        # that now lives in an archive directory, and quietly reported an
+        # in-sample estimate as an out-of-sample one.
+        prior = [tuning] + sorted(C.LABELS_DIR.glob("VOID_*/java_" + a.principle
+                                                    + "_labeling_sample.csv"))
+        prior = [f for f in prior if f.exists()]
+        if not prior:
+            sys.exit(f"--holdout needs at least one judged sample first: {tuning}")
+        burned: set[str] = set()
+        for f in prior:
+            t = pd.read_csv(f)
+            shared = [k for k in keys if k in t.columns]
+            if len(shared) != len(keys):
+                sys.exit(f"cannot build a comparable row_key: {f.name} lacks "
+                         f"{set(keys) - set(shared)}. Refusing to draw a holdout "
+                         f"that might overlap an already-judged set.")
+            judged = t[t[judge].notna()] if judge in t.columns else t
+            burned |= set(judged[shared].astype(str).agg("||".join, axis=1))
+            print(f"  burned {len(judged):,} judged rows from {f.name}")
         n0 = len(d)
         d = d[~d.row_key.isin(burned)]
-        print(f"  excluded {n0 - len(d):,} tuning rows; {len(d):,} remain")
+        print(f"  excluded {n0 - len(d):,} previously judged rows; {len(d):,} remain")
 
     seed = a.seed if a.seed is not None else C.RANDOM_SEED + (1000 if a.holdout else 0)
     print(f"  seed={seed}")

@@ -156,7 +156,12 @@ def main() -> None:
 
     f = C.LABELS_DIR / a.file if not Path(a.file).exists() else Path(a.file)
     df = pd.read_csv(f)
-    out = Path(a.out_dir) if a.out_dir else (C.LABELS_DIR / f"java_{a.principle}_batches")
+    # The batch directory follows the SAMPLE FILE, so a holdout round cannot
+    # write into the first round's directory and silently overwrite the
+    # material those labels were made from.
+    _rnd = f.stem.replace(f"java_{a.principle}_labeling_sample", "")
+    out = Path(a.out_dir) if a.out_dir else (
+        C.LABELS_DIR / f"java_{a.principle}_batches{_rnd}")
     out.mkdir(parents=True, exist_ok=True)
 
     # BOUNDED cache. This used to be an unbounded dict and it held the FULL

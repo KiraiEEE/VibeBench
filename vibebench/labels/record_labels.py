@@ -50,9 +50,20 @@ PRINCIPLES = ["srp", "ocp", "lsp", "isp", "dip"]
 MIN_NOTE = 12          # a note shorter than this is not a reason
 
 
+# A round is identified by a suffix, so the holdout round uses exactly the same
+# guards as the first one rather than a hand-edited copy of them.
+ROUND = ""
+
+
+def use_round(suffix: str) -> None:
+    """Point every path at a named round, e.g. use_round('_holdout')."""
+    global ROUND
+    ROUND = suffix
+
+
 def _paths(p: str) -> tuple[Path, Path]:
-    return (C.LABELS_DIR / f"java_{p}_labeling_sample.csv",
-            C.LABELS_DIR / f"java_{p}_batches")
+    return (C.LABELS_DIR / f"java_{p}_labeling_sample{ROUND}.csv",
+            C.LABELS_DIR / f"java_{p}_batches{ROUND}")
 
 
 def batch_index(p: str) -> dict[int, Path]:

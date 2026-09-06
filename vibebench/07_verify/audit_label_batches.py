@@ -74,9 +74,9 @@ def ok(msg: str) -> None:
     print(f"  ok    {msg}")
 
 
-def audit(p: str) -> None:
-    csv = C.LABELS_DIR / f"java_{p}_labeling_sample.csv"
-    bdir = C.LABELS_DIR / f"java_{p}_batches"
+def audit(p: str, rnd: str = "") -> None:
+    csv = C.LABELS_DIR / f"java_{p}_labeling_sample{rnd}.csv"
+    bdir = C.LABELS_DIR / f"java_{p}_batches{rnd}"
     print(f"\n=== {p.upper()} ===")
     if not csv.exists():
         warn(f"no sample CSV at {csv.name}, nothing to audit")
@@ -183,12 +183,14 @@ def audit(p: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--principle", choices=PRINCIPLES)
+    ap.add_argument("--round", default="",
+                    help="suffix identifying the round, e.g. _holdout")
     a = ap.parse_args()
     print("=" * 70)
     print("LABEL BATCH AUDIT -- can every label be traced to source the judge saw?")
     print("=" * 70)
     for p in ([a.principle] if a.principle else PRINCIPLES):
-        audit(p)
+        audit(p, a.round)
     print("\n" + "=" * 70)
     print(f"{len(fails)} FAIL, {len(warns)} warn")
     print("=" * 70)
