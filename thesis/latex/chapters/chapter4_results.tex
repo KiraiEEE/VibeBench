@@ -1,0 +1,1079 @@
+\chapter{Experimental Setup and Results}
+\label{ch:results}
+\newpage
+
+\section{Overview}
+\label{sec:ch4-overview}
+
+This chapter describes the concrete realisation of the methodology from
+Chapter~\ref{ch:methodology} and reports its results. It covers the curation of the corpus from
+the AIDev dataset (Section~\ref{sec:dataset}), the analysis toolchain and why each tool was chosen
+(Section~\ref{sec:toolchain}), the exact per-principle proxy definitions with their thresholds and
+equations (Section~\ref{sec:proxies-detail}), the analysis pipeline (Section~\ref{sec:pipeline}), the
+validation procedure (Section~\ref{sec:validation}), and the results, instrument validation, agent
+differentiation, the locus of risk, and the cross-cutting findings
+(Section~\ref{sec:results}). The limitations that bound every result are collected once,
+after the conclusion (Section~\ref{sec:limitations}), rather than distributed through the
+chapter.
+
+The harness is written in Python and the analysis is deterministic: the third-party footprint of
+the core pipeline is two data libraries, the \texttt{git} command-line client, and a JDK for the
+fact extractor. Nothing in the measurement path depends on a network service or a model.
+
+\section{Dataset}
+\label{sec:dataset}
+
+\subsection{Source}
+
+The corpus is drawn from \textbf{AIDev} \citep{li2025aidev}, a large collection of pull requests
+authored by autonomous coding agents against public GitHub repositories, enriched with repository
+and commit metadata. Two properties of the raw data shaped curation.
+
+First, the released tables are not all the same population. The files named
+\texttt{pull\_request.parquet} and \texttt{repository.parquet} contain only a curated
+high-visibility subset; the master tables are \texttt{all\_pull\_request.parquet} and
+\texttt{all\_repository.parquet}. Reading the former while believing it to be the latter silently
+under-counts by an order of magnitude, and all figures reported here are taken from the master
+tables.
+
+Second, per-file attribution is present for most but not all pull requests, and \emph{which} agent
+is missing it changes between dataset releases. The curation therefore never branches on an agent
+name: where the dataset lacks a file list, the list is recovered from the GitHub API for every
+agent alike.
+
+\subsection{Curation}
+
+Curation keeps pull requests that touch \textbf{Java source by file extension}, not by the
+repository's declared primary language, which misses Java modules inside polyglot projects, in
+repositories with \textbf{$\geq$25 stars} and a licence in a permissive allowlist (MIT, Apache-2.0,
+BSD-2/3, ISC, 0BSD, Unlicense, CC0-1.0, MPL-2.0).
+
+The sampling frame is then \textbf{balanced on agent $\times$ outcome}. Three agents have enough
+Java across all three outcomes to support a mix-controlled comparison; the remainder are excluded
+on data volume rather than preference. The three outcomes are \textbf{merged}, \textbf{rejected}
+(closed without merging) and \textbf{open} (still awaiting a decision at collection time).
+Table~\ref{tab:corpus-composition} gives the resulting corpus.
+
+\begin{table}[htb]
+\centering
+\caption{Corpus composition: pull requests by agent and outcome, with repository spread and
+concentration. \emph{top-1} and \emph{top-3} give the share of a cell's pull requests contributed
+by its largest one and three repositories.}
+\label{tab:corpus-composition}
+\begin{tabular}{@{}L{2.6cm}L{1.9cm}rrrr@{}}
+\toprule
+\textbf{Agent} & \textbf{Outcome} & \textbf{PRs} & \textbf{Repos} & \textbf{top-1} & \textbf{top-3} \\
+\midrule
+Claude Code   & merged   &   970 & 271 &  0.9\% &  2.8\% \\
+Claude Code   & rejected &   485 & 171 & 15.1\% & 23.9\% \\
+Claude Code   & open     &   283 & 137 &  7.1\% & 20.1\% \\
+\midrule
+GitHub Copilot & merged   & 2{,}544 & 372 &  7.6\% & 22.7\% \\
+GitHub Copilot & rejected & 1{,}272 & 334 &  9.7\% & 21.4\% \\
+GitHub Copilot & open     &   364 & 149 & 10.2\% & 23.4\% \\
+\midrule
+OpenAI Codex  & merged   &   630 & 122 &  4.0\% & 11.7\% \\
+OpenAI Codex  & rejected &   315 &  80 & 13.3\% & 36.5\% \\
+OpenAI Codex  & open     &    93 &  57 & 17.2\% & 26.9\% \\
+\midrule
+\textbf{Total} & & \textbf{6{,}956} & \textbf{1{,}010} & & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Concentration was checked before the corpus was accepted, because a benchmark in which one
+repository supplies most of an agent's contributions reports that repository's house style as the
+agent's behaviour. No cell exceeds 17.2\% in its largest repository, and every reported rate is
+given both pooled and as a macro average over repositories.
+
+\paragraph{Rejection is not refusal.} The \emph{rejected} outcome is a coarse label, and the
+thesis never treats it as a quality verdict. Decomposing it by how the request actually ended
+(Table~\ref{tab:rejection-strata}) shows that an explicit maintainer objection is rare: the
+overwhelming majority of closed requests were never reviewed at all, which in practice means
+superseded, stale or abandoned. Only \texttt{changes\_requested} carries a recorded objection, and
+\texttt{reviewed\_then\_closed} a completed review ending in closure. Wherever the outcome axis is
+used, it is reported by stratum.
+
+\begin{table}[htb]
+\centering
+\caption{How not-merged pull requests actually ended.}
+\label{tab:rejection-strata}
+\begin{tabular}{@{}L{2.8cm}rrrr@{}}
+\toprule
+\textbf{Agent} & \textbf{changes\_requested} & \textbf{reviewed\_then\_closed} &
+\textbf{closed\_unreviewed} & \textbf{open} \\
+\midrule
+Claude Code    &  1 &  11 &   473 & 283 \\
+GitHub Copilot & 42 & 169 & 1{,}061 & 364 \\
+OpenAI Codex   &  2 &  36 &   277 &  93 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Reconstruction and Attrition}
+
+Every measurement of what a pull request \emph{changed} requires two source trees, before and
+after. Recovering that pair is the single most failure-prone step in the pipeline, and it is
+handled by four methods tried in order: the merge commit's first parent; the pull request's own
+commit set; the \texttt{refs/pull/N/head} reference together with its merge base; and, last, the
+base and head commit identifiers reported by the GitHub API.
+
+The first method applies only to merged pull requests, which is precisely why the tier a pull
+request was reconstructed by must be controlled when merged and not-merged code are compared. That
+control is applied throughout Section~\ref{sec:results}. Table~\ref{tab:attrition} accounts for
+every pull request between the curated corpus and the analysable one.
+
+\begin{table}[htb]
+\centering
+\caption{Attrition from curated corpus to analysable corpus.}
+\label{tab:attrition}
+\begin{tabular}{@{}L{5.6cm}rL{5.2cm}@{}}
+\toprule
+\textbf{Status} & \textbf{PRs} & \textbf{Meaning} \\
+\midrule
+\texttt{ok} & \textbf{4{,}245} & analysable: valid before/after pair, Java touched \\
+\texttt{no\_touched\_files} & 2{,}540 & the request touches no production Java \\
+\texttt{repo\_too\_large} & 150 & tree exceeds the parsing budget \\
+\texttt{archive\_failed} & 18 & upstream decay: history rewritten or repository deleted \\
+\texttt{no\_delta\_pair} & 3 & no tier could recover a distinct before tree \\
+\midrule
+\textbf{Total} & \textbf{6{,}956} & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two properties of that attrition are reported rather than buried, because both bound what the
+outcome comparison can claim. The analysable rate differs by outcome, 62.1\% of merged requests,
+66.9\% of open, and 56.8\% of rejected, so a naive merged-versus-rejected comparison is partly a
+comparison of \emph{reconstructability}. And the distribution over reconstruction tiers differs
+sharply, since tier~1 is available only for merged requests. Both are why the outcome contrast is
+reported on a \textbf{tier-matched subset} (tiers 2, 3 and 4 only), where the two sides build their
+\emph{before} tree the same way.
+
+An empty file list is never accepted as a finding unless the GitHub API confirms it. An empty raw
+diff is a resolution failure, and treating it as ``this request changed nothing'' silently deletes
+pull requests; the pipeline records the distinction and the verifier enforces it.
+
+\subsection{Resolution Quality}
+\label{sec:resolution}
+
+The fact extractor resolves supertypes and imports from source alone, with no build and no
+classpath, so a type defined outside the repository cannot be resolved. Median supertype resolution
+is \textbf{87.0\%} (10th percentile 37.8\%, 90th percentile 98.4\%), with 498 parse errors across
+all touched files. Resolution is even across agents, Claude Code 86.2\%, Copilot 85.9\%, OpenAI
+Codex 89.3\%, so it does not bias the comparison between them.
+
+Resolution is nonetheless bimodal by repository kind: 718 of 4{,}245 pull requests resolve below
+50\%, and these are concentrated in framework-heavy projects whose supertypes live in Spring,
+Android or Jakarta. The two principles that depend on resolved hierarchies, Liskov and Interface
+Segregation, \emph{under}-count in those repositories. The direction matters: unresolved
+supertypes cause missed violations, never invented ones, so the reported rates are lower bounds
+there rather than inflated.
+
+\section{Toolchain}
+\label{sec:toolchain}
+
+\subsection{Selection Principles}
+
+Tools were chosen to be \textbf{local, free, deterministic, zero-configuration, and requiring no
+GPU}, the properties that make a benchmark reproducible and cheap to re-run across a thousand arbitrary
+repositories. This ruled out otherwise-attractive options that need per-repository setup:
+\texttt{grimp} and \texttt{import-linter} for dependency analysis require importable packages on
+\texttt{sys.path} per repository (fragile across arbitrary layouts), and running \texttt{mypy}/
+\texttt{Pyright} for the LSP override check would require a resolvable import environment for each
+repository. In both cases a custom analyser was written instead, an
+import-graph builder for DIP/ISP and an override-compatibility checker for LSP that replicates the
+type checker's rule directly on the syntax tree.
+
+\subsection{Tools Used}
+
+\begin{table}[p]
+\centering
+\caption{Analysis toolchain.}
+\label{tab:toolchain}
+\small
+\begin{tabular}{@{}L{2.9cm}L{4.3cm}L{1.7cm}L{2.2cm}@{}}
+\toprule
+\textbf{Tool} & \textbf{Role} & \textbf{Type} & \textbf{Used by} \\
+\midrule
+\textbf{JavaParser + SymbolSolver} 3.25.10 & Java parse trees \textbf{with resolved symbols},
+emitted as a language-neutral fact record & Static & all five \\
+TF-IDF + cosine (custom) & C3 conceptual cohesion --- classical information retrieval, no model &
+Semantic & SRP \\
+\texttt{git} CLI & Recover the before and after source trees for a pull request & Static &
+OCP/LSP/ISP/DIP \\
+GitHub REST and GraphQL API & Authoritative file lists and base/head commits where the local
+history is insufficient & Static & corpus construction \\
+\textbf{CK} 0.7.0 & Independent per-class metrics for convergent validity & Cross-check &
+Section~\ref{sec:validation-independent} \\
+\textbf{PMD} 7.7.0 & Independent design rules (\texttt{GodClass}, \texttt{TooManyMethods},
+\texttt{NcssCount}, \texttt{CouplingBetweenObjects}) & Cross-check &
+Section~\ref{sec:validation-independent} \\
+\textbf{DesigniteJava} 1.1.2 & Independent design smells spanning SRP, hierarchy and cycles &
+Cross-check & Section~\ref{sec:validation-independent} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The core pipeline depends only on \texttt{pandas}, \texttt{pyarrow} and \texttt{git}, plus a JDK
+for the fact extractor and the three cross-check analysers. The large language model used as the
+validation \textbf{label judge} \citep{zheng2023llmjudge} is not a pipeline tool and computes no
+reported metric: it reads source and produces labels, and every number in this chapter is computed
+by a deterministic program from those labels and the parquet outputs.
+
+\paragraph{Why symbol resolution, and not a syntax-only parser.} A syntax-only grammar such as
+tree-sitter is the cheaper option and it does not work here. tree-sitter parses Java correctly but \textbf{cannot resolve symbols}, so two classes
+named \texttt{Node} in different packages collapse into one identifier and every inherited
+relationship built on top of them is corrupted. Measured on an early build of this corpus, a syntax-only parse yielded \textbf{zero} interface
+contracts and only \textbf{seven} override pairs, against thousands of each once symbols were
+resolved. The lesson
+generalises beyond this study, SRP and OCP are \emph{local} properties that syntax alone can
+decide, whereas LSP, ISP and DIP are \emph{relations between types} and cannot be measured without
+knowing which type is which.
+
+The decisive implementation detail is worth recording because it is invisible in documentation. A
+\texttt{JavaParserTypeSolver} maps package \texttt{a.b.C} to \texttt{<root>/a/b/C.java}, so it must
+be rooted at the \textbf{source root}, not the repository root. Rooted at the repository root,
+supertype resolution on one corpus repository fell from 93.3\% to \textbf{17.3\%}. Source roots are
+therefore inferred from each file's own \texttt{package} declaration, which needs no build file and
+handles Maven, Gradle, multi-module and flat layouts identically.
+
+\textbf{Tool coverage across the five principles is not uniform, and the gap is the contribution.}
+Mature source-only analysers implement detectors for exactly one of the five principles. CK, PMD and
+DesigniteJava all carry god-class rules that speak to SRP, and DesigniteJava also carries
+hierarchy and cycle smells that speak partially to LSP and DIP. \textbf{No published tool implements
+an open/closed or interface-segregation check}, a survey of the Java static-analysis landscape
+returns general-purpose rule sets (coding flaws, style, security, size metrics such as
+\texttt{TooManyMethods}) but no dedicated detector for either principle, and the practitioner
+literature identifies both through manual code-smell reading rather than automation.
+
+The reason is technical rather than accidental. Deciding whether a dispatch chain ranges over an
+\emph{open} variant set requires resolving the types under test to a shared hierarchy; deciding
+whether an interface forces its implementers to stub requires linking a declaration to every
+implementation across the codebase. Both need a cross-file semantic graph, which single-file
+linters do not build and which compiler-backed tools obtain only from a resolvable classpath. That
+is precisely the capability established above on bare \texttt{git archive} trees, 87\% median
+supertype resolution with no build, and it is what makes deterministic OCP and ISP evaluators
+possible here at all.
+
+This study therefore contributes validated evaluators for the four principles the existing
+toolchain does not cover, and cross-checks the one it does.
+
+\subsection{Experimental Environment}
+
+All analysis ran on a single consumer laptop, with no cluster, no cloud compute and no GPU
+acceleration.
+
+\begin{table}[htb]
+\centering
+\caption{Machine and runtime environment.}
+\label{tab:environment}
+\begin{tabular}{@{}L{3.4cm}L{9.6cm}@{}}
+\toprule
+\textbf{Component} & \textbf{Specification} \\
+\midrule
+Machine & Lenovo IdeaPad Gaming 3 (consumer laptop) \\
+CPU & AMD Ryzen 5 5600H --- 6 physical / 12 logical cores, 3.3\,GHz \\
+Memory & 16\,GB (15.4\,GB addressable) \\
+Storage & 1\,TB NVMe SSD (corpus, clones, tree and fact caches) + 512\,GB NVMe system disk \\
+Operating system & Windows 11 Home, 10.0.26200 \\
+Network & $\sim$30\,Mbit/s domestic connection \\
+Python & 3.11.9 --- pandas 3.0.5, pyarrow 25.0.0 (harness only) \\
+Java & OpenJDK 17 LTS, Maven 3.9.16 (sidecar build) \\
+Version control & Git 2.55.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This is not incidental detail; four methodological decisions follow directly from it.
+
+\begin{itemize}
+  \item \textbf{Source-only analysis is mandatory, not preferred.} Compiling the corpus would mean
+  building two commits for each of 4,245 pull requests, 8,490 builds, each needing the right
+  JDK and resolvable historical dependencies. That is beyond the available compute, and more
+  the failures would be \emph{biased} toward older and more complex pull requests
+  rather than random. Every Java tool in Table~\ref{tab:toolchain} was selected because it runs on
+  a bare \texttt{git archive} tree with no build and no classpath.
+  \item \textbf{The per-tree fact cache exists because a cold pass costs 125 minutes} against 3.6
+  minutes warm, which is what makes repeated whole-corpus runs practical on this hardware.
+  \item \textbf{The cross-check tools are serialised rather than parallel.} DesigniteJava requires a
+  5\,GB heap on the largest repositories, which a 15.4\,GB machine cannot supply concurrently, so it
+  runs behind a semaphore while the lighter tools run in parallel.
+  \item \textbf{Network bandwidth, not CPU, bounds the acquisition stage.} Over a 30\,Mbit/s link,
+  re-downloading the same commit for each of the delta evaluators would dominate total runtime,
+  which is why repositories are fetched to a shallow depth of two commits, why the before/after
+  trees are read through \texttt{git archive} rather than a working-tree checkout, and why a
+  gzipped per-(repository, commit) tree cache is shared by every evaluator instead of each fetching
+  independently.
+\end{itemize}
+
+Reproducing the study needs none of this specific hardware, only enough disk for the cached
+corpus and a JDK, but the runtimes quoted above are the ones this machine produced.
+
+\subsection{Research Instruments, as Distinct from Measurement Instruments}
+
+Table~\ref{tab:toolchain} lists the software that computes reported numbers. A second, disjoint set
+of tools supports the \emph{conduct and writing} of the research and touches no measurement; the
+two are kept separate deliberately, since only the first can affect a result.
+
+\begin{table}[htb]
+\centering
+\caption{Research and authoring tools.}
+\label{tab:research-tools}
+\begin{tabular}{@{}C{1.5cm}L{2.3cm}L{9.6cm}@{}}
+\toprule
+\textbf{Logo} & \textbf{Tool} & \textbf{Description} \\
+\midrule
+\includegraphics[height=0.5cm]{figures/logos/zotero.png} & Zotero & Reference manager; every
+entry checked against its primary source before entering \texttt{references.bib}. \\
+\includegraphics[height=0.5cm]{figures/logos/overleaf.png} & Overleaf & \LaTeX{} compilation of
+the thesis manuscript and the defence presentation. \\
+\includegraphics[height=0.5cm]{figures/logos/vscode.png} & VS Code 1.133 & Development
+environment for the pipeline and the analysis scripts. \\
+\includegraphics[height=0.5cm]{figures/logos/github.png} & Git / GitHub & Version control and
+hosting for the pipeline, its configuration and its result tables. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+GitHub occupies two unrelated positions in this study and conflating them would be an error: it
+hosts the pipeline's own source, and it is separately the \textbf{object of study}, since the
+corpus consists of merged pull requests mined from public GitHub repositories through the AIDev
+dataset. Nothing about the former influences the latter.
+
+\section{Per-Principle Proxies, Thresholds, and Equations}
+\label{sec:proxies-detail}
+
+Each evaluator is a pure function over source. This section gives the exact computation. All
+thresholds live in a single configuration module and were fixed \emph{before} the corresponding
+validation labelling, except where a suppressor was added later and re-validated
+(Section~\ref{sec:instrument-validation}).
+
+\textbf{None of the five principles is directly measurable.} Each is a statement about
+\emph{intent}, the reasons a module may change, the variants a design anticipates, the promises
+a subtype makes, and none of those is present in source text. What a static evaluator can decide
+is a structural consequence that a violation tends to leave behind. Table~\ref{tab:principle-gap}
+states, for each principle, the gap between what the principle asks and what is actually computed,
+because every result in Section~\ref{sec:results} is a statement about the proxy first and about the
+principle only through it.
+
+\begin{table}[p]
+\centering
+\caption{What each principle asks, and what is measured instead.}
+\label{tab:principle-gap}
+\small
+\begin{tabular}{@{}L{1.6cm}L{2.3cm}L{5.4cm}L{1.4cm}L{2.6cm}@{}}
+\toprule
+\textbf{Principle} & \textbf{What the principle asks} & \textbf{Structural proxy actually
+computed} & \textbf{Unit} & \textbf{Judge agreement (P / R)} \\
+\midrule
+\textbf{SRP} & A class should have one reason to change & Seven-metric god-class rubric --- class
+length, weighted methods, method count, per-method complexity and parameters, LCOM4 --- with a
+TF-IDF \textbf{C3 conceptual-cohesion} suppressor that spares large-but-coherent classes & Class &
+0.350 / 0.972 \\
+\textbf{OCP} & Open for extension, closed for modification & \textbf{Width of type- and tag-dispatch
+chains} (\texttt{instanceof} ladders, \texttt{switch} on an enum or tag), flagged past a calibrated
+branch count, with a \textbf{closed-set suppressor} for dispatch over a fixed, exhaustive set &
+Dispatch chain & 0.330 / 0.943 \\
+\textbf{LSP} & A subtype must be substitutable for its base & \textbf{Override-versus-ancestor
+comparison} over the resolved hierarchy, restricted to the signals a compiler cannot check:
+refused bequest, strengthened precondition, weakened postcondition & Override pair & 0.400 / 1.000
+\newline (\textbf{1.000 / 0.775} restricted to refused bequest) \\
+\textbf{ISP} & Clients should not depend on members they do not use & \textbf{Contract width and
+implementer stub ratio} --- every interface and abstract class inventoried, with the share of
+members each implementer leaves unimplemented & Contract & 0.320 / 0.914 \newline
+(\textbf{0.862 / 0.714} at $\geq$30 members) \\
+\textbf{DIP} & Depend on abstractions, not concretions & \textbf{Newly cyclic module pairs} in the
+import graph, charged to the pull request only when one end is a file it changed & Pull request &
+\textbf{0.890 / 1.000} \\
+\textbf{Zones} & (descriptive) Martin's $A$/$I$ position & Zone of pain, main sequence, zone
+of uselessness, intermediate & Package & Not validated --- \textbf{descriptive only}
+(Section~\ref{sec:zones-detail}) \\
+\bottomrule
+\end{tabular}
+
+\vspace{4pt}
+\footnotesize $\dagger$ The Liskov figure is for the flag as originally composed; restricting it
+to refused bequest raises precision to 1.000 (Section~\ref{sec:instrument-validation}).
+$\ddagger$ The DIP flag reports the new-cycle signal alone. The distance-from-main-sequence signal
+was measured, found to be right 0 times out of 7, and excluded from the flag
+(Section~\ref{sec:zones-detail}).
+\end{table}
+
+Two properties of the table govern how its numbers should be read. The proxies are
+\textbf{conservative by construction}: each fires on a structure that a violation usually produces,
+never on the intent itself, so a design fault expressed without that structure is invisible to it,
+and recall is bounded by the choice of proxy rather than by the threshold. And the agreement
+figures state how often a flag matches a judge that reads the same source, they measure fidelity
+to \emph{a reading of the principle}, not to ground truth.
+
+\textbf{Attribution for the relation-level principles.} For LSP, ISP and DIP a violation is charged
+to a pull request when \textbf{either} side of the relation sits in a touched file. Charging only
+the flagged entity would exempt an agent that edits a base class or widens an interface and thereby
+breaks subclasses and implementers in files it never opened. The rule brings 81{,}235 override
+pairs and 20{,}705 contracts into scope across the corpus, and it changes which pull request a
+violation is attributed to rather than how many violations exist.
+
+\subsection{SRP, God-Class Rubric with Conceptual-Cohesion Suppressor}
+
+Each class receives a \textbf{rubric hit} for every threshold it crosses among seven
+size/complexity metrics (class lines of code, method count, weighted methods per class, maximum
+per-method cyclomatic complexity, maximum per-method parameter count, file lines of code ---
+excluded from class scope, and cohesion). A class is flagged (\texttt{srp\_risk}) when it
+accumulates \textbf{$\geq$2 hits}; a stricter operating point (\texttt{srp\_risk\_strict}, $\geq$3
+hits) is reported alongside.
+
+\paragraph{Cohesion, LCOM.} Following the LCOM4 formulation, build a graph with one node per
+method; connect two methods if they access a shared instance attribute or one calls the other.
+Constructors (\texttt{\_\_init\_\_}/\texttt{\_\_new\_\_}/\texttt{\_\_post\_init\_\_}) are excluded,
+because a constructor touches every attribute and would collapse an obvious three-responsibility
+split into a single ``cohesive'' component. LCOM is then the number of connected components (a
+saturation guard applies for classes with $\geq$4 methods). A naive computation without the
+constructor exclusion scored a synthetic three-responsibility God Class as fully cohesive
+(LCOM\,=\,0); with the exclusion it correctly scores it as split.
+
+LCOM is reported as \textbf{undefined} when the method graph admits no edge \emph{by construction}.
+A type whose methods touch no field and call nothing has no edges for reasons of syntax alone, and
+its normalised value pins near 1.0 regardless of design, mean LCOM is 0.857 for interfaces
+against 0.425 for everything else. Scoring such types would let the cohesion knob fire as a second
+rubric hit on types whose only real signal is width, double-counting the method-count knob. The
+condition is tested on the \emph{graph} rather than on the declaration keyword, so an interface
+whose default methods call one another keeps its value.
+
+\paragraph{Conceptual cohesion, C3 (the semantic suppressor).} Treat each non-constructor method
+as a bag of identifier and docstring terms \citep{marcus2008c3}, form a smoothed \textbf{TF-IDF}
+vector per method, and take the mean pairwise cosine similarity:
+
+\begin{align}
+\cos(a,b) &= \frac{a \cdot b}{\lVert a \rVert \, \lVert b \rVert} \\
+C3 &= \operatorname*{mean}_{i<j} \cos(v_i, v_j)
+\end{align}
+
+where $v_i$ is the TF-IDF vector of method $i$. C3 ranges from 0 (methods share no vocabulary ---
+mixed responsibilities) to $\sim$1 (all methods discuss the same domain, cohesive). A
+rubric-flagged class whose $C3 \geq 0.4$ is \textbf{un-flagged}: its methods demonstrably share one
+vocabulary, so it is the ``large but single-topic'' class that a pure size proxy cannot forgive.
+This is the C3-suppressor pattern that recurs, in structural form, for OCP and LSP.
+
+\subsection{OCP, Dispatch Width with Closed-Set Suppressor}
+
+The evaluator finds every \textbf{dispatch chain}, an \texttt{if/elif} or \texttt{match} ladder
+that discriminates on one subject's type or tag, and classifies each as \texttt{isinstance},
+\texttt{type\_eq}, \texttt{match\_type} (type-based) or \texttt{value\_switch}, \texttt{match\_value}
+(tag-based). Thresholds were calibrated from the observed branch-count distribution over 621
+in-scope chains \emph{before} labelling: type-based chains are flagged at \textbf{$\geq$3 branches}
+(also Martin's minimum ``switch''), value-based at \textbf{$\geq$6} (a conservative bar, since short
+value ladders are often legitimate parsers or state machines).
+
+The \textbf{closed-set suppressor} (added and validated in Section~\ref{sec:instrument-validation})
+encodes the real open-vs-closed distinction:
+\[
+\text{smell} \;=\; (\text{branch\_count} \geq \text{threshold}) \; \wedge \; \lnot\,
+\text{is\_closed\_type\_set}(\text{types})
+\]
+where \texttt{is\_closed\_type\_set} holds when every tested type is a builtin (\texttt{str},
+\texttt{dict}, \texttt{list}, \texttt{int}, $\ldots$) or when every type shares one fixed grammar
+prefix (e.g.\ \texttt{ast.*}).
+
+Dispatching over a \emph{closed, exhaustive} set (JSON's \texttt{str}/\texttt{dict}/\texttt{list};
+the standard-library \texttt{ast} node grammar) is not the open-ended extension OCP guards against,
+so such chains are not flagged.
+
+\subsection{LSP, Override Compatibility with False-Positive Suppressor}
+
+For every internal subclass$\to$nearest-ancestor override pair, the evaluator computes five signals
+in three families, mirroring a type checker's override rule and adding a behavioural case:
+
+\begin{itemize}
+  \item \textbf{Static (the mypy \texttt{[override]} rule, on the AST):} \texttt{param\_required\_added}
+  (a strengthened precondition, a new required argument) and \texttt{param\_removed} (a
+  parameter callers rely on is gone);
+  \item \textbf{Semantic variance:} \texttt{param\_type\_narrowed} (a parameter type made more
+  specific, contravariance violation) and \texttt{return\_type\_widened} (a return type made more
+  general, covariance violation), proven over the in-repository class hierarchy;
+  \item \textbf{Behavioural:} \texttt{refused\_bequest} (a working inherited method overridden by a
+  body that only \texttt{raise}s).
+\end{itemize}
+
+Constructors are excluded (not substitutable call sites). A deterministic
+\textbf{false-positive suppressor} (added and validated in Section~\ref{sec:instrument-validation})
+removes four structurally-identifiable idioms that the naive rule misreads: a
+\texttt{*args/**kwargs}-only plugin-placeholder base; variance against \texttt{Any} or an unbound
+type variable; a \texttt{**kwargs}-absorbed optional-parameter drop; and constructor-like factory
+classmethods.
+
+\subsection{ISP, Interface Width and Implementer Stub Ratio}
+
+The evaluator builds a repository-wide index of interfaces across three tiers, abstract base
+classes, \texttt{Protocol}s, and implicit interfaces, resolving import aliases and the symbol
+table so inherited abstract contracts are counted. For each interface it records \textbf{width}
+(number of abstract methods) and, for each implementer, a \textbf{stub ratio} (proportion of
+methods left as trivial stubs) and coverage. A fat interface is one wider than the $\sim$93rd
+percentile of observed widths ($>$10 abstract methods), and a forced-stub implementer is one with a
+high stub ratio, but width alone does not flag: an implementer that uses the whole interface
+(coverage 1.0) is not a violation.
+
+\subsection{DIP, Import-Graph Delta}
+
+The evaluator builds the internal import graph before and after the PR, restricted to modules the
+PR touched, and computes:
+
+\begin{itemize}
+  \item \textbf{Cycles}, strongly-connected components of size $>$1 (Tarjan's algorithm
+  \citep{tarjan1972scc}). Novelty is decided on the \textbf{whole} import graph and expressed as
+  \textbf{newly mutually-reachable module pairs}: $(u,v)$ is newly cyclic when the two modules
+  became mutually reachable across the change, and the PR is flagged when such a pair involves a
+  touched file. Three operationalisations of ``a new cycle'' were implemented and they differ by an
+  order of magnitude, so the definition is reported beside every DIP rate
+  (Section~\ref{sec:findings}, Finding~2). Attribution is at the \textbf{compilation-unit} level rather
+  than the package level. Package-level filtering is too coarse for the common single-package
+  layout: measured on one Android project it admitted 44 newly cyclic pairs where only one involved
+  a file the pull request had touched.
+  \item \textbf{Martin metrics} per package, Instability $I = C_e / (C_a + C_e)$, Abstractness
+  $A = N_a / N_c$, and distance from the main sequence $D = |A + I - 1|$, where $C_e$/$C_a$ are
+  efferent/afferent couplings and $N_a$/$N_c$ are abstract/total class counts. A PR is flagged if
+  it worsens mean $D$ by more than 0.15.
+  \item \textbf{Abstract-dependency ratio}, the share of a touched module's new dependencies
+  that land on modules defining an abstraction, reported as context.
+\end{itemize}
+
+\subsection{Component Zones, a Package-Level Descriptor, Not a Sixth Detector}
+\label{sec:zones-detail}
+
+The five proxies above operate below the package: a class, a dispatch chain, an override pair, an
+interface, a module edge. A design claim about \emph{architecture} needs at least one measurement
+at the level where architecture is normally discussed, so a sixth evaluator classifies where each
+package sits on Martin's abstractness/instability plane (Figure~\ref{fig:martin-plane}). It reuses
+the same \texttt{martin\_metrics} implementation the DIP evaluator already shares across languages,
+so the coordinates are the ones defined above:
+
+\begin{figure}[htb]
+\centering
+\input{figures/fig_martin_plane.tex}
+\caption{Martin's abstractness/instability plane. The zone of pain (concrete and stable) and the
+zone of uselessness (abstract and unused) occupy the opposite corners; packages within $\pm 0.15$
+of $A+I=1$ sit on the main sequence.}
+\label{fig:martin-plane}
+\end{figure}
+
+\begin{itemize}
+  \item $I = C_e / (C_e + C_a)$, instability, 0 when nothing depends outward.
+  \item $A = N_a / N_c$, abstractness, the share of a package's classes that are abstract.
+  \item Two corner regions of radius \textbf{0.5}, the \textbf{zone of pain} near $(A{=}0,
+  I{=}0)$, concrete and stable, so everything depends on it and it cannot change; and the
+  \textbf{zone of uselessness} near $(1,1)$, abstract and depended on by nobody. Packages within
+  \textbf{$\pm$0.15} of the line $A+I=1$ are \textbf{on the main sequence}; the rest are
+  \textbf{intermediate}. Both the radius and the band are presentation choices rather than
+  measurements, and are stated here so a reader can reposition them.
+  \item \textbf{Unknown} is a fourth outcome, kept deliberately distinct from zero: $A$ is undefined
+  for a package that declares no classes and $I$ is undefined for one with no internal coupling at
+  all. Collapsing either to 0 would place every class-free utility package in the zone of pain,
+  manufacturing the study's headline result out of an encoding error.
+\end{itemize}
+
+Three scoping decisions bound what this evaluator claims. First, it reads the \textbf{after} tree
+only and emits \textbf{no delta, no violation flag and no agent ranking}, it describes the
+codebases the agents worked in, and it is not validated against a judge. That restriction is
+empirical rather than cautious. The distance-from-main-sequence signal was measured as a change
+signal and was correct 0 times out of 7, because mean $D$ moves when the graph is
+\emph{recomposed}, files added or moved, and not when a dependency actually inverts.
+Distance from the main sequence is a discredited \emph{change} signal on this corpus; the $A$/$I$
+\emph{position} of a package is a different and defensible use of the same coordinates. Calling a
+zone-of-pain package a violation would require its own validation round.
+
+Second, packages are aggregated on the \textbf{parent} package rather than on the first dotted
+segment of the module name. The top-segment rule that the cycle detector uses is correct for
+attribution but useless here, because a reverse-DNS prefix places most of a repository in one
+package, which gives $C_e = C_a = 0$ and therefore an undefined $I$. Attribution is otherwise
+identical to the DIP harness.
+
+Third, the classifier is pure and self-checking, including the assertion that an undefined
+coordinate never resolves to a zone.
+
+\section{Analysis Pipeline}
+\label{sec:pipeline}
+
+The pipeline is a sequence of independent, resumable stages, each reading upstream Parquet outputs
+and writing its own, so any stage can be re-run in isolation (Figure~\ref{fig:pipeline}).
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=0.92\linewidth]{figures/fig_pipeline_diagram.png}
+\caption{The five-stage analysis pipeline. Every stage is independently resumable; the
+before/after delta harness (stage 3) is shared by DIP, ISP, OCP and LSP.}
+\label{fig:pipeline}
+\end{figure}
+
+The four architecture evaluators each reconstruct the before/after trees independently, fetching
+the merge commit and its first parent and reading the tree via \texttt{git archive}. Every stage is
+resumable: each pull request is processed independently, permanent outcomes are retained while
+transient failures are retried, and every attempt is recorded so that attrition is auditable rather
+than silent.
+
+\section{Validation Procedure}
+\label{sec:validation}
+
+For each principle a \textbf{stratified sample} is drawn, deliberately balancing flagged and
+unflagged items, and, for the entity-level principles, stratifying across the three agents. The
+\textbf{label judge} (Claude) then reads the actual source of each item and records a binary label
+(\texttt{llm\_<principle>\_risk}); for LSP the extractor presents the overriding method and its
+base method side by side, since substitutability cannot be judged from one side alone. The
+deterministic flag is scored against the label as precision, recall, and F1, overall and per agent.
+
+Each principle is validated on \textbf{one} stratified sample of 200 entities, drawn with a seed
+recorded alongside the result. The sample deliberately balances flagged and unflagged items,
+because a sample drawn only from flagged items can measure precision but can never discover a
+violation the detector missed.
+
+No out-of-sample holdout was drawn. This bounds two claims and is stated wherever they appear: the
+two detector refinements in Section~\ref{sec:instrument-validation} were derived from the same
+labels against which they are scored, and are therefore \textbf{in-sample} estimates. The Liskov
+restriction has partial independent support, since an earlier round on a different sample of the
+same population produced the same ordering among its three signals; the interface-width restriction
+does not.
+
+A second consideration constrains re-use of a sample. Once a detector has been changed in response
+to the rows in a sample, that sample can no longer estimate the changed detector's performance, so
+a genuine holdout must exclude every previously judged row. Section~\ref{sec:future-work} names
+this as the immediate next step rather than treating it as done.
+
+\subsection{A Second Validation Axis: Agreement with Independent Analysers}
+\label{sec:validation-independent}
+
+Judge-based validation has a structural weakness that no amount of sampling fixes. The judge reads
+the same code the rubric read, and can therefore be wrong \emph{in the same direction} as the
+rubric, if both treat ``large'' as ``does too much,'' neither will notice. A second axis is added
+in Java, where mature source-only analysers exist: three independently developed tools are run over
+\textbf{exactly the same source trees} the detector sees, and their verdicts are compared with
+ours.
+
+The comparison uses one head-state tree per repository, taken from the \texttt{after} tree of that
+repository's most recent pull request, across all 1{,}010 repositories in the corpus. CK 0.7.0
+supplies per-class metrics, PMD 7.7.0 supplies design rules, and DesigniteJava 1.1.2 supplies
+design smells. All three run at their \textbf{default thresholds}, deliberately: re-tuning them
+until they agreed with us would destroy the only property they are being asked for.
+
+Three design points matter for interpretation. First, agreement is reported \textbf{symmetrically},
+with no tool treated as ground truth. The question is not ``is our rubric right?'' but ``does our
+rubric sit inside the spread that published detectors already show among themselves?'', which
+requires measuring the established tools against \emph{each other} as well as against ours.
+
+Second, CK's \texttt{lcom} is LCOM1 and its \texttt{lcom*} is Henderson-Sellers
+\citep{hendersonsellers1996metrics}, whereas ours is LCOM4. These are different formulas, so
+cohesion is compared by \textbf{rank correlation only} and never as an agreement check.
+
+Third, all three tools fail quietly, and every failure mode flatters the study: a crashed analysis
+produces an empty result file that reads as ``this repository is clean''. Each tool's per-repository
+status is therefore recorded, and repositories where a tool failed are excluded from that tool's
+comparison rather than counted as agreement.
+
+One property of rank-based convergent validity bounds its interpretation. \textbf{Spearman
+correlation is invariant to any monotone rescaling}, so a high correlation on a size metric
+establishes agreement on \emph{ordering} only. It cannot certify the scale on which either tool
+measures, and a high correlation on lines of code is entirely consistent with two tools counting
+lines differently.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Instrument Validation (RQ2)}
+\label{sec:instrument-validation}
+\label{sec:construct-validity}
+
+Each detector was validated on a stratified sample of 200 entities: 100 that it flagged and 100
+that it did not. Sampling only flagged entities can measure precision but cannot discover a missed
+violation, so both strata are drawn. The sample is taken after the same production filter the
+report uses, so the validated population and the reported population are the same one.
+
+A judge read the source of each entity and recorded a verdict together with the reason for it.
+The material shown to the judge omits the detector's own answer, so agreement cannot be inflated
+by anchoring, and every judged row is required to trace back to the file the judge was shown.
+Table~\ref{tab:validation} gives the result over all 1{,}000 rows.
+
+\begin{table}[htb]
+\centering
+\caption{Detector agreement with the reading judge. TP, FP and FN are counted against the judge's
+verdict; recall is estimated from the unflagged stratum.}
+\label{tab:validation}
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+\textbf{Principle} & \textbf{n} & \textbf{TP} & \textbf{FP} & \textbf{FN} & \textbf{Precision} &
+\textbf{Recall} \\
+\midrule
+DIP & 200 & 89 & 11 & 0 & \textbf{0.890} & 1.000 \\
+LSP & 200 & 40 & 60 & 0 & 0.400 & 1.000 \\
+SRP & 200 & 35 & 65 & 1 & 0.350 & 0.972 \\
+OCP & 200 & 33 & 67 & 2 & 0.330 & 0.943 \\
+ISP & 200 & 32 & 68 & 3 & 0.320 & 0.914 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Recall is between 0.914 and 1.000 for all five principles. Every flag rate reported in this
+chapter is therefore an upper bound on the violations the judge would recognise: the detectors miss
+few violations and over-report many. That asymmetry is deliberate, since a screen that misses
+nothing can be tightened afterwards from its own labels, whereas a screen that misses violations
+cannot be repaired without re-reading the corpus.
+
+Precision below 0.5 for four principles is the substantive finding of RQ2 rather than a defect to
+be apologised for. A structural proxy answers a syntactic question; the principles are semantic;
+and the gap between the two is what these numbers quantify. The remainder of this section
+identifies where the gap comes from, and in two cases closes it.
+
+\paragraph{Evenness across agents.} A detector that over-flags one agent more than another
+manufactures a difference that is not in the code, so a per-agent ranking is only admissible if
+precision is comparable across agents. Table~\ref{tab:validation-agent} gives precision by agent.
+
+\begin{table}[htb]
+\centering
+\caption{Detector precision by agent. Recall is 0.875--1.000 in every cell.}
+\label{tab:validation-agent}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Principle} & \textbf{Claude Code} & \textbf{GitHub Copilot} & \textbf{OpenAI Codex} \\
+\midrule
+DIP & 0.778 & 0.943 & 1.000 \\
+LSP & 0.519 & 0.250 & 0.286 \\
+SRP & 0.327 & 0.263 & 1.000 \\
+OCP & 0.338 & 0.280 & 0.429 \\
+ISP & 0.348 & 0.318 & 0.200 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The OpenAI Codex column rests on 15 to 28 judged rows per principle, so its cells are unstable and
+the values of 1.000 stand on 7 and 11 flags. The comparison that the agent ranking actually needs
+is between Claude Code and Copilot, which carry 83 to 132 rows each and agree closely on every
+principle. Codex's \emph{rates} are computed over its full 770 pull requests and are not affected;
+it is only its per-agent precision that is thin.
+
+\paragraph{Two refinements earned from the labels.} Two detectors can be made substantially more
+precise by a change that the labels themselves identify, and in both cases the change is a
+restriction rather than a new signal.
+
+The Liskov detector originally combined three signals. Decomposed against the labels, they behave
+very differently: \emph{refused bequest}, a base method that does real work, replaced by an
+override whose body is a bare \texttt{throw new UnsupportedOperationException}, was correct on
+31 of 31 flags, while \emph{postcondition weakened} was correct on 6 of 36 and \emph{precondition
+strengthened} on 3 of 33. Restricting the flag to refused bequest gives precision 1.000 (95\%
+interval 0.890--1.000) at recall 0.775. An earlier, independent validation round on a different
+sample gave 51 of 62 for the same signal and the same near-zero rates for the other two, so the
+restriction is supported by two samples rather than fitted to one.
+
+The Interface Segregation detector improves under a width condition. Precision rises monotonically
+with contract width and the transition is sharp (Table~\ref{tab:isp-width}). Requiring at least 30
+members raises precision from 0.320 to 0.862 (0.694--0.945) at recall 0.714.
+
+\begin{table}[htb]
+\centering
+\caption{ISP precision by contract width.}
+\label{tab:isp-width}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Members} & \textbf{Flags judged} & \textbf{True} & \textbf{Precision} \\
+\midrule
+0--17    & 43 &  5 & 0.116 \\
+18--29   & 28 &  2 & 0.071 \\
+30--49   & 14 & 11 & 0.786 \\
+50--99   & 10 &  9 & 0.900 \\
+$\geq$100 &  5 &  5 & 1.000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Judge consistency.} 174 entities appear in both validation rounds, mostly because the
+Dependency Inversion detector flags only 195 pull requests in the whole corpus, so a second sample
+of 100 necessarily repeats earlier rows. The round-one labels were not consulted until the second
+round was complete. Agreement between the two independent readings is \textbf{89.7\%} (156 of 174),
+ranging from 84.0\% for ISP to 92.2\% for DIP. This is a measure of the judge, not of the
+detectors, and it places a ceiling on how precisely any agreement figure in
+Table~\ref{tab:validation} can be known.
+
+\subsection{Agent Differentiation (RQ1)}
+\label{sec:agent-differentiation}
+
+Table~\ref{tab:agent-rates} gives the flag rate for each principle by agent. The macro average over
+repositories is given beside the pooled rate throughout, and is the figure to read where the two
+disagree, because it prevents a single large repository from reporting its own conventions as an
+agent's behaviour.
+
+\begin{table}[htb]
+\centering
+\caption{Flag rate by agent. Pooled rate first, macro average over repositories in brackets. SRP is
+reported over classes the agent authored; the other four are reported over pull requests.}
+\label{tab:agent-rates}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Principle} & \textbf{Claude Code} & \textbf{GitHub Copilot} & \textbf{OpenAI Codex} \\
+\midrule
+SRP (authored classes) & 9.5\% (8.4\%) & \textbf{5.1\%} (3.5\%) & 6.8\% (7.4\%) \\
+OCP & 10.6\% (10.1\%) & 6.4\% (3.0\%) & \textbf{2.1\%} (2.2\%) \\
+ISP & 8.7\% (6.0\%) & 6.7\% (4.0\%) & \textbf{2.9\%} (5.0\%) \\
+DIP & 6.5\% (5.1\%) & 4.1\% (2.8\%) & \textbf{3.2\%} (5.4\%) \\
+LSP & 0.7\% (0.3\%) & 0.3\% (0.1\%) & \textbf{0.0\%} (0.0\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Claude Code has the highest pooled rate on all five principles and Codex the lowest on four. The
+ordering is consistent, but three qualifications bound what may be read into it.
+
+First, the agents did not work in the same period. The median pull request date is August 2025 for
+Codex, January 2026 for Copilot and March 2026 for Claude Code. An agent measured on older code is
+measured against different repositories, different framework versions and a different population of
+tasks, and this study cannot separate the agent from its era.
+
+Second, the macro and pooled figures disagree for Codex on ISP and DIP, where its macro rate
+exceeds Copilot's while its pooled rate is lower. That pattern means Codex's flagged pull requests
+are spread across many repositories while its unflagged volume is concentrated in few, and the
+mix-controlled figure is the one to quote.
+
+Third, Codex contributes 770 analysable pull requests against 2{,}366 for Copilot, so its intervals
+are wider throughout.
+
+\paragraph{Change size confounds the comparison, and partly explains it.}
+\citet{cynthia2026postmerge} report that apparent differences between agents in raw issue counts
+largely disappear once normalised by code churn, because an agent that writes larger changes
+accumulates more issues without writing worse code. The same confound is present here and has to be
+reported, because it qualifies the ordering above.
+
+The three agents do not write changes of the same size. The mean number of Java files touched is
+46.4 for Claude Code, 18.5 for Copilot and 10.9 for OpenAI Codex, and Codex puts 63.0\% of its pull
+requests in the smallest band against roughly 49\% for the other two. Flag rates rise steeply with
+size for every agent and every principle, which is expected: a delta-level detector has more
+opportunity to fire when more code changes.
+
+\begin{table}[htb]
+\centering
+\caption{Flag rate by agent within bands of change size, in Java files touched. The pooled ordering
+holds in the largest band and does not hold in the smallest.}
+\label{tab:size-control}
+\begin{tabular}{@{}llccc@{}}
+\toprule
+\textbf{Principle} & \textbf{Files touched} & \textbf{Claude Code} & \textbf{Copilot} &
+\textbf{OpenAI Codex} \\
+\midrule
+OCP & 1--3   &  1.3\% &  \textbf{1.9\%} &  0.4\% \\
+    & 4--10  &  \textbf{7.0\%} &  3.5\% &  1.9\% \\
+    & 11+    & \textbf{31.3\%} & 19.3\% &  8.9\% \\
+\midrule
+ISP & 1--3   &  0.4\% &  \textbf{0.9\%} &  0.6\% \\
+    & 4--10  &  \textbf{7.7\%} &  6.0\% &  4.3\% \\
+    & 11+    & \textbf{24.7\%} & 19.6\% &  9.7\% \\
+\midrule
+DIP & 1--3   &  0.4\% &  0.5\% &  \textbf{0.8\%} \\
+    & 4--10  &  1.8\% &  2.4\% &  \textbf{3.7\%} \\
+    & 11+    & \textbf{22.3\%} & 13.7\% & 12.1\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:size-control} splits the comparison by change size, and the result is not a simple
+confirmation of the pooled ordering. In the largest band the ordering holds on all three
+principles, and the separation is wide: Claude Code flags 31.3\% of its largest Open/Closed changes
+against 8.9\% for Codex. In the smallest band the ordering does not hold. Copilot is highest on
+Open/Closed and Interface Segregation among changes touching three files or fewer, and Codex is
+highest on Dependency Inversion in both of the two smaller bands, reversing its pooled position.
+
+Two conclusions follow, and the second is the one to carry forward. First, part of the pooled
+difference between agents is a difference in how much they change at once rather than in how they
+design. Second, the pooled ordering is not purely an artefact, because it survives within the band
+where most of the flagged pull requests are. The defensible statement is therefore narrower than
+the pooled table suggests: \textbf{on large changes Claude Code introduces more structural
+violations than Copilot, and Copilot more than Codex; on small changes the agents are not
+distinguishable and the ordering sometimes inverts.}
+
+The Liskov row deserves separate comment. Codex introduced no refused-bequest violation in 770
+pull requests, and the corpus-wide rate is 16 pull requests out of 4{,}245. This is not a null
+result produced by a weak detector: the same detector finds 681 refused-bequest relationships
+present in the code these agents touched. The rate is low because the violation requires authoring
+a base and an override that contradict each other, which a single pull request rarely does.
+
+\paragraph{Authored code against edited code.} The Single Responsibility detector is the only one
+that operates per class rather than per pull request, which makes it the only principle where
+agent-authored code can be compared directly against the code the agent merely edited.
+
+\begin{table}[htb]
+\centering
+\caption{SRP flag rate, classes the agent authored against pre-existing classes it edited.}
+\label{tab:authored-edited}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+ & \textbf{Authored} & \textbf{Edited} & \textbf{All touched} \\
+\midrule
+Pooled  & 7.7\% & 13.5\% & 12.2\% \\
+Macro over repositories & 5.6\% & 20.9\% & 18.2\% \\
+Classes & 13{,}712 & 48{,}433 & 62{,}145 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Classes the agents wrote are flagged at roughly half the rate of the pre-existing classes they
+edited, and the gap widens under repository-mix control. The comparison is between two populations
+rather than two treatments, so it does not establish that agents write better classes than the
+humans who preceded them: new classes are smaller and younger, and a class accumulates
+responsibilities over years of maintenance. What it does establish is that the flagged classes in
+this corpus are overwhelmingly not the agents' work.
+
+\paragraph{Merged code against rejected code.} The outcome axis is the reason the corpus includes
+requests that were never merged. Because the reconstruction tier available to a pull request
+depends on whether it was merged, the comparison is made only within tiers 2, 3 and 4, where both
+sides recover their \emph{before} tree the same way.
+
+\begin{table}[htb]
+\centering
+\caption{Flag rate by outcome on the tier-matched subset (1{,}521 merged and 1{,}177 rejected pull
+requests).}
+\label{tab:outcome-contrast}
+\begin{tabular}{@{}lccr@{}}
+\toprule
+\textbf{Principle} & \textbf{Merged} & \textbf{Rejected} & \textbf{Difference} \\
+\midrule
+OCP & 8.3\% & 8.0\% & $-0.4$ pp \\
+ISP & 7.5\% & 6.6\% & $-0.9$ pp \\
+DIP & 4.6\% & 6.6\% & $+2.0$ pp \\
+LSP & 0.5\% & 0.5\% & $\pm0.0$ pp \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+There is no consistent structural difference between the pull requests maintainers merged and those
+they closed. Three of the four differences are under one percentage point, and the largest,
+Dependency Inversion at two points, runs in the direction of rejected code carrying more
+violations, on a base rate small enough that the intervals overlap.
+
+The reading is not that review is ineffective. It is that SOLID adherence, as measured here, is not
+what review is deciding on. Review attends to correctness, scope, tests and fit with the project's
+direction; the structural properties measured here are close to invisible in that process. This
+also settles a methodological question for anyone building on merged corpora: for these signals,
+merged code is not a biased sample of agent output, so a merged-only corpus would have reached the
+same conclusions. That could not have been known without measuring the requests that were turned
+down.
+
+\subsection{Locus of Risk (RQ3)}
+\label{sec:locus-of-risk}
+
+The detectors report two quantities that must not be conflated. A violation \emph{present} in the
+code a pull request touched may have been written by anyone at any time. A violation the pull
+request \emph{introduced} is one that the before/after comparison attributes to this change.
+Table~\ref{tab:present-introduced} places them side by side, with the precision figures from
+Table~\ref{tab:validation} applied so that both columns estimate genuine violations rather than
+flags.
+
+\begin{table}[htb]
+\centering
+\caption{Violations present in touched code against violations introduced, after correcting both
+for measured precision.}
+\label{tab:present-introduced}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Principle} & \textbf{Flagged entities present} & \textbf{Est.\ genuine} &
+\textbf{PRs that introduced one} \\
+\midrule
+SRP & 11{,}822 classes        & $\approx$4{,}100 & --- \\
+OCP & 2{,}577 dispatch chains & $\approx$850 & 286 (2.2\% corrected) \\
+ISP & 1{,}090 contracts       & $\approx$350 & 276 (2.1\% corrected) \\
+LSP & 681 override pairs      & $\approx$270 & 16 (0.4\% corrected) \\
+DIP & 195 cycles              & $\approx$175 & 195 (4.1\% corrected) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[htb]
+\centering
+\input{figures/fig_present_introduced.tex}
+\caption{Violations present in the code the agents touched, against violations their pull requests
+introduced. The gap is widest for the three relation-level principles, whose violations require
+authoring both ends of a relation between units.}
+\label{fig:present-introduced}
+\end{figure}
+
+Between two and four per cent of pull requests introduce a SOLID violation, in codebases that
+already contain thousands. The three inter-unit principles show the effect most sharply: 681
+refused-bequest relationships exist in the touched code and pull requests introduced 16 of them.
+
+The explanation is structural rather than behavioural. Single Responsibility and Open/Closed are
+properties of \emph{one} unit, a class, a dispatch chain, which a single pull request can
+author whole. Liskov, Interface Segregation and Dependency Inversion are properties of a
+\emph{relation between} units: a base and its override, an interface and its implementers, a cycle
+among modules. Authoring both ends of such a relation in one contribution is rare, so these
+violations accumulate across many changes and across authors rather than arriving in one.
+
+The practical consequence is that per-change review, whether human or automated, can plausibly
+catch intra-unit damage and structurally cannot catch inter-unit damage. Detecting the latter
+requires a view of the repository over time, which no single diff provides.
+
+\subsection{Cross-Cutting Findings}
+\label{sec:findings}
+
+\paragraph{Finding 1: what a compiler enforces determines which violations are expressible.}
+Three of the five signals used to detect Liskov violations in a dynamically typed language cannot
+occur in Java code that compiles. A changed parameter list produces an overload rather than an
+override; parameter types are invariant; visibility cannot narrow and checked exceptions cannot
+broaden. Covariant return types are legal and safe. The Java detector therefore keeps only the
+signals a type system cannot check, and the labels confirm which of those survive contact with real
+code: refused bequest is correct on 31 of 31 flags, while the two behavioural-contract signals are
+correct on 6 of 36 and 3 of 33. A language's type system does not merely make violations harder; it
+removes some of them from the space of things a program can express.
+
+\paragraph{Finding 2: structural width is a valid signal for one principle and not for another,
+for a principled reason.} Interface width predicts Interface Segregation violations sharply
+(Table~\ref{tab:isp-width}): precision is 0.071 below 30 members and 0.900 above 50. Branch width
+predicts Open/Closed violations not at all, staying between 0.270 and 0.400 across every band
+(Table~\ref{tab:ocp-width}).
+
+\begin{table}[htb]
+\centering
+\caption{OCP precision by dispatch width. The threshold cannot be moved to improve it.}
+\label{tab:ocp-width}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Branches} & \textbf{Flags judged} & \textbf{True} & \textbf{Precision} \\
+\midrule
+0--5     & 37 & 10 & 0.270 \\
+6--9     & 23 &  9 & 0.391 \\
+10--15   & 19 &  6 & 0.316 \\
+16--30   & 10 &  4 & 0.400 \\
+$\geq$31 & 11 &  4 & 0.364 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The asymmetry follows from what the two principles are about. Interface Segregation is a statement
+about size: ``clients should not be forced to depend on members they do not use'' is violated by
+breadth, so a width threshold measures the construct directly. Open/Closed is a statement about
+whether a set of variants can grow. A 64-branch switch over PostgreSQL type identifiers is closed,
+because the set is fixed by a wire protocol; a five-branch switch over supported storage backends is
+open, because the next release adds one. Counting branches cannot separate them, and no threshold
+placement will.
+
+\paragraph{Finding 3: the closed sets that matter are external specifications.} The Open/Closed
+detector carries a suppressor for dispatch over a closed type set, written to recognise sets fixed
+by the language. It fired on none of the 100 flagged rows in the validation sample. Reading the
+false positives shows why: the closed sets that occur in practice are fixed by specifications
+outside the language, JDBC type codes, protobuf scalar types, FHIR binding strengths, Unicode
+blocks, AWT cursor constants, Android key codes, and by generated parser tables, where a
+356-branch keyword switch is machine-produced from a grammar file that is the actual source of
+truth. This gives a concrete and testable route to a more precise detector, which is that the
+suppressor should recognise external specification enums rather than only language builtins.
+
+\paragraph{Finding 4: the risk is intra-unit.} Stated as a single sentence for the abstract: of
+roughly 4{,}100 single-responsibility violations and 270 substitutability violations present in the
+Java code these agents touched, the agents introduced a violation in two to four per cent of their
+pull requests, and almost all of what the instruments find is pre-existing human code. The five
+principles agree on this, and the reason they agree is the intra-unit versus inter-unit distinction
+developed in Section~\ref{sec:locus-of-risk}.
+
+\paragraph{Finding 5: agent-authored classes are flagged less often than the classes they edit.}
+7.7\% against 13.5\% pooled, and 5.6\% against 20.9\% under repository-mix control
+(Table~\ref{tab:authored-edited}). The comparison is observational and the two populations differ
+in age and size, so this is a description of the corpus rather than a claim that agents write
+better classes than people. It does mean that a reader who assumes agent code is the source of the
+structural problems in these repositories has the direction wrong.
+
+\paragraph{Finding 6: review does not select on these properties.} Merged and rejected pull
+requests are structurally indistinguishable on four principles once reconstruction method is held
+constant (Table~\ref{tab:outcome-contrast}). Since human review is the only quality filter these
+contributions pass through, and it does not appear to act on SOLID adherence, the case for an
+automated structural check at review time rests on it catching something review demonstrably does
+not.
