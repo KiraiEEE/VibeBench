@@ -32,8 +32,8 @@ judged round it can find and prints which files it burned from.
 ### Progress
 
 ```
-LSP  extraction 200/200 DONE   audit gate 0 FAIL   judged 8/200
-ISP  extraction in progress    (was ~17/200 at 19:54)
+LSP  extraction 200/200 DONE   audit gate 0 FAIL   judged 200/200 COMPLETE
+ISP  extraction 200/200 DONE   audit gate 0 FAIL   judged 200/200 COMPLETE
 ```
 
 ### Commands
@@ -72,11 +72,92 @@ itself can return null.
 `throw new UnsupportedOperationException`; the override narrows accepted inputs;
 the override returns null where the base guarantees a value.
 
-**ISP:** width plus whether implementers carve it up. Violation when the contract
+**ISP decision rule actually applied in the holdout** (written down because it
+must NOT be the width threshold under test, or the validation is circular). A
+contract is a violation when any of these holds, and otherwise is not:
+
+* **(A)** the contract has >= 10 members AND at least one implementer is forced
+  to stub one of them;
+* **(B)** the contract is very wide (>= 35 members) and its members fall into
+  clearly separable groups serving different clients, even with no stub present;
+* **(C)** at least two implementers each stub half or more of what they declare,
+  which is systematic carving rather than one class that cannot cope.
+
+Stubs inside a TEST DOUBLE do not count as evidence, since a mock stubs what the
+test does not exercise rather than what the contract forces on production code.
+An implementer that stubs EVERYTHING it declares is a substitutability problem,
+not a fat interface, so that alone is not counted. Tiny contracts are not fat by
+construction. The original round 2 wording follows.
+
+**ISP (round 2 wording):** width plus whether implementers carve it up. Violation when the contract
 is wide (>=30 members) and implementers take wildly different slices, or when an
 adapter exists purely to stub most of it. Not a violation when every implementer
 implements the whole surface, when defaults let implementers override only what
 they need, or when it is a fluent builder or query DSL.
+
+## HOLDOUT ROUND: COMPLETE, FOLDED INTO THE THESIS, VERIFIED (2026-09-06)
+
+400 further entities judged, 200 LSP + 200 ISP, drawn with seed 424242 and
+excluding every row judged in any earlier round. Both gates passed 0 FAIL.
+
+### The two refinements behaved in OPPOSITE ways, and that is the result
+
+```
+                                   fitted sample     HOLDOUT      pooled
+LSP restricted to refused_bequest   1.000 (31/31)  1.000 (33/33)  1.000 (64/64)
+ISP restricted to >=30 members      0.862 (25/29)  0.704 (19/27)  0.786 (44/56)
+```
+
+The Liskov restriction held exactly, no false positive in 64 flags over two
+independent samples. The width condition lost 16 points and its fitted 0.862 is
+OUTSIDE the holdout interval [0.515, 0.841]. Refused bequest is categorical, so
+there is no quantity to overfit; 30 members is a numeric threshold read off the
+false positives it was then scored against. Broad flags reproduced closely
+(LSP 0.400 -> 0.440, ISP 0.320 -> 0.350), so the shipped numbers are stable.
+
+### The holdout also found a real error in the thesis. NOW FIXED.
+
+Ch4 reported recall as raw TP/(TP+FN) on a sample that is half flagged, and
+concluded every flag rate is "an upper bound". The corpus is nowhere near half
+flagged: for LSP it is 1,546 flagged against 79,689 unflagged, so a sampled
+unflagged row stands for 797 entities and a flagged one for 15. Weighting each
+stratum back to its population size:
+
+```
+        raw R   weighted R      95% CI          judged
+SRP     0.972     0.875     [0.562, 0.975]        200
+OCP     0.943     0.733     [0.440, 0.909]        200
+DIP     1.000     1.000     [0.410, 1.000]        200
+ISP     0.914     0.552     [0.400, 0.700]        400
+LSP     0.966     0.352     [0.159, 0.614]        400
+```
+
+The upper-bound claim survives for SRP, OCP and DIP and does NOT for LSP and
+ISP. Flag rates, agent comparison and merged-vs-rejected are unaffected: one
+detector applied uniformly, so the ratios stand.
+
+The three LSP violations the detector missed say what its blind spot is made of,
+and all three are silent rather than declared refusals:
+* Vaadin `StateTree.RootNode.setParent` throws `IllegalStateException` for every
+  non-null parent where the base accepts any.
+* CommCare `BlankLoginActivityUIController.setPermissionDeniedState` is an
+  EMPTY body where the base disables the login button and shows the error.
+* nd4j `Linspace.setY` assigns `this.y = null`, a setter that discards its input.
+
+### What was changed in the thesis
+
+* ch3: the in-sample paragraph now describes the holdout design.
+* ch4 `sec:validation`: "no holdout was drawn" replaced by how it was drawn.
+* ch4 `tab:validation`: pooled over every round, weighted recall with CIs, plus
+  a new paragraph on why weighting is required and what it costs.
+* ch4: new `tab:holdout` and the categorical-vs-numeric explanation.
+* ch4 summary table cells, ch5 RQ2, and all three abstracts (EN, FR, AR).
+* `07_verify/verify_thesis_numbers.py` now pools every judged round, weights
+  recall against the parquet populations, and checks the holdout figures.
+  Its stale-number check respects digit boundaries, so a real 1,546 is no
+  longer reported as the superseded 546.
+
+**Verifier: 21 checks, 0 FAIL. Thesis builds clean, 86 pages.**
 
 ## Disk: decision recorded 2026-09-06
 

@@ -54,6 +54,17 @@ def claims(value: str) -> bool:
     return value in TXT
 
 
+def stale_present(value: str) -> bool:
+    """Like claims(), but a bare number must not sit inside a larger one.
+
+    Without this, the superseded corpus size 546 is 'found' inside the genuine
+    V2 figure 1,546, and a real number cannot be written down.
+    """
+    if not value[0].isdigit():
+        return claims(value)
+    return re.search(r"(?<![\d,])" + re.escape(value) + r"(?![\d])", TXT) is not None
+
+
 def check(label: str, expected: str, forbidden: list[str] | None = None) -> None:
     global oks
     if not claims(expected):
@@ -61,7 +72,7 @@ def check(label: str, expected: str, forbidden: list[str] | None = None) -> None
         print(f"  FAIL  {label}: expected {expected!r} not found")
         return
     for bad in (forbidden or []):
-        if claims(bad):
+        if stale_present(bad):
             fails.append(f"{label}: thesis still contains stale {bad!r}")
             print(f"  FAIL  {label}: stale value {bad!r} still present")
             return
@@ -94,41 +105,79 @@ else:
 print("\n-- validation, recomputed from the label CSVs --")
 PRED = {'srp': 'srp_risk', 'ocp': 'smell', 'lsp': 'violation',
         'isp': 'flagged', 'dip': 'dip_risk'}
+# The population each stratum was drawn from, needed to weight recall. A sample
+# is half flagged and half unflagged; the corpus is nowhere near that, so an
+# unweighted recall silently assumes a base rate that does not exist.
+POP = {'srp': 'srp_results_java.parquet', 'ocp': 'ocp_results_java.parquet',
+       'lsp': 'lsp_results_java.parquet', 'isp': 'isp_results_java.parquet',
+       'dip': 'dip_results_java.parquet'}
+
+
+def _labels(p, col):
+    """Every judged round for this principle, pooled."""
+    frames = []
+    for f in sorted(C.LABELS_DIR.glob(f"java_{p}_labeling_sample*.csv")):
+        d = pd.read_csv(f)
+        if f"llm_{p}_risk" in d.columns:
+            frames.append(d)
+    return pd.concat(frames, ignore_index=True)
+
+
+def _population(p, col):
+    r = pd.read_parquet(C.CORPUS_DIR / POP[p])
+    if 'row_type' in r.columns:          # ISP mixes interface and implementer rows
+        r = r[r.row_type == 'interface']
+    v = r[col].fillna(False).astype(bool)
+    return int(v.sum()), int((~v).sum())
+
+
 for p, col in PRED.items():
-    f = C.LABELS_DIR / f"java_{p}_labeling_sample.csv"
-    d = pd.read_csv(f)
+    d = _labels(p, col)
     lab = d[f"llm_{p}_risk"].astype(str).str.strip().str.lower().map(
         {'true': True, 'false': False})
     flag = d[col].fillna(False).astype(bool)
     tp = int((flag & lab).sum()); fp = int((flag & ~lab).sum())
     fn = int((~flag & lab).sum())
     prec = tp / max(tp + fp, 1)
-    rec = tp / max(tp + fn, 1)
+    nf, nu = int(flag.sum()), int((~flag).sum())
+    popF, popU = _population(p, col)
+    est_tp = tp * popF / max(nf, 1)
+    est_fn = fn * popU / max(nu, 1)
+    wrec = est_tp / max(est_tp + est_fn, 1e-9)
     check(f"{p.upper()} precision", f"{prec:.3f}")
-    check(f"{p.upper()} recall", f"{rec:.3f}")
+    check(f"{p.upper()} weighted recall", f"{wrec:.3f}")
 
 # --------------------------------------------------- refinements claimed
 print("\n-- the two refinements --")
-d = pd.read_csv(C.LABELS_DIR / "java_lsp_labeling_sample.csv")
-lab = d.llm_lsp_risk.astype(str).str.strip().str.lower().map({'true': True, 'false': False})
-nar = d.signals.fillna('').str.contains('refused_bequest')
-tp = int((nar & lab).sum()); fp = int((nar & ~lab).sum()); fn = int((~nar & lab).sum())
-check("LSP restricted precision", f"{tp/max(tp+fp,1):.3f}")
-check("LSP restricted recall", f"{tp/max(tp+fn,1):.3f}")
+def _refined(path, labcol, mask):
+    d = pd.read_csv(C.LABELS_DIR / path)
+    lab = d[labcol].astype(str).str.strip().str.lower().map({'true': True, 'false': False})
+    m = mask(d)
+    tp = int((m & lab).sum()); fp = int((m & ~lab).sum())
+    return tp, fp, tp / max(tp + fp, 1)
 
-d = pd.read_csv(C.LABELS_DIR / "java_isp_labeling_sample.csv")
-lab = d.llm_isp_risk.astype(str).str.strip().str.lower().map({'true': True, 'false': False})
-wide = d['flagged'].fillna(False).astype(bool) & (d.n_members >= 30)
-tp = int((wide & lab).sum()); fp = int((wide & ~lab).sum()); fn = int((~wide & lab).sum())
-check("ISP width-restricted precision", f"{tp/max(tp+fp,1):.3f}")
-check("ISP width-restricted recall", f"{tp/max(tp+fn,1):.3f}")
+RB = lambda d: d.signals.fillna('').str.contains('refused_bequest')
+W30 = lambda d: d['flagged'].fillna(False).astype(bool) & (d.n_members >= 30)
+
+for name, stem, labcol, mask in [
+        ("LSP restricted", "lsp", "llm_lsp_risk", RB),
+        ("ISP width-restricted", "isp", "llm_isp_risk", W30)]:
+    a = _refined(f"java_{stem}_labeling_sample.csv", labcol, mask)
+    h = _refined(f"java_{stem}_labeling_sample_holdout.csv", labcol, mask)
+    tp, fp = a[0] + h[0], a[1] + h[1]
+    check(f"{name} precision, fitted sample", f"{a[2]:.3f}")
+    check(f"{name} precision, HOLDOUT", f"{h[2]:.3f}")
+    check(f"{name} precision, pooled", f"{tp/max(tp+fp,1):.3f}")
 
 # ------------------------------------------------------- forbidden text
 print("\n-- residue from the superseded study --")
+# Bare numbers are matched on a DIGIT BOUNDARY, so a V1 figure like 546 is not
+# reported when it appears inside a genuine V2 one such as 1{,}546.
 STALE = ["546", "867", "147 repositories", "27 repositories", "0.455", "0.679",
          "13/13", "five agents", "30,984", "2,921", "6,618",
          "Python pull request", "Python corpus", "TypeScript", "JavaScript"]
-found = [t for t in STALE if claims(t)]
+
+found = [t for t in STALE if stale_present(t)]
 if found:
     for t in found:
         fails.append(f"stale text present: {t!r}")

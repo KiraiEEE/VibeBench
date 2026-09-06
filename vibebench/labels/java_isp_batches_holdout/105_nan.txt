@@ -1,0 +1,717 @@
+row 105   vaadin/flow#22016
+============================================================================
+CONTRACT com.vaadin.flow.server.VaadinService   members=12.0 implementers=16.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+      110  public abstract class VaadinService implements Serializable {
+      111  
+      112      private static final String SEPARATOR = "\n=================================================================";
+      113  
+      114      public static final String INVALID_ATMOSPHERE_VERSION_WARNING = SEPARATOR
+      115              + "\nVaadin depends on Atmosphere {} but version {} was found.\n"
+      116              + "This might cause compatibility problems if push is used."
+      117              + SEPARATOR;
+      118  
+      119      public static final String ATMOSPHERE_MISSING_ERROR = SEPARATOR
+      120              + "\nAtmosphere could not be loaded. When using push with Vaadin, the\n"
+      121              + "Atmosphere framework must be present on the classpath.\n"
+      122              + "If using a dependency management system, please add a dependency\n"
+      123              + "to vaadin-push.\n"
+      124              + "If managing dependencies manually, please make sure Atmosphere\n"
+      125              + Constants.REQUIRED_ATMOSPHERE_RUNTIME_VERSION
+      126              + " is included on the classpath.\n" + "Will fall back to using "
+      127              + PushMode.class.getSimpleName() + "." + PushMode.DISABLED.name()
+      128              + "." + SEPARATOR;
+      129  
+      130      /**
+      131       * Attribute name for telling
+      132       * {@link VaadinSession#valueUnbound(jakarta.servlet.http.HttpSessionBindingEvent)}
+      133       * that it should not close a {@link VaadinSession} even though it gets
+      134       * unbound. If a {@code VaadinSession} has an attribute with this name and
+      135       * the attribute value is {@link Boolean#TRUE}, that session will not be
+      136       * closed when it is unbound from the underlying session.
+      137       */
+      138      // Use the old name.reinitializing value for backwards compatibility
+      139      static final String PRESERVE_UNBOUND_SESSION_ATTRIBUTE = VaadinService.class
+      140              .getName() + ".reinitializing";
+      141  
+      142      private static final String REQUEST_START_TIME_ATTRIBUTE = "requestStartTime";
+      143  
+      144      /**
+      145       * Should never be used directly, always use
+      146       * {@link #getDeploymentConfiguration()}.
+      147       */
+      148      private final DeploymentConfiguration deploymentConfiguration;
+      149  
+      150      /*
+      151       * Can't use EventRouter for these listeners since it's not thread safe. One
+      152       * option would be to use an EventRouter instance guarded with a lock, but
+      153       * then we would needlessly hold a "global" lock while invoking potentially
+      154       * slow listener implementations.
+      155       */
+      156      private final Set<ServiceDestroyListener> serviceDestroyListeners = Collections
+      157              .newSetFromMap(new ConcurrentHashMap<>());
+      158  
+      159      private final List<SessionInitListener> sessionInitListeners = new CopyOnWriteArrayList<>();
+      160      private final List<UIInitListener> uiInitListeners = new CopyOnWriteArrayList<>();
+      161      private final List<SessionDestroyListener> sessionDestroyListeners = new CopyOnWriteArrayList<>();
+      162  
+      163      private SystemMessagesProvider systemMessagesProvider = DefaultSystemMessagesProvider
+      164              .get();
+      165  
+      166      private ClassLoader classLoader;
+      167  
+      168      private Iterable<RequestHandler> requestHandlers;
+      169  
+      170      private transient Iterable<IndexHtmlRequestListener> indexHtmlRequestListeners;
+      171  
+      172      private Iterable<DependencyFilter> dependencyFilters;
+      173  
+      174      private boolean atmosphereAvailable = checkAtmosphereSupport();
+      175  
+      176      private BootstrapInitialPredicate bootstrapInitialPredicate;
+      177      private BootstrapUrlPredicate bootstrapUrlPredicate;
+      178  
+      179      /**
+      180       * Keeps track of whether a warning about missing push support has already
+      181       * been logged. This is used to avoid spamming the log with the same message
+      182       * every time a new UI is bootstrapped.
+      183       */
+      184      private boolean pushWarningEmitted = false;
+      185  
+      186      /**
+      187       * Set to true when {@link #init()} has been run.
+      188       */
+      189      private boolean initialized = false;
+      190  
+      191      private Router router;
+      192  
+      193      private Instantiator instantiator;
+      194  
+      195      private Executor executor;
+      196  
+      197      private boolean defaultExecutorInUse;
+      198  
+      199      private VaadinContext vaadinContext;
+      200  
+      201      private Iterable<VaadinRequestInterceptor> vaadinRequestInterceptors;
+      202  
+      203      /**
+      204       * Creates a new vaadin service based on a deployment configuration.
+      205       *
+      206       * @param deploymentConfiguration
+      207       *            the deployment configuration for the service
+      208       */
+      209      public VaadinService(DeploymentConfiguration deploymentConfiguration) {
+      210          this.deploymentConfiguration = deploymentConfiguration;
+      211      }
+      212  
+      213      /**
+      214       * Creates a service. This method is for use by dependency injection
+      215       * frameworks etc. and must be followed by a call to
+      216       * {@link #setClassLoader(ClassLoader)} or {@link #setDefaultClassLoader()}
+      217       * before use. Furthermore {@link #getDeploymentConfiguration()} and
+      218       * {@link #getContext()} should be overridden (or otherwise intercepted) not
+      219       * to return <code>null</code>.
+      220       */
+      221      protected VaadinService() {
+      222          deploymentConfiguration = null;
+      223          vaadinContext = null;
+      224      }
+      225  
+      226      /**
+      227       * Initializes this service. The service should be initialized before it is
+      228       * used.
+      229       *
+      230       * @throws ServiceException
+      231       *             if a problem occurs when creating the service
+      232       */
+      233      public void init() throws ServiceException {
+      234          doSetClassLoader();
+      235          instantiator = createInstantiator();
+      236  
+      237          // init the router now so that registry will be available for
+      238          // modifications
+      239          router = new Router(getRouteRegistry());
+      240  
+      241          List<RequestHandler> handlers = createRequestHandlers();
+      242  
+      243          // If the user has already provided interceptors we will add them to the
+      244          // list
+      245          // and append ones from the ServiceInitEvent
+      246          List<VaadinRequestInterceptor> requestInterceptors = createVaadinRequestInterceptors();
+      247  
+      248          ServiceInitEvent event = new ServiceInitEvent(this);
+      249  
+      250          VaadinRequestInterceptor dauInterceptorWrapper;
+      251          if (DAUUtils.isDauEnabled(this)) {
+      252              getLogger().info("Daily Active User tracking enabled");
+      253  
+      254              DAUCustomizer dauCustomizer;
+      255              try {
+      256                  dauCustomizer = instantiator.getOrCreate(DAUCustomizer.class);
+      257                  getContext().setAttribute(DAUCustomizer.class, dauCustomizer);
+      258              } catch (Exception e) {
+      259                  getLogger().debug("DAUCustomizer not available");
+      260                  if (getLogger().isTraceEnabled()) {
+      261                      getLogger().trace("Cannot get an instance of DAUCustomizer",
+      262                              e);
+      263                  }
+      264                  dauCustomizer = null;
+      265              }
+      266  
+      267              DAUVaadinRequestInterceptor dauInterceptor = new DAUVaadinRequestInterceptor(
+      268                      getDeploymentConfiguration(), dauCustomizer);
+      269              dauInterceptor.serviceInit(event);
+      270              dauInterceptorWrapper = new VaadinSessionOnRequestStartInterceptorWrapper(
+      271                      dauInterceptor);
+      272          } else {
+      273              dauInterceptorWrapper = null;
+      274          }
+      275  
+      276          // allow service init listeners and DI to use thread local access to
+      277          // e.g. application scoped route registry
+      278          runWithServiceContext(() -> {
+      279              instantiator.getServiceInitListeners()
+      280                      .forEach(listener -> listener.serviceInit(event));
+      281  
+      282              this.executor = event.getExecutor()
+      283                      .orElseGet(this::createDefaultExecutor);
+      284  
+      285              event.getAddedRequestHandlers().forEach(handlers::add);
+      286  
+      287              Collections.reverse(handlers);
+      288  
+      289              requestHandlers = Collections.unmodifiableCollection(handlers);
+      290  
+      291              event.getAddedVaadinRequestInterceptor()
+      292                      .forEach(requestInterceptors::add);
+      293              // DAU interceptor should always run first
+      294              if (dauInterceptorWrapper != null) {
+      295                  requestInterceptors.add(dauInterceptorWrapper);
+      296              }
+      297              Collections.reverse(requestInterceptors);
+      298  
+      299              vaadinRequestInterceptors = Collections
+      300                      .unmodifiableCollection(requestInterceptors);
+      301  
+      302              dependencyFilters = Collections.unmodifiableCollection(instantiator
+      303                      .getDependencyFilters(event.getAddedDependencyFilters())
+      304                      .collect(Collectors.toList()));
+      305              indexHtmlRequestListeners = instantiator
+      306                      .getIndexHtmlRequestListeners(
+      307                              event.getAddedIndexHtmlRequestListeners())
+      308                      .collect(Collectors.toList());
+      309          });
+      310  
+      311          if (this.executor == null) {
+      312              throw new ServiceException(
+      313                      "Unable to create the default Executor for "
+      314                              + getClass().getName()
+      315                              + ". This is most likely a bug in a custom VaadinService implementation "
+      316                              + "that overrides the createDefaultExecutor() method "
+      317                              + "but returns a null Executor instance. "
+      318                              + "As a workaround, you can register a "
+      319                              + VaadinServiceInitListener.class.getSimpleName()
+      320                              + " providing a custom Executor instance.");
+      321          }
+      322  
+      323          try {
+      324              initSignalsEnvironment();
+      325          } catch (Exception e) {
+      326              if (FeatureFlags.get(getContext())
+      327                      .isEnabled(FeatureFlags.FLOW_FULLSTACK_SIGNALS.getId())) {
+      328                  throw e;
+      329              } else {
+      330                  getLogger().info(
+      331                          "Error initializing signals. This is non-fatal since signals are "
+      332                                  + "a preview feature and the feature flag is not enabled.",
+      333                          e);
+      334              }
+      335          }
+      336  
+      337          DeploymentConfiguration configuration = getDeploymentConfiguration();
+      338          if (!configuration.isProductionMode()) {
+      339              Logger logger = getLogger();
+      340              logger.debug("The application has the following routes: ");
+      341              List<RouteData> routeDataList = getRouteRegistry()
+      342                      .getRegisteredRoutes();
+      343              if (!routeDataList.isEmpty()) {
+      344                  addRouterUsageStatistics();
+      345              }
+      346              routeDataList.stream().map(Object::toString).forEach(logger::debug);
+      347              addAutoLayoutUsageStatistics();
+      348              DevToolsToken.init(this);
+      349          }
+      350          if (getDeploymentConfiguration().isPnpmEnabled()) {
+      351              UsageStatistics.markAsUsed("flow/pnpm", null);
+      352          }
+      353          if (getDeploymentConfiguration().isBunEnabled()) {
+      354              UsageStatistics.markAsUsed("flow/bun", null);
+      355          }
+      356  
+      357          if (getDeploymentConfiguration().isProductionMode()) {
+      358              // Postpone the check until dev-server is fully initialized and
+      359              // client routes are computed.
+      360              RouteUtil.checkForClientRouteCollisions(this,
+      361                      getRouteRegistry().getRegisteredRoutes());
+      362          }
+      363  
+      364          initialized = true;
+      365      }
+      366  
+      367      private void initSignalsEnvironment() {
+      368          boolean enabled = FeatureFlags.get(getContext())
+      369                  .isEnabled(FeatureFlags.FLOW_FULLSTACK_SIGNALS.getId());
+      370          if (enabled) {
+      371              // Trigger check for multiple TaskExecutor candidates
+      372              getExecutor();
+      373          }
+      374  
+      375          class VaadinServiceEnvironment extends SignalEnvironment
+      376                  implements Serializable {
+      377              @Override
+      378              public boolean isActive() {
+      379                  if (VaadinService.getCurrent() != VaadinService.this) {
+      380                      return false;
+      381                  } else if (!enabled) {
+      382                      throw new DisabledFeatureException(
+      383                              FeatureFlags.FLOW_FULLSTACK_SIGNALS);
+      384                  } else {
+      385                      return true;
+      386                  }
+      387              }
+      388  
+      389              private Executor createCurrentUiDispatcher() {
+      390                  UI owner = UI.getCurrent();
+      391                  if (owner == null) {
+      392                      return getExecutor();
+      393                  }
+      394  
+      395                  return task -> {
+      396                      if (UI.getCurrent() == owner) {
+      397                          task.run();
+      398                      } else {
+      399                          try {
+      400                              getExecutor()
+      401                                      .execute(() -> owner.access(task::run));
+      402                          } catch (Exception e) {
+      403                              // submitted when executor is shut down, ignore
+      404                          }
+      405                      }
+      406                  };
+      407              }
+      408  
+      409              @Override
+      410              public Executor getResultNotifier() {
+      411                  return createCurrentUiDispatcher();
+      412              }
+      413  
+      414              @Override
+      415              public Executor getEffectDispatcher() {
+      416                  return getExecutor();
+      417              }
+      418          }
+      419  
+      420          Runnable unregister = SignalEnvironment
+      421                  .register(new VaadinServiceEnvironment());
+      422  
+      423          addServiceDestroyListener(event -> unregister.run());
+      424      }
+      425  
+      426      private void addRouterUsageStatistics() {
+      427          if (UsageStatistics.getEntries().anyMatch(
+      428                  e -> Constants.STATISTIC_ROUTING_CLIENT.equals(e.getName()))) {
+      429              UsageStatistics.removeEntry(Constants.STATISTIC_ROUTING_CLIENT);
+      430              UsageStatistics.markAsUsed(Constants.STATISTIC_ROUTING_HYBRID,
+      431                      Version.getFullVersion());
+      432          } else if (UsageStatistics.getEntries()
+      433                  .noneMatch(e -> Constants.STATISTIC_FLOW_BOOTSTRAPHANDLER
+      434                          .equals(e.getName()))) {
+      435              UsageStatistics.markAsUsed(Constants.STATISTIC_ROUTING_SERVER,
+      436                      Version.getFullVersion());
+      437          }
+      438          UsageStatistics.markAsUsed(Constants.STATISTIC_HAS_FLOW_ROUTE, null);
+      439      }
+      440  
+      441      private void addAutoLayoutUsageStatistics() {
+      442          if (getRouteRegistry() instanceof AbstractRouteRegistry registry
+      443                  && RouteUtil.hasAutoLayout(registry)) {
+      444              UsageStatistics.markAsUsed(Constants.STATISTIC_HAS_AUTO_LAYOUT,
+      445                      null);
+      446              if (RouteUtil.hasClientRouteWithAutoLayout(
+      447                      getDeploymentConfiguration())) {
+      448                  UsageStatistics.markAsUsed(
+      449                          Constants.STATISTIC_HAS_CLIENT_ROUTE_WITH_AUTO_LAYOUT,
+      450                          null);
+      451              }
+      452              if (RouteUtil.hasServerRouteWithAutoLayout(registry)) {
+      453                  UsageStatistics.markAsUsed(
+      454                          Constants.STATISTIC_HAS_SERVER_ROUTE_WITH_AUTO_LAYOUT,
+      455                          null);
+      456              }
+      457          }
+      458      }
+      459  
+      460      /**
+      461       * Find a route registry to use for this service.
+      462       *
+      463       * @return the route registry to use, not <code>null</code>
+      464       */
+      465      protected abstract RouteRegistry getRouteRegistry();
+      466  
+      467      protected abstract PwaRegistry getPwaRegistry();
+      468  
+      469      /**
+      470       * Returns relative context path for given request. Override this method in
+      471       * subclasses.
+      472       *
+      473       * @param request
+      474       *            Request.
+      475       * @return Relative context root path for that request.
+      476       */
+      477      public abstract String getContextRootRelativePath(VaadinRequest request);
+      478  
+      479      /**
+      480       * Called during initialization to add the request handlers for the service.
+      481       * Note that the returned list will be reversed so the last handler will be
+      482       * called first. This enables overriding this method and using add on the
+      483       * returned list to add a custom request handler which overrides any
+      484       * predefined handler.
+      485       *
+      486       * @return The list of request handlers used by this service.
+      487       * @throws ServiceException
+      488       *             if a problem occurs when creating the request handlers
+      489       */
+      490      protected List<RequestHandler> createRequestHandlers()
+      491              throws ServiceException {
+      492          List<RequestHandler> handlers = new ArrayList<>();
+      493          handlers.add(new JavaScriptBootstrapHandler());
+      494          handlers.add(new SessionRequestHandler());
+      495          handlers.add(new HeartbeatHandler());
+      496          handlers.add(new UidlRequestHandler());
+      497          handlers.add(new UnsupportedBrowserHandler());
+      498          handlers.add(new StreamRequestHandler());
+      499          handlers.add(new PwaHandler(() -> getPwaRegistry()));
+      500          handlers.add(new TranslationFileRequestHandler(
+      501                  getInstantiator().getI18NProvider(), getClassLoader()));
+      502  
+      503          handlers.add(new WebComponentBootstrapHandler());
+      504          handlers.add(new WebComponentProvider());
+      505  
+      506          return handlers;
+      507      }
+      508  
+      509      /**
+       ... truncated at 400 lines ...
+
+---------- IMPLEMENTER com.vaadin.flow.data.provider.DataCommunicatorTest.MockService  stubs=0/1 ----------
+     1881      public static class MockService extends VaadinServletService {
+     1882  
+     1883          @Override
+     1884          public RouteRegistry getRouteRegistry() {
+     1885              return super.getRouteRegistry();
+     1886          }
+     1887      }
+
+---------- IMPLEMENTER com.vaadin.flow.server.VaadinServletService  stubs=0/12 ----------
+       51  public class VaadinServletService extends VaadinService {
+       52  
+       53      /**
+       54       * Should never be used directly, always use {@link #getServlet()}.
+       55       */
+       56      private final VaadinServlet servlet;
+       57      private final ServiceContextUriResolver contextResolver = new ServiceContextUriResolver();
+       58  
+       59      /**
+       60       * Creates an instance connected to the given servlet and using the given
+       61       * configuration.
+       62       *
+       63       * @param servlet
+       64       *            the servlet which receives requests
+       65       * @param deploymentConfiguration
+       66       *            the configuration to use
+       67       */
+       68      public VaadinServletService(VaadinServlet servlet,
+       69              DeploymentConfiguration deploymentConfiguration) {
+       70          super(deploymentConfiguration);
+       71          this.servlet = servlet;
+       72      }
+       73  
+       74      /**
+       75       * Creates a servlet service. This method is for use by dependency injection
+       76       * frameworks etc. {@link #getServlet()} and {@link #getContext()} should be
+       77       * overridden (or otherwise intercepted) to not return <code>null</code>.
+       78       */
+       79      protected VaadinServletService() {
+       80          servlet = null;
+       81      }
+       82  
+       83      @Override
+       84      protected List<RequestHandler> createRequestHandlers()
+       85              throws ServiceException {
+       86          List<RequestHandler> handlers = super.createRequestHandlers();
+       87          handlers.add(0, new FaviconHandler());
+       88  
+       89          Mode mode = getDeploymentConfiguration().getMode();
+       90          if (mode == Mode.DEVELOPMENT_FRONTEND_LIVERELOAD
+       91                  || mode == Mode.DEVELOPMENT_BUNDLE) {
+       92              Optional<DevModeHandler> handlerManager = DevModeHandlerManager
+       93                      .getDevModeHandler(this);
+       94              if (handlerManager.isPresent()) {
+       95                  DevModeHandler devModeHandler = handlerManager.get();
+       96                  // WebComponentProvider handler should run before DevModeHandler
+       97                  // to avoid responding with html contents when dev bundle is
+       98                  // not ready (e.g. dev-mode-not-ready.html)
+       99                  handlers.stream().filter(WebComponentProvider.class::isInstance)
+      100                          .findFirst().map(handlers::indexOf)
+      101                          .ifPresentOrElse(idx -> {
+      102                              handlers.add(idx, devModeHandler);
+      103                          }, () -> handlers.add(devModeHandler));
+      104              } else if (mode == Mode.DEVELOPMENT_FRONTEND_LIVERELOAD) {
+      105                  getLogger()
+      106                          .warn("""
+      107                                  'vaadin-dev-server' not found, but dev server is enabled. Add 'com.vaadin:vaadin-dev' dependency
+      108                                  or 'com.vaadin:vaadin-dev-server' for minimal working configuration.
+      109  
+      110                                  Maven:
+      111                                      <dependency>
+      112                                          <groupId>com.vaadin</groupId>
+      113                                          <artifactId>vaadin-dev</artifactId>
+      114                                      </dependency>
+      115  
+      116                                  Gradle:
+      117                                      dependencies {
+      118                                          implementation('com.vaadin:vaadin-dev')
+      119                                      }
+      120  
+      121                                  """);
+      122              }
+      123          }
+      124  
+      125          // PushRequestHandler should run before DevModeHandler to avoid
+      126          // responding with html contents when dev mode server is not ready
+      127          // (e.g. dev-mode-not-ready.html)
+      128          if (isAtmosphereAvailable()) {
+      129              try {
+      130                  handlers.add(new PushRequestHandler(this));
+      131              } catch (ServiceException e) {
+      132                  // Atmosphere init failed. Push won't work but we don't throw a
+      133                  // service exception as we don't want to prevent non-push
+      134                  // applications from working
+      135                  getLogger().warn(
+      136                          "Error initializing Atmosphere. Push will not work.",
+      137                          e);
+      138              }
+      139          }
+      140  
+      141          addBootstrapHandler(handlers);
+      142          return handlers;
+      143      }
+      144  
+      145      private void addBootstrapHandler(List<RequestHandler> handlers) {
+      146          handlers.add(0, new IndexHtmlRequestHandler());
+      147          getLogger().debug("Using '{}' in client mode bootstrapping",
+      148                  IndexHtmlRequestHandler.class.getName());
+      149      }
+      150  
+      151      /**
+      152       * Retrieves a reference to the servlet associated with this service. Should
+      153       * be overridden (or otherwise intercepted) if the no-arg constructor is
+      154       * used to prevent NPEs.
+      155       *
+      156       * @return A reference to the VaadinServlet this service is using
+      157       */
+      158      public VaadinServlet getServlet() {
+      159          return servlet;
+      160      }
+      161  
+      162      @Override
+      163      public String getMimeType(String resourceName) {
+      164          return getServlet().getServletContext().getMimeType(resourceName);
+      165      }
+      166  
+      167      @Override
+      168      protected boolean requestCanCreateSession(VaadinRequest request) {
+      169          if (isOtherRequest(request)) {
+      170              /*
+      171               * I.e URIs that are not RPC calls or static file requests.
+      172               */
+      173              return true;
+      174          }
+      175  
+      176          return false;
+      177      }
+      178  
+      179      private boolean isOtherRequest(VaadinRequest request) {
+      180          String type = request
+      181                  .getParameter(ApplicationConstants.REQUEST_TYPE_PARAMETER);
+      182          return type == null
+      183                  || ApplicationConstants.REQUEST_TYPE_INIT.equals(type)
+      184                  || ApplicationConstants.REQUEST_TYPE_WEBCOMPONENT_RESYNC
+      185                          .equals(type);
+      186      }
+      187  
+      188      public static HttpServletRequest getCurrentServletRequest() {
+      189          return VaadinServletRequest.getCurrent();
+      190      }
+      191  
+      192      public static VaadinServletResponse getCurrentResponse() {
+      193          return VaadinServletResponse.getCurrent();
+      194      }
+      195  
+      196      @Override
+      197      public String getServiceName() {
+      198          return getServlet().getServletName();
+      199      }
+      200  
+      201      @Override
+      202      public String getMainDivId(VaadinSession session, VaadinRequest request) {
+      203          String appId = null;
+      204          try {
+      205              URL appUrl = VaadinServlet
+      206                      .getApplicationUrl((VaadinServletRequest) request);
+      207              appId = appUrl.getPath();
+      208          } catch (MalformedURLException e) {
+      209              // Just ignore problem here
+      210          }
+
+---------- IMPLEMENTER com.vaadin.flow.router.RouteConfigurationTest.MockService  stubs=0/1 ----------
+      634      private static class MockService extends VaadinServletService {
+      635  
+      636          @Override
+      637          public RouteRegistry getRouteRegistry() {
+      638              return super.getRouteRegistry();
+      639          }
+      640      }
+
+---------- IMPLEMENTER com.vaadin.flow.server.menu.MenuRegistryTest.MockService  stubs=0/1 ----------
+      662      public static class MockService extends VaadinServletService {
+      663  
+      664          @Override
+      665          public RouteRegistry getRouteRegistry() {
+      666              return super.getRouteRegistry();
+      667          }
+      668  
+      669          @Override
+      670          public Instantiator getInstantiator() {
+      671              return new DefaultInstantiator(this);
+      672          }
+      673      }
+
+---------- IMPLEMENTER com.vaadin.flow.server.MockServletServiceSessionSetup.TestVaadinServletService  stubs=0/1 ----------
+       65      public class TestVaadinServletService extends VaadinServletService {
+       66  
+       67          private List<DependencyFilter> dependencyFilterOverride;
+       68          private TestRouteRegistry routeRegistry;
+       69          private Router router;
+       70          private List<IndexHtmlRequestListener> indexHtmlRequestListeners = new ArrayList<>();
+       71          private VaadinContext context;
+       72          private List<RequestHandler> handlers;
+       73          private Instantiator overriddenInstantiator;
+       74  
+       75          public TestVaadinServletService(TestVaadinServlet testVaadinServlet,
+       76                  DeploymentConfiguration deploymentConfiguration) {
+       77              super(testVaadinServlet, deploymentConfiguration);
+       78          }
+       79  
+       80          @Override
+       81          public Iterable<DependencyFilter> getDependencyFilters() {
+       82              if (dependencyFilterOverride != null) {
+       83                  return dependencyFilterOverride;
+       84              }
+       85              return super.getDependencyFilters();
+       86          }
+       87  
+       88          public void setDependencyFilters(
+       89                  List<DependencyFilter> dependencyFilters) {
+       90              dependencyFilterOverride = dependencyFilters;
+       91          }
+       92  
+       93          public void setRouteRegistry(TestRouteRegistry routeRegistry) {
+       94              this.routeRegistry = routeRegistry;
+       95          }
+       96  
+       97          @Override
+       98          protected List<RequestHandler> createRequestHandlers()
+       99                  throws ServiceException {
+      100              List<RequestHandler> requestHandlers = super.createRequestHandlers();
+      101              handlers = requestHandlers;
+      102              return requestHandlers;
+      103          }
+      104  
+      105          public List<RequestHandler> getRequestHandlers() {
+      106              return handlers;
+      107          }
+      108  
+      109          @Override
+      110          protected RouteRegistry getRouteRegistry() {
+      111              if (routeRegistry != null) {
+      112                  return routeRegistry;
+      113              }
+      114              return super.getRouteRegistry();
+      115          }
+      116  
+      117          @Override
+      118          public Router getRouter() {
+      119              if (router != null) {
+      120                  return router;
+      121              }
+      122              return super.getRouter();
+      123          }
+      124  
+      125          public void setRouter(Router router) {
+      126              this.router = router;
+      127          }
+      128  
+      129          public void addIndexHtmlRequestListener(
+      130                  IndexHtmlRequestListener listener) {
+      131              indexHtmlRequestListeners.add(listener);
+      132          }
+      133  
+      134          @Override
+      135          public void modifyIndexHtmlResponse(IndexHtmlResponse response) {
+      136              indexHtmlRequestListeners.forEach(
+      137                      listener -> listener.modifyIndexHtmlResponse(response));
+      138  
+      139              super.modifyIndexHtmlResponse(response);
+      140          }
+      141  
+      142          @Override
+      143          public VaadinContext getContext() {
+      144              if (context != null) {
+      145                  return context;
+      146              }
+      147              return super.getContext();
+      148          }
+      149  
+      150          public void setContext(VaadinContext context) {
+      151              this.context = context;
+      152          }
+      153  
+      154          @Override
+      155          protected Instantiator createInstantiator() throws ServiceException {
+      156              return Mockito.spy(super.createInstantiator());
+      157          }
+      158  
+      159          @Override
+      160          public Instantiator getInstantiator() {
+      161              if (this.overriddenInstantiator != null) {
+      162                  return overriddenInstantiator;
+      163              }
+      164              return super.getInstantiator();
+      165          }
+      166  
+      167          public void setInstantiator(Instantiator instantiator) {
+      168              this.overriddenInstantiator = instantiator;
+      169          }
+      170      }
+
+---------- IMPLEMENTER com.vaadin.flow.server.SessionRouteRegistryTest.MockService  stubs=0/1 ----------
+     1225      private static class MockService extends VaadinServletService {
+     1226  
+     1227          @Override
+     1228          public RouteRegistry getRouteRegistry() {
+     1229              return super.getRouteRegistry();
+     1230          }
+     1231      }

@@ -1,0 +1,871 @@
+row 138   questdb/questdb#6290
+============================================================================
+CONTRACT io.questdb.cairo.TableStructure   members=14.0 implementers=14.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       29  public interface TableStructure {
+       30  
+       31      int getColumnCount();
+       32  
+       33      CharSequence getColumnName(int columnIndex);
+       34  
+       35      int getColumnType(int columnIndex);
+       36  
+       37      int getIndexBlockCapacity(int columnIndex);
+       38  
+       39      default MatViewDefinition getMatViewDefinition() {
+       40          return null;
+       41      }
+       42  
+       43      int getMaxUncommittedRows();
+       44  
+       45      long getO3MaxLag();
+       46  
+       47      int getPartitionBy();
+       48  
+       49      boolean getSymbolCacheFlag(int columnIndex);
+       50  
+       51      int getSymbolCapacity(int columnIndex);
+       52  
+       53      CharSequence getTableName();
+       54  
+       55      int getTimestampIndex();
+       56  
+       57      /**
+       58       * Returns the time-to-live (TTL) of the data in this table:
+       59       * if positive, it's in hours;
+       60       * if negative, it's in months (and the actual value is positive);
+       61       * zero means "no TTL".
+       62       */
+       63      default int getTtlHoursOrMonths() {
+       64          return 0; // TTL disabled by default
+       65      }
+       66  
+       67      default void init(TableToken tableToken) {
+       68      }
+       69  
+       70      boolean isDedupKey(int columnIndex);
+       71  
+       72      boolean isIndexed(int columnIndex);
+       73  
+       74      default boolean isMatView() {
+       75          return false;
+       76      }
+       77  
+       78      boolean isWalEnabled();
+       79  }
+
+---------- IMPLEMENTER io.questdb.cairo.TableReaderMetadata  stubs=0/9 ----------
+       47  public class TableReaderMetadata extends AbstractRecordMetadata implements TableMetadata, Mutable {
+       48      protected final CairoConfiguration configuration;
+       49      private final IntList columnOrderList = new IntList();
+       50      private final FilesFacade ff;
+       51      private final LowerCaseCharSequenceIntHashMap tmpValidationMap = new LowerCaseCharSequenceIntHashMap();
+       52      private boolean isCopy;
+       53      private boolean isSoftLink;
+       54      private int maxUncommittedRows;
+       55      private MemoryCARW metaCopyMem; // used when loadFrom() called
+       56      private MemoryMR metaMem;
+       57      private long metadataVersion;
+       58      private long o3MaxLag;
+       59      private int partitionBy;
+       60      private Path path;
+       61      private int plen;
+       62      private int tableId;
+       63      private TableToken tableToken;
+       64      private TableReaderMetadataTransitionIndex transitionIndex;
+       65      private MemoryMR transitionMeta;
+       66      private int ttlHoursOrMonths;
+       67      private boolean walEnabled;
+       68  
+       69      public TableReaderMetadata(CairoConfiguration configuration, TableToken tableToken) {
+       70          try {
+       71              this.configuration = configuration;
+       72              this.ff = configuration.getFilesFacade();
+       73              this.tableToken = tableToken;
+       74              this.path = new Path();
+       75              this.path.of(configuration.getDbRoot()).concat(tableToken.getDirName());
+       76              this.plen = path.size();
+       77              this.isSoftLink = Files.isSoftLink(path.$());
+       78              this.metaMem = Vm.getCMRInstance();
+       79              this.metaCopyMem = Vm.getCARWInstance(ff.getPageSize(), Integer.MAX_VALUE, MemoryTag.NATIVE_METADATA_READER);
+       80          } catch (Throwable th) {
+       81              close();
+       82              throw th;
+       83          }
+       84      }
+       85  
+       86      // This constructor used to read random metadata files.
+       87      public TableReaderMetadata(CairoConfiguration configuration) {
+       88          this.configuration = configuration;
+       89          this.ff = configuration.getFilesFacade();
+       90          this.tableToken = null;
+       91          this.metaMem = Vm.getCMRInstance();
+       92      }
+       93  
+       94      public TableReaderMetadataTransitionIndex applyTransition() {
+       95          // Swap meta and transitionMeta. It's fine if we're dealing with
+       96          // a metadata copy and metaMem wasn't initialized.
+       97          MemoryMR temp = this.metaMem;
+       98          this.metaMem = this.transitionMeta;
+       99          transitionMeta = temp;
+      100          isCopy = false;
+      101          Misc.free(transitionMeta); // memory is safe to double close, do not assign null to transitionMeta
+      102          Misc.free(metaCopyMem); // close copy memory in case if it was in-use
+      103  
+      104          return applyTransition0(metaMem, columnCount);
+      105      }
+      106  
+      107      public TableReaderMetadataTransitionIndex applyTransitionFrom(TableReaderMetadata srcMeta) {
+      108          copyMemFrom(srcMeta);
+      109          isCopy = true;
+      110          Misc.free(metaMem);
+      111          Misc.free(transitionMeta);
+      112  
+      113          return applyTransition0(metaCopyMem, columnCount);
+      114      }
+      115  
+      116      @Override
+      117      public void clear() {
+      118          super.clear();
+      119          Misc.free(metaMem);
+      120          Misc.free(metaCopyMem);
+      121          Misc.free(transitionMeta);
+      122          isCopy = false;
+      123      }
+      124  
+      125      @Override
+      126      public void close() {
+      127          metaMem = Misc.free(metaMem);
+      128          metaCopyMem = Misc.free(metaCopyMem);
+      129          transitionMeta = Misc.free(transitionMeta);
+      130          path = Misc.free(path);
+      131          isCopy = false;
+      132      }
+      133  
+      134      public void dumpTo(MemoryMA mem) {
+      135          // This may be mmapped _meta file or its copy.
+      136          final MemoryR metaMem = getMetaMem();
+      137          // Since _meta files are immutable and get updated with a single atomic rename
+      138          // operation replacing the old file with the new one, it's ok to clone the metadata
+      139          // by copying metaMem's contents. Even if _meta file was already replaced, the file
+      140          // should be still kept on disk until inode's ref counter is above zero.
+      141          long len = metaMem.size();
+      142          for (long p = 0; p < len; p++) {
+      143              mem.putByte(metaMem.getByte(p));
+      144          }
+      145      }
+      146  
+      147      public int getDenseSymbolIndex(int columnIndex) {
+      148          return ((TableReaderMetadataColumn) columnMetadata.getQuick(columnIndex)).getDenseSymbolIndex();
+      149      }
+      150  
+      151      @Override
+      152      public int getIndexBlockCapacity(int columnIndex) {
+      153          return getColumnMetadata(columnIndex).getIndexValueBlockCapacity();
+      154      }
+      155  
+      156      @Override
+      157      public int getMaxUncommittedRows() {
+      158          return maxUncommittedRows;
+      159      }
+      160  
+      161      @Override
+      162      public long getMetadataVersion() {
+      163          return metadataVersion;
+      164      }
+      165  
+      166      @Override
+      167      public long getO3MaxLag() {
+      168          return o3MaxLag;
+      169      }
+      170  
+      171      @Override
+      172      public int getPartitionBy() {
+      173          return partitionBy;
+      174      }
+      175  
+      176      @Override
+      177      public boolean getSymbolCacheFlag(int columnIndex) {
+      178          return getColumnMetadata(columnIndex).isSymbolIndexFlag();
+      179      }
+      180  
+      181      @Override
+      182      public int getSymbolCapacity(int columnIndex) {
+      183          return getColumnMetadata(columnIndex).getSymbolCapacity();
+      184      }
+      185  
+      186      @Override
+      187      public int getTableId() {
+      188          return tableId;
+      189      }
+      190  
+      191      @Override
+      192      public CharSequence getTableName() {
+      193          return tableToken.getTableName();
+      194      }
+      195  
+      196      @Override
+      197      public TableToken getTableToken() {
+      198          return tableToken;
+      199      }
+      200  
+      201      @Override
+      202      public int getTtlHoursOrMonths() {
+      203          return ttlHoursOrMonths;
+      204      }
+      205  
+      206      @Override
+
+---------- IMPLEMENTER io.questdb.cairo.TableWriterMetadata  stubs=0/9 ----------
+       35  public class TableWriterMetadata extends AbstractRecordMetadata implements TableMetadata, TableStructure {
+       36      private int maxUncommittedRows;
+       37      private long metadataVersion;
+       38      private long o3MaxLag;
+       39      private int partitionBy;
+       40      private int symbolMapCount;
+       41      private int tableId;
+       42      private TableToken tableToken;
+       43      private int ttlHoursOrMonths;
+       44      private boolean walEnabled;
+       45  
+       46      public TableWriterMetadata(TableToken tableToken) {
+       47          this.tableToken = tableToken;
+       48      }
+       49  
+       50      @Override
+       51      public void close() {
+       52          // nothing to release
+       53      }
+       54  
+       55      @Override
+       56      public int getIndexBlockCapacity(int columnIndex) {
+       57          return getColumnMetadata(columnIndex).getIndexValueBlockCapacity();
+       58      }
+       59  
+       60      @Override
+       61      public int getMaxUncommittedRows() {
+       62          return maxUncommittedRows;
+       63      }
+       64  
+       65      @Override
+       66      public long getMetadataVersion() {
+       67          return metadataVersion;
+       68      }
+       69  
+       70      @Override
+       71      public long getO3MaxLag() {
+       72          return o3MaxLag;
+       73      }
+       74  
+       75      @Override
+       76      public int getPartitionBy() {
+       77          return partitionBy;
+       78      }
+       79  
+       80      public int getReplacingColumnIndex(int columnIndex) {
+       81          return columnMetadata.get(columnIndex).getReplacingIndex();
+       82      }
+       83  
+       84      @Override
+       85      public boolean getSymbolCacheFlag(int columnIndex) {
+       86          return getColumnMetadata(columnIndex).isSymbolCacheFlag();
+       87      }
+       88  
+       89      @Override
+       90      public int getSymbolCapacity(int columnIndex) {
+       91          return getColumnMetadata(columnIndex).getSymbolCapacity();
+       92      }
+       93  
+       94      public int getSymbolMapCount() {
+       95          return symbolMapCount;
+       96      }
+       97  
+       98      @Override
+       99      public int getTableId() {
+      100          return tableId;
+      101      }
+      102  
+      103      @Override
+      104      public CharSequence getTableName() {
+      105          return tableToken.getTableName();
+      106      }
+      107  
+      108      @Override
+      109      public TableToken getTableToken() {
+      110          return tableToken;
+      111      }
+      112  
+      113      @Override
+      114      public int getTtlHoursOrMonths() {
+      115          return ttlHoursOrMonths;
+      116      }
+      117  
+      118      @Override
+      119      public boolean isIndexed(int columnIndex) {
+      120          return getColumnMetadata(columnIndex).isSymbolIndexFlag();
+      121      }
+      122  
+      123      @Override
+      124      public boolean isWalEnabled() {
+      125          return walEnabled;
+      126      }
+      127  
+      128      public final void reload(MemoryMR metaMem) {
+      129          this.partitionBy = metaMem.getInt(META_OFFSET_PARTITION_BY);
+      130          this.columnCount = metaMem.getInt(TableUtils.META_OFFSET_COUNT);
+      131          this.columnNameIndexMap.clear();
+      132          this.tableId = metaMem.getInt(TableUtils.META_OFFSET_TABLE_ID);
+      133          this.maxUncommittedRows = metaMem.getInt(TableUtils.META_OFFSET_MAX_UNCOMMITTED_ROWS);
+      134          this.o3MaxLag = metaMem.getLong(TableUtils.META_OFFSET_O3_MAX_LAG);
+      135          TableUtils.validateMeta(metaMem, columnNameIndexMap, ColumnType.VERSION);
+      136          this.timestampIndex = metaMem.getInt(TableUtils.META_OFFSET_TIMESTAMP_INDEX);
+      137          this.columnMetadata.clear();
+      138          this.metadataVersion = metaMem.getLong(TableUtils.META_OFFSET_METADATA_VERSION);
+      139          this.walEnabled = metaMem.getBool(TableUtils.META_OFFSET_WAL_ENABLED);
+      140          this.ttlHoursOrMonths = TableUtils.getTtlHoursOrMonths(metaMem);
+      141  
+      142          long offset = TableUtils.getColumnNameOffset(columnCount);
+      143          this.symbolMapCount = 0;
+      144          columnNameIndexMap.clear();
+      145          // don't create strings in this loop, we already have them in columnNameIndexMap
+      146          for (int i = 0; i < columnCount; i++) {
+      147              CharSequence name = metaMem.getStrA(offset);
+      148              assert name != null;
+      149              int type = TableUtils.getColumnType(metaMem, i);
+      150              String nameStr = Chars.toString(name);
+      151              columnMetadata.add(
+      152                      new WriterTableColumnMetadata(
+      153                              nameStr,
+      154                              type,
+      155                              TableUtils.isColumnIndexed(metaMem, i),
+      156                              TableUtils.getIndexBlockCapacity(metaMem, i),
+      157                              true,
+      158                              null,
+      159                              i,
+      160                              TableUtils.getSymbolCapacity(metaMem, i),
+      161                              TableUtils.isColumnDedupKey(metaMem, i),
+      162                              TableUtils.getReplacingColumnIndex(metaMem, i),
+      163                              TableUtils.isSymbolCached(metaMem, i)
+      164                      )
+      165              );
+      166              if (type > -1) {
+      167                  columnNameIndexMap.put(nameStr, i);
+      168                  if (ColumnType.isSymbol(type)) {
+      169                      symbolMapCount++;
+      170                  }
+      171              }
+      172              offset += Vm.getStorageLength(name);
+      173          }
+      174      }
+      175  
+      176      public void setMaxUncommittedRows(int rows) {
+      177          this.maxUncommittedRows = rows;
+      178      }
+      179  
+      180      public void setMetadataVersion(long value) {
+      181          this.metadataVersion = value;
+      182      }
+      183  
+      184      public void setO3MaxLag(long o3MaxLagUs) {
+      185          this.o3MaxLag = o3MaxLagUs;
+      186      }
+      187  
+      188      public void setTtlHoursOrMonths(int ttlHoursOrMonths) {
+      189          this.ttlHoursOrMonths = ttlHoursOrMonths;
+      190      }
+      191  
+      192      public void updateTableToken(TableToken tableToken) {
+      193          this.tableToken = tableToken;
+      194      }
+
+---------- IMPLEMENTER io.questdb.cutlass.line.tcp.TableStructureAdapter  stubs=0/14 ----------
+       44  public class TableStructureAdapter implements TableStructure {
+       45      private static final String DEFAULT_TIMESTAMP_FIELD = "timestamp";
+       46      private static final ThreadLocal<StringSink> tempSink = new ThreadLocal<>(StringSink::new);
+       47      private final CairoConfiguration cairoConfiguration;
+       48      private final DefaultColumnTypes defaultColumnTypes;
+       49      private final int defaultPartitionBy;
+       50      private final ObjList<LineTcpParser.ProtoEntity> entities = new ObjList<>();
+       51      private final LowerCaseCharSequenceHashSet entityNamesUtf16 = new LowerCaseCharSequenceHashSet();
+       52      private final boolean walEnabledDefault;
+       53      private CharSequence tableName;
+       54      private int timestampIndex = -1;
+       55      private int timestampUnit = -1;
+       56  
+       57      public TableStructureAdapter(
+       58              CairoConfiguration configuration,
+       59              DefaultColumnTypes defaultColumnTypes,
+       60              int defaultPartitionBy,
+       61              boolean walEnabledDefault
+       62      ) {
+       63          this.cairoConfiguration = configuration;
+       64          this.defaultColumnTypes = defaultColumnTypes;
+       65          this.defaultPartitionBy = defaultPartitionBy;
+       66          this.walEnabledDefault = walEnabledDefault;
+       67      }
+       68  
+       69      @Override
+       70      public int getColumnCount() {
+       71          final int size = entities.size();
+       72          return timestampIndex == -1 ? size + 1 : size;
+       73      }
+       74  
+       75      @Override
+       76      public CharSequence getColumnName(int columnIndex) {
+       77          assert columnIndex < getColumnCount();
+       78          if (columnIndex == getTimestampIndex()) {
+       79              return DEFAULT_TIMESTAMP_FIELD;
+       80          }
+       81          CharSequence colName = entities.get(columnIndex).getName().toString();
+       82          if (TableUtils.isValidColumnName(colName, cairoConfiguration.getMaxFileNameLength())) {
+       83              return colName;
+       84          }
+       85          throw CairoException.nonCritical().put("column name contains invalid characters [colName=").put(colName).put(']');
+       86      }
+       87  
+       88      public CharSequence getColumnNameNoValidation(int columnIndex) {
+       89          assert columnIndex < getColumnCount();
+       90          if (columnIndex == getTimestampIndex()) {
+       91              return DEFAULT_TIMESTAMP_FIELD;
+       92          }
+       93          return entities.get(columnIndex).getName().toString();
+       94      }
+       95  
+       96      @Override
+       97      public int getColumnType(int columnIndex) {
+       98          if (columnIndex == getTimestampIndex()) {
+       99              int columnType = defaultColumnTypes.defaultColumnTypes[LineTcpParser.ENTITY_TYPE_TIMESTAMP];
+      100              if (columnType == TIMESTAMP && timestampUnit == TIMESTAMP_UNIT_NANOS) {
+      101                  columnType = TIMESTAMP_NANO;
+      102              }
+      103              return columnType;
+      104          }
+      105  
+      106          LineTcpParser.ProtoEntity entity = entities.get(columnIndex);
+      107          int columnType = defaultColumnTypes.defaultColumnTypes[entity.getType()];
+      108          if (columnType == ARRAY) {
+      109              columnType = entity.getArray().getType();
+      110          }
+      111          if (columnType == TIMESTAMP && entity.getUnit() == TIMESTAMP_UNIT_NANOS) {
+      112              columnType = TIMESTAMP_NANO;
+      113          }
+      114          return columnType;
+      115      }
+      116  
+      117      @Override
+      118      public int getIndexBlockCapacity(int columnIndex) {
+      119          return 0;
+      120      }
+      121  
+      122      @Override
+      123      public int getMaxUncommittedRows() {
+      124          return cairoConfiguration.getMaxUncommittedRows();
+      125      }
+      126  
+      127      @Override
+      128      public long getO3MaxLag() {
+      129          return cairoConfiguration.getO3MaxLag();
+      130      }
+      131  
+      132      @Override
+      133      public int getPartitionBy() {
+      134          return defaultPartitionBy;
+      135      }
+      136  
+      137      @Override
+      138      public boolean getSymbolCacheFlag(int columnIndex) {
+      139          return cairoConfiguration.getDefaultSymbolCacheFlag();
+      140      }
+      141  
+      142      @Override
+      143      public int getSymbolCapacity(int columnIndex) {
+      144          return cairoConfiguration.getDefaultSymbolCapacity();
+      145      }
+      146  
+      147      @Override
+      148      public CharSequence getTableName() {
+      149          return tableName;
+      150      }
+      151  
+      152      @Override
+      153      public int getTimestampIndex() {
+      154          return timestampIndex == -1 ? entities.size() : timestampIndex;
+      155      }
+      156  
+      157      @Override
+      158      public boolean isDedupKey(int columnIndex) {
+      159          return false;
+      160      }
+      161  
+      162      @Override
+      163      public boolean isIndexed(int columnIndex) {
+      164          return false;
+      165      }
+      166  
+      167      @Override
+      168      public boolean isWalEnabled() {
+      169          return walEnabledDefault && PartitionBy.isPartitioned(getPartitionBy());
+      170      }
+      171  
+      172      public TableStructureAdapter of(CharSequence tableName, LineTcpParser parser) {
+      173          this.tableName = tableName;
+      174          entityNamesUtf16.clear();
+      175          entities.clear();
+      176          timestampIndex = -1;
+      177          timestampUnit = parser.hasTimestamp() ? parser.getTimestampUnit() : (
+      178                  defaultColumnTypes.defaultTimestampColumnType == TIMESTAMP_NANO ? TIMESTAMP_UNIT_NANOS : TIMESTAMP_UNIT_MICROS
+      179          );
+      180          for (int i = 0; i < parser.getEntityCount(); i++) {
+      181              final LineTcpParser.ProtoEntity entity = parser.getEntity(i);
+      182              final DirectUtf8Sequence colNameUtf8 = entity.getName();
+      183              final CharSequence colNameUtf16 = Utf8s.directUtf8ToUtf16(colNameUtf8, tempSink.get());
+      184              int index = entityNamesUtf16.keyIndex(colNameUtf16);
+      185              if (index > -1) {
+      186                  entityNamesUtf16.addAt(index, colNameUtf16.toString());
+      187                  if (Chars.equals(colNameUtf16, DEFAULT_TIMESTAMP_FIELD)) {
+      188                      timestampIndex = entities.size();
+      189                  }
+      190                  entities.add(entity);
+      191              }
+      192          }
+      193          return this;
+      194      }
+      195  }
+
+---------- IMPLEMENTER io.questdb.cutlass.line.udp.LineUdpParserImpl.TableStructureAdapter  stubs=0/14 ----------
+      554      private class TableStructureAdapter implements TableStructure {
+      555          private CharSequenceCache cache;
+      556          private int columnCount;
+      557          private int timestampIndex;
+      558  
+      559          @Override
+      560          public int getColumnCount() {
+      561              return columnCount;
+      562          }
+      563  
+      564          @Override
+      565          public CharSequence getColumnName(int columnIndex) {
+      566              if (columnIndex == getTimestampIndex()) {
+      567                  return "timestamp";
+      568              }
+      569              CharSequence colName = cache.get(columnNameType.getQuick(columnIndex * 2));
+      570              if (TableUtils.isValidColumnName(colName, configuration.getMaxFileNameLength())) {
+      571                  return colName;
+      572              }
+      573              throw CairoException.nonCritical().put("column name contains invalid characters [colName=").put(colName).put(']');
+      574          }
+      575  
+      576          @Override
+      577          public int getColumnType(int columnIndex) {
+      578              if (columnIndex == getTimestampIndex()) {
+      579                  return ColumnType.TIMESTAMP_MICRO;
+      580              }
+      581              return (int) columnNameType.getQuick(columnIndex * 2 + 1);
+      582          }
+      583  
+      584          @Override
+      585          public int getIndexBlockCapacity(int columnIndex) {
+      586              return 0;
+      587          }
+      588  
+      589          @Override
+      590          public int getMaxUncommittedRows() {
+      591              return configuration.getMaxUncommittedRows();
+      592          }
+      593  
+      594          @Override
+      595          public long getO3MaxLag() {
+      596              return configuration.getO3MaxLag();
+      597          }
+      598  
+      599          @Override
+      600          public int getPartitionBy() {
+      601              return udpConfiguration.getDefaultPartitionBy();
+      602          }
+      603  
+      604          @Override
+      605          public boolean getSymbolCacheFlag(int columnIndex) {
+      606              return configuration.getDefaultSymbolCacheFlag();
+      607          }
+      608  
+      609          @Override
+      610          public int getSymbolCapacity(int columnIndex) {
+      611              return configuration.getDefaultSymbolCapacity();
+      612          }
+      613  
+      614          @Override
+      615          public CharSequence getTableName() {
+      616              return cache.get(tableName);
+      617          }
+      618  
+      619          @Override
+      620          public int getTimestampIndex() {
+      621              return timestampIndex;
+      622          }
+      623  
+      624          @Override
+      625          public boolean isDedupKey(int columnIndex) {
+      626              return false;
+      627          }
+      628  
+      629          @Override
+      630          public boolean isIndexed(int columnIndex) {
+      631              return false;
+      632          }
+      633  
+      634          @Override
+      635          public boolean isWalEnabled() {
+      636              return configuration.getWalEnabledDefault() && PartitionBy.isPartitioned(getPartitionBy());
+      637          }
+      638  
+      639          TableStructureAdapter of(CharSequenceCache cache) {
+      640              this.cache = cache;
+      641              this.timestampIndex = columnNameType.size() / 2;
+      642              this.columnCount = timestampIndex + 1;
+      643              return this;
+      644          }
+      645      }
+
+---------- IMPLEMENTER io.questdb.cutlass.text.CairoTextWriter.TableStructureAdapter  stubs=0/14 ----------
+      464      private class TableStructureAdapter implements TableStructure {
+      465          private ObjList<CharSequence> names;
+      466          private ObjList<TypeAdapter> types;
+      467  
+      468          @Override
+      469          public int getColumnCount() {
+      470              return types.size();
+      471          }
+      472  
+      473          @Override
+      474          public CharSequence getColumnName(int columnIndex) {
+      475              return names.getQuick(columnIndex);
+      476          }
+      477  
+      478          @Override
+      479          public int getColumnType(int columnIndex) {
+      480              return types.getQuick(columnIndex).getType();
+      481          }
+      482  
+      483          @Override
+      484          public int getIndexBlockCapacity(int columnIndex) {
+      485              return configuration.getIndexValueBlockSize();
+      486          }
+      487  
+      488          @Override
+      489          public int getMaxUncommittedRows() {
+      490              return maxUncommittedRows > -1 && PartitionBy.isPartitioned(partitionBy) ? maxUncommittedRows : configuration.getMaxUncommittedRows();
+      491          }
+      492  
+      493          @Override
+      494          public long getO3MaxLag() {
+      495              return o3MaxLag > -1 && PartitionBy.isPartitioned(partitionBy) ? o3MaxLag : configuration.getO3MaxLag();
+      496          }
+      497  
+      498          @Override
+      499          public int getPartitionBy() {
+      500              return partitionBy;
+      501          }
+      502  
+      503          @Override
+      504          public boolean getSymbolCacheFlag(int columnIndex) {
+      505              return configuration.getDefaultSymbolCacheFlag();
+      506          }
+      507  
+      508          @Override
+      509          public int getSymbolCapacity(int columnIndex) {
+      510              return configuration.getDefaultSymbolCapacity();
+      511          }
+      512  
+      513          @Override
+      514          public CharSequence getTableName() {
+      515              return tableName;
+      516          }
+      517  
+      518          @Override
+      519          public int getTimestampIndex() {
+      520              return timestampIndex;
+      521          }
+      522  
+      523          @Override
+      524          public boolean isDedupKey(int columnIndex) {
+      525              return false;
+      526          }
+      527  
+      528          @Override
+      529          public boolean isIndexed(int columnIndex) {
+      530              return types.getQuick(columnIndex).isIndexed();
+      531          }
+      532  
+      533          @Override
+      534          public boolean isWalEnabled() {
+      535              return configuration.getWalEnabledDefault() && PartitionBy.isPartitioned(partitionBy);
+      536          }
+      537  
+      538          TableStructureAdapter of(ObjList<CharSequence> names, ObjList<TypeAdapter> types) throws TextException {
+      539              this.names = names;
+      540              this.types = types;
+      541  
+      542              if (importedTimestampColumnName == null && designatedTimestampColumnName == null) {
+      543                  timestampIndex = NO_INDEX;
+      544              } else if (importedTimestampColumnName != null) {
+      545                  timestampIndex = names.indexOf(importedTimestampColumnName);
+      546                  if (timestampIndex == NO_INDEX) {
+      547                      throw TextException.$("invalid timestamp column '").put(importedTimestampColumnName).put('\'');
+      548                  }
+      549              } else {
+      550                  timestampIndex = names.indexOf(designatedTimestampColumnName);
+      551                  if (timestampIndex == NO_INDEX) {
+      552                      // columns in the imported file may not have headers, then use writer timestamp index
+      553                      timestampIndex = designatedTimestampIndex;
+      554                  }
+      555              }
+      556  
+      557              if (timestampIndex != NO_INDEX) {
+      558                  final TypeAdapter timestampAdapter = types.getQuick(timestampIndex);
+      559                  final int typeTag = ColumnType.tagOf(timestampAdapter.getType());
+      560                  if ((typeTag != ColumnType.LONG && typeTag != ColumnType.TIMESTAMP) || timestampAdapter == BadTimestampAdapter.INSTANCE) {
+      561                      throw TextException.$("not a timestamp '").put(importedTimestampColumnName).put('\'');
+      562                  }
+      563              }
+      564              return this;
+      565          }
+      566      }
+
+---------- IMPLEMENTER io.questdb.cutlass.text.ParallelCsvFileImporter.TableStructureAdapter  stubs=0/14 ----------
+     1589      public static class TableStructureAdapter implements TableStructure {
+     1590          private final LongList columnBits = new LongList();
+     1591          private final CairoConfiguration configuration;
+     1592          private ObjList<CharSequence> columnNames;
+     1593          private boolean ignoreColumnIndexedFlag;
+     1594          private int partitionBy;
+     1595          private IntList symbolCapacities;
+     1596          private CharSequence tableName;
+     1597          private int timestampColumnIndex;
+     1598  
+     1599          public TableStructureAdapter(CairoConfiguration configuration) {
+     1600              this.configuration = configuration;
+     1601          }
+     1602  
+     1603          @Override
+     1604          public int getColumnCount() {
+     1605              return columnNames.size();
+     1606          }
+     1607  
+     1608          public int getColumnIndex(CharSequence symbolColumnName) {
+     1609              int index = -1;
+     1610              for (int i = 0, n = columnNames.size(); i < n; i++) {
+     1611                  index++;
+     1612                  if (Chars.equalsIgnoreCase(symbolColumnName, columnNames.get(i))) {
+     1613                      return index;
+     1614                  }
+     1615              }
+     1616              return -1;
+     1617          }
+     1618  
+     1619          @Override
+     1620          public CharSequence getColumnName(int columnIndex) {
+     1621              return columnNames.getQuick(columnIndex);
+     1622          }
+     1623  
+     1624          @Override
+     1625          public int getColumnType(int columnIndex) {
+     1626              return Numbers.decodeLowInt(columnBits.getQuick(columnIndex));
+     1627          }
+     1628  
+     1629          public int getDenseSymbolIndex(CharSequence symbolColumnName) {
+     1630              int index = -1;
+     1631              for (int i = 0, n = columnNames.size(); i < n; i++) {
+     1632                  if (getColumnType(i) == ColumnType.SYMBOL) {
+     1633                      index++;
+     1634                      if (Chars.equalsIgnoreCase(symbolColumnName, columnNames.get(i))) {
+     1635                          return index;
+     1636                      }
+     1637                  }
+     1638              }
+     1639              return -1;
+     1640          }
+     1641  
+     1642          @Override
+     1643          public int getIndexBlockCapacity(int columnIndex) {
+     1644              return configuration.getIndexValueBlockSize();
+     1645          }
+     1646  
+     1647          @Override
+     1648          public int getMaxUncommittedRows() {
+     1649              return configuration.getMaxUncommittedRows();
+     1650          }
+     1651  
+     1652          @Override
+     1653          public long getO3MaxLag() {
+     1654              return configuration.getO3MaxLag();
+     1655          }
+     1656  
+     1657          @Override
+     1658          public int getPartitionBy() {
+     1659              return partitionBy;
+     1660          }
+     1661  
+     1662          @Override
+     1663          public boolean getSymbolCacheFlag(int columnIndex) {
+     1664              return false;
+     1665          }
+     1666  
+     1667          @Override
+     1668          public int getSymbolCapacity(int columnIndex) {
+     1669              final int capacity = symbolCapacities.getQuick(columnIndex);
+     1670              return capacity != -1 ? capacity : configuration.getDefaultSymbolCapacity();
+     1671          }
+     1672  
+     1673          @Override
+     1674          public CharSequence getTableName() {
+     1675              return tableName;
+     1676          }
+     1677  
+     1678          @Override
+     1679          public int getTimestampIndex() {
+     1680              return timestampColumnIndex;
+     1681          }
+     1682  
+     1683          @Override
+     1684          public boolean isDedupKey(int columnIndex) {
+     1685              return false;
+     1686          }
+     1687  
+     1688          @Override
+     1689          public boolean isIndexed(int columnIndex) {
+     1690              return !ignoreColumnIndexedFlag && Numbers.decodeHighInt(columnBits.getQuick(columnIndex)) != 0;
+     1691          }
+     1692  
+     1693          @Override
+     1694          public boolean isWalEnabled() {
+     1695              return configuration.getWalEnabledDefault() && PartitionBy.isPartitioned(partitionBy);
+     1696          }
+     1697  
+     1698          public void of(
+     1699                  final CharSequence tableName,
+     1700                  final ObjList<CharSequence> names,
+     1701                  final ObjList<TypeAdapter> types,
+     1702                  final IntList symbolCapacities,
+     1703                  final int timestampColumnIndex,
+     1704                  final int partitionBy
+     1705          ) {
+     1706              this.tableName = tableName;
+     1707              this.columnNames = names;
+     1708              this.symbolCapacities = symbolCapacities;
+     1709              this.ignoreColumnIndexedFlag = false;
+     1710  
+     1711              this.columnBits.clear();
+     1712              for (int i = 0, size = types.size(); i < size; i++) {
+     1713                  final TypeAdapter adapter = types.getQuick(i);
+     1714                  this.columnBits.add(Numbers.encodeLowHighInts(adapter.getType(), adapter.isIndexed() ? 1 : 0));
+     1715              }
+     1716  
+     1717              this.timestampColumnIndex = timestampColumnIndex;
+     1718              this.partitionBy = partitionBy;
+     1719          }
+     1720  
+     1721          public void setIgnoreColumnIndexedFlag(boolean flag) {
+     1722              this.ignoreColumnIndexedFlag = flag;
+     1723          }
+     1724      }

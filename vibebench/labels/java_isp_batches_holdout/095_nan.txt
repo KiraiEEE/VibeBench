@@ -1,0 +1,1003 @@
+row 95   apache/flink-cdc#4195
+============================================================================
+CONTRACT org.apache.flink.cdc.connectors.base.source.reader.external.FetchTask.Context   members=12.0 implementers=7.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       55      interface Context {
+       56  
+       57          void configure(SourceSplitBase sourceSplitBase);
+       58  
+       59          ChangeEventQueue<DataChangeEvent> getQueue();
+       60  
+       61          TableId getTableId(SourceRecord record);
+       62  
+       63          Tables.TableFilter getTableFilter();
+       64  
+       65          Offset getStreamOffset(SourceRecord record);
+       66  
+       67          boolean isDataChangeRecord(SourceRecord record);
+       68  
+       69          boolean isRecordBetween(SourceRecord record, Object[] splitStart, Object[] splitEnd);
+       70  
+       71          /**
+       72           * Returns true if the implementation can provide a split key that is comparable with {@link
+       73           * FinishedSnapshotSplitInfo} boundaries, enabling binary search optimizations.
+       74           */
+       75          default boolean supportsSplitKeyOptimization() {
+       76              return false;
+       77          }
+       78  
+       79          /**
+       80           * Returns the chunk key extracted from the given {@link SourceRecord}. Only invoked when
+       81           * {@link #supportsSplitKeyOptimization()} returns true.
+       82           */
+       83          default Object[] getSplitKey(SourceRecord record) {
+       84              throw new UnsupportedOperationException(
+       85                      "Split key extraction is not supported by this fetch task context.");
+       86          }
+       87  
+       88          void rewriteOutputBuffer(Map<Struct, SourceRecord> outputBuffer, SourceRecord changeRecord);
+       89  
+       90          List<SourceRecord> formatMessageTimestamp(Collection<SourceRecord> snapshotRecords);
+       91  
+       92          void close() throws Exception;
+       93  
+       94          DataSourceDialect getDataSourceDialect();
+       95  
+       96          SourceConfig getSourceConfig();
+       97      }
+
+---------- IMPLEMENTER org.apache.flink.cdc.connectors.base.source.reader.external.JdbcSourceFetchTaskContext  stubs=0/7 ----------
+       49  @Internal
+       50  public abstract class JdbcSourceFetchTaskContext implements FetchTask.Context {
+       51  
+       52      protected final JdbcSourceConfig sourceConfig;
+       53      protected final JdbcDataSourceDialect dataSourceDialect;
+       54      protected CommonConnectorConfig dbzConnectorConfig;
+       55      protected final SchemaNameAdjuster schemaNameAdjuster;
+       56  
+       57      public JdbcSourceFetchTaskContext(
+       58              JdbcSourceConfig sourceConfig, JdbcDataSourceDialect dataSourceDialect) {
+       59          this.sourceConfig = sourceConfig;
+       60          this.dataSourceDialect = dataSourceDialect;
+       61          this.dbzConnectorConfig = sourceConfig.getDbzConnectorConfig();
+       62          this.schemaNameAdjuster = SchemaNameAdjuster.create();
+       63      }
+       64  
+       65      @Override
+       66      public TableId getTableId(SourceRecord record) {
+       67          return SourceRecordUtils.getTableId(record);
+       68      }
+       69  
+       70      @Override
+       71      public boolean isDataChangeRecord(SourceRecord record) {
+       72          return SourceRecordUtils.isDataChangeRecord(record);
+       73      }
+       74  
+       75      @Override
+       76      public boolean isRecordBetween(SourceRecord record, Object[] splitStart, Object[] splitEnd) {
+       77          Object[] key = getSplitKey(record);
+       78          return SplitKeyUtils.splitKeyRangeContains(key, splitStart, splitEnd);
+       79      }
+       80  
+       81      @Override
+       82      public boolean supportsSplitKeyOptimization() {
+       83          return true;
+       84      }
+       85  
+       86      @Override
+       87      public Object[] getSplitKey(SourceRecord record) {
+       88          RowType splitKeyType = getSplitType(getDatabaseSchema().tableFor(this.getTableId(record)));
+       89          return SplitKeyUtils.getSplitKey(splitKeyType, record, getSchemaNameAdjuster());
+       90      }
+       91  
+       92      @Override
+       93      public void rewriteOutputBuffer(
+       94              Map<Struct, SourceRecord> outputBuffer, SourceRecord changeRecord) {
+       95          Struct key = (Struct) changeRecord.key();
+       96          Struct value = (Struct) changeRecord.value();
+       97          if (value != null) {
+       98              Envelope.Operation operation =
+       99                      Envelope.Operation.forCode(value.getString(Envelope.FieldName.OPERATION));
+      100              switch (operation) {
+      101                  case CREATE:
+      102                  case UPDATE:
+      103                      Envelope envelope = Envelope.fromSchema(changeRecord.valueSchema());
+      104                      Struct source = value.getStruct(Envelope.FieldName.SOURCE);
+      105                      Struct after = value.getStruct(Envelope.FieldName.AFTER);
+      106                      Instant fetchTs =
+      107                              Instant.ofEpochMilli((Long) source.get(Envelope.FieldName.TIMESTAMP));
+      108                      SourceRecord record =
+      109                              new SourceRecord(
+      110                                      changeRecord.sourcePartition(),
+      111                                      changeRecord.sourceOffset(),
+      112                                      changeRecord.topic(),
+      113                                      changeRecord.kafkaPartition(),
+      114                                      changeRecord.keySchema(),
+      115                                      changeRecord.key(),
+      116                                      changeRecord.valueSchema(),
+      117                                      envelope.read(after, source, fetchTs));
+      118                      outputBuffer.put(key, record);
+      119                      break;
+      120                  case DELETE:
+      121                      outputBuffer.remove(key);
+      122                      break;
+      123                  case READ:
+      124                      throw new IllegalStateException(
+      125                              String.format(
+      126                                      "Data change record shouldn't use READ operation, the the record is %s.",
+      127                                      changeRecord));
+      128              }
+      129          }
+      130      }
+      131  
+      132      @Override
+      133      public List<SourceRecord> formatMessageTimestamp(Collection<SourceRecord> snapshotRecords) {
+      134          return snapshotRecords.stream()
+      135                  .map(
+      136                          record -> {
+      137                              Envelope envelope = Envelope.fromSchema(record.valueSchema());
+      138                              Struct value = (Struct) record.value();
+      139                              Struct updateAfter = value.getStruct(Envelope.FieldName.AFTER);
+      140                              // set message timestamp (source.ts_ms) to 0L
+      141                              Struct source = value.getStruct(Envelope.FieldName.SOURCE);
+      142                              source.put(Envelope.FieldName.TIMESTAMP, 0L);
+      143                              // extend the fetch timestamp(ts_ms)
+      144                              Instant fetchTs =
+      145                                      Instant.ofEpochMilli(
+      146                                              value.getInt64(Envelope.FieldName.TIMESTAMP));
+      147                              SourceRecord sourceRecord =
+      148                                      new SourceRecord(
+      149                                              record.sourcePartition(),
+      150                                              record.sourceOffset(),
+      151                                              record.topic(),
+      152                                              record.kafkaPartition(),
+      153                                              record.keySchema(),
+      154                                              record.key(),
+      155                                              record.valueSchema(),
+      156                                              envelope.read(updateAfter, source, fetchTs));
+      157                              return sourceRecord;
+      158                          })
+      159                  .collect(Collectors.toList());
+      160      }
+      161  
+      162      public SourceConfig getSourceConfig() {
+      163          return sourceConfig;
+      164      }
+      165  
+      166      public JdbcDataSourceDialect getDataSourceDialect() {
+      167          return dataSourceDialect;
+      168      }
+      169  
+      170      public CommonConnectorConfig getDbzConnectorConfig() {
+      171          return dbzConnectorConfig;
+      172      }
+      173  
+      174      public void setDbzConnectorConfig(CommonConnectorConfig dbzConnectorConfig) {
+      175          this.dbzConnectorConfig = dbzConnectorConfig;
+      176      }
+      177  
+      178      public SchemaNameAdjuster getSchemaNameAdjuster() {
+      179          return SchemaNameAdjuster.create();
+      180      }
+      181  
+      182      public abstract RelationalDatabaseSchema getDatabaseSchema();
+      183  
+      184      public abstract RowType getSplitType(Table table);
+      185  
+      186      public abstract ErrorHandler getErrorHandler();
+      187  
+      188      public abstract EventDispatcher getEventDispatcher();
+      189  
+      190      public abstract WatermarkDispatcher getWaterMarkDispatcher();
+      191  
+      192      public abstract OffsetContext getOffsetContext();
+      193  
+      194      public abstract Partition getPartition();
+      195  }
+
+---------- IMPLEMENTER org.apache.flink.cdc.connectors.db2.source.fetch.Db2SourceFetchTaskContext  stubs=0/6 ----------
+       70  public class Db2SourceFetchTaskContext extends JdbcSourceFetchTaskContext {
+       71  
+       72      /** Connection used for reading CDC tables. */
+       73      private final Db2Connection connection;
+       74  
+       75      private final Db2Connection metaDataConnection;
+       76  
+       77      private final Db2EventMetadataProvider metadataProvider;
+       78      private Db2OffsetContext offsetContext;
+       79      private Db2Partition partition;
+       80      private Db2DatabaseSchema databaseSchema;
+       81      private JdbcSourceEventDispatcher<Db2Partition> dispatcher;
+       82      private ErrorHandler errorHandler;
+       83      private ChangeEventQueue<DataChangeEvent> queue;
+       84      private Db2TaskContext taskContext;
+       85      private TopicSelector<TableId> topicSelector;
+       86      private EventDispatcher.SnapshotReceiver<Db2Partition> snapshotReceiver;
+       87      private SnapshotChangeEventSourceMetrics<Db2Partition> snapshotChangeEventSourceMetrics;
+       88      private StreamingChangeEventSourceMetrics<Db2Partition> streamingChangeEventSourceMetrics;
+       89  
+       90      public Db2SourceFetchTaskContext(
+       91              JdbcSourceConfig sourceConfig,
+       92              Db2Dialect dataSourceDialect,
+       93              Db2Connection connection,
+       94              Db2Connection metaDataConnection) {
+       95          super(sourceConfig, dataSourceDialect);
+       96          this.connection = connection;
+       97          this.metadataProvider = new Db2EventMetadataProvider();
+       98          this.metaDataConnection = metaDataConnection;
+       99      }
+      100  
+      101      @Override
+      102      public void configure(SourceSplitBase sourceSplitBase) {
+      103          // initial stateful objects
+      104          final Db2ConnectorConfig connectorConfig = getDbzConnectorConfig();
+      105          this.topicSelector = Db2TopicSelector.defaultSelector(connectorConfig);
+      106          EmbeddedFlinkDatabaseHistory.registerHistory(
+      107                  sourceConfig
+      108                          .getDbzConfiguration()
+      109                          .getString(EmbeddedFlinkDatabaseHistory.DATABASE_HISTORY_INSTANCE_NAME),
+      110                  sourceSplitBase.getTableSchemas().values());
+      111  
+      112          this.databaseSchema = Db2Utils.createDb2DatabaseSchema(connectorConfig, connection);
+      113          this.offsetContext = loadStartingOffsetState(new Loader(connectorConfig), sourceSplitBase);
+      114  
+      115          String serverName = connectorConfig.getLogicalName();
+      116          this.partition = new Db2Partition(serverName);
+      117  
+      118          validateAndLoadDatabaseHistory(offsetContext, databaseSchema);
+      119  
+      120          this.taskContext = new Db2TaskContext(connectorConfig, databaseSchema);
+      121  
+      122          final int queueSize =
+      123                  sourceSplitBase.isSnapshotSplit()
+      124                          ? getSourceConfig().getSplitSize()
+      125                          : getSourceConfig().getDbzConnectorConfig().getMaxQueueSize();
+      126          this.queue =
+      127                  new Builder<DataChangeEvent>()
+      128                          .pollInterval(connectorConfig.getPollInterval())
+      129                          .maxBatchSize(connectorConfig.getMaxBatchSize())
+      130                          .maxQueueSize(queueSize)
+      131                          .maxQueueSizeInBytes(connectorConfig.getMaxQueueSizeInBytes())
+      132                          .loggingContextSupplier(
+      133                                  () -> taskContext.configureLoggingContext("Db2-cdc-connector-task"))
+      134                          // do not buffer any element, we use signal event
+      135                          //                         .buffering()
+      136                          .build();
+      137          this.dispatcher =
+      138                  new JdbcSourceEventDispatcher<>(
+      139                          connectorConfig,
+      140                          topicSelector,
+      141                          databaseSchema,
+      142                          queue,
+      143                          connectorConfig.getTableFilters().dataCollectionFilter(),
+      144                          DataChangeEvent::new,
+      145                          metadataProvider,
+      146                          schemaNameAdjuster,
+      147                          new Db2SchemaChangeEventHandler());
+      148  
+      149          this.snapshotReceiver = dispatcher.getSnapshotChangeEventReceiver();
+      150  
+      151          final DefaultChangeEventSourceMetricsFactory<Db2Partition> changeEventSourceMetricsFactory =
+      152                  new DefaultChangeEventSourceMetricsFactory<>();
+      153          this.snapshotChangeEventSourceMetrics =
+      154                  changeEventSourceMetricsFactory.getSnapshotMetrics(
+      155                          taskContext, queue, metadataProvider);
+      156          this.streamingChangeEventSourceMetrics =
+      157                  changeEventSourceMetricsFactory.getStreamingMetrics(
+      158                          taskContext, queue, metadataProvider);
+      159          this.errorHandler = new ErrorHandler(Db2Connector.class, connectorConfig, queue);
+      160      }
+      161  
+      162      /** Loads the connector's persistent offset (if present) via the given loader. */
+      163      private Db2OffsetContext loadStartingOffsetState(
+      164              Db2OffsetContext.Loader loader, SourceSplitBase sourceSplitBase) {
+      165          Offset offset =
+      166                  sourceSplitBase.isSnapshotSplit()
+      167                          ? LsnOffset.INITIAL_OFFSET
+      168                          : sourceSplitBase.asStreamSplit().getStartingOffset();
+      169  
+      170          return loader.load(offset.getOffset());
+      171      }
+      172  
+      173      private void validateAndLoadDatabaseHistory(Db2OffsetContext offset, Db2DatabaseSchema schema) {
+      174          schema.initializeStorage();
+      175          schema.recover(partition, offset);
+      176      }
+      177  
+      178      @Override
+      179      public ChangeEventQueue<DataChangeEvent> getQueue() {
+      180          return queue;
+      181      }
+      182  
+      183      @Override
+      184      public TableFilter getTableFilter() {
+      185          return getDbzConnectorConfig().getTableFilters().dataCollectionFilter();
+      186      }
+      187  
+      188      @Override
+      189      public Offset getStreamOffset(SourceRecord record) {
+      190          return Db2Utils.getLsn(record);
+      191      }
+      192  
+      193      @Override
+      194      public Db2DatabaseSchema getDatabaseSchema() {
+      195          return databaseSchema;
+      196      }
+      197  
+      198      @Override
+      199      public RowType getSplitType(Table table) {
+      200          Column splitColumn = Db2Utils.getSplitColumn(table, sourceConfig.getChunkKeyColumn());
+      201          return Db2Utils.getSplitType(splitColumn);
+      202      }
+      203  
+      204      @Override
+      205      public ErrorHandler getErrorHandler() {
+      206          return errorHandler;
+      207      }
+      208  
+      209      @Override
+      210      public Db2ConnectorConfig getDbzConnectorConfig() {
+      211          return (Db2ConnectorConfig) super.getDbzConnectorConfig();
+      212      }
+      213  
+      214      @Override
+      215      public Db2SourceConfig getSourceConfig() {
+      216          return (Db2SourceConfig) sourceConfig;
+      217      }
+      218  
+      219      @Override
+      220      public JdbcSourceEventDispatcher getEventDispatcher() {
+      221          return dispatcher;
+      222      }
+      223  
+      224      @Override
+      225      public WatermarkDispatcher getWaterMarkDispatcher() {
+      226          return dispatcher;
+      227      }
+      228  
+      229      public EventDispatcher.SnapshotReceiver<Db2Partition> getSnapshotReceiver() {
+
+---------- IMPLEMENTER org.apache.flink.cdc.connectors.gaussdb.source.fetch.GaussDBSourceFetchTaskContext  stubs=0/6 ----------
+       63  public class GaussDBSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
+       64  
+       65      private static final Logger LOG = LoggerFactory.getLogger(GaussDBSourceFetchTaskContext.class);
+       66  
+       67      private GaussDBConnection jdbcConnection;
+       68      private CustomGaussDBSchema schema;
+       69      private io.debezium.connector.gaussdb.GaussDBSchema relationalSchema;
+       70      private AbstractMessageDecoder messageDecoder;
+       71      private Partition partition;
+       72      private ChangeEventQueue<DataChangeEvent> queue;
+       73      private io.debezium.connector.gaussdb.connection.GaussDBReplicationConnection replicationConnection;
+       74      // Separate replication connection for backfill tasks to avoid slot contention
+       75      private io.debezium.connector.gaussdb.connection.GaussDBReplicationConnection backfillReplicationConnection;
+       76      // Current split ID for generating unique backfill slot names
+       77      private String currentSplitId;
+       78      // Watermark dispatcher for dispatching watermark events during
+       79      // snapshot/backfill
+       80      private CDCGaussDBDispatcher watermarkDispatcher;
+       81  
+       82      public GaussDBSourceFetchTaskContext(
+       83              JdbcSourceConfig sourceConfig, GaussDBDialect dataSourceDialect) {
+       84          super(sourceConfig, dataSourceDialect);
+       85      }
+       86  
+       87      @Override
+       88      public GaussDBConnectorConfig getDbzConnectorConfig() {
+       89          return (GaussDBConnectorConfig) super.getDbzConnectorConfig();
+       90      }
+       91  
+       92      @Override
+       93      public void configure(SourceSplitBase sourceSplitBase) {
+       94  
+       95          GaussDBConnectorConfig dbzConfig = getDbzConnectorConfig();
+       96  
+       97          setDbzConnectorConfig(dbzConfig);
+       98  
+       99          // Initialize ChangeEventQueue for passing events between fetcher and source
+      100          // reader
+      101          if (queue == null) {
+      102              final int queueSize = sourceSplitBase instanceof SnapshotSplit
+      103                      ? sourceConfig.getSplitSize()
+      104                      : dbzConfig.getMaxQueueSize();
+      105              queue = new ChangeEventQueue.Builder<DataChangeEvent>()
+      106                      .pollInterval(dbzConfig.getPollInterval())
+      107                      .maxBatchSize(dbzConfig.getMaxBatchSize())
+      108                      .maxQueueSize(queueSize)
+      109                      .maxQueueSizeInBytes(dbzConfig.getMaxQueueSizeInBytes())
+      110                      .loggingContextSupplier(
+      111                              () -> LoggingContext.forConnector(
+      112                                      "gaussdb-cdc",
+      113                                      dbzConfig.getLogicalName(),
+      114                                      "gaussdb-cdc-connector-task"))
+      115                      // do not buffer any element, we use signal event
+      116                      // .buffering()
+      117                      .build();
+      118          }
+      119  
+      120          // Initialize partition
+      121          if (partition == null) {
+      122              partition = new GaussDBPartition(dbzConfig.getLogicalName());
+      123          }
+      124  
+      125          // Initialize watermark dispatcher for snapshot/backfill watermark events
+      126          if (watermarkDispatcher == null) {
+      127              String topic = dbzConfig.getLogicalName();
+      128              watermarkDispatcher = new CDCGaussDBDispatcher(topic, queue);
+      129          }
+      130  
+      131          // Initialize JDBC connection
+      132          try {
+      133              if (jdbcConnection == null) {
+      134                  jdbcConnection = new GaussDBConnection(
+      135                          dbzConfig.getJdbcConfig(), "gaussdb-fetch-task-connection");
+      136                  jdbcConnection.connect();
+      137              }
+      138          } catch (SQLException e) {
+      139              throw new RuntimeException("Failed to create GaussDB JDBC connection", e);
+      140          }
+      141  
+      142          // Initialize schema cache
+      143          if (schema == null) {
+      144              schema = new CustomGaussDBSchema(jdbcConnection);
+      145          }
+      146  
+      147          // Initialize relational schema for getDatabaseSchema()
+      148          if (relationalSchema == null) {
+      149              relationalSchema = new io.debezium.connector.gaussdb.GaussDBSchema(dbzConfig, jdbcConnection);
+      150          }
+      151  
+      152          // Register table schemas for this split
+      153          if (sourceSplitBase.getTableSchemas() != null) {
+      154              sourceSplitBase
+      155                      .getTableSchemas()
+      156                      .values()
+      157                      .forEach(tableChange -> schema.applyTableChange(tableChange));
+      158          }
+      159  
+      160          // Initialize message decoder for streaming
+      161          if (messageDecoder == null) {
+      162              messageDecoder = new MppdbDecodingMessageDecoder();
+      163          }
+      164  
+      165          // Initialize replication connection for streaming (unbounded stream splits
+      166          // only)
+      167          // For bounded splits (backfill), use the separate backfill connection
+      168          if (replicationConnection == null && !isBoundedRead(sourceSplitBase)) {
+      169              try {
+      170                  replicationConnection = createReplicationConnection(dbzConfig, false);
+      171              } catch (Exception e) {
+      172                  throw new RuntimeException("Failed to create GaussDB replication connection", e);
+      173              }
+      174          }
+      175  
+      176          // Initialize backfill replication connection for bounded reads
+      177          // This includes: SnapshotSplits and StreamSplits with ending offset (backfill)
+      178          // Uses a separate slot to avoid contention with the main streaming slot
+      179          // Each split gets a unique slot name to avoid conflicts when multiple splits
+      180          // run concurrently
+      181          if (isBoundedRead(sourceSplitBase)) {
+      182              // Store current split ID for unique slot naming
+      183              this.currentSplitId = sourceSplitBase.splitId();
+      184  
+      185              // Close previous backfill connection if exists (from previous split)
+      186              if (backfillReplicationConnection != null) {
+      187                  try {
+      188                      backfillReplicationConnection.close();
+      189                  } catch (Exception e) {
+      190                      LOG.warn("Failed to close previous backfill connection", e);
+      191                  }
+      192                  backfillReplicationConnection = null;
+      193              }
+      194  
+      195              try {
+      196                  LOG.info("Creating backfill replication connection for split: {}", currentSplitId);
+      197                  backfillReplicationConnection = createReplicationConnection(dbzConfig, true);
+      198              } catch (Exception e) {
+      199                  throw new RuntimeException(
+      200                          "Failed to create GaussDB backfill replication connection for split: " + currentSplitId, e);
+      201              }
+      202          }
+      203      }
+      204  
+      205      /**
+      206       * Closes the backfill replication connection and optionally drops the
+      207       * replication slot.
+      208       */
+      209      public void closeBackfillConnection(boolean dropSlot) {
+      210          if (backfillReplicationConnection != null) {
+      211              try {
+      212                  LOG.info("Closing backfill replication connection (dropSlot={})", dropSlot);
+      213                  backfillReplicationConnection.close(dropSlot);
+      214              } catch (Exception e) {
+      215                  LOG.warn("Failed to close backfill connection", e);
+      216              } finally {
+      217                  backfillReplicationConnection = null;
+      218              }
+      219          }
+      220      }
+      221  
+      222      /**
+
+---------- IMPLEMENTER org.apache.flink.cdc.connectors.mongodb.source.reader.fetch.MongoDBFetchTaskContext  stubs=1/12 ----------
+       51  public class MongoDBFetchTaskContext implements FetchTask.Context {
+       52  
+       53      private final MongoDBDialect dialect;
+       54      private final MongoDBSourceConfig sourceConfig;
+       55      private final ChangeStreamDescriptor changeStreamDescriptor;
+       56      private ChangeEventQueue<DataChangeEvent> changeEventQueue;
+       57  
+       58      public MongoDBFetchTaskContext(
+       59              MongoDBDialect dialect,
+       60              MongoDBSourceConfig sourceConfig,
+       61              ChangeStreamDescriptor changeStreamDescriptor) {
+       62          this.dialect = dialect;
+       63          this.sourceConfig = sourceConfig;
+       64          this.changeStreamDescriptor = changeStreamDescriptor;
+       65      }
+       66  
+       67      @Override
+       68      public void configure(SourceSplitBase sourceSplitBase) {
+       69          // we need to use small batch size instead of INT.MAX as earlier because
+       70          // now under the hood of debezium the ArrayDequeue was used as queue implementation
+       71          // TODO: replace getBatchSize with getSnapshotBatchSize
+       72          //  when SNAPSHOT_BATCH_SIZE option will be added
+       73          final int queueSize = sourceConfig.getBatchSize();
+       74  
+       75          this.changeEventQueue =
+       76                  new ChangeEventQueue.Builder<DataChangeEvent>()
+       77                          .pollInterval(Duration.ofMillis(sourceConfig.getPollAwaitTimeMillis()))
+       78                          .maxBatchSize(sourceConfig.getPollMaxBatchSize())
+       79                          .maxQueueSize(queueSize)
+       80                          .loggingContextSupplier(
+       81                                  () ->
+       82                                          LoggingContext.forConnector(
+       83                                                  "mongodb-cdc",
+       84                                                  "mongodb-cdc-connector",
+       85                                                  "mongodb-cdc-connector-task"))
+       86                          // do not buffer any element, we use signal event
+       87                          // .buffering()
+       88                          .build();
+       89      }
+       90  
+       91      @Override
+       92      public MongoDBSourceConfig getSourceConfig() {
+       93          return sourceConfig;
+       94      }
+       95  
+       96      @Override
+       97      public MongoDBDialect getDataSourceDialect() {
+       98          return dialect;
+       99      }
+      100  
+      101      public ChangeStreamDescriptor getChangeStreamDescriptor() {
+      102          return changeStreamDescriptor;
+      103      }
+      104  
+      105      @Override
+      106      public ChangeEventQueue<DataChangeEvent> getQueue() {
+      107          return changeEventQueue;
+      108      }
+      109  
+      110      @Override
+      111      public TableId getTableId(SourceRecord record) {
+      112          return MongoRecordUtils.getTableId(record);
+      113      }
+      114  
+      115      @Override
+      116      public Tables.TableFilter getTableFilter() {
+      117          // We have pushed down the filters to server side.
+      118          return Tables.TableFilter.includeAll();
+      119      }
+      120  
+      121      @Override
+      122      public Offset getStreamOffset(SourceRecord record) {
+      123          return new ChangeStreamOffset(MongoRecordUtils.getResumeToken(record));
+      124      }
+      125  
+      126      @Override
+      127      public boolean isDataChangeRecord(SourceRecord record) {
+      128          return MongoRecordUtils.isDataChangeRecord(record);
+      129      }
+      130  
+      131      @Override
+      132      public boolean isRecordBetween(SourceRecord record, Object[] splitStart, Object[] splitEnd) {
+      133          BsonDocument documentKey = MongoRecordUtils.getDocumentKey(record);
+      134          // In the case of a compound index, we can also agree to only compare the range of the first
+      135          // key.
+      136          BsonDocument splitKeys = (BsonDocument) splitStart[0];
+      137          String firstKey = splitKeys.getFirstKey();
+      138          BsonValue keyValue = documentKey.get(firstKey);
+      139          BsonValue lowerBound = ((BsonDocument) splitStart[1]).get(firstKey);
+      140          BsonValue upperBound = ((BsonDocument) splitEnd[1]).get(firstKey);
+      141  
+      142          // for all range
+      143          if (lowerBound.getBsonType() == BsonType.MIN_KEY
+      144                  && upperBound.getBsonType() == BsonType.MAX_KEY) {
+      145              return true;
+      146          }
+      147  
+      148          // keyValue -> [lower, upper)
+      149          if (compareBsonValue(lowerBound, keyValue) <= 0
+      150                  && compareBsonValue(keyValue, upperBound) < 0) {
+      151              return true;
+      152          }
+      153  
+      154          return false;
+      155      }
+      156  
+      157      @Override
+      158      public void rewriteOutputBuffer(
+      159              Map<Struct, SourceRecord> outputBuffer, SourceRecord changeRecord) {
+      160          Struct key = (Struct) changeRecord.key();
+      161          Struct value = (Struct) changeRecord.value();
+      162          if (value != null) {
+      163              OperationType operation =
+      164                      OperationType.fromString(value.getString(MongoDBEnvelope.OPERATION_TYPE_FIELD));
+      165              switch (operation) {
+      166                  case INSERT:
+      167                  case UPDATE:
+      168                  case REPLACE:
+      169                      value.put(
+      170                              MongoDBEnvelope.OPERATION_TYPE_FIELD, OperationType.INSERT.getValue());
+      171                      outputBuffer.put(key, changeRecord);
+      172                      break;
+      173                  case DELETE:
+      174                      outputBuffer.remove(key);
+      175                      break;
+      176                  default:
+      177                      throw new IllegalStateException(
+      178                              String.format(
+      179                                      "Data change record meet UNKNOWN operation, the the record is %s.",
+      180                                      changeRecord));
+      181              }
+      182          }
+      183      }
+      184  
+      185      @Override
+      186      public List<SourceRecord> formatMessageTimestamp(Collection<SourceRecord> snapshotRecords) {
+      187          return snapshotRecords.stream()
+      188                  .peek(
+      189                          record -> {
+      190                              Struct value = (Struct) record.value();
+      191                              // set message timestamp (source.ts_ms) to 0L
+      192                              Struct source =
+      193                                      new Struct(
+      194                                              value.schema()
+      195                                                      .field(MongoDBEnvelope.SOURCE_FIELD)
+      196                                                      .schema());
+      197                              source.put(MongoDBEnvelope.TIMESTAMP_KEY_FIELD, 0L);
+      198                              source.put(MongoDBEnvelope.SNAPSHOT_KEY_FIELD, "true");
+      199                              value.put(MongoDBEnvelope.SOURCE_FIELD, source);
+      200                          })
+      201                  .collect(Collectors.toList());
+      202      }
+      203  
+      204      @Override
+      205      public void close() throws Exception {}
+      206  }
+
+---------- IMPLEMENTER org.apache.flink.cdc.connectors.oracle.source.reader.fetch.OracleSourceFetchTaskContext  stubs=0/7 ----------
+       78  public class OracleSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
+       79  
+       80      private static final Logger LOG = LoggerFactory.getLogger(OracleSourceFetchTaskContext.class);
+       81  
+       82      private final OracleConnection connection;
+       83      private final OracleEventMetadataProvider metadataProvider;
+       84  
+       85      private OracleDatabaseSchema databaseSchema;
+       86      private OracleTaskContext taskContext;
+       87      private OracleOffsetContext offsetContext;
+       88      private OraclePartition partition;
+       89  
+       90      private SnapshotChangeEventSourceMetrics<OraclePartition> snapshotChangeEventSourceMetrics;
+       91      private OracleStreamingChangeEventSourceMetrics streamingChangeEventSourceMetrics;
+       92      private TopicSelector<TableId> topicSelector;
+       93      private JdbcSourceEventDispatcher<OraclePartition> dispatcher;
+       94      private ChangeEventQueue<DataChangeEvent> queue;
+       95      private OracleErrorHandler errorHandler;
+       96  
+       97      public OracleSourceFetchTaskContext(
+       98              JdbcSourceConfig sourceConfig, JdbcDataSourceDialect dataSourceDialect) {
+       99          super(sourceConfig, dataSourceDialect);
+      100          this.connection = createOracleConnection(sourceConfig.getDbzConfiguration());
+      101          this.metadataProvider = new OracleEventMetadataProvider();
+      102      }
+      103  
+      104      @Override
+      105      public void configure(SourceSplitBase sourceSplitBase) {
+      106          // initial stateful objects
+      107          final OracleConnectorConfig connectorConfig = getDbzConnectorConfig();
+      108          this.topicSelector = OracleTopicSelector.defaultSelector(connectorConfig);
+      109          EmbeddedFlinkDatabaseHistory.registerHistory(
+      110                  sourceConfig
+      111                          .getDbzConfiguration()
+      112                          .getString(EmbeddedFlinkDatabaseHistory.DATABASE_HISTORY_INSTANCE_NAME),
+      113                  sourceSplitBase.getTableSchemas().values());
+      114          this.databaseSchema = OracleUtils.createOracleDatabaseSchema(connectorConfig, connection);
+      115          // todo logMiner or xStream
+      116          this.offsetContext =
+      117                  loadStartingOffsetState(
+      118                          new LogMinerOracleOffsetContextLoader(connectorConfig), sourceSplitBase);
+      119          this.partition = new OraclePartition(connectorConfig.getLogicalName());
+      120          validateAndLoadDatabaseHistory(offsetContext, databaseSchema);
+      121  
+      122          this.taskContext = new OracleTaskContext(connectorConfig, databaseSchema);
+      123          final int queueSize =
+      124                  sourceSplitBase.isSnapshotSplit()
+      125                          ? getSourceConfig().getSplitSize()
+      126                          : getSourceConfig().getDbzConnectorConfig().getMaxQueueSize();
+      127          this.queue =
+      128                  new ChangeEventQueue.Builder<DataChangeEvent>()
+      129                          .pollInterval(connectorConfig.getPollInterval())
+      130                          .maxBatchSize(connectorConfig.getMaxBatchSize())
+      131                          .maxQueueSize(queueSize)
+      132                          .maxQueueSizeInBytes(connectorConfig.getMaxQueueSizeInBytes())
+      133                          .loggingContextSupplier(
+      134                                  () ->
+      135                                          taskContext.configureLoggingContext(
+      136                                                  "oracle-cdc-connector-task"))
+      137                          // do not buffer any element, we use signal event
+      138                          // .buffering()
+      139                          .build();
+      140          this.dispatcher =
+      141                  new JdbcSourceEventDispatcher<>(
+      142                          connectorConfig,
+      143                          topicSelector,
+      144                          databaseSchema,
+      145                          queue,
+      146                          connectorConfig.getTableFilters().dataCollectionFilter(),
+      147                          DataChangeEvent::new,
+      148                          metadataProvider,
+      149                          schemaNameAdjuster,
+      150                          new OracleSchemaChangeEventHandler());
+      151  
+      152          final OracleChangeEventSourceMetricsFactory changeEventSourceMetricsFactory =
+      153                  new OracleChangeEventSourceMetricsFactory(
+      154                          new OracleStreamingChangeEventSourceMetrics(
+      155                                  taskContext, queue, metadataProvider, connectorConfig));
+      156          this.snapshotChangeEventSourceMetrics =
+      157                  changeEventSourceMetricsFactory.getSnapshotMetrics(
+      158                          taskContext, queue, metadataProvider);
+      159          this.streamingChangeEventSourceMetrics =
+      160                  (OracleStreamingChangeEventSourceMetrics)
+      161                          changeEventSourceMetricsFactory.getStreamingMetrics(
+      162                                  taskContext, queue, metadataProvider);
+      163          this.errorHandler = new OracleErrorHandler(connectorConfig, queue);
+      164      }
+      165  
+      166      @Override
+      167      public OracleSourceConfig getSourceConfig() {
+      168          return (OracleSourceConfig) sourceConfig;
+      169      }
+      170  
+      171      public OracleConnection getConnection() {
+      172          return connection;
+      173      }
+      174  
+      175      @Override
+      176      public OracleConnectorConfig getDbzConnectorConfig() {
+      177          return (OracleConnectorConfig) super.getDbzConnectorConfig();
+      178      }
+      179  
+      180      @Override
+      181      public OracleOffsetContext getOffsetContext() {
+      182          return offsetContext;
+      183      }
+      184  
+      185      public SnapshotChangeEventSourceMetrics<OraclePartition> getSnapshotChangeEventSourceMetrics() {
+      186          return snapshotChangeEventSourceMetrics;
+      187      }
+      188  
+      189      public OracleStreamingChangeEventSourceMetrics getStreamingChangeEventSourceMetrics() {
+      190          return streamingChangeEventSourceMetrics;
+      191      }
+      192  
+      193      @Override
+      194      public ErrorHandler getErrorHandler() {
+      195          return errorHandler;
+      196      }
+      197  
+      198      @Override
+      199      public OracleDatabaseSchema getDatabaseSchema() {
+      200          return databaseSchema;
+      201      }
+      202  
+      203      @Override
+      204      public RowType getSplitType(Table table) {
+      205          OracleSourceConfig oracleSourceConfig = getSourceConfig();
+      206          return ChunkUtils.getSplitType(
+      207                  getChunkKeyColumn(table, oracleSourceConfig.getChunkKeyColumn()));
+      208      }
+      209  
+      210      @Override
+      211      public boolean isRecordBetween(SourceRecord record, Object[] splitStart, Object[] splitEnd) {
+      212          RowType splitKeyType =
+      213                  getSplitType(getDatabaseSchema().tableFor(SourceRecordUtils.getTableId(record)));
+      214  
+      215          // RowId is chunk key column by default, compare RowId
+      216          if (splitKeyType.getFieldNames().contains(ROWID.class.getSimpleName())) {
+      217              ConnectHeaders headers = (ConnectHeaders) record.headers();
+      218              ROWID rowId = null;
+      219              try {
+      220                  rowId = new ROWID(headers.iterator().next().value().toString());
+      221              } catch (SQLException e) {
+      222                  LOG.error("{} can not convert to RowId", record);
+      223              }
+      224              Object[] rowIds = new ROWID[] {rowId};
+      225              return SplitKeyUtils.splitKeyRangeContains(rowIds, splitStart, splitEnd);
+      226          } else {
+      227              // config chunk key column compare
+      228              Object[] key = SplitKeyUtils.getSplitKey(splitKeyType, record, getSchemaNameAdjuster());
+      229              return SplitKeyUtils.splitKeyRangeContains(key, splitStart, splitEnd);
+      230          }
+      231      }
+      232  
+      233      @Override
+      234      public boolean supportsSplitKeyOptimization() {
+      235          return false;
+      236      }
+      237  
+
+---------- IMPLEMENTER org.apache.flink.cdc.connectors.postgres.source.fetch.PostgresSourceFetchTaskContext  stubs=0/6 ----------
+       83  public class PostgresSourceFetchTaskContext extends JdbcSourceFetchTaskContext {
+       84  
+       85      private static final String CONNECTION_NAME = "postgres-fetch-task-connection";
+       86  
+       87      private static final Logger LOG = LoggerFactory.getLogger(PostgresSourceFetchTaskContext.class);
+       88  
+       89      private PostgresTaskContext taskContext;
+       90      private ChangeEventQueue<DataChangeEvent> queue;
+       91      private PostgresConnection jdbcConnection;
+       92      private ReplicationConnection replicationConnection;
+       93      private PostgresOffsetContext offsetContext;
+       94      private PostgresPartition partition;
+       95      private PostgresSchema schema;
+       96      private ErrorHandler errorHandler;
+       97      private CDCPostgresDispatcher postgresDispatcher;
+       98      private EventMetadataProvider metadataProvider;
+       99      private SnapshotChangeEventSourceMetrics<PostgresPartition> snapshotChangeEventSourceMetrics;
+      100      private Snapshotter snapShotter;
+      101  
+      102      public PostgresSourceFetchTaskContext(
+      103              JdbcSourceConfig sourceConfig, PostgresDialect dataSourceDialect) {
+      104          super(sourceConfig, dataSourceDialect);
+      105      }
+      106  
+      107      @Override
+      108      public PostgresConnectorConfig getDbzConnectorConfig() {
+      109          return (PostgresConnectorConfig) super.getDbzConnectorConfig();
+      110      }
+      111  
+      112      private PostgresOffsetContext loadStartingOffsetState(
+      113              PostgresOffsetContext.Loader loader, SourceSplitBase sourceSplitBase) {
+      114          Offset offset =
+      115                  sourceSplitBase.isSnapshotSplit()
+      116                          ? new PostgresOffsetFactory()
+      117                                  .createInitialOffset() // get an offset for starting snapshot
+      118                          : sourceSplitBase.asStreamSplit().getStartingOffset();
+      119  
+      120          return PostgresOffsetUtils.getPostgresOffsetContext(loader, offset);
+      121      }
+      122  
+      123      @Override
+      124      public void configure(SourceSplitBase sourceSplitBase) {
+      125          LOG.debug("Configuring PostgresSourceFetchTaskContext for split: {}", sourceSplitBase);
+      126          PostgresConnectorConfig dbzConfig = getDbzConnectorConfig();
+      127          if (sourceSplitBase instanceof SnapshotSplit) {
+      128              dbzConfig =
+      129                      new PostgresConnectorConfig(
+      130                              dbzConfig
+      131                                      .getConfig()
+      132                                      .edit()
+      133                                      .with(
+      134                                              "table.include.list",
+      135                                              ((SnapshotSplit) sourceSplitBase)
+      136                                                      .getTableId()
+      137                                                      .toString())
+      138                                      .with(
+      139                                              SLOT_NAME.name(),
+      140                                              ((PostgresSourceConfig) sourceConfig)
+      141                                                      .getSlotNameForBackfillTask())
+      142                                      // drop slot for backfill stream split
+      143                                      .with(DROP_SLOT_ON_STOP.name(), true)
+      144                                      // Disable heartbeat event in snapshot split fetcher
+      145                                      .with(Heartbeat.HEARTBEAT_INTERVAL, 0)
+      146                                      .build());
+      147          } else {
+      148  
+      149              Configuration.Builder builder = dbzConfig.getConfig().edit();
+      150              if (isBackFillSplit(sourceSplitBase)) {
+      151                  // when backfilled split, only current table schema should be scan
+      152                  builder.with(
+      153                          "table.include.list",
+      154                          sourceSplitBase
+      155                                  .asStreamSplit()
+      156                                  .getTableSchemas()
+      157                                  .keySet()
+      158                                  .iterator()
+      159                                  .next()
+      160                                  .toString());
+      161              }
+      162  
+      163              dbzConfig =
+      164                      new PostgresConnectorConfig(
+      165                              builder
+      166                                      // never drop slot for stream split, which is also global split
+      167                                      .with(DROP_SLOT_ON_STOP.name(), false)
+      168                                      .build());
+      169          }
+      170          setDbzConnectorConfig(dbzConfig);
+      171          PostgresConnectorConfig.SnapshotMode snapshotMode =
+      172                  PostgresConnectorConfig.SnapshotMode.parse(
+      173                          dbzConfig.getConfig().getString(SNAPSHOT_MODE));
+      174          this.snapShotter = snapshotMode.getSnapshotter(dbzConfig.getConfig());
+      175  
+      176          PostgresConnection.PostgresValueConverterBuilder valueConverterBuilder =
+      177                  newPostgresValueConverterBuilder(dbzConfig);
+      178          this.jdbcConnection =
+      179                  new PostgresConnection(
+      180                          dbzConfig.getJdbcConfig(), valueConverterBuilder, CONNECTION_NAME);
+      181  
+      182          TopicSelector<TableId> topicSelector = PostgresTopicSelector.create(dbzConfig);
+      183          EmbeddedFlinkDatabaseHistory.registerHistory(
+      184                  sourceConfig
+      185                          .getDbzConfiguration()
+      186                          .getString(EmbeddedFlinkDatabaseHistory.DATABASE_HISTORY_INSTANCE_NAME),
+      187                  sourceSplitBase.getTableSchemas().values());
+      188  
+      189          try {
+      190              this.schema =
+      191                      PostgresObjectUtils.newSchema(
+      192                              jdbcConnection,
+      193                              dbzConfig,
+      194                              jdbcConnection.getTypeRegistry(),
+      195                              topicSelector,
+      196                              valueConverterBuilder.build(jdbcConnection.getTypeRegistry()));
+      197          } catch (SQLException e) {
+      198              throw new RuntimeException("Failed to initialize PostgresSchema", e);
+      199          }
+      200  
+      201          this.offsetContext =
+      202                  loadStartingOffsetState(
+      203                          new PostgresOffsetContext.Loader(dbzConfig), sourceSplitBase);
+      204          this.partition = new PostgresPartition(dbzConfig.getLogicalName());
+      205          this.taskContext = PostgresObjectUtils.newTaskContext(dbzConfig, schema, topicSelector);
+      206  
+      207          if (replicationConnection == null) {
+      208              replicationConnection =
+      209                      createReplicationConnection(
+      210                              this.taskContext,
+      211                              jdbcConnection,
+      212                              this.snapShotter.shouldSnapshot(),
+      213                              dbzConfig);
+      214          }
+      215  
+      216          this.queue =
+      217                  new ChangeEventQueue.Builder<DataChangeEvent>()
+      218                          .pollInterval(dbzConfig.getPollInterval())
+      219                          .maxBatchSize(dbzConfig.getMaxBatchSize())
+      220                          .maxQueueSize(dbzConfig.getMaxQueueSize())
+      221                          .maxQueueSizeInBytes(dbzConfig.getMaxQueueSizeInBytes())
+      222                          .loggingContextSupplier(
+      223                                  () ->
+      224                                          taskContext.configureLoggingContext(
+      225                                                  "postgres-cdc-connector-task"))
+      226                          // do not buffer any element, we use signal event
+      227                          // .buffering()
+      228                          .build();
+      229  
+      230          this.errorHandler = new PostgresErrorHandler(getDbzConnectorConfig(), queue);
+      231          this.metadataProvider = PostgresObjectUtils.newEventMetadataProvider();
+      232  
+      233          PostgresConnectorConfig finalDbzConfig = dbzConfig;
+      234          this.postgresDispatcher =
+      235                  new CDCPostgresDispatcher(
+      236                          finalDbzConfig,
+      237                          topicSelector,
+      238                          schema,
+      239                          queue,
+      240                          finalDbzConfig.getTableFilters().dataCollectionFilter(),
+      241                          DataChangeEvent::new,
+      242                          metadataProvider,

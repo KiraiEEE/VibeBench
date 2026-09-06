@@ -1,0 +1,264 @@
+row 183   apache/atlas#529
+============================================================================
+CONTRACT org.apache.atlas.notification.MessageDeserializer   members=1.0 implementers=6.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       24  public interface MessageDeserializer<T> {
+       25      /**
+       26       * Get a message of type T from the given JSON message string.
+       27       *
+       28       * @param json  the JSON message
+       29       *
+       30       * @return  the message deserialized from the given JSON
+       31       */
+       32      T deserialize(String json);
+       33  }
+
+---------- IMPLEMENTER org.apache.atlas.notification.AtlasNotificationMessageDeserializer  stubs=0/1 ----------
+       46  public abstract class AtlasNotificationMessageDeserializer<T> implements MessageDeserializer<T> {
+       47      private static final Logger LOG = LoggerFactory.getLogger(AtlasNotificationMessageDeserializer.class);
+       48  
+       49  
+       50      public static final String VERSION_MISMATCH_MSG =
+       51          "Notification message version mismatch. Expected %s but recieved %s. Message %s";
+       52  
+       53      private final TypeReference<T> messageType;
+       54      private final TypeReference<AtlasNotificationMessage<T>> notificationMessageType;
+       55      private final MessageVersion                             expectedVersion;
+       56      private final Logger                                     notificationLogger;
+       57  
+       58  
+       59      private final Map<String, SplitMessageAggregator> splitMsgBuffer = new HashMap<>();
+       60      private final long                                splitMessageBufferPurgeIntervalMs;
+       61      private final long                                splitMessageSegmentsWaitTimeMs;
+       62      private long                                      splitMessagesLastPurgeTime    = System.currentTimeMillis();
+       63      private final AtomicLong                          messageCountTotal             = new AtomicLong(0);
+       64      private final AtomicLong                          messageCountSinceLastInterval = new AtomicLong(0);
+       65      private long                                      msgCreated;
+       66      private boolean                                   spooled;
+       67      // ----- Constructors ----------------------------------------------------
+       68  
+       69      /**
+       70       * Create a notification message deserializer.
+       71       *
+       72       * @param expectedVersion         the expected message version
+       73       * @param notificationLogger      logger for message version mismatch
+       74       */
+       75      public AtlasNotificationMessageDeserializer(TypeReference<T> messageType,
+       76                                                  TypeReference<AtlasNotificationMessage<T>> notificationMessageType,
+       77                                                  MessageVersion expectedVersion, Logger notificationLogger) {
+       78          this(messageType, notificationMessageType, expectedVersion, notificationLogger,
+       79               NOTIFICATION_SPLIT_MESSAGE_SEGMENTS_WAIT_TIME_SECONDS.getLong() * 1000,
+       80               NOTIFICATION_SPLIT_MESSAGE_BUFFER_PURGE_INTERVAL_SECONDS.getLong() * 1000);
+       81      }
+       82  
+       83      public AtlasNotificationMessageDeserializer(TypeReference<T> messageType,
+       84                                                  TypeReference<AtlasNotificationMessage<T>> notificationMessageType,
+       85                                                  MessageVersion expectedVersion,
+       86                                                  Logger notificationLogger,
+       87                                                  long splitMessageSegmentsWaitTimeMs,
+       88                                                  long splitMessageBufferPurgeIntervalMs) {
+       89          this.messageType                       = messageType;
+       90          this.notificationMessageType           = notificationMessageType;
+       91          this.expectedVersion                   = expectedVersion;
+       92          this.notificationLogger                = notificationLogger;
+       93          this.splitMessageSegmentsWaitTimeMs    = splitMessageSegmentsWaitTimeMs;
+       94          this.splitMessageBufferPurgeIntervalMs = splitMessageBufferPurgeIntervalMs;
+       95      }
+       96  
+       97      public TypeReference<T> getMessageType() {
+       98          return messageType;
+       99      }
+      100  
+      101      public TypeReference<AtlasNotificationMessage<T>> getNotificationMessageType() {
+      102          return notificationMessageType;
+      103      }
+      104  
+      105      // ----- MessageDeserializer ---------------------------------------------
+      106      public long getMsgCreated() {
+      107          return this.msgCreated;
+      108      }
+      109  
+      110      public boolean getSpooled() {
+      111          return this.spooled;
+      112      }
+      113  
+      114      @Override
+      115      public T deserialize(String messageJson) {
+      116          final T ret;
+      117  
+      118          messageCountTotal.incrementAndGet();
+      119          messageCountSinceLastInterval.incrementAndGet();
+      120          this.msgCreated = 0;
+      121          this.spooled = false;
+      122  
+      123          AtlasNotificationBaseMessage msg = AtlasType.fromV1Json(messageJson, AtlasNotificationMessage.class);
+      124  
+      125          if (msg == null || msg.getVersion() == null) { // older style messages not wrapped with AtlasNotificationMessage
+      126              ret = AtlasType.fromV1Json(messageJson, messageType);
+      127          } else  {
+      128              this.msgCreated = ((AtlasNotificationMessage) msg).getMsgCreationTime();
+      129              this.spooled = ((AtlasNotificationMessage) msg).getSpooled();
+      130  
+      131              String msgJson = messageJson;
+      132  
+      133              if (msg.getMsgSplitCount() > 1) { // multi-part message
+      134                  AtlasNotificationStringMessage splitMsg = AtlasType.fromV1Json(msgJson, AtlasNotificationStringMessage.class);
+      135  
+      136                  checkVersion(splitMsg, msgJson);
+      137  
+      138                  String msgId = splitMsg.getMsgId();
+      139  
+      140                  if (StringUtils.isEmpty(msgId)) {
+      141                      LOG.error("Received multi-part message with no message ID. Ignoring message");
+      142  
+      143                      msg = null;
+      144                  } else {
+      145                      final int splitIdx   = splitMsg.getMsgSplitIdx();
+      146                      final int splitCount = splitMsg.getMsgSplitCount();
+      147  
+      148                      final SplitMessageAggregator splitMsgs;
+      149  
+      150                      if (splitIdx == 0) {
+      151                          splitMsgs = new SplitMessageAggregator(splitMsg);
+      152  
+      153                          splitMsgBuffer.put(splitMsgs.getMsgId(), splitMsgs);
+      154                      } else {
+      155                          splitMsgs = splitMsgBuffer.get(msgId);
+      156                      }
+      157  
+      158                      if (splitMsgs == null) {
+      159                          LOG.error("Received msgID={}: {} of {}, but first message didn't arrive. Ignoring message", msgId, splitIdx + 1, splitCount);
+      160  
+      161                          msg = null;
+      162                      } else if (splitMsgs.getTotalSplitCount() <= splitIdx) {
+      163                          LOG.error("Received msgID={}: {} of {} - out of bounds. Ignoring message", msgId, splitIdx + 1, splitCount);
+      164  
+      165                          msg = null;
+      166                      } else {
+      167                          LOG.info("Received msgID={}: {} of {}", msgId, splitIdx + 1, splitCount);
+      168  
+      169                          boolean isReady = splitMsgs.add(splitMsg);
+      170  
+      171                          if (isReady) { // last message
+      172                              splitMsgBuffer.remove(msgId);
+      173  
+      174                              boolean isValidMessage = true;
+      175  
+      176                              StringBuilder sb = new StringBuilder();
+      177  
+      178                              for (int i = 0; i < splitMsgs.getTotalSplitCount(); i++) {
+      179                                  splitMsg = splitMsgs.get(i);
+      180  
+      181                                  if (splitMsg == null) {
+      182                                      LOG.warn("MsgID={}: message {} of {} is missing. Ignoring message", msgId, i + 1, splitCount);
+      183  
+      184                                      isValidMessage = false;
+      185  
+      186                                      break;
+      187                                  }
+      188  
+      189                                  sb.append(splitMsg.getMessage());
+      190                              }
+      191  
+      192                              if (isValidMessage) {
+      193                                  msgJson = sb.toString();
+      194  
+      195                                  if (CompressionKind.GZIP.equals(splitMsg.getMsgCompressionKind())) {
+      196                                      byte[] encodedBytes = AtlasNotificationBaseMessage.getBytesUtf8(msgJson);
+      197                                      byte[] bytes        = AtlasNotificationBaseMessage.decodeBase64AndGzipUncompress(encodedBytes);
+      198  
+      199                                      msgJson = AtlasNotificationBaseMessage.getStringUtf8(bytes);
+      200  
+      201                                      LOG.info("Received msgID={}: splitCount={}, compressed={} bytes, uncompressed={} bytes", msgId, splitCount, encodedBytes.length, bytes.length);
+      202                                  } else {
+      203                                      byte[] encodedBytes = AtlasNotificationBaseMessage.getBytesUtf8(msgJson);
+      204                                      byte[] bytes        = AtlasNotificationBaseMessage.decodeBase64(encodedBytes);
+      205  
+
+---------- IMPLEMENTER org.apache.atlas.notification.entity.EntityMessageDeserializer  stubs=0/1 ----------
+       32  public class EntityMessageDeserializer extends AbstractMessageDeserializer<EntityNotification> {
+       33  
+       34      /**
+       35       * Logger for entity notification messages.
+       36       */
+       37      private static final Logger NOTIFICATION_LOGGER = LoggerFactory.getLogger(EntityMessageDeserializer.class);
+       38  
+       39  
+       40      // ----- Constructors ----------------------------------------------------
+       41  
+       42      /**
+       43       * Create an entity notification message deserializer.
+       44       */
+       45      public EntityMessageDeserializer() {
+       46          super(new TypeReference<EntityNotification>() {},
+       47                new TypeReference<AtlasNotificationMessage<EntityNotification>>() {},
+       48                AbstractNotification.CURRENT_MESSAGE_VERSION, NOTIFICATION_LOGGER);
+       49      }
+       50  
+       51      @Override
+       52      public EntityNotification deserialize(String messageJson) {
+       53          final EntityNotification ret = super.deserialize(messageJson);
+       54  
+       55          if (ret != null) {
+       56              ret.normalize();
+       57          }
+       58  
+       59          return ret;
+       60      }
+       61  }
+
+---------- IMPLEMENTER org.apache.atlas.notification.hook.HookMessageDeserializer  stubs=0/1 ----------
+       34  public class HookMessageDeserializer extends AbstractMessageDeserializer<HookNotification> {
+       35  
+       36      /**
+       37       * Logger for hook notification messages.
+       38       */
+       39      private static final Logger NOTIFICATION_LOGGER = LoggerFactory.getLogger(HookMessageDeserializer.class);
+       40  
+       41  
+       42      // ----- Constructors ----------------------------------------------------
+       43  
+       44      /**
+       45       * Create a hook notification message deserializer.
+       46       */
+       47      public HookMessageDeserializer() {
+       48          super(new TypeReference<HookNotification>() {},
+       49                new TypeReference<AtlasNotificationMessage<HookNotification>>() {},
+       50                AbstractNotification.CURRENT_MESSAGE_VERSION, NOTIFICATION_LOGGER);
+       51      }
+       52  
+       53      @Override
+       54      public HookNotification deserialize(String messageJson) {
+       55          final HookNotification ret = super.deserialize(messageJson);
+       56  
+       57          if (ret != null) {
+       58              ret.normalize();
+       59          }
+       60  
+       61          return ret;
+       62      }
+       63  }
+
+---------- IMPLEMENTER org.apache.atlas.notification.task.AtlasDistributedTaskMessageDeserializer  stubs=0/1 ----------
+       12  public class AtlasDistributedTaskMessageDeserializer extends AbstractMessageDeserializer<AtlasDistributedTaskNotification> {
+       13      private static final Logger NOTIFICATION_LOGGER = LoggerFactory.getLogger(HookMessageDeserializer.class);
+       14  
+       15      public AtlasDistributedTaskMessageDeserializer() {
+       16          super(new TypeReference<AtlasDistributedTaskNotification>() {},
+       17                new TypeReference<AtlasNotificationMessage<AtlasDistributedTaskNotification>>() {},
+       18                AbstractNotification.CURRENT_MESSAGE_VERSION, NOTIFICATION_LOGGER);
+       19      }
+       20  
+       21      @Override
+       22      public AtlasDistributedTaskNotification deserialize(String messageJson) {
+       23          final AtlasDistributedTaskNotification ret = super.deserialize(messageJson);
+       24  
+       25          if (ret != null) {
+       26              ret.normalize();
+       27          }
+       28  
+       29          return ret;
+       30      }
+       31  
+       32  }

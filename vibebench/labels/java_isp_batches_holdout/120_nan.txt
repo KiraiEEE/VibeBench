@@ -1,0 +1,461 @@
+row 120   apache/pulsar#24592
+============================================================================
+CONTRACT org.apache.pulsar.packages.management.core.PackagesStorage   members=7.0 implementers=3.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       26  public interface PackagesStorage {
+       27      /**
+       28       * Initialize the packages management service with the given storage.
+       29       */
+       30      void initialize();
+       31      /**
+       32       * Write a input stream to a path.
+       33       *
+       34       * @param path
+       35       *          file path
+       36       * @param inputStream
+       37       *          the input file stream
+       38       * @return
+       39       */
+       40      CompletableFuture<Void> writeAsync(String path, InputStream inputStream);
+       41  
+       42      /**
+       43       * Read a file to a output stream.
+       44       *
+       45       * @param path
+       46       *          file path
+       47       * @param outputStream
+       48       *          the output file stream
+       49       * @return
+       50       */
+       51      CompletableFuture<Void> readAsync(String path, OutputStream outputStream);
+       52  
+       53      /**
+       54       * Delete a file.
+       55       *
+       56       * @param path
+       57       *          file path
+       58       * @return
+       59       */
+       60      CompletableFuture<Void> deleteAsync(String path);
+       61  
+       62      /**
+       63       * List all the file under a path.
+       64       *
+       65       * @param path
+       66       *          file path
+       67       * @return
+       68       */
+       69      CompletableFuture<List<String>> listAsync(String path);
+       70  
+       71      /**
+       72       * Check the file is or not exists.
+       73       *
+       74       * @param path
+       75       *          file path
+       76       * @return
+       77       */
+       78      CompletableFuture<Boolean> existAsync(String path);
+       79  
+       80      /**
+       81       * Close storage asynchronously.
+       82       *
+       83       * @return
+       84       */
+       85      CompletableFuture<Void> closeAsync();
+       86  
+       87      /**
+       88       * The extra path for saving package data.
+       89       *
+       90       * For example, we have a package function://public/default/package@v0.1,
+       91       * it will save the meta to the path function/public/default/package/v0.1/meta,
+       92       * and save the data to the path function/public/default/package/v0.1.
+       93       * By default, we are using distributed log as the package storage, and it supports
+       94       * saving data at a directory.
+       95       * But some storage like filesystem don't have the similar ability, it needs another path
+       96       * for saving the data.
+       97       * This api provides the ability to support saving the data in another place.
+       98       * If you specify the data path as `/data`, the package will saved into
+       99       * function/public/default/package/v0.1/data.
+      100       *
+      101       * @return
+      102       *      the data path
+      103       */
+      104      default String dataPath() {
+      105          return "";
+      106      }
+      107  }
+
+---------- IMPLEMENTER org.apache.pulsar.packages.management.storage.bookkeeper.BookKeeperPackagesStorage  stubs=0/7 ----------
+       49  @Slf4j
+       50  public class BookKeeperPackagesStorage implements PackagesStorage {
+       51  
+       52      private static final String NS_CLIENT_ID = "packages-management";
+       53      public static final String ZK_SCHEME_IDENTIFIER = "zk:";
+       54      final BookKeeperPackagesStorageConfiguration configuration;
+       55      private Namespace namespace;
+       56  
+       57      BookKeeperPackagesStorage(PackagesStorageConfiguration configuration) {
+       58          this.configuration = new BookKeeperPackagesStorageConfiguration(configuration);
+       59      }
+       60  
+       61      @Override
+       62      public void initialize() {
+       63          DistributedLogConfiguration conf = new DistributedLogConfiguration()
+       64              .setImmediateFlushEnabled(true)
+       65              .setOutputBufferSize(0)
+       66              .setWriteQuorumSize(configuration.getPackagesReplicas())
+       67              .setEnsembleSize(configuration.getPackagesReplicas())
+       68              .setAckQuorumSize(configuration.getPackagesReplicas())
+       69              .setLockTimeout(DistributedLogConstants.LOCK_IMMEDIATE);
+       70          if (!Strings.isNullOrEmpty(configuration.getBookkeeperClientAuthenticationPlugin())) {
+       71              conf.setProperty("bkc.clientAuthProviderFactoryClass",
+       72                  configuration.getBookkeeperClientAuthenticationPlugin());
+       73              if (!Strings.isNullOrEmpty(configuration.getBookkeeperClientAuthenticationParametersName())) {
+       74                  conf.setProperty("bkc." + configuration.getBookkeeperClientAuthenticationParametersName(),
+       75                      configuration.getBookkeeperClientAuthenticationParameters());
+       76              }
+       77          }
+       78          // Map arbitrary bookkeeper client configuration into DLog Config. Note that this only configures the
+       79          // bookie client.
+       80          PropertiesUtils.filterAndMapProperties(configuration.getProperties(), "bookkeeper_", "bkc.")
+       81                  .forEach((key, value) -> {
+       82                      log.info("Applying DLog BookKeeper client configuration setting {}={}", key, value);
+       83                      conf.setProperty(key, value);
+       84                  });
+       85          try {
+       86              this.namespace = NamespaceBuilder.newBuilder()
+       87                  .conf(conf).clientId(NS_CLIENT_ID).uri(initializeDlogNamespace()).build();
+       88          } catch (IOException e) {
+       89              throw new RuntimeException("Initialize distributed log for packages management service failed.", e);
+       90          }
+       91          log.info("Packages management bookKeeper storage initialized successfully");
+       92      }
+       93  
+       94      private URI initializeDlogNamespace() throws IOException {
+       95          String bookkeeperMetadataServiceUri = configuration.getProperty("bookkeeperMetadataServiceUri");
+       96          String ledgersRootPath;
+       97          String ledgersStoreServers;
+       98          if (StringUtils.isNotBlank(bookkeeperMetadataServiceUri)) {
+       99              URI metadataServiceUri = URI.create(bookkeeperMetadataServiceUri);
+      100              ledgersStoreServers = metadataServiceUri.getAuthority().replace(";", ",");
+      101              ledgersRootPath = metadataServiceUri.getPath();
+      102          } else {
+      103              ledgersRootPath = configuration.getPackagesManagementLedgerRootPath();
+      104              if (StringUtils.isNotBlank(configuration.getMetadataStoreUrl())) {
+      105                  ledgersStoreServers = configuration.getMetadataStoreUrl();
+      106                  if (ledgersStoreServers.startsWith(ZK_SCHEME_IDENTIFIER)) {
+      107                      ledgersStoreServers = ledgersStoreServers.substring(ZK_SCHEME_IDENTIFIER.length());
+      108                  }
+      109              } else {
+      110                  ledgersStoreServers = configuration.getZookeeperServers();
+      111              }
+      112          }
+      113          BKDLConfig bkdlConfig = new BKDLConfig(ledgersStoreServers, ledgersRootPath);
+      114          DLMetadata dlMetadata = DLMetadata.create(bkdlConfig);
+      115          URI dlogURI = URI.create(String.format("distributedlog://%s/pulsar/packages", ledgersStoreServers));
+      116          try {
+      117              dlMetadata.create(dlogURI);
+      118          } catch (ZKException e) {
+      119              if (e.getKeeperExceptionCode() == KeeperException.Code.NODEEXISTS) {
+      120                  return dlogURI;
+      121              }
+      122          }
+      123          return dlogURI;
+      124      }
+      125  
+      126      private CompletableFuture<DistributedLogManager> openLogManagerAsync(String path) {
+      127          CompletableFuture<DistributedLogManager> logFuture = new CompletableFuture<>();
+      128          CompletableFuture.runAsync(() -> {
+      129              try {
+      130                  logFuture.complete(namespace.openLog(path));
+      131              } catch (IOException e) {
+      132                  logFuture.completeExceptionally(e);
+      133              }
+      134          });
+      135          return logFuture;
+      136      }
+      137  
+      138      @Override
+      139      public CompletableFuture<Void> writeAsync(String path, InputStream inputStream) {
+      140          return openLogManagerAsync(path)
+      141              .thenCompose(DLOutputStream::openWriterAsync)
+      142              .thenCompose(dlOutputStream -> dlOutputStream.writeAsync(inputStream))
+      143              .thenCompose(DLOutputStream::closeAsync);
+      144      }
+      145  
+      146      @Override
+      147      public CompletableFuture<Void> readAsync(String path, OutputStream outputStream) {
+      148          return openLogManagerAsync(path)
+      149              .thenCompose(DLInputStream::openReaderAsync)
+      150              .thenCompose(dlInputStream -> dlInputStream.readAsync(outputStream))
+      151              .thenCompose(DLInputStream::closeAsync);
+      152      }
+      153  
+      154      @Override
+      155      public CompletableFuture<Void> deleteAsync(String path) {
+      156          return namespace.getNamespaceDriver().getLogMetadataStore().getLogLocation(path)
+      157              .thenCompose(uri -> uri.map(value -> namespace.getNamespaceDriver()
+      158                  .getLogStreamMetadataStore(NamespaceDriver.Role.WRITER).deleteLog(value, path))
+      159                  .orElse(null));
+      160      }
+      161  
+      162  
+      163      @Override
+      164      public CompletableFuture<List<String>> listAsync(String path) {
+      165          return namespace.getNamespaceDriver().getLogMetadataStore().getLogs(path)
+      166              .thenApply(logs -> {
+      167                  ArrayList<String> packages = new ArrayList<>();
+      168                  logs.forEachRemaining(packages::add);
+      169                  return packages;
+      170              });
+      171      }
+      172  
+      173      @Override
+      174      public CompletableFuture<Boolean> existAsync(String path) {
+      175          CompletableFuture<Boolean> result = new CompletableFuture<>();
+      176          namespace.getNamespaceDriver().getLogMetadataStore().getLogLocation(path)
+      177              .whenComplete((uriOptional, throwable) -> {
+      178                  if (throwable != null) {
+      179                      result.complete(false);
+      180                      return;
+      181                  }
+      182  
+      183                  if (uriOptional.isPresent()) {
+      184                      namespace.getNamespaceDriver()
+      185                          .getLogStreamMetadataStore(NamespaceDriver.Role.WRITER)
+      186                          .logExists(uriOptional.get(), path)
+      187                          .whenComplete((ignore, e) -> {
+      188                              if (e != null) {
+      189                                  result.complete(false);
+      190                              } else {
+      191                                  result.complete(true);
+      192                              }
+      193                          });
+      194                  } else {
+      195                      result.complete(false);
+      196                  }
+      197              });
+      198          return result;    }
+      199  
+      200      @Override
+      201      public CompletableFuture<Void> closeAsync() {
+      202          return CompletableFuture.runAsync(() -> this.namespace.close());
+      203      }
+      204  }
+
+---------- IMPLEMENTER org.apache.pulsar.packages.management.core.MockedPackagesStorage  stubs=1/7 ----------
+       29  public class MockedPackagesStorage implements PackagesStorage {
+       30      private PackagesStorageConfiguration configuration;
+       31  
+       32      private ConcurrentHashMap<String, byte[]> storage = new ConcurrentHashMap<>();
+       33  
+       34      MockedPackagesStorage(PackagesStorageConfiguration configuration) {
+       35          this.configuration = configuration;
+       36      }
+       37  
+       38      @Override
+       39      public void initialize() {
+       40  
+       41      }
+       42  
+       43      @Override
+       44      public CompletableFuture<Void> writeAsync(String path, InputStream inputStream) {
+       45          CompletableFuture<Void> future = new CompletableFuture<>();
+       46          CompletableFuture.runAsync(() -> {
+       47              try {
+       48                  byte[] bytes = new byte[inputStream.available()];
+       49                  inputStream.read(bytes);
+       50                  storage.put(path, bytes);
+       51                  future.complete(null);
+       52              } catch (IOException e) {
+       53                  future.completeExceptionally(e);
+       54              }
+       55          });
+       56          return future;
+       57      }
+       58  
+       59      @Override
+       60      public CompletableFuture<Void> readAsync(String path, OutputStream outputStream) {
+       61          CompletableFuture<Void> future = new CompletableFuture<>();
+       62          CompletableFuture.runAsync(() -> {
+       63              byte[] bytes = storage.get(path);
+       64              if (bytes == null) {
+       65                  future.completeExceptionally(
+       66                      new Exception(String.format("Path '%s' does not exist", path)));
+       67                  return;
+       68              }
+       69              try {
+       70                  outputStream.write(bytes);
+       71                  outputStream.flush();
+       72                  future.complete(null);
+       73              } catch (IOException e) {
+       74                  future.completeExceptionally(e);
+       75              }
+       76          });
+       77          return future;
+       78      }
+       79  
+       80      @Override
+       81      public CompletableFuture<Void> deleteAsync(String path) {
+       82          storage.remove(path);
+       83          return CompletableFuture.completedFuture(null);
+       84      }
+       85  
+       86      @Override
+       87      public CompletableFuture<List<String>> listAsync(String path) {
+       88          return CompletableFuture.completedFuture(storage.keySet().stream()
+       89              .filter(s -> s.startsWith(path))
+       90              .map(s -> s.substring(path.length()))
+       91              .map(s -> s.split("/")[1])
+       92              .distinct()
+       93              .collect(Collectors.toList()));
+       94      }
+       95  
+       96      @Override
+       97      public CompletableFuture<Boolean> existAsync(String path) {
+       98          return CompletableFuture.completedFuture(storage.keySet().stream()
+       99              .filter(s -> s.startsWith(path))
+      100              .collect(Collectors.toList()))
+      101              .thenApply(paths -> !paths.isEmpty());
+      102      }
+      103  
+      104      @Override
+      105      public CompletableFuture<Void> closeAsync() {
+      106          storage.clear();
+      107          return CompletableFuture.completedFuture(null);
+      108      }
+      109  }
+
+---------- IMPLEMENTER org.apache.pulsar.packages.management.storage.filesystem.FileSystemPackagesStorage  stubs=0/7 ----------
+       44  @Slf4j
+       45  public class FileSystemPackagesStorage implements PackagesStorage {
+       46  
+       47      private static final String STORAGE_PATH = "STORAGE_PATH";
+       48      private static final String DEFAULT_STORAGE_PATH = "packages-storage";
+       49  
+       50      private final File storagePath;
+       51  
+       52      FileSystemPackagesStorage(PackagesStorageConfiguration configuration) {
+       53          String storagePath = configuration.getProperty(STORAGE_PATH);
+       54          if (storagePath != null) {
+       55              this.storagePath = new File(storagePath);
+       56          } else {
+       57              this.storagePath = new File(DEFAULT_STORAGE_PATH);
+       58          }
+       59      }
+       60  
+       61      private File getPath(String path) throws IOException {
+       62          // Normalize the path to remove any redundant path elements
+       63          File f = Paths.get(storagePath.toString(), path).normalize().toFile();
+       64  
+       65          // Ensure the normalized path is still within the storagePath
+       66          if (!f.getAbsolutePath().startsWith(storagePath.getAbsolutePath())) {
+       67              throw new IOException("Invalid path: " + path);
+       68          }
+       69  
+       70          if (!f.getParentFile().exists()) {
+       71              if (!f.getParentFile().mkdirs()) {
+       72                  throw new RuntimeException("Failed to create parent dirs for " + path);
+       73              }
+       74          }
+       75          return f;
+       76      }
+       77  
+       78      @Override
+       79      public void initialize() {
+       80          if (!storagePath.exists()) {
+       81              if (!storagePath.mkdirs()) {
+       82                  throw new RuntimeException("Failed to create base storage directory at " + storagePath);
+       83              }
+       84          }
+       85  
+       86          log.info("Packages management filesystem storage initialized on {}", storagePath);
+       87      }
+       88  
+       89      @Override
+       90      public CompletableFuture<Void> writeAsync(String path, InputStream inputStream) {
+       91          try {
+       92              File f = getPath(path);
+       93  
+       94              @Cleanup
+       95              OutputStream os = new FileOutputStream(f);
+       96  
+       97              @Cleanup
+       98              BufferedOutputStream bos = new BufferedOutputStream(os);
+       99              ByteStreams.copy(inputStream, bos);
+      100  
+      101              return CompletableFuture.completedFuture(null);
+      102          } catch (IOException e) {
+      103              CompletableFuture<Void> f = new CompletableFuture<>();
+      104              f.completeExceptionally(e);
+      105              return f;
+      106          }
+      107      }
+      108  
+      109      @Override
+      110      public CompletableFuture<Void> readAsync(String path, OutputStream outputStream) {
+      111          try {
+      112              @Cleanup
+      113              InputStream is = new FileInputStream(getPath(path));
+      114  
+      115              @Cleanup
+      116              BufferedInputStream bis = new BufferedInputStream(is);
+      117              ByteStreams.copy(bis, outputStream);
+      118  
+      119              return CompletableFuture.completedFuture(null);
+      120          } catch (IOException e) {
+      121              CompletableFuture<Void> f = new CompletableFuture<>();
+      122              f.completeExceptionally(e);
+      123              return f;
+      124          }
+      125      }
+      126  
+      127      @Override
+      128      public CompletableFuture<Void> deleteAsync(String path) {
+      129          try {
+      130              if (getPath(path).delete()) {
+      131                  return CompletableFuture.completedFuture(null);
+      132              } else {
+      133                  CompletableFuture<Void> f = new CompletableFuture<>();
+      134                  f.completeExceptionally(new IOException("Failed to delete file at " + path));
+      135                  return f;
+      136              }
+      137          } catch (IOException e) {
+      138              return CompletableFuture.failedFuture(e);
+      139          }
+      140      }
+      141  
+      142      @Override
+      143      public CompletableFuture<List<String>> listAsync(String path) {
+      144          try {
+      145              String[] files = getPath(path).list();
+      146              if (files == null) {
+      147                  return CompletableFuture.completedFuture(Collections.emptyList());
+      148              } else {
+      149                  return CompletableFuture.completedFuture(Arrays.asList(files));
+      150              }
+      151          } catch (IOException e) {
+      152              return CompletableFuture.failedFuture(e);
+      153          }
+      154      }
+      155  
+      156      @Override
+      157      public CompletableFuture<Boolean> existAsync(String path) {
+      158          try {
+      159              return CompletableFuture.completedFuture(getPath(path).exists());
+      160          } catch (IOException e) {
+      161              return CompletableFuture.failedFuture(e);
+      162          }
+      163      }
+      164  
+      165      @Override
+      166      public CompletableFuture<Void> closeAsync() {
+      167          return CompletableFuture.completedFuture(null);
+      168      }
+      169  
+      170      @Override
+      171      public String dataPath() {
+      172          return "/data";
+      173      }
+      174  }

@@ -1,0 +1,420 @@
+row 126   open-metadata/OpenMetadata#26572
+============================================================================
+CONTRACT org.openmetadata.service.apps.bundles.searchIndex.distributed.DistributedJobNotifier   members=7.0 implementers=3.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       29  public interface DistributedJobNotifier {
+       30  
+       31    /**
+       32     * Notify all servers that a job has started and they should participate.
+       33     *
+       34     * @param jobId The job ID that started
+       35     * @param jobType The type of job (e.g., "SEARCH_INDEX")
+       36     */
+       37    void notifyJobStarted(UUID jobId, String jobType);
+       38  
+       39    /**
+       40     * Notify all servers that a job has completed.
+       41     *
+       42     * @param jobId The job ID that completed
+       43     */
+       44    void notifyJobCompleted(UUID jobId);
+       45  
+       46    /**
+       47     * Register a callback to be invoked when a job starts.
+       48     *
+       49     * @param callback Consumer that receives the job ID
+       50     */
+       51    void onJobStarted(Consumer<UUID> callback);
+       52  
+       53    /**
+       54     * Start the notifier (begin listening for notifications).
+       55     */
+       56    void start();
+       57  
+       58    /**
+       59     * Stop the notifier and release resources.
+       60     */
+       61    void stop();
+       62  
+       63    /**
+       64     * Check if the notifier is currently running.
+       65     *
+       66     * @return true if running
+       67     */
+       68    boolean isRunning();
+       69  
+       70    /**
+       71     * Get the type of notifier (for logging/debugging).
+       72     *
+       73     * @return notifier type name
+       74     */
+       75    String getType();
+       76  }
+
+---------- IMPLEMENTER org.openmetadata.service.apps.bundles.searchIndex.distributed.PollingJobNotifier  stubs=0/7 ----------
+       40  @Slf4j
+       41  public class PollingJobNotifier implements DistributedJobNotifier {
+       42  
+       43    /** Poll interval when no job is running (30 seconds) */
+       44    private static final long IDLE_POLL_INTERVAL_MS = 30_000;
+       45  
+       46    /** Poll interval when actively participating (1 second) */
+       47    private static final long ACTIVE_POLL_INTERVAL_MS = 1_000;
+       48  
+       49    private final CollectionDAO collectionDAO;
+       50    private final String serverId;
+       51    private final AtomicBoolean running = new AtomicBoolean(false);
+       52    private final AtomicBoolean participating = new AtomicBoolean(false);
+       53    private final Set<UUID> knownJobs = ConcurrentHashMap.newKeySet();
+       54  
+       55    private ScheduledExecutorService scheduler;
+       56    private Consumer<UUID> jobStartedCallback;
+       57    private volatile long lastPollTime = 0;
+       58  
+       59    public PollingJobNotifier(CollectionDAO collectionDAO, String serverId) {
+       60      this.collectionDAO = collectionDAO;
+       61      this.serverId = serverId;
+       62    }
+       63  
+       64    @Override
+       65    public void start() {
+       66      if (!running.compareAndSet(false, true)) {
+       67        LOG.warn("PollingJobNotifier already running");
+       68        return;
+       69      }
+       70  
+       71      scheduler =
+       72          Executors.newSingleThreadScheduledExecutor(
+       73              Thread.ofPlatform()
+       74                  .name(
+       75                      "reindex-job-notifier-" + serverId.substring(0, Math.min(8, serverId.length())))
+       76                  .factory());
+       77  
+       78      // Schedule with fixed delay of 1 second, but actual polling is controlled by interval logic
+       79      scheduler.scheduleWithFixedDelay(
+       80          this::pollForJobs, 0, ACTIVE_POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
+       81  
+       82      LOG.info(
+       83          "PollingJobNotifier started on server {} (idle: {}s, active: {}s)",
+       84          serverId,
+       85          IDLE_POLL_INTERVAL_MS / 1000,
+       86          ACTIVE_POLL_INTERVAL_MS / 1000);
+       87    }
+       88  
+       89    @Override
+       90    public void stop() {
+       91      if (!running.compareAndSet(true, false)) {
+       92        return;
+       93      }
+       94  
+       95      if (scheduler != null) {
+       96        scheduler.shutdown();
+       97        try {
+       98          if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+       99            scheduler.shutdownNow();
+      100          }
+      101        } catch (InterruptedException e) {
+      102          scheduler.shutdownNow();
+      103          Thread.currentThread().interrupt();
+      104        }
+      105      }
+      106  
+      107      knownJobs.clear();
+      108      LOG.info("PollingJobNotifier stopped on server {}", serverId);
+      109    }
+      110  
+      111    @Override
+      112    public void notifyJobStarted(UUID jobId, String jobType) {
+      113      // In polling mode, we don't actively notify - other servers will discover via polling
+      114      // But we track it locally to avoid re-notifying ourselves
+      115      knownJobs.add(jobId);
+      116      LOG.debug(
+      117          "Job {} (type: {}) started - other servers will discover via polling", jobId, jobType);
+      118    }
+      119  
+      120    @Override
+      121    public void notifyJobCompleted(UUID jobId) {
+      122      knownJobs.remove(jobId);
+      123      LOG.debug("Job {} completed - removed from known jobs", jobId);
+      124    }
+      125  
+      126    @Override
+      127    public void onJobStarted(Consumer<UUID> callback) {
+      128      this.jobStartedCallback = callback;
+      129    }
+      130  
+      131    @Override
+      132    public boolean isRunning() {
+      133      return running.get();
+      134    }
+      135  
+      136    @Override
+      137    public String getType() {
+      138      return "database-polling";
+      139    }
+      140  
+      141    /**
+      142     * Mark that this server is actively participating in a job. This speeds up polling to detect job
+      143     * completion faster.
+      144     */
+      145    public void setParticipating(boolean isParticipating) {
+      146      this.participating.set(isParticipating);
+      147    }
+      148  
+      149    private void pollForJobs() {
+      150      if (!running.get()) {
+      151        return;
+      152      }
+      153  
+      154      long now = System.currentTimeMillis();
+      155      long interval = participating.get() ? ACTIVE_POLL_INTERVAL_MS : IDLE_POLL_INTERVAL_MS;
+      156  
+      157      // Skip poll if not enough time has elapsed
+      158      if (now - lastPollTime < interval) {
+      159        return;
+      160      }
+      161      lastPollTime = now;
+      162  
+      163      try {
+      164        // Fast, lightweight query for running jobs
+      165        List<String> runningJobIds = collectionDAO.searchIndexJobDAO().getRunningJobIds();
+      166  
+      167        if (runningJobIds.isEmpty()) {
+      168          // No jobs running - clear known jobs and stay in idle mode
+      169          if (!knownJobs.isEmpty()) {
+      170            LOG.debug("No running jobs found, clearing {} known jobs", knownJobs.size());
+      171            knownJobs.clear();
+      172          }
+      173          return;
+      174        }
+      175  
+      176        // Check for new jobs we haven't seen
+      177        for (String jobIdStr : runningJobIds) {
+      178          UUID jobId = UUID.fromString(jobIdStr);
+      179          if (!knownJobs.contains(jobId)) {
+      180            // New job discovered!
+      181            LOG.info("Discovered new running job via polling: {}", jobId);
+      182            knownJobs.add(jobId);
+      183  
+      184            if (jobStartedCallback != null) {
+      185              jobStartedCallback.accept(jobId);
+      186            }
+      187          }
+      188        }
+      189  
+      190        // Clean up jobs that are no longer running
+      191        knownJobs.removeIf(
+      192            jobId -> runningJobIds.stream().noneMatch(id -> id.equals(jobId.toString())));
+      193  
+      194      } catch (Exception e) {
+      195        LOG.error("Error polling for jobs", e);
+      196      }
+      197    }
+      198  }
+
+---------- IMPLEMENTER org.openmetadata.service.apps.bundles.searchIndex.distributed.RedisJobNotifier  stubs=0/7 ----------
+       34  @Slf4j
+       35  public class RedisJobNotifier implements DistributedJobNotifier {
+       36  
+       37    private static final String CHANNEL_PREFIX = "om:distributed-jobs:";
+       38    private static final String START_CHANNEL = CHANNEL_PREFIX + "start";
+       39    private static final String COMPLETE_CHANNEL = CHANNEL_PREFIX + "complete";
+       40  
+       41    private final CacheConfig.Redis redisConfig;
+       42    private final String serverId;
+       43    private final AtomicBoolean running = new AtomicBoolean(false);
+       44  
+       45    private RedisClient redisClient;
+       46    private StatefulRedisPubSubConnection<String, String> subConnection;
+       47    private StatefulRedisConnection<String, String> pubConnection;
+       48    private Consumer<UUID> jobStartedCallback;
+       49  
+       50    public RedisJobNotifier(CacheConfig cacheConfig, String serverId) {
+       51      this.redisConfig = cacheConfig.redis;
+       52      this.serverId = serverId;
+       53    }
+       54  
+       55    @Override
+       56    public void start() {
+       57      if (!running.compareAndSet(false, true)) {
+       58        LOG.warn("RedisJobNotifier already running");
+       59        return;
+       60      }
+       61  
+       62      try {
+       63        RedisURI uri = buildRedisURI();
+       64        redisClient = RedisClient.create(uri);
+       65  
+       66        // Create subscription connection
+       67        subConnection = redisClient.connectPubSub();
+       68        subConnection.addListener(
+       69            new RedisPubSubAdapter<>() {
+       70              @Override
+       71              public void message(String channel, String message) {
+       72                handleMessage(channel, message);
+       73              }
+       74            });
+       75  
+       76        // Subscribe to job channels
+       77        subConnection.sync().subscribe(START_CHANNEL, COMPLETE_CHANNEL);
+       78  
+       79        // Create publish connection (separate from subscription)
+       80        pubConnection = redisClient.connect();
+       81  
+       82        LOG.info(
+       83            "RedisJobNotifier started on server {} - subscribed to channels: {}, {}",
+       84            serverId,
+       85            START_CHANNEL,
+       86            COMPLETE_CHANNEL);
+       87  
+       88      } catch (Exception e) {
+       89        running.set(false);
+       90        LOG.error("Failed to start RedisJobNotifier", e);
+       91        throw new RuntimeException("Failed to initialize Redis Pub/Sub", e);
+       92      }
+       93    }
+       94  
+       95    @Override
+       96    public void stop() {
+       97      if (!running.compareAndSet(true, false)) {
+       98        return;
+       99      }
+      100  
+      101      try {
+      102        if (subConnection != null) {
+      103          subConnection.sync().unsubscribe(START_CHANNEL, COMPLETE_CHANNEL);
+      104          subConnection.close();
+      105        }
+      106        if (pubConnection != null) {
+      107          pubConnection.close();
+      108        }
+      109        if (redisClient != null) {
+      110          redisClient.shutdown();
+      111        }
+      112        LOG.info("RedisJobNotifier stopped on server {}", serverId);
+      113      } catch (Exception e) {
+      114        LOG.error("Error stopping RedisJobNotifier", e);
+      115      }
+      116    }
+      117  
+      118    @Override
+      119    public void notifyJobStarted(UUID jobId, String jobType) {
+      120      if (!running.get() || pubConnection == null) {
+      121        LOG.warn("Cannot notify job started - RedisJobNotifier not running");
+      122        return;
+      123      }
+      124  
+      125      try {
+      126        String message = formatMessage(jobId, jobType, serverId);
+      127        long receivers = pubConnection.sync().publish(START_CHANNEL, message);
+      128        LOG.info(
+      129            "Published job start notification for {} (type: {}) to {} subscribers",
+      130            jobId,
+      131            jobType,
+      132            receivers);
+      133      } catch (Exception e) {
+      134        LOG.error("Failed to publish job start notification for {}", jobId, e);
+      135      }
+      136    }
+      137  
+      138    @Override
+      139    public void notifyJobCompleted(UUID jobId) {
+      140      if (!running.get() || pubConnection == null) {
+      141        LOG.warn("Cannot notify job completed - RedisJobNotifier not running");
+      142        return;
+      143      }
+      144  
+      145      try {
+      146        String message = formatMessage(jobId, "COMPLETED", serverId);
+      147        pubConnection.sync().publish(COMPLETE_CHANNEL, message);
+      148        LOG.debug("Published job completion notification for {}", jobId);
+      149      } catch (Exception e) {
+      150        LOG.error("Failed to publish job completion notification for {}", jobId, e);
+      151      }
+      152    }
+      153  
+      154    @Override
+      155    public void onJobStarted(Consumer<UUID> callback) {
+      156      this.jobStartedCallback = callback;
+      157    }
+      158  
+      159    @Override
+      160    public boolean isRunning() {
+      161      return running.get();
+      162    }
+      163  
+      164    @Override
+      165    public String getType() {
+      166      return "redis-pubsub";
+      167    }
+      168  
+      169    private void handleMessage(String channel, String message) {
+      170      try {
+      171        String[] parts = message.split("\\|");
+      172        if (parts.length < 3) {
+      173          LOG.warn("Invalid message format: {}", message);
+      174          return;
+      175        }
+      176  
+      177        UUID jobId = UUID.fromString(parts[0]);
+      178        String jobType = parts[1];
+      179        String sourceServer = parts[2];
+      180  
+      181        // Don't process our own messages
+      182        if (serverId.equals(sourceServer)) {
+      183          LOG.debug("Ignoring own message for job {}", jobId);
+      184          return;
+      185        }
+      186  
+      187        if (START_CHANNEL.equals(channel)) {
+      188          LOG.info(
+      189              "Received job start notification from server {}: job={}, type={}",
+      190              sourceServer,
+      191              jobId,
+      192              jobType);
+      193          if (jobStartedCallback != null) {
+
+---------- IMPLEMENTER org.openmetadata.service.apps.bundles.searchIndex.distributed.DistributedJobParticipantTest.TestJobNotifier  stubs=2/7 ----------
+       94    static class TestJobNotifier implements DistributedJobNotifier {
+       95      private Consumer<UUID> callback;
+       96      private boolean running = false;
+       97  
+       98      @Override
+       99      public void notifyJobStarted(UUID jobId, String jobType) {}
+      100  
+      101      @Override
+      102      public void notifyJobCompleted(UUID jobId) {}
+      103  
+      104      @Override
+      105      public void onJobStarted(Consumer<UUID> callback) {
+      106        this.callback = callback;
+      107      }
+      108  
+      109      @Override
+      110      public void start() {
+      111        this.running = true;
+      112      }
+      113  
+      114      @Override
+      115      public void stop() {
+      116        this.running = false;
+      117      }
+      118  
+      119      @Override
+      120      public boolean isRunning() {
+      121        return running;
+      122      }
+      123  
+      124      @Override
+      125      public String getType() {
+      126        return "test";
+      127      }
+      128  
+      129      /** Manually trigger job discovery for testing */
+      130      public void triggerJobDiscovered(UUID jobId) {
+      131        if (callback != null) {
+      132          callback.accept(jobId);
+      133        }
+      134      }
+      135    }

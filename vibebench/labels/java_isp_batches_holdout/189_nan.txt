@@ -1,0 +1,527 @@
+row 189   linkedin/venice#2510
+============================================================================
+CONTRACT com.linkedin.venice.acl.handler.AbstractStoreAclHandler   members=3.0 implementers=3.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       37  @ChannelHandler.Sharable
+       38  public abstract class AbstractStoreAclHandler<REQUEST_TYPE> extends SimpleChannelInboundHandler<HttpRequest> {
+       39    private static class CachedAcl {
+       40      AccessResult accessResult;
+       41      long timestamp;
+       42  
+       43      public CachedAcl(AccessResult accessResult, long timestamp) {
+       44        this.accessResult = accessResult;
+       45        this.timestamp = timestamp;
+       46      }
+       47    }
+       48  
+       49    private static final Logger LOGGER = LogManager.getLogger(AbstractStoreAclHandler.class);
+       50    public static final String STORE_ACL_CHECK_RESULT = "STORE_ACL_CHECK_RESULT_ATTRIBUTE_KEY";
+       51    public static final AttributeKey<VeniceConcurrentHashMap<String, CachedAcl>> STORE_ACL_CHECK_RESULT_ATTRIBUTE_KEY =
+       52        AttributeKey.valueOf(STORE_ACL_CHECK_RESULT);
+       53    private static final byte[] BAD_REQUEST_RESPONSE = "Unexpected! Original channel should not be null".getBytes();
+       54  
+       55    private final int cacheTTLMs;
+       56    private final Time time;
+       57    private final boolean aclCacheEnabled;
+       58  
+       59    private final IdentityParser identityParser;
+       60    private final ReadOnlyStoreRepository metadataRepository;
+       61    private final DynamicAccessController accessController;
+       62  
+       63    public AbstractStoreAclHandler(
+       64        IdentityParser identityParser,
+       65        DynamicAccessController accessController,
+       66        ReadOnlyStoreRepository metadataRepository,
+       67        int cacheTTLMs) {
+       68      this(identityParser, accessController, metadataRepository, cacheTTLMs, new SystemTime());
+       69    }
+       70  
+       71    public AbstractStoreAclHandler(
+       72        IdentityParser identityParser,
+       73        DynamicAccessController accessController,
+       74        ReadOnlyStoreRepository metadataRepository,
+       75        int cacheTTLMs,
+       76        Time time) {
+       77      this.identityParser = identityParser;
+       78      this.metadataRepository = metadataRepository;
+       79      this.accessController = accessController
+       80          .init(metadataRepository.getAllStores().stream().map(Store::getName).collect(Collectors.toList()));
+       81      this.metadataRepository.registerStoreDataChangedListener(new AclCreationDeletionListener(accessController));
+       82      this.cacheTTLMs = cacheTTLMs;
+       83      this.time = time;
+       84      this.aclCacheEnabled = cacheTTLMs > 0;
+       85    }
+       86  
+       87    /**
+       88     * Verify if client has permission to access.
+       89     *
+       90     * @param ctx
+       91     * @param req
+       92     * @throws SSLPeerUnverifiedException
+       93     */
+       94    @Override
+       95    public void channelRead0(ChannelHandlerContext ctx, HttpRequest req) throws SSLPeerUnverifiedException {
+       96      Channel originalChannel = ServerHandlerUtils.getOriginalChannel(ctx);
+       97      if (originalChannel == null) {
+       98        NettyUtils.setupResponseAndFlush(HttpResponseStatus.BAD_REQUEST, BAD_REQUEST_RESPONSE, false, ctx);
+       99        return;
+      100      }
+      101      if (isAccessAlreadyApproved(originalChannel)) {
+      102        ReferenceCountUtil.retain(req);
+      103        ctx.fireChannelRead(req);
+      104        return;
+      105      }
+      106  
+      107      String uri = req.uri();
+      108      // Parse resource type and store name
+      109      String[] requestParts = URI.create(uri).getPath().split("/");
+      110      REQUEST_TYPE requestType = validateRequest(requestParts);
+      111  
+      112      if (requestType == null) {
+      113        String errorMessage = "Invalid request uri: " + uri;
+      114        NettyUtils.setupResponseAndFlush(HttpResponseStatus.BAD_REQUEST, errorMessage.getBytes(), false, ctx);
+      115        return;
+      116      }
+      117  
+      118      if (!needsAclValidation(requestType)) {
+      119        ReferenceCountUtil.retain(req);
+      120        ctx.fireChannelRead(req);
+      121        return;
+      122      }
+      123  
+      124      String storeName = extractStoreName(requestType, requestParts);
+      125  
+      126      // When there is no store present in the metadata repository, pass the ACL check and let the next handler handle the
+      127      // case of deleted or migrated store
+      128      if (!metadataRepository.hasStore(storeName)) {
+      129        ReferenceCountUtil.retain(req);
+      130        ctx.fireChannelRead(req);
+      131        return;
+      132      }
+      133  
+      134      String method = req.method().name();
+      135  
+      136      if (!method.equals(HttpMethod.GET.name()) && !method.equals(HttpMethod.POST.name())) {
+      137        // Neither get nor post method, just let it pass
+      138        ReferenceCountUtil.retain(req);
+      139        ctx.fireChannelRead(req);
+      140        return;
+      141      }
+      142      AccessResult accessResult;
+      143      if (aclCacheEnabled) {
+      144        VeniceConcurrentHashMap<String, CachedAcl> storeAclCache =
+      145            originalChannel.attr(STORE_ACL_CHECK_RESULT_ATTRIBUTE_KEY).get();
+      146        if (storeAclCache == null) {
+      147          originalChannel.attr(STORE_ACL_CHECK_RESULT_ATTRIBUTE_KEY).setIfAbsent(new VeniceConcurrentHashMap<>());
+      148          storeAclCache = originalChannel.attr(STORE_ACL_CHECK_RESULT_ATTRIBUTE_KEY).get();
+      149        }
+      150  
+      151        accessResult = storeAclCache.compute(storeName, (ignored, value) -> {
+      152          long currentTimestamp = time.getMilliseconds();
+      153          if (value == null || currentTimestamp - value.timestamp > cacheTTLMs) {
+      154            try {
+      155              return new CachedAcl(
+      156                  checkAccess(uri, extractClientCert(ctx), storeName, HttpMethod.GET.name()),
+      157                  currentTimestamp);
+      158            } catch (Exception e) {
+      159              LOGGER.error("Error while checking access", e);
+      160              return new CachedAcl(AccessResult.ERROR_FORBIDDEN, currentTimestamp);
+      161            }
+      162          } else {
+      163            return value;
+      164          }
+      165        }).accessResult;
+      166      } else {
+      167        accessResult = checkAccess(uri, extractClientCert(ctx), storeName, HttpMethod.GET.name());
+      168      }
+      169      switch (accessResult) {
+      170        case GRANTED:
+      171          ReferenceCountUtil.retain(req);
+      172          ctx.fireChannelRead(req);
+      173          break;
+      174        case UNAUTHORIZED:
+      175          NettyUtils
+      176              .setupResponseAndFlush(HttpResponseStatus.UNAUTHORIZED, accessResult.getMessage().getBytes(), false, ctx);
+      177          break;
+      178        case FORBIDDEN:
+      179        case ERROR_FORBIDDEN:
+      180          NettyUtils
+      181              .setupResponseAndFlush(HttpResponseStatus.FORBIDDEN, accessResult.getMessage().getBytes(), false, ctx);
+      182          break;
+      183      }
+      184    }
+      185  
+      186    protected boolean isAccessAlreadyApproved(Channel originalChannel) {
+      187      return false;
+      188    }
+      189  
+      190    protected abstract boolean needsAclValidation(REQUEST_TYPE requestType);
+      191  
+      192    protected abstract String extractStoreName(REQUEST_TYPE requestType, String[] requestParts);
+      193  
+      194    /**
+      195     * Validate the request and return the request type. If the request is invalid, return {@code null}
+      196     *
+      197     * @param requestParts the parts of the request URI
+      198     * @return the request type; null if the request is invalid
+      199     */
+      200    protected abstract REQUEST_TYPE validateRequest(String[] requestParts);
+      201  
+      202    /**
+      203     * N.B.: This function is called on the hot path, so it's important to make it as efficient as possible. The order of
+      204     *       operations is carefully considered so that short-circuiting comes into play as much as possible. We also try
+      205     *       to minimize the overhead of logging wherever possible (e.g., by minimizing expensive calls, such as the one
+      206     *       to {@link IdentityParser#parseIdentityFromCert(X509Certificate)}).
+      207     */
+      208    protected AccessResult checkAccess(String uri, X509Certificate clientCert, String storeName, String method) {
+      209      try {
+      210        if (accessController.hasAccess(clientCert, storeName, method)) {
+      211          return AccessResult.GRANTED;
+      212        }
+      213  
+      214        if (VeniceSystemStoreUtils.isSystemStore(storeName)) {
+      215          return AccessResult.GRANTED;
+      216        }
+      217  
+      218        // Fact:
+      219        // Request gets rejected.
+      220        // Possible Reasons:
+      221        // A. ACL not found. OR,
+      222        // B. ACL exists but caller does not have permission.
+      223  
+      224        if (!accessController.isFailOpen() && !accessController.hasAcl(storeName)) { // short circuit, order matters
+      225          // Case A
+      226          // Conditions:
+      227          // 0. (outside) Store exists and is being access controlled. AND,
+      228          // 1. (left) The following policy is applied: if ACL not found, reject the request. AND,
+      229          // 2. (right) ACL not found.
+      230          // Result:
+      231          // Request is rejected by DynamicAccessController#hasAccess()
+      232          // Root cause:
+      233          // Requested resource exists but does not have ACL.
+      234          // Action:
+      235          // return 401 Unauthorized
+      236          if (LOGGER.isWarnEnabled()) {
+      237            LOGGER.warn(
+      238                "Requested store does not have ACL: {} requested {} {}",
+      239                identityParser.parseIdentityFromCert(clientCert),
+      240                method,
+      241                uri);
+      242            if (LOGGER.isDebugEnabled()) {
+      243              LOGGER.debug(
+      244                  "Existing stores: {}",
+      245                  metadataRepository.getAllStores().stream().map(Store::getName).sorted().collect(Collectors.toList()));
+      246              LOGGER.debug(
+      247                  "Access-controlled stores: {}",
+      248                  accessController.getAccessControlledResources().stream().sorted().collect(Collectors.toList()));
+      249            }
+      250          }
+      251          return AccessResult.UNAUTHORIZED;
+      252        } else {
+      253          // Case B
+      254          // Conditions:
+      255          // 1. Fail closed, and ACL found. OR,
+      256          // 2. Fail open, and ACL found. OR,
+      257          // 3. Fail open, and ACL not found.
+      258          // Analyses:
+      259          // (1) ACL exists, therefore result is determined by ACL.
+      260          // Since the request has been rejected, it must be due to lack of permission.
+      261          // (2) ACL exists, therefore result is determined by ACL.
+      262          // Since the request has been rejected, it must be due to lack of permission.
+      263          // (3) In such case, request would NOT be rejected in the first place,
+      264          // according to the definition of hasAccess() in DynamicAccessController interface.
+      265          // Contradiction to the fact, therefore this case is impossible.
+      266          // Root cause:
+      267          // Caller does not have permission to access the resource.
+      268          // Action:
+      269          // return 403 Forbidden
+      270          if (LOGGER.isDebugEnabled()) {
+      271            LOGGER.debug(
+      272                "Unauthorized access rejected: {} requested {} {}",
+      273                identityParser.parseIdentityFromCert(clientCert),
+      274                method,
+      275                uri);
+      276          }
+      277          return AccessResult.FORBIDDEN;
+      278        }
+      279      } catch (AclException e) {
+      280        if (accessController.isFailOpen()) {
+      281          if (LOGGER.isWarnEnabled()) {
+      282            LOGGER.warn(
+      283                "Exception occurred! Access granted: {} requested {} {}",
+      284                identityParser.parseIdentityFromCert(clientCert),
+      285                method,
+      286                uri,
+      287                e);
+      288          }
+      289          return AccessResult.GRANTED;
+      290        } else {
+      291          if (LOGGER.isWarnEnabled()) {
+      292            LOGGER.warn(
+      293                "Exception occurred! Access rejected: {} requested {} {}",
+      294                identityParser.parseIdentityFromCert(clientCert),
+      295                method,
+      296                uri,
+      297                e);
+      298          }
+      299          return AccessResult.ERROR_FORBIDDEN;
+      300        }
+      301      }
+      302    }
+      303  }
+
+---------- IMPLEMENTER com.linkedin.venice.acl.handler.AbstractStoreAclHandlerTest.MockStoreAclHandler  stubs=0/1 ----------
+      382    private static class MockStoreAclHandler extends AbstractStoreAclHandler<TestRequestType> {
+      383      public MockStoreAclHandler(
+      384          IdentityParser identityParser,
+      385          DynamicAccessController accessController,
+      386          HelixReadOnlyStoreRepository metadataRepository,
+      387          Time mockTime) {
+      388        super(identityParser, accessController, metadataRepository, CACHE_TTL_MS, mockTime);
+      389      }
+      390  
+      391      public MockStoreAclHandler(
+      392          IdentityParser identityParser,
+      393          DynamicAccessController accessController,
+      394          HelixReadOnlyStoreRepository metadataRepository,
+      395          int cacheTTLMs,
+      396          Time mockTime) {
+      397        super(identityParser, accessController, metadataRepository, cacheTTLMs, mockTime);
+      398      }
+      399  
+      400      @Override
+      401      protected boolean needsAclValidation(TestRequestType requestType) {
+      402        return requestType != TestRequestType.NO_ACL;
+      403      }
+      404  
+      405      @Override
+      406      protected String extractStoreName(TestRequestType requestType, String[] requestParts) {
+      407        return requestParts[2];
+      408      }
+      409  
+      410      @Override
+      411      protected TestRequestType validateRequest(String[] requestParts) {
+      412        if (requestParts[1].equals("noAcl")) {
+      413          return TestRequestType.NO_ACL;
+      414        } else if (requestParts[1].equals("goodUri")) {
+      415          return TestRequestType.GOOD_URI;
+      416        } else {
+      417          return null;
+      418        }
+      419      }
+      420    }
+
+---------- IMPLEMENTER com.linkedin.venice.router.acl.RouterStoreAclHandler  stubs=0/1 ----------
+       20  @ChannelHandler.Sharable
+       21  public class RouterStoreAclHandler extends AbstractStoreAclHandler<RouterResourceType> {
+       22    public RouterStoreAclHandler(
+       23        IdentityParser identityParser,
+       24        DynamicAccessController accessController,
+       25        ReadOnlyStoreRepository metadataRepository,
+       26        int cacheTTLMs) {
+       27      super(identityParser, accessController, metadataRepository, cacheTTLMs);
+       28      metadataRepository.registerStoreDataChangedListener(new AclCreationDeletionListener(accessController));
+       29    }
+       30  
+       31    @Override
+       32    protected boolean needsAclValidation(RouterResourceType resourceType) {
+       33      if (resourceType == TYPE_STORAGE || resourceType == TYPE_COMPUTE) {
+       34        return true;
+       35      }
+       36  
+       37      if (resourceType == TYPE_INVALID) {
+       38        throw new VeniceUnsupportedOperationException(resourceType.name());
+       39      }
+       40  
+       41      return false;
+       42    }
+       43  
+       44    /**
+       45     * Extract the store name from the incoming resource name.
+       46     */
+       47    @Override
+       48    protected String extractStoreName(RouterResourceType resourceType, String[] requestParts) {
+       49      // In Routers, all requests that go through ACL checks have the 2nd part as the store name
+       50      return requestParts[2];
+       51    }
+       52  
+       53    @Override
+       54    protected RouterResourceType validateRequest(String[] requestParts) {
+       55      int partsLength = requestParts.length;
+       56  
+       57      if (partsLength < 3) {
+       58        // In routers, all requests have at least the request type and store name
+       59        return null;
+       60      } else { // throw exception to retain current behavior for invalid query actions
+       61        String requestType = requestParts[1].toLowerCase();
+       62        RouterResourceType resourceType = RouterResourceType.getTypeResourceType(requestType);
+       63        if (resourceType == TYPE_INVALID) {
+       64          return null;
+       65        }
+       66        return resourceType;
+       67      }
+       68    }
+       69  }
+
+---------- IMPLEMENTER com.linkedin.venice.listener.ServerStoreAclHandler  stubs=0/1 ----------
+       41  public class ServerStoreAclHandler extends AbstractStoreAclHandler<QueryAction> implements ServerInterceptor {
+       42    private final static Logger LOGGER = LogManager.getLogger(ServerStoreAclHandler.class);
+       43  
+       44    /**
+       45     *  Skip ACL for requests to /metadata, /admin, /current_version, /health, /topic_partition_ingestion_context and
+       46     *  /host_heartbeat_lag as there's no sensitive information in the response.
+       47     */
+       48    private static final Set<QueryAction> QUERIES_TO_SKIP_ACL = EnumSet.of(
+       49        QueryAction.METADATA,
+       50        QueryAction.STORE_PROPERTIES,
+       51        QueryAction.ADMIN,
+       52        QueryAction.HEALTH,
+       53        QueryAction.CURRENT_VERSION,
+       54        QueryAction.TOPIC_PARTITION_INGESTION_CONTEXT,
+       55        QueryAction.HOST_HEARTBEAT_LAG,
+       56        QueryAction.KEY_PARTITION_PROFILER);
+       57  
+       58    public ServerStoreAclHandler(
+       59        IdentityParser identityParser,
+       60        DynamicAccessController accessController,
+       61        ReadOnlyStoreRepository metadataRepository,
+       62        int cacheTTLMs) {
+       63      super(identityParser, accessController, metadataRepository, cacheTTLMs);
+       64    }
+       65  
+       66    public ServerStoreAclHandler(
+       67        IdentityParser identityParser,
+       68        DynamicAccessController accessController,
+       69        ReadOnlyStoreRepository metadataRepository,
+       70        int cacheTTLMs,
+       71        Time time) {
+       72      super(identityParser, accessController, metadataRepository, cacheTTLMs, time);
+       73    }
+       74  
+       75    @Override
+       76    protected boolean needsAclValidation(QueryAction queryAction) {
+       77      /*
+       78       * Skip request uri validations for store name and certificates due to special actions
+       79       * TODO: Identify validations for each query actions and have a flow to perform validations and actions based on
+       80       * query actions
+       81       */
+       82      return !QUERIES_TO_SKIP_ACL.contains(queryAction);
+       83    }
+       84  
+       85    @Override
+       86    public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+       87        ServerCall<ReqT, RespT> call,
+       88        Metadata headers,
+       89        ServerCallHandler<ReqT, RespT> next) {
+       90      if (checkWhetherAccessHasAlreadyApproved(headers)) {
+       91        LOGGER.debug("Access already approved by ServerAclHandler");
+       92        return next.startCall(call, headers);
+       93      } else {
+       94        return new ForwardingServerCallListener.SimpleForwardingServerCallListener<ReqT>(next.startCall(call, headers)) {
+       95          @Override
+       96          public void onMessage(ReqT message) {
+       97            validateStoreAclForGRPC(super::onMessage, message, call, headers);
+       98          }
+       99        };
+      100      }
+      101    }
+      102  
+      103    // Visible for testing
+      104    <ReqT, RespT> void validateStoreAclForGRPC(
+      105        Consumer<ReqT> onAuthenticated,
+      106        ReqT message,
+      107        ServerCall<ReqT, RespT> call,
+      108        Metadata headers) {
+      109      // The store-level read ACL is keyed on VeniceClientRequest's resourceName/method. Other gRPC services
+      110      // (e.g. the ingestion monitor) use different message types that carry neither, so forward them rather than
+      111      // mis-cast. Such diagnostic endpoints are gated by mutual TLS rather than store-level read ACL.
+      112      if (!(message instanceof VeniceClientRequest)) {
+      113        onAuthenticated.accept(message);
+      114        return;
+      115      }
+      116      VeniceClientRequest request = (VeniceClientRequest) message;
+      117      // For now, GRPC only supports STORAGE query
+      118      String resourceName = request.getResourceName();
+      119      String storeName;
+      120      try {
+      121        storeName = extractStoreName(resourceName, QueryAction.STORAGE);
+      122      } catch (IllegalArgumentException e) {
+      123        LOGGER.error("Invalid store name in resource '{}'", resourceName);
+      124        call.close(Status.INVALID_ARGUMENT.withDescription("Invalid request"), headers);
+      125        return;
+      126      }
+      127      String method = request.getMethod();
+      128  
+      129      if (StringUtils.isEmpty(method)) {
+      130        LOGGER.error("Invalid method {}", method);
+      131        call.close(Status.INVALID_ARGUMENT.withDescription("Invalid request"), headers);
+      132        return;
+      133      }
+      134  
+      135      try {
+      136        X509Certificate clientCert = extractGrpcClientCert(call);
+      137        AccessResult accessResult = checkAccess(call.getAuthority(), clientCert, storeName, method);
+      138        switch (accessResult) {
+      139          case GRANTED:
+      140            onAuthenticated.accept(message);
+      141            break;
+      142          case UNAUTHORIZED:
+      143          case FORBIDDEN:
+      144          case ERROR_FORBIDDEN:
+      145            call.close(accessResultToGrpcStatus(accessResult), headers);
+      146            break;
+      147        }
+      148      } catch (SSLPeerUnverifiedException e) {
+      149        LOGGER.error("Cannot verify the certificate.", e);
+      150        call.close(Status.UNAUTHENTICATED.withDescription("Invalid certificate"), headers);
+      151      } catch (VeniceException e) {
+      152        LOGGER.error("Cannot process request successfully due to", e);
+      153        call.close(Status.INTERNAL.withDescription(e.getMessage()), headers);
+      154      }
+      155    }
+      156  
+      157    @Override
+      158    protected String extractStoreName(QueryAction queryAction, String[] requestParts) {
+      159      String resourceName = requestParts[2];
+      160      return extractStoreName(resourceName, queryAction);
+      161    }
+      162  
+      163    /**
+      164     * In Venice Server, the resource name is actually a Kafka topic name for STORAGE/COMPUTE but store name for DICTIONARY.
+      165     */
+      166    private String extractStoreName(String resourceName, QueryAction queryAction) {
+      167      switch (queryAction) {
+      168        case STORAGE:
+      169        case COMPUTE:
+      170          return Version.parseStoreFromKafkaTopicName(resourceName);
+      171        case DICTIONARY:
+      172          return resourceName;
+      173        default:
+      174          throw new IllegalArgumentException(
+      175              String.format("Unexpected QueryAction: %s with resource name: %s", queryAction, resourceName));
+      176      }
+      177    }
+      178  
+      179    @Override
+      180    protected QueryAction validateRequest(String[] requestParts) {
+      181      int partsLength = requestParts.length;
+      182      // Only for HEALTH queries, parts length can be 2
+      183      if (partsLength == 2) {
+      184        if (requestParts[1].equalsIgnoreCase(QueryAction.HEALTH.name())) {
+      185          return QueryAction.HEALTH;
+      186        } else {
+      187          return null;
+      188        }
+      189      } else if (partsLength < 3) { // invalid request if parts length < 3 except health queries
+      190        return null;
+      191      } else { // throw exception to retain current behavior for invalid query actions
+      192        try {
+      193          return QueryAction.valueOf(requestParts[1].toUpperCase());
+      194        } catch (IllegalArgumentException exception) {
+      195          return null;
+      196        }
+      197      }
+      198    }
+      199  
+      200    @Override
