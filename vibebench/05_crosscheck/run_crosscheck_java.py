@@ -890,7 +890,10 @@ def _self_check() -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--limit", type=int, default=None,
+                    help="alphabetical head; biased, use --sample instead")
+    ap.add_argument("--sample", type=int, default=None,
+                    help="seeded random sample of N repositories (unbiased, unlike --limit)")
     ap.add_argument("--repo", default=None)
     ap.add_argument("--skip-tools", action="store_true",
                     help="compute our own metrics only (fast sanity pass)")
@@ -945,7 +948,12 @@ def main() -> None:
     if a.repo:
         head = head[head["full_name"] == a.repo]
     head = head.sort_values("full_name")
-    if a.limit:
+    if a.sample and a.sample < len(head):
+        # Seeded so the drawn set is reproducible from the seed alone.
+        head = head.sample(n=a.sample, random_state=C.RANDOM_SEED).sort_values("full_name")
+        print(f"seeded random sample: {len(head)} of the corpus's repositories "
+              f"(seed {C.RANDOM_SEED})", flush=True)
+    elif a.limit:
         head = head.head(a.limit)
     print(f"head-state trees: {len(head)} repos", flush=True)
 
