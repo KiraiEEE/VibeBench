@@ -1,0 +1,606 @@
+row 31   JetBrains/youtrackdb#649
+============================================================================
+CONTRACT com.jetbrains.youtrackdb.internal.core.YouTrackDBShutdownListener   members=1.0 implementers=6.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+        8  public interface YouTrackDBShutdownListener {
+        9  
+       10    void onShutdown();
+       11  }
+
+---------- IMPLEMENTER com.jetbrains.youtrackdb.internal.common.concur.resource.ReentrantResourcePool  stubs=0/1 ----------
+       37  public class ReentrantResourcePool<K, V> extends ResourcePool<K, V>
+       38      implements YouTrackDBStartupListener, YouTrackDBShutdownListener {
+       39  
+       40    private volatile ThreadLocal<Map<K, ResourceHolder<V>>> activeResources =
+       41        new ThreadLocal<Map<K, ResourceHolder<V>>>();
+       42  
+       43    private static final class ResourceHolder<V> {
+       44  
+       45      private final V resource;
+       46      private int counter = 1;
+       47  
+       48      private ResourceHolder(V resource) {
+       49        this.resource = resource;
+       50      }
+       51    }
+       52  
+       53    public ReentrantResourcePool(
+       54        final int maxResources, final ResourcePoolListener<K, V> listener) {
+       55      super(maxResources, listener);
+       56  
+       57      YouTrackDBEnginesManager.instance().registerWeakYouTrackDBShutdownListener(this);
+       58      YouTrackDBEnginesManager.instance().registerWeakYouTrackDBStartupListener(this);
+       59    }
+       60  
+       61    @Override
+       62    public void onShutdown() {
+       63      activeResources = null;
+       64    }
+       65  
+       66    @Override
+       67    public void onStartup() {
+       68      if (activeResources == null) {
+       69        activeResources = new ThreadLocal<Map<K, ResourceHolder<V>>>();
+       70      }
+       71    }
+       72  
+       73    @Override
+       74    public V getResource(K key, final long maxWaitMillis, Object... additionalArgs)
+       75        throws LockException {
+       76      var resourceHolderMap = activeResources.get();
+       77  
+       78      if (resourceHolderMap == null) {
+       79        resourceHolderMap = new HashMap<K, ResourceHolder<V>>();
+       80        activeResources.set(resourceHolderMap);
+       81      }
+       82  
+       83      final var holder = resourceHolderMap.get(key);
+       84      if (holder != null) {
+       85        holder.counter++;
+       86        return holder.resource;
+       87      }
+       88      try {
+       89        final var res = super.getResource(key, maxWaitMillis, additionalArgs);
+       90        resourceHolderMap.put(key, new ResourceHolder<V>(res));
+       91        return res;
+       92  
+       93      } catch (RuntimeException e) {
+       94        resourceHolderMap.remove(key);
+       95  
+       96        // PROPAGATE IT
+       97        throw e;
+       98      }
+       99    }
+      100  
+      101    @Override
+      102    public boolean returnResource(final V res) {
+      103      final var resourceHolderMap = activeResources.get();
+      104      if (resourceHolderMap != null) {
+      105        K keyToRemove = null;
+      106        for (var entry : resourceHolderMap.entrySet()) {
+      107          final var holder = entry.getValue();
+      108          if (holder.resource.equals(res)) {
+      109            holder.counter--;
+      110            assert holder.counter >= 0;
+      111            if (holder.counter > 0) {
+      112              return false;
+      113            }
+      114  
+      115            keyToRemove = entry.getKey();
+      116            break;
+      117          }
+      118        }
+      119  
+      120        resourceHolderMap.remove(keyToRemove);
+      121      }
+      122  
+      123      return super.returnResource(res);
+      124    }
+      125  
+      126    public int getConnectionsInCurrentThread(final K key) {
+      127      final var resourceHolderMap = activeResources.get();
+      128      if (resourceHolderMap == null) {
+      129        return 0;
+      130      }
+      131  
+      132      final var holder = resourceHolderMap.get(key);
+      133      if (holder == null) {
+      134        return 0;
+      135      }
+      136  
+      137      return holder.counter;
+      138    }
+      139  
+      140    @Override
+      141    public void remove(final V res) {
+      142      this.resources.remove(res);
+      143  
+      144      final List<K> activeResourcesToRemove = new ArrayList<K>();
+      145      final var activeResourcesMap = activeResources.get();
+      146  
+      147      if (activeResourcesMap != null) {
+      148        for (var entry : activeResourcesMap.entrySet()) {
+      149          final var holder = entry.getValue();
+      150          if (holder.resource.equals(res)) {
+      151            activeResourcesToRemove.add(entry.getKey());
+      152          }
+      153        }
+      154  
+      155        for (var resourceKey : activeResourcesToRemove) {
+      156          activeResourcesMap.remove(resourceKey);
+      157          sem.release();
+      158        }
+      159      }
+      160    }
+      161  }
+
+---------- IMPLEMENTER com.jetbrains.youtrackdb.internal.common.concur.resource.ResourcePoolFactory  stubs=0/1 ----------
+       11  public class ResourcePoolFactory<K, T> extends YouTrackDBListenerAbstract {
+       12  
+       13    private volatile int maxPartitions = Runtime.getRuntime().availableProcessors() << 3;
+       14    private volatile int maxPoolSize = 64;
+       15    private boolean closed = false;
+       16  
+       17    private final ConcurrentLinkedHashMap<K, ResourcePool<K, T>> poolStore;
+       18    private final ObjectFactoryFactory<K, T> objectFactoryFactory;
+       19  
+       20    private final EvictionListener<K, ResourcePool<K, T>> evictionListener =
+       21        new EvictionListener<K, ResourcePool<K, T>>() {
+       22          @Override
+       23          public void onEviction(K key, ResourcePool<K, T> partitionedObjectPool) {
+       24            partitionedObjectPool.close();
+       25          }
+       26        };
+       27  
+       28    public ResourcePoolFactory(final ObjectFactoryFactory<K, T> objectFactoryFactory) {
+       29      this(objectFactoryFactory, 100);
+       30    }
+       31  
+       32    public ResourcePoolFactory(
+       33        final ObjectFactoryFactory<K, T> objectFactoryFactory, final int capacity) {
+       34      this.objectFactoryFactory = objectFactoryFactory;
+       35      poolStore =
+       36          new ConcurrentLinkedHashMap.Builder<K, ResourcePool<K, T>>()
+       37              .maximumWeightedCapacity(capacity)
+       38              .listener(evictionListener)
+       39              .build();
+       40  
+       41      YouTrackDBEnginesManager.instance().registerWeakYouTrackDBStartupListener(this);
+       42      YouTrackDBEnginesManager.instance().registerWeakYouTrackDBShutdownListener(this);
+       43    }
+       44  
+       45    public int getMaxPoolSize() {
+       46      return maxPoolSize;
+       47    }
+       48  
+       49    public void setMaxPoolSize(final int maxPoolSize) {
+       50      checkForClose();
+       51  
+       52      this.maxPoolSize = maxPoolSize;
+       53    }
+       54  
+       55    public ResourcePool<K, T> get(final K key) {
+       56      checkForClose();
+       57  
+       58      var pool = poolStore.get(key);
+       59      if (pool != null) {
+       60        return pool;
+       61      }
+       62  
+       63      pool = new ResourcePool<K, T>(maxPoolSize, objectFactoryFactory.create(key));
+       64  
+       65      final var oldPool = poolStore.putIfAbsent(key, pool);
+       66      if (oldPool != null) {
+       67        pool.close();
+       68        return oldPool;
+       69      }
+       70  
+       71      return pool;
+       72    }
+       73  
+       74    public int getMaxPartitions() {
+       75      return maxPartitions;
+       76    }
+       77  
+       78    public void setMaxPartitions(final int maxPartitions) {
+       79      this.maxPartitions = maxPartitions;
+       80    }
+       81  
+       82    public Collection<ResourcePool<K, T>> getPools() {
+       83      checkForClose();
+       84  
+       85      return Collections.unmodifiableCollection(poolStore.values());
+       86    }
+       87  
+       88    public void close() {
+       89      if (closed) {
+       90        return;
+       91      }
+       92  
+       93      closed = true;
+       94  
+       95      while (!poolStore.isEmpty()) {
+       96        final var poolIterator = poolStore.values().iterator();
+       97  
+       98        while (poolIterator.hasNext()) {
+       99          final var pool = poolIterator.next();
+      100  
+      101          try {
+      102            pool.close();
+      103          } catch (Exception e) {
+      104            LogManager.instance().error(this, "Error during pool close", e);
+      105          }
+      106  
+      107          poolIterator.remove();
+      108        }
+      109      }
+      110  
+      111      for (var pool : poolStore.values()) {
+      112        pool.close();
+      113      }
+      114  
+      115      poolStore.clear();
+      116    }
+      117  
+      118    @Override
+      119    public void onShutdown() {
+      120      close();
+      121    }
+      122  
+      123    private void checkForClose() {
+      124      if (closed) {
+      125        throw new IllegalStateException("Pool factory is closed");
+      126      }
+      127    }
+      128  
+      129    public interface ObjectFactoryFactory<K, T> {
+      130  
+      131      ResourcePoolListener<K, T> create(K key);
+      132    }
+      133  }
+
+---------- IMPLEMENTER com.jetbrains.youtrackdb.internal.common.profiler.Profiler  stubs=0/1 ----------
+       33  public class Profiler implements YouTrackDBStartupListener, YouTrackDBShutdownListener {
+       34  
+       35    private static final Logger logger = LoggerFactory.getLogger(Profiler.class);
+       36  
+       37    private final Ticker ticker = new GranularTicker(
+       38        GlobalConfiguration.PROFILER_TICKER_GRANULARITY.getValueAsLong());
+       39    private final MetricsRegistry metricsRegistry = new MetricsRegistry(ticker);
+       40    private final YouTrackDBScheduler scheduler;
+       41  
+       42    public Profiler(YouTrackDBScheduler scheduler) {
+       43      this.scheduler = scheduler;
+       44    }
+       45  
+       46    public MetricsRegistry getMetricsRegistry() {
+       47      return metricsRegistry;
+       48    }
+       49  
+       50    @Override
+       51    public void onStartup() {
+       52      ticker.start();
+       53  
+       54      final long memoryCheckInterval = GlobalConfiguration.PROFILER_MEMORYCHECK_INTERVAL.getValueAsLong();
+       55  
+       56      if (memoryCheckInterval > 0) {
+       57        scheduler.scheduleTask(new MemoryChecker(), memoryCheckInterval, memoryCheckInterval);
+       58      }
+       59    }
+       60  
+       61    @Override
+       62    public void onShutdown() {
+       63      metricsRegistry.shutdown();
+       64      ticker.stop();
+       65    }
+       66  
+       67    public static String dumpEnvironment() {
+       68      final StringBuilder buffer = new StringBuilder();
+       69  
+       70      final Runtime runtime = Runtime.getRuntime();
+       71  
+       72      final long freeSpaceInMB = new File(".").getFreeSpace();
+       73      final long totalSpaceInMB = new File(".").getTotalSpace();
+       74  
+       75      int stgs = 0;
+       76      long diskCacheUsed = 0;
+       77      long diskCacheTotal = 0;
+       78      for (Storage stg : YouTrackDBEnginesManager.instance().getStorages()) {
+       79        if (stg instanceof DiskStorage) {
+       80          diskCacheUsed += ((DiskStorage) stg).getReadCache().getUsedMemory();
+       81          diskCacheTotal += GlobalConfiguration.DISK_CACHE_SIZE.getValueAsLong() * 1024 * 1024;
+       82          stgs++;
+       83        }
+       84      }
+       85      try {
+       86        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+       87        ObjectName osMBeanName =
+       88            ObjectName.getInstance(ManagementFactory.OPERATING_SYSTEM_MXBEAN_NAME);
+       89        if (mbs.isInstanceOf(osMBeanName, "com.sun.management.OperatingSystemMXBean")) {
+       90          final long osTotalMem =
+       91              ((Number) mbs.getAttribute(osMBeanName, "TotalPhysicalMemorySize")).longValue();
+       92          final long osUsedMem =
+       93              osTotalMem
+       94                  - ((Number) mbs.getAttribute(osMBeanName, "FreePhysicalMemorySize")).longValue();
+       95  
+       96          buffer.append(
+       97              String.format(
+       98                  "YouTrackDB Memory profiler: HEAP=%s of %s - DISKCACHE (%s dbs)=%s of %s - OS=%s of"
+       99                      + " %s - FS=%s of %s",
+      100                  FileUtils.getSizeAsString(runtime.totalMemory() - runtime.freeMemory()),
+      101                  FileUtils.getSizeAsString(runtime.maxMemory()),
+      102                  stgs,
+      103                  FileUtils.getSizeAsString(diskCacheUsed),
+      104                  FileUtils.getSizeAsString(diskCacheTotal),
+      105                  FileUtils.getSizeAsString(osUsedMem),
+      106                  FileUtils.getSizeAsString(osTotalMem),
+      107                  FileUtils.getSizeAsString(freeSpaceInMB),
+      108                  FileUtils.getSizeAsString(totalSpaceInMB)));
+      109        }
+      110  
+      111      } catch (Exception e) {
+      112        // JMX NOT AVAILABLE, AVOID OS DATA
+      113        buffer.append(
+      114            String.format(
+      115                "YouTrackDB Memory profiler: HEAP=%s of %s - DISKCACHE (%s dbs)=%s of %s - FS=%s of %s",
+      116                FileUtils.getSizeAsString(runtime.totalMemory() - runtime.freeMemory()),
+      117                FileUtils.getSizeAsString(runtime.maxMemory()),
+      118                stgs,
+      119                FileUtils.getSizeAsString(diskCacheUsed),
+      120                FileUtils.getSizeAsString(diskCacheTotal),
+      121                FileUtils.getSizeAsString(freeSpaceInMB),
+      122                FileUtils.getSizeAsString(totalSpaceInMB)));
+      123      }
+      124  
+      125      return buffer.toString();
+      126    }
+      127  
+      128    public static String threadDump() {
+      129      final StringBuilder dump = new StringBuilder();
+      130      dump.append("THREAD DUMP\n");
+      131      final ThreadMXBean threadMXBean = ManagementFactory.getThreadMXBean();
+      132      final ThreadInfo[] threadInfos =
+      133          threadMXBean.getThreadInfo(threadMXBean.getAllThreadIds(), 100);
+      134      for (ThreadInfo threadInfo : threadInfos) {
+      135        dump.append('"');
+      136        dump.append(threadInfo.getThreadName());
+      137        dump.append("\" ");
+      138        final Thread.State state = threadInfo.getThreadState();
+      139        dump.append("\n   java.lang.Thread.State: ");
+      140        dump.append(state);
+      141        final StackTraceElement[] stackTraceElements = threadInfo.getStackTrace();
+      142        for (final StackTraceElement stackTraceElement : stackTraceElements) {
+      143          dump.append("\n        at ");
+      144          dump.append(stackTraceElement);
+      145        }
+      146        dump.append("\n\n");
+      147      }
+      148      return dump.toString();
+      149    }
+      150  
+      151    static final class MemoryChecker implements Runnable {
+      152  
+      153      @Override
+      154      public void run() {
+      155        try {
+      156          final long jvmTotMemory = Runtime.getRuntime().totalMemory();
+      157          final long jvmMaxMemory = Runtime.getRuntime().maxMemory();
+      158  
+      159          for (Storage s : YouTrackDBEnginesManager.instance().getStorages()) {
+      160            if (s instanceof DiskStorage) {
+      161              final ReadCache dk = ((DiskStorage) s).getReadCache();
+      162              final WriteCache wk = ((DiskStorage) s).getWriteCache();
+      163              if (dk == null || wk == null)
+      164              // NOT YET READY
+      165              {
+      166                continue;
+      167              }
+      168  
+      169              final long totalDiskCacheUsedMemory =
+      170                  (dk.getUsedMemory() + wk.getExclusiveWriteCachePagesSize()) / FileUtils.MEGABYTE;
+      171              final long maxDiskCacheUsedMemory =
+      172                  GlobalConfiguration.DISK_CACHE_SIZE.getValueAsLong();
+      173  
+      174              // CHECK IF THERE IS MORE THAN 40% HEAP UNUSED AND DISK-CACHE IS 80% OF THE MAXIMUM SIZE
+      175              if ((jvmTotMemory * 140 / 100) < jvmMaxMemory
+      176                  && (totalDiskCacheUsedMemory * 120 / 100) > maxDiskCacheUsedMemory) {
+      177  
+      178                final long suggestedMaxHeap = jvmTotMemory * 120 / 100;
+      179                final long suggestedDiskCache =
+      180                    GlobalConfiguration.DISK_CACHE_SIZE.getValueAsLong()
+      181                        + (jvmMaxMemory - suggestedMaxHeap) / FileUtils.MEGABYTE;
+      182  
+      183                LogManager.instance()
+      184                    .info(
+      185                        this,
+      186                        "Database '%s' uses %,dMB/%,dMB of DISKCACHE memory, while Heap is not"
+      187                            + " completely used (usedHeap=%dMB maxHeap=%dMB). To improve performance"
+      188                            + " set maxHeap to %dMB and DISKCACHE to %dMB",
+      189                        s.getName(),
+      190                        totalDiskCacheUsedMemory,
+      191                        maxDiskCacheUsedMemory,
+      192                        jvmTotMemory / FileUtils.MEGABYTE,
+
+---------- IMPLEMENTER com.jetbrains.youtrackdb.internal.core.db.DatabasePoolAbstract  stubs=0/1 ----------
+       46  public abstract class DatabasePoolAbstract extends AdaptiveLock
+       47      implements ResourcePoolListener<String, DatabaseSessionEmbedded>, YouTrackDBListener {
+       48  
+       49    private static final Logger logger = LoggerFactory.getLogger(DatabasePoolAbstract.class);
+       50    private final HashMap<String, ReentrantResourcePool<String, DatabaseSessionEmbedded>> pools =
+       51        new HashMap<>();
+       52    protected Object owner;
+       53    private final int maxSize;
+       54    private final int timeout;
+       55    private volatile Timer evictionTask;
+       56    private Evictor evictor;
+       57  
+       58    /**
+       59     * The idle object evictor {@link TimerTask}.
+       60     */
+       61    class Evictor extends TimerTask {
+       62  
+       63      private final HashMap<String, Object2LongOpenHashMap<DatabaseSessionEmbedded>> evictionMap =
+       64          new HashMap<>();
+       65      private final long minIdleTime;
+       66  
+       67      public Evictor(long minIdleTime) {
+       68        this.minIdleTime = minIdleTime;
+       69      }
+       70  
+       71      /**
+       72       * Run pool maintenance. Evict objects qualifying for eviction
+       73       */
+       74      @Override
+       75      public void run() {
+       76        LogManager.instance().debug(this, "Running Connection Pool Evictor Service...", logger);
+       77        lock();
+       78        try {
+       79          for (var pool :
+       80              this.evictionMap.entrySet()) {
+       81            var poolDbs = pool.getValue();
+       82            Iterator<Object2LongMap.Entry<DatabaseSessionEmbedded>> iterator =
+       83                poolDbs.object2LongEntrySet().iterator();
+       84            while (iterator.hasNext()) {
+       85              Entry<DatabaseSessionEmbedded, Long> db = iterator.next();
+       86              if (System.currentTimeMillis() - db.getValue() >= this.minIdleTime) {
+       87  
+       88                var oResourcePool =
+       89                    pools.get(pool.getKey());
+       90                if (oResourcePool != null) {
+       91                  LogManager.instance()
+       92                      .debug(this, "Closing idle pooled database '%s'...",
+       93                          logger, db.getKey().getDatabaseName());
+       94                  ((DatabasePooled) db.getKey()).forceClose();
+       95                  oResourcePool.remove(db.getKey());
+       96                  iterator.remove();
+       97                }
+       98              }
+       99            }
+      100          }
+      101        } finally {
+      102          unlock();
+      103        }
+      104      }
+      105  
+      106      public void updateIdleTime(final String poolName, final DatabaseSessionEmbedded iDatabase) {
+      107        var pool = this.evictionMap.get(poolName);
+      108        if (pool == null) {
+      109          pool = new Object2LongOpenHashMap<>();
+      110          pool.defaultReturnValue(-1);
+      111  
+      112          this.evictionMap.put(poolName, pool);
+      113        }
+      114  
+      115        pool.put(iDatabase, System.currentTimeMillis());
+      116      }
+      117    }
+      118  
+      119    public DatabasePoolAbstract(
+      120        final Object iOwner,
+      121        final int iMinSize,
+      122        final int iMaxSize,
+      123        final long idleTimeout,
+      124        final long timeBetweenEvictionRunsMillis) {
+      125      this(
+      126          iOwner,
+      127          iMinSize,
+      128          iMaxSize,
+      129          GlobalConfiguration.CLIENT_CONNECT_POOL_WAIT_TIMEOUT.getValueAsInteger(),
+      130          idleTimeout,
+      131          timeBetweenEvictionRunsMillis);
+      132    }
+      133  
+      134    public DatabasePoolAbstract(
+      135        final Object iOwner,
+      136        final int iMinSize,
+      137        final int iMaxSize,
+      138        final int iTimeout,
+      139        final long idleTimeoutMillis,
+      140        final long timeBetweenEvictionRunsMillis) {
+      141      super(true, GlobalConfiguration.STORAGE_LOCK_TIMEOUT.getValueAsInteger(), true);
+      142  
+      143      maxSize = iMaxSize;
+      144      timeout = iTimeout;
+      145      owner = iOwner;
+      146      YouTrackDBEnginesManager.instance().registerListener(this);
+      147  
+      148      if (idleTimeoutMillis > 0 && timeBetweenEvictionRunsMillis > 0) {
+      149        this.evictionTask = new Timer();
+      150        this.evictor = new Evictor(idleTimeoutMillis);
+      151        this.evictionTask.schedule(
+      152            evictor, timeBetweenEvictionRunsMillis, timeBetweenEvictionRunsMillis);
+      153      }
+      154    }
+      155  
+      156    public DatabaseSessionEmbedded acquire(
+      157        final String iURL, final String iUserName, final String iUserPassword)
+      158        throws LockException {
+      159      return acquire(iURL, iUserName, iUserPassword, null);
+      160    }
+      161  
+      162    public DatabaseSessionEmbedded acquire(
+      163        final String iURL,
+      164        final String iUserName,
+      165        final String iUserPassword,
+      166        final Map<String, Object> iOptionalParams)
+      167        throws LockException {
+      168      final var dbPooledName = IOUtils.getUnixFileName(iUserName + "@" + iURL);
+      169      ReentrantResourcePool<String, DatabaseSessionEmbedded> pool;
+      170      lock();
+      171      try {
+      172        pool = pools.get(dbPooledName);
+      173        if (pool == null)
+      174        // CREATE A NEW ONE
+      175        {
+      176          pool = new ReentrantResourcePool<>(maxSize, this);
+      177        }
+      178  
+      179        // PUT IN THE POOL MAP ONLY IF AUTHENTICATION SUCCEED
+      180        pools.put(dbPooledName, pool);
+      181  
+      182      } finally {
+      183        unlock();
+      184      }
+      185      return pool.getResource(iURL, timeout, iUserName, iUserPassword, iOptionalParams);
+      186    }
+      187  
+      188    public int getMaxConnections(final String url, final String userName) {
+      189      final var dbPooledName = IOUtils.getUnixFileName(userName + "@" + url);
+      190      final ReentrantResourcePool<String, DatabaseSessionEmbedded> pool;
+      191      lock();
+      192      try {
+      193        pool = pools.get(dbPooledName);
+      194      } finally {
+      195        unlock();
+      196      }
+      197      if (pool == null) {
+      198        return maxSize;
+      199      }
+      200  
+      201      return pool.getMaxResources();
+      202    }
+      203  
+      204    public int getCreatedInstances(String url, String userName) {
+      205      final var dbPooledName = IOUtils.getUnixFileName(userName + "@" + url);
+
+---------- IMPLEMENTER com.jetbrains.youtrackdb.internal.core.YouTrackDBListenerAbstract  stubs=1/1 ----------
+       27  public abstract class YouTrackDBListenerAbstract
+       28      implements YouTrackDBListener, YouTrackDBStartupListener, YouTrackDBShutdownListener {
+       29  
+       30    @Override
+       31    public void onStartup() {
+       32    }
+       33  
+       34    @Override
+       35    public void onStorageRegistered(Storage iStorage) {
+       36    }
+       37  
+       38    @Override
+       39    public void onStorageUnregistered(Storage iStorage) {
+       40    }
+       41  
+       42    @Override
+       43    public void onShutdown() {
+       44    }
+       45  }

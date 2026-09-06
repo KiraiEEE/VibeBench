@@ -1,0 +1,129 @@
+row 133   apache/solr#3886
+============================================================================
+OVERRIDE  org.apache.solr.update.processor.AddSchemaFieldsUpdateProcessorFactory.AddSchemaFieldsUpdateProcessor.processAdd(AddUpdateCommand)
+BASE      org.apache.solr.update.processor.UpdateRequestProcessor.processAdd(AddUpdateCommand)
+QUESTION: can an instance of the SUBCLASS be used anywhere the BASE
+          is expected, without breaking the caller?
+
+---------------- BASE METHOD ----------------
+       53    public void processAdd(AddUpdateCommand cmd) throws IOException {
+       54      if (next != null) next.processAdd(cmd);
+       55    }
+
+---------------- OVERRIDE ----------------
+      419      @Override
+      420      public void processAdd(AddUpdateCommand cmd) throws IOException {
+      421        if (!cmd.getReq().getSchema().isMutable()) {
+      422          final String message = "This IndexSchema is not mutable.";
+      423          throw new SolrException(BAD_REQUEST, message);
+      424        }
+      425        final SolrInputDocument doc = cmd.getSolrInputDocument();
+      426        final SolrCore core = cmd.getReq().getCore();
+      427        // use the cmd's schema rather than the latest, because the schema
+      428        // can be updated during processing.  Using the cmd's schema guarantees
+      429        // this will be detected and the cmd's schema updated.
+      430        IndexSchema oldSchema = cmd.getReq().getSchema();
+      431        for (; ; ) {
+      432          List<SchemaField> newFields = new ArrayList<>();
+      433          // Group copyField defs per field and then per maxChar, to adapt to IndexSchema API
+      434          Map<String, Map<Integer, List<CopyFieldDef>>> newCopyFields = new HashMap<>();
+      435          // build a selector each time through the loop b/c the schema we are
+      436          // processing may have changed
+      437          FieldNameSelector selector = buildSelector(oldSchema);
+      438          Map<String, List<SolrInputField>> unknownFields = new HashMap<>();
+      439          getUnknownFields(selector, doc, unknownFields);
+      440          for (final Map.Entry<String, List<SolrInputField>> entry : unknownFields.entrySet()) {
+      441            String fieldName = entry.getKey();
+      442            String fieldTypeName = defaultFieldType;
+      443            TypeMapping typeMapping = mapValueClassesToFieldType(entry.getValue());
+      444            if (typeMapping != null) {
+      445              fieldTypeName = typeMapping.fieldTypeName;
+      446              if (!typeMapping.copyFieldDefs.isEmpty()) {
+      447                newCopyFields.put(
+      448                    fieldName,
+      449                    typeMapping.copyFieldDefs.stream()
+      450                        .collect(Collectors.groupingBy(CopyFieldDef::getMaxChars)));
+      451              }
+      452            }
+      453            newFields.add(oldSchema.newField(fieldName, fieldTypeName, Collections.emptyMap()));
+      454          }
+      455          if (newFields.isEmpty() && newCopyFields.isEmpty()) {
+      456            // nothing to do - no fields will be added - exit from the retry loop
+      457            log.debug("No fields or copyFields to add to the schema.");
+      458            break;
+      459          } else if (isImmutableConfigSet(core)) {
+      460            final String message = "This ConfigSet is immutable.";
+      461            throw new SolrException(BAD_REQUEST, message);
+      462          }
+      463          if (log.isDebugEnabled()) {
+      464            StringBuilder builder = new StringBuilder();
+      465            builder.append("\nFields to be added to the schema: [");
+      466            boolean isFirst = true;
+      467            for (SchemaField field : newFields) {
+      468              builder.append(isFirst ? "" : ",");
+      469              isFirst = false;
+      470              builder.append(field.getName());
+      471              builder.append("{type=").append(field.getType().getTypeName()).append("}");
+      472            }
+      473            builder.append("]");
+      474            builder.append("\nCopyFields to be added to the schema: [");
+      475            isFirst = true;
+      476            for (Map.Entry<String, Map<Integer, List<CopyFieldDef>>> entry :
+      477                newCopyFields.entrySet()) {
+      478              String fieldName = entry.getKey();
+      479              builder.append(isFirst ? "" : ",");
+      480              isFirst = false;
+      481              builder.append("source=").append(fieldName).append("{");
+      482              for (List<CopyFieldDef> copyFieldDefList : entry.getValue().values()) {
+      483                for (CopyFieldDef copyFieldDef : copyFieldDefList) {
+      484                  builder.append("{dest=").append(copyFieldDef.getDest(fieldName));
+      485                  builder.append(", maxChars=").append(copyFieldDef.getMaxChars()).append("}");
+      486                }
+      487              }
+      488              builder.append("}");
+      489            }
+      490            builder.append("]");
+      491            log.debug("{}", builder);
+      492          }
+      493          // Need to hold the lock during the entire attempt to ensure that
+      494          // the schema on the request is the latest
+      495          synchronized (oldSchema.getSchemaUpdateLock()) {
+      496            try {
+      497              IndexSchema newSchema = oldSchema.addFields(newFields, Collections.emptyMap(), false);
+      498              // Add copyFields
+      499              for (Map.Entry<String, Map<Integer, List<CopyFieldDef>>> entry :
+      500                  newCopyFields.entrySet()) {
+      501                String srcField = entry.getKey();
+      502                for (Integer maxChars : entry.getValue().keySet()) {
+      503                  newSchema =
+      504                      newSchema.addCopyFields(
+      505                          srcField,
+      506                          entry.getValue().get(maxChars).stream()
+      507                              .map(f -> f.getDest(srcField))
+      508                              .collect(Collectors.toList()),
+      509                          maxChars);
+      510                }
+      511              }
+      512              if (null != newSchema) {
+      513                ((ManagedIndexSchema) newSchema).persistManagedSchema(false);
+      514                core.setLatestSchema(newSchema);
+      515                cmd.getReq().updateSchemaToLatest();
+      516                log.debug("Successfully added field(s) and copyField(s) to the schema.");
+      517                break; // success - exit from the retry loop
+      518              } else {
+      519                throw new SolrException(
+      520                    SolrException.ErrorCode.SERVER_ERROR, "Failed to add fields and/or copyFields.");
+      521              }
+      522            } catch (ManagedIndexSchema.FieldExistsException e) {
+      523              log.error("At least one field to be added already exists in the schema - retrying.");
+      524              oldSchema = core.getLatestSchema();
+      525              cmd.getReq().updateSchemaToLatest();
+      526            } catch (ManagedIndexSchema.SchemaChangedInZkException e) {
+      527              log.debug("Schema changed while processing request - retrying.");
+      528              oldSchema = core.getLatestSchema();
+      529              cmd.getReq().updateSchemaToLatest();
+      530            }
+      531          }
+      532        }
+      533        super.processAdd(cmd);
+      534      }

@@ -1,0 +1,568 @@
+row 77   debezium/debezium#7130
+============================================================================
+CONTRACT io.debezium.relational.RelationalSnapshotChangeEventSource   members=8.0 implementers=6.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       79  public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O extends OffsetContext> extends AbstractSnapshotChangeEventSource<P, O> {
+       80  
+       81      private static final Logger LOGGER = LoggerFactory.getLogger(RelationalSnapshotChangeEventSource.class);
+       82  
+       83      public static final Pattern SELECT_ALL_PATTERN = Pattern.compile("\\*");
+       84      public static final Pattern MATCH_ALL_PATTERN = Pattern.compile(".*");
+       85  
+       86      private final RelationalDatabaseConnectorConfig connectorConfig;
+       87      private final JdbcConnection jdbcConnection;
+       88      private final MainConnectionProvidingConnectionFactory<? extends JdbcConnection> jdbcConnectionFactory;
+       89      private final RelationalDatabaseSchema schema;
+       90      protected final EventDispatcher<P, TableId> dispatcher;
+       91      protected final Clock clock;
+       92      private final SnapshotProgressListener<P> snapshotProgressListener;
+       93      protected final SnapshotterService snapshotterService;
+       94      protected Queue<JdbcConnection> connectionPool;
+       95      private final TableId signalDataCollectionTableId;
+       96      private final ThreadNameContext threadNameContext;
+       97  
+       98      public RelationalSnapshotChangeEventSource(RelationalDatabaseConnectorConfig connectorConfig,
+       99                                                 MainConnectionProvidingConnectionFactory<? extends JdbcConnection> jdbcConnectionFactory,
+      100                                                 RelationalDatabaseSchema schema, EventDispatcher<P, TableId> dispatcher, Clock clock,
+      101                                                 SnapshotProgressListener<P> snapshotProgressListener, NotificationService<P, O> notificationService,
+      102                                                 SnapshotterService snapshotterService) {
+      103          super(connectorConfig, snapshotProgressListener, notificationService);
+      104          this.connectorConfig = connectorConfig;
+      105          this.jdbcConnection = jdbcConnectionFactory.mainConnection();
+      106          this.jdbcConnectionFactory = jdbcConnectionFactory;
+      107          this.schema = schema;
+      108          this.dispatcher = dispatcher;
+      109          this.clock = clock;
+      110          this.snapshotProgressListener = snapshotProgressListener;
+      111          this.snapshotterService = snapshotterService;
+      112          this.threadNameContext = ThreadNameContext.from(connectorConfig);
+      113  
+      114          if (!Strings.isNullOrBlank(connectorConfig.getSignalingDataCollectionId())) {
+      115              this.signalDataCollectionTableId = TableId.parse(connectorConfig.getSignalingDataCollectionId());
+      116          }
+      117          else {
+      118              this.signalDataCollectionTableId = null;
+      119          }
+      120      }
+      121  
+      122      @Override
+      123      public SnapshotResult<O> doExecute(ChangeEventSourceContext context, O previousOffset,
+      124                                         SnapshotContext<P, O> snapshotContext, SnapshottingTask snapshottingTask)
+      125              throws Exception {
+      126          final RelationalSnapshotContext<P, O> ctx = (RelationalSnapshotContext<P, O>) snapshotContext;
+      127  
+      128          Connection connection = null;
+      129          Throwable exceptionWhileSnapshot = null;
+      130          try {
+      131  
+      132              Set<Pattern> dataCollectionsToBeSnapshotted = getDataCollectionPattern(snapshottingTask.getDataCollections());
+      133  
+      134              Map<DataCollectionId, String> snapshotSelectOverridesByTable = snapshottingTask.getFilterQueries();
+      135  
+      136              preSnapshot();
+      137  
+      138              LOGGER.info("Snapshot step 1 - Preparing");
+      139  
+      140              if (previousOffset != null && previousOffset.isInitialSnapshotRunning()) {
+      141                  LOGGER.info("Previous snapshot was cancelled before completion; a new snapshot will be taken.");
+      142              }
+      143  
+      144              connection = createSnapshotConnection();
+      145              connectionCreated(ctx);
+      146  
+      147              LOGGER.info("Snapshot step 2 - Determining captured tables");
+      148  
+      149              // Note that there's a minor race condition here: a new table matching the filters could be created between
+      150              // this call and the determination of the initial snapshot position below; this seems acceptable, though
+      151              determineCapturedTables(ctx, dataCollectionsToBeSnapshotted, snapshottingTask);
+      152              snapshotProgressListener.monitoredDataCollectionsDetermined(snapshotContext.partition, ctx.capturedTables);
+      153              // Init jdbc connection pool for reading table schema and data
+      154              connectionPool = createConnectionPool(ctx);
+      155  
+      156              LOGGER.info("Snapshot step 3 - Locking captured tables {}", ctx.capturedTables);
+      157  
+      158              if (snapshottingTask.snapshotSchema()) {
+      159                  lockTablesForSchemaSnapshot(context, ctx);
+      160              }
+      161  
+      162              LOGGER.info("Snapshot step 4 - Determining snapshot offset");
+      163              determineSnapshotOffset(ctx, previousOffset);
+      164  
+      165              LOGGER.info("Snapshot step 5 - Reading structure of captured tables");
+      166              readTableStructure(context, ctx, previousOffset, snapshottingTask);
+      167  
+      168              if (snapshottingTask.snapshotSchema()) {
+      169                  LOGGER.info("Snapshot step 6 - Persisting schema history");
+      170  
+      171                  createSchemaChangeEventsForTables(context, ctx, snapshottingTask);
+      172  
+      173                  // if we've been interrupted before, the TX rollback will cause any locks to be released
+      174                  releaseSchemaSnapshotLocks(ctx);
+      175              }
+      176              else {
+      177                  LOGGER.info("Snapshot step 6 - Skipping persisting of schema history");
+      178              }
+      179  
+      180              if (snapshottingTask.snapshotData()) {
+      181                  LOGGER.info("Snapshot step 7 - Snapshotting data");
+      182                  createDataEvents(context, ctx, connectionPool, snapshotSelectOverridesByTable);
+      183              }
+      184              else {
+      185                  LOGGER.info("Snapshot step 7 - Skipping snapshotting of data");
+      186                  releaseDataSnapshotLocks(ctx);
+      187                  ctx.offset.preSnapshotCompletion();
+      188                  ctx.offset.postSnapshotCompletion();
+      189              }
+      190  
+      191              postSnapshot();
+      192              dispatcher.alwaysDispatchHeartbeatEvent(ctx.partition, ctx.offset);
+      193              return SnapshotResult.completed(ctx.offset);
+      194          }
+      195          catch (final Exception | AssertionError e) {
+      196              LOGGER.error("Error during snapshot", e);
+      197              exceptionWhileSnapshot = e;
+      198              throw e;
+      199          }
+      200          finally {
+      201              try {
+      202                  if (connectionPool != null) {
+      203                      for (JdbcConnection conn : connectionPool) {
+      204                          if (!jdbcConnection.equals(conn)) {
+      205                              conn.close();
+      206                          }
+      207                      }
+      208                  }
+      209                  rollbackTransaction(connection);
+      210              }
+      211              catch (final Exception e) {
+      212                  LOGGER.error("Error in finally block", e);
+      213                  if (exceptionWhileSnapshot != null) {
+      214                      e.addSuppressed(exceptionWhileSnapshot);
+      215                  }
+      216                  throw e;
+      217              }
+      218          }
+      219      }
+      220  
+      221      private Queue<JdbcConnection> createConnectionPool(final RelationalSnapshotContext<P, O> ctx) throws SQLException {
+      222          Queue<JdbcConnection> connectionPool = new ConcurrentLinkedQueue<>();
+      223          connectionPool.add(jdbcConnection);
+      224  
+      225          int snapshotMaxThreads = Math.max(1, Math.min(connectorConfig.getSnapshotMaxThreads(), ctx.capturedTables.size()));
+      226          if (snapshotMaxThreads > 1) {
+      227              Optional<String> firstQuery = getSnapshotConnectionFirstSelect(ctx, ctx.capturedTables.iterator().next());
+      228              for (int i = 1; i < snapshotMaxThreads; i++) {
+      229                  JdbcConnection conn = jdbcConnectionFactory.newConnection().setAutoCommit(false);
+      230                  conn.connection().setTransactionIsolation(jdbcConnection.connection().getTransactionIsolation());
+      231                  connectionPoolConnectionCreated(ctx, conn);
+      232                  connectionPool.add(conn);
+      233                  if (firstQuery.isPresent()) {
+      234                      conn.execute(firstQuery.get());
+      235                  }
+      236              }
+      237          }
+      238  
+      239          LOGGER.info("Created connection pool with {} threads", snapshotMaxThreads);
+      240          return connectionPool;
+      241      }
+      242  
+      243      public Connection createSnapshotConnection() throws SQLException {
+      244  
+      245          if (!jdbcConnection.isValid()) {
+      246              jdbcConnection.reconnect();
+      247          }
+      248  
+      249          Connection connection = jdbcConnection.connection();
+      250          connection.setAutoCommit(false);
+      251          return connection;
+      252      }
+      253  
+      254      @Override
+      255      public SnapshottingTask getBlockingSnapshottingTask(P partition, O previousOffset, SnapshotConfiguration snapshotConfiguration) {
+      256  
+      257          Map<DataCollectionId, String> filtersByTable = snapshotConfiguration.getAdditionalConditions().stream()
+      258                  .collect(Collectors.toMap(k -> TableId.parse(k.getDataCollection().toString()), AdditionalCondition::getFilter));
+      259  
+      260          return new SnapshottingTask(true, true, snapshotConfiguration.getDataCollections(), filtersByTable, true);
+      261      }
+      262  
+      263      public SnapshottingTask getSnapshottingTask(P partition, O previousOffset) {
+      264  
+      265          final Snapshotter snapshotter = snapshotterService.getSnapshotter();
+      266  
+      267          List<String> dataCollectionsToBeSnapshotted = connectorConfig.getDataCollectionsToBeSnapshotted();
+      268          Map<DataCollectionId, String> snapshotSelectOverridesByTable = connectorConfig.getSnapshotSelectOverridesByTable();
+      269  
+      270          boolean offsetExists = previousOffset != null;
+      271          boolean snapshotInProgress = false;
+      272  
+      273          if (offsetExists) {
+      274              snapshotInProgress = previousOffset.isInitialSnapshotRunning();
+      275          }
+      276  
+      277          if (offsetExists && !previousOffset.isInitialSnapshotRunning()) {
+      278              LOGGER.info("A previous offset indicating a completed snapshot has been found.");
+      279          }
+      280  
+      281          boolean shouldSnapshotSchema = snapshotter.shouldSnapshotSchema(offsetExists, snapshotInProgress);
+      282          boolean shouldSnapshotData = snapshotter.shouldSnapshotData(offsetExists, snapshotInProgress);
+      283  
+      284          if (shouldSnapshotData && shouldSnapshotSchema) {
+      285              LOGGER.info("According to the connector configuration both schema and data will be snapshot.");
+      286          }
+      287          else if (shouldSnapshotSchema) {
+      288              LOGGER.info("According to the connector configuration only schema will be snapshot.");
+      289          }
+      290  
+      291          return new SnapshottingTask(shouldSnapshotSchema, shouldSnapshotData,
+      292                  dataCollectionsToBeSnapshotted, snapshotSelectOverridesByTable,
+      293                  false);
+      294      }
+      295  
+      296      /**
+      297       * Executes steps which have to be taken just after the database connection is created.
+      298       */
+      299      protected void connectionCreated(RelationalSnapshotContext<P, O> snapshotContext) throws Exception {
+      300      }
+      301  
+      302      /**
+      303       * Executes steps which have to be taken just after a connection pool connection is created.
+      304       */
+      305      protected void connectionPoolConnectionCreated(RelationalSnapshotContext<P, O> snapshotContext, JdbcConnection connection) throws SQLException {
+      306      }
+      307  
+      308      protected List<Pattern> getSignalDataCollectionPattern(String signalingDataCollection) {
+      309          return Strings.listOfRegex(signalingDataCollection, Pattern.CASE_INSENSITIVE);
+      310      }
+      311  
+      312      private Stream<TableId> toTableIds(Set<TableId> tableIds, Pattern pattern) {
+      313          return tableIds
+      314                  .stream()
+      315                  .filter(tid -> pattern.matcher(connectorConfig.getTableIdMapper().toString(tid)).matches())
+      316                  .sorted();
+      317      }
+      318  
+      319      private Set<TableId> addSignalingCollectionAndSort(Set<TableId> capturedTables) {
+      320  
+      321          String tableIncludeList = connectorConfig.tableIncludeList();
+      322          String signalingDataCollection = connectorConfig.getSignalingDataCollectionId();
+      323  
+      324          List<Pattern> captureTablePatterns = new ArrayList<>();
+      325          if (!Strings.isNullOrBlank(tableIncludeList)) {
+      326              captureTablePatterns.addAll(Strings.listOfRegex(tableIncludeList, Pattern.CASE_INSENSITIVE));
+      327          }
+      328          else {
+      329              captureTablePatterns.add(MATCH_ALL_PATTERN);
+      330          }
+      331  
+      332          if (!Strings.isNullOrBlank(signalingDataCollection)) {
+      333              captureTablePatterns.addAll(getSignalDataCollectionPattern(signalingDataCollection));
+      334          }
+      335  
+      336          return captureTablePatterns
+      337                  .stream()
+      338                  .flatMap(pattern -> toTableIds(capturedTables, pattern))
+      339                  .collect(Collectors.toCollection(LinkedHashSet::new));
+      340      }
+      341  
+      342      private void determineCapturedTables(RelationalSnapshotContext<P, O> ctx, Set<Pattern> dataCollectionsToBeSnapshotted, SnapshottingTask snapshottingTask)
+      343              throws Exception {
+      344  
+      345          Set<TableId> allTableIds = getAllTableIds(ctx);
+      346          Set<TableId> snapshottedTableIds = determineDataCollectionsToBeSnapshotted(allTableIds, dataCollectionsToBeSnapshotted).collect(Collectors.toSet());
+      347  
+      348          Set<TableId> capturedTables = new HashSet<>();
+      349          Set<TableId> capturedSchemaTables = new HashSet<>();
+      350  
+      351          for (TableId tableId : allTableIds) {
+      352              if (connectorConfig.getTableFilters().eligibleForSchemaDataCollectionFilter().isIncluded(tableId) && !snapshottingTask.isOnDemand()) {
+      353                  LOGGER.info("Adding table {} to the list of capture schema tables", tableId);
+      354                  capturedSchemaTables.add(tableId);
+      355              }
+      356          }
+      357  
+      358          for (TableId tableId : snapshottedTableIds) {
+      359              if (connectorConfig.getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
+      360                  LOGGER.trace("Adding table {} to the list of captured tables for which the data will be snapshotted", tableId);
+      361                  capturedTables.add(tableId);
+      362              }
+      363              else {
+      364                  LOGGER.trace("Ignoring table {} for data snapshotting as it's not included in the filter configuration", tableId);
+      365              }
+      366          }
+      367  
+      368          ctx.capturedTables = addSignalingCollectionAndSort(capturedTables);
+      369          ctx.capturedSchemaTables = snapshottingTask.isOnDemand() ? ctx.capturedTables
+      370                  : capturedSchemaTables
+      371                          .stream()
+      372                          .sorted()
+      373                          .collect(Collectors.toCollection(LinkedHashSet::new));
+      374      }
+      375  
+      376      /**
+      377       * Returns all candidate tables; the current filter configuration will be applied to the result set, resulting in
+      378       * the effective set of captured tables.
+      379       */
+      380      protected abstract Set<TableId> getAllTableIds(RelationalSnapshotContext<P, O> snapshotContext) throws Exception;
+      381  
+      382      /**
+      383       * Locks all tables to be captured, so that no concurrent schema changes can be applied to them.
+      384       */
+      385      protected abstract void lockTablesForSchemaSnapshot(ChangeEventSourceContext sourceContext,
+      386                                                          RelationalSnapshotContext<P, O> snapshotContext)
+      387              throws Exception;
+      388  
+      389      /**
+      390       * Determines the current offset (MySQL binlog position, Oracle SCN etc.), storing it into the passed context
+      391       * object. Subsequently, the DB's schema (and data) will be be read at this position. Once the snapshot is
+      392       * completed, a {@link StreamingChangeEventSource} will be set up with this initial position to continue with stream
+      393       * reading from there.
+      394       */
+      395      protected abstract void determineSnapshotOffset(RelationalSnapshotContext<P, O> snapshotContext, O previousOffset)
+      396              throws Exception;
+      397  
+      398      /**
+      399       * Reads the structure of all the captured tables, writing it to {@link RelationalSnapshotContext#tables}.
+      400       */
+      401      protected abstract void readTableStructure(ChangeEventSourceContext sourceContext,
+      402                                                 RelationalSnapshotContext<P, O> snapshotContext, O offsetContext, SnapshottingTask snapshottingTask)
+      403              throws Exception;
+      404  
+      405      /**
+      406       * Releases all locks established in order to create a consistent schema snapshot.
+      407       */
+      408      protected abstract void releaseSchemaSnapshotLocks(RelationalSnapshotContext<P, O> snapshotContext)
+      409              throws Exception;
+      410  
+      411      /**
+      412       * Releases all locks established in order to create a consistent data snapshot.
+      413       */
+      414      protected void releaseDataSnapshotLocks(RelationalSnapshotContext<P, O> snapshotContext) throws Exception {
+      415      }
+      416  
+      417      protected void createSchemaChangeEventsForTables(ChangeEventSourceContext sourceContext,
+      418                                                       RelationalSnapshotContext<P, O> snapshotContext,
+      419                                                       SnapshottingTask snapshottingTask)
+      420              throws Exception {
+      421          tryStartingSnapshot(snapshotContext);
+      422          if (!schema.isHistorized()) {
+      423              return;
+      424          }
+      425          for (Iterator<TableId> iterator = getTablesForSchemaChange(snapshotContext).iterator(); iterator.hasNext();) {
+      426              final TableId tableId = iterator.next();
+      427              if (!sourceContext.isRunning()) {
+      428                  throw new InterruptedException("Interrupted while capturing schema of table " + tableId);
+      429              }
+      430  
+      431              LOGGER.info("Capturing structure of table {}", tableId);
+      432  
+      433              snapshotContext.offset.event(tableId, getClock().currentTime());
+      434  
+      435              // If data are not snapshotted then the last schema change must set last snapshot flag
+      436              if (!snapshottingTask.snapshotData() && !iterator.hasNext()) {
+      437                  lastSnapshotRecord(snapshotContext);
+      438              }
+      439  
+      440              final Table table = snapshotContext.tables.forTable(tableId);
+      441              if (table == null) {
+      442                  throw new DebeziumException("Unable to find relational table model for '" + tableId +
+      443                          "', there may be an issue with your include/exclude list configuration.");
+      444              }
+      445  
+      446              SchemaChangeEvent event = getCreateTableEvent(snapshotContext, table);
+      447              if (HistorizedRelationalDatabaseSchema.class.isAssignableFrom(schema.getClass()) &&
+      448                      ((HistorizedRelationalDatabaseSchema) schema).skipSchemaChangeEvent(event)) {
+      449                  continue;
+      450              }
+      451  
+      452              dispatcher.dispatchSchemaChangeEvent(snapshotContext.partition, snapshotContext.offset, tableId, (receiver) -> {
+      453                  try {
+      454                      receiver.schemaChangeEvent(event);
+      455                  }
+      456                  catch (Exception e) {
+      457                      throw new DebeziumException(e);
+      458                  }
+      459              });
+      460          }
+      461      }
+      462  
+      463      protected Collection<TableId> getTablesForSchemaChange(RelationalSnapshotContext<P, O> snapshotContext) {
+      464          return snapshotContext.capturedTables;
+      465      }
+      466  
+      467      /**
+      468       * Creates a {@link SchemaChangeEvent} representing the creation of the given table.
+      469       */
+      470      protected abstract SchemaChangeEvent getCreateTableEvent(RelationalSnapshotContext<P, O> snapshotContext,
+      471                                                               Table table)
+      472              throws Exception;
+      473  
+      474      private void createDataEvents(ChangeEventSourceContext sourceContext,
+      475                                    RelationalSnapshotContext<P, O> snapshotContext,
+      476                                    Queue<JdbcConnection> connectionPool, Map<DataCollectionId, String> snapshotSelectOverridesByTable)
+      477              throws Exception {
+      478          tryStartingSnapshot(snapshotContext);
+       ... truncated at 400 lines ...
+
+---------- IMPLEMENTER io.debezium.connector.binlog.BinlogSnapshotChangeEventSource  stubs=0/7 ----------
+       67  public abstract class BinlogSnapshotChangeEventSource<P extends BinlogPartition, O extends BinlogOffsetContext<?>>
+       68          extends RelationalSnapshotChangeEventSource<P, O> {
+       69  
+       70      private static final Logger LOGGER = LoggerFactory.getLogger(BinlogSnapshotChangeEventSource.class);
+       71      private static final Logger ROW_ESTIMATE_LOGGER = LoggerFactory.getLogger(BinlogSnapshotChangeEventSource.class.getName() + ".RowEstimate");
+       72  
+       73      private final BinlogConnectorConfig connectorConfig;
+       74      private final BinlogConnectorConnection connection;
+       75      private final RelationalTableFilters filters;
+       76      private final BinlogSnapshotChangeEventSourceMetrics<P> metrics;
+       77      private final BinlogDatabaseSchema<P, O, ?, ?> databaseSchema;
+       78      private final Set<SchemaChangeEvent> schemaEvents = new LinkedHashSet<>();
+       79      private final BlockingConsumer<Function<SourceRecord, SourceRecord>> lastEventProcessor;
+       80      private final Runnable preSnapshotAction;
+       81      private Set<TableId> delayedSchemaSnapshotTables = Collections.emptySet();
+       82      private long globalLockAcquiredAt = -1;
+       83      private long tableLockAcquiredAt = -1;
+       84      private final ThreadNameContext threadNameContext;
+       85  
+       86      public BinlogSnapshotChangeEventSource(BinlogConnectorConfig connectorConfig,
+       87                                             MainConnectionProvidingConnectionFactory<BinlogConnectorConnection> connectionFactory,
+       88                                             BinlogDatabaseSchema<P, O, ?, ?> schema,
+       89                                             EventDispatcher<P, TableId> dispatcher,
+       90                                             Clock clock,
+       91                                             BinlogSnapshotChangeEventSourceMetrics<P> metrics,
+       92                                             BlockingConsumer<Function<SourceRecord, SourceRecord>> lastEventProcessor,
+       93                                             Runnable preSnapshotAction,
+       94                                             NotificationService<P, O> notificationService,
+       95                                             SnapshotterService snapshotterService) {
+       96          super(connectorConfig, connectionFactory, schema, dispatcher, clock, metrics, notificationService, snapshotterService);
+       97          this.connectorConfig = connectorConfig;
+       98          this.connection = connectionFactory.mainConnection();
+       99          this.filters = connectorConfig.getTableFilters();
+      100          this.metrics = metrics;
+      101          this.databaseSchema = schema;
+      102          this.lastEventProcessor = lastEventProcessor;
+      103          this.preSnapshotAction = preSnapshotAction;
+      104          this.threadNameContext = ThreadNameContext.from(connectorConfig);
+      105      }
+      106  
+      107      @Override
+      108      protected SnapshotContext<P, O> prepare(P partition, boolean onDemand) {
+      109          return new BinlogSnapshotContext<>(partition, onDemand);
+      110      }
+      111  
+      112      @Override
+      113      protected Set<TableId> getAllTableIds(RelationalSnapshotContext<P, O> ctx) throws Exception {
+      114          // Use the connection's getAllTableIds method which also tracks readable databases
+      115          final BinlogConnectorConnection.TablesWithReadableDatabases result = connection.getAllTableIdsWithReadableDatabases();
+      116  
+      117          // Log the databases that were readable and are included based on filters
+      118          final Set<String> includedDatabaseNames = result.getReadableDatabaseNames().stream()
+      119                  .filter(filters.databaseFilter())
+      120                  .collect(Collectors.toSet());
+      121          LOGGER.info("\tsnapshot continuing with database(s): {}", includedDatabaseNames);
+      122          return result.getTableIds();
+      123      }
+      124  
+      125      @Override
+      126      protected void lockTablesForSchemaSnapshot(ChangeEventSourceContext sourceContext,
+      127                                                 RelationalSnapshotContext<P, O> snapshotContext)
+      128              throws SQLException {
+      129          // Set the transaction isolation level to REPEATABLE READ. This is the default, but the default can be changed
+      130          // which is why we explicitly set it here.
+      131          //
+      132          // With REPEATABLE READ, all SELECT queries within the scope of a transaction (which we don't yet have) will read
+      133          // from the same MVCC snapshot. Thus each plain (non-locking) SELECT statements within the same transaction are
+      134          // consistent also with respect to each other.
+      135          //
+      136          // See: https://dev.mysql.com/doc/refman/8.2/en/set-transaction.html
+      137          // See: https://dev.mysql.com/doc/refman/8.2/en/innodb-transaction-isolation-levels.html
+      138          // See: https://dev.mysql.com/doc/refman/8.2/en/innodb-consistent-read.html
+      139          connection.connection().setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+      140          connection.executeWithoutCommitting("SET SESSION lock_wait_timeout=" + connectorConfig.snapshotLockTimeout().getSeconds());
+      141          try {
+      142              connection.executeWithoutCommitting("SET SESSION innodb_lock_wait_timeout=" + connectorConfig.snapshotLockTimeout().getSeconds());
+      143          }
+      144          catch (SQLException e) {
+      145              LOGGER.warn("Unable to set innodb_lock_wait_timeout", e);
+      146          }
+      147  
+      148          // ------------------------------------
+      149          // LOCK TABLES
+      150          // ------------------------------------
+      151          // Obtain read lock on all tables. This statement closes all open tables and locks all tables
+      152          // for all databases with a global read lock, and it prevents ALL updates while we have this lock.
+      153          // It also ensures that everything we do while we have this lock will be consistent.
+      154          if (connectorConfig.getSnapshotLockingStrategy().isLockingEnabled() && connectorConfig.isGlobalLockUseRequested()) {
+      155              try {
+      156                  globalLock();
+      157                  metrics.setGlobalLockAcquired();
+      158              }
+      159              catch (SQLException e) {
+      160                  LOGGER.info("Unable to flush and acquire global read lock, will use table read locks after reading table names");
+      161                  // Continue anyway, since RDS (among others) don't allow setting a global lock
+      162                  assert !isGloballyLocked();
+      163              }
+      164              if (connectorConfig.getSnapshotLockingStrategy().isIsolationLevelResetOnFlush()) {
+      165                  // FLUSH TABLES resets TX and isolation level
+      166                  connection.executeWithoutCommitting("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      167              }
+      168          }
+      169      }
+      170  
+      171      @Override
+      172      protected void releaseSchemaSnapshotLocks(RelationalSnapshotContext<P, O> snapshotContext) throws SQLException {
+      173          if (connectorConfig.getSnapshotLockingStrategy().isMinimalLockingEnabled()) {
+      174              if (isGloballyLocked()) {
+      175                  globalUnlock();
+      176              }
+      177              if (isTablesLocked()) {
+      178                  // We could not acquire a global read lock and instead had to obtain individual table-level read locks
+      179                  // using 'FLUSH TABLE <tableName> WITH READ LOCK'. However, if we were to do this, the 'UNLOCK TABLES'
+      180                  // would implicitly commit our active transaction, and this would break our consistent snapshot logic.
+      181                  // Therefore, we cannot unlock the tables here!
+      182                  // https://dev.mysql.com/doc/refman/8.2/en/flush.html
+      183                  LOGGER.warn("Tables were locked explicitly, but to get a consistent snapshot we cannot release the locks until we've read all tables.");
+      184              }
+      185          }
+      186      }
+      187  
+      188      @Override
+      189      protected void releaseDataSnapshotLocks(RelationalSnapshotContext<P, O> snapshotContext) throws Exception {
+      190          if (isGloballyLocked()) {
+      191              globalUnlock();
+      192          }
+      193          if (isTablesLocked()) {
+      194              tableUnlock();
+      195              if (!delayedSchemaSnapshotTables.isEmpty()) {
+      196                  schemaEvents.clear();
+      197                  if (connectorConfig.getSnapshotLockingStrategy().isLockingEnabled()) {
+      198                      createSchemaEventsForTables(snapshotContext, delayedSchemaSnapshotTables, false);
+      199                  }
+      200                  else {
+      201                      int snapshotMaxThreads = connectionPool.size();
+      202                      LOGGER.info("Creating delayed schema snapshot worker pool with {} worker thread(s)", snapshotMaxThreads);
+      203                      ExecutorService executorService = Threads.newFixedThreadPool(
+      204                              BinlogSnapshotChangeEventSource.class,
+      205                              connectorConfig.getLogicalName(),
+      206                              "delayed-schema-snapshot",
+      207                              threadNameContext,
+      208                              snapshotMaxThreads);
+      209                      try {
+      210                          createSchemaEventsForTables(snapshotContext, delayedSchemaSnapshotTables, false, executorService);
+      211                      }
+      212                      finally {
+      213                          executorService.shutdownNow();
+      214                      }
+      215                  }
+      216  
+      217                  for (final SchemaChangeEvent event : schemaEvents) {
+      218                      if (databaseSchema.storeOnlyCapturedTables()
+      219                              && event.getDatabase() != null
+      220                              && !event.getDatabase().isEmpty()
+      221                              && !connectorConfig.getTableFilters().databaseFilter().test(event.getDatabase())) {
+      222                          LOGGER.trace("Skipping schema event as it belongs to a non-captured database: '{}'", event);
+      223                          continue;
+      224                      }
+      225  
+      226                      LOGGER.trace("Processing schema event {}", event);

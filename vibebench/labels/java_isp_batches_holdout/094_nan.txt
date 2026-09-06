@@ -1,0 +1,717 @@
+row 94   StarRocks/starrocks#70987
+============================================================================
+CONTRACT com.starrocks.server.StorageVolumeMgr   members=19.0 implementers=2.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       61  public abstract class StorageVolumeMgr implements Writable, GsonPostProcessable {
+       62      private static final String ENABLED = "enabled";
+       63  
+       64      public static final String DEFAULT = "default";
+       65  
+       66      public static final String LOCAL = "local";
+       67  
+       68      public static final String BUILTIN_STORAGE_VOLUME = "builtin_storage_volume";
+       69  
+       70      private static final String S3 = "s3";
+       71  
+       72      private static final String AZBLOB = "azblob";
+       73  
+       74      private static final String ADLS2 = "adls2";
+       75  
+       76      private static final String GS = "gs";
+       77  
+       78      private static final String HDFS = "hdfs";
+       79  
+       80      @SerializedName("defaultSVId")
+       81      protected String defaultStorageVolumeId = "";
+       82  
+       83      protected final ReadWriteLock rwLock = new ReentrantReadWriteLock();
+       84  
+       85      // volume id to dbs
+       86      @SerializedName("svToDbs")
+       87      protected Map<String, Set<Long>> storageVolumeToDbs = new HashMap<>();
+       88  
+       89      // volume id to tables
+       90      @SerializedName("svToTables")
+       91      protected Map<String, Set<Long>> storageVolumeToTables = new HashMap<>();
+       92  
+       93      protected Map<Long, String> dbToStorageVolume = new HashMap<>();
+       94  
+       95      protected Map<Long, String> tableToStorageVolume = new HashMap<>();
+       96  
+       97      protected static final Set<String> PARAM_NAMES = new HashSet<>();
+       98  
+       99      static {
+      100          Field[] fields = CloudConfigurationConstants.class.getFields();
+      101          for (int i = 0; i < fields.length; ++i) {
+      102              try {
+      103                  Object obj = CloudConfigurationConstants.class.newInstance();
+      104                  Object value = fields[i].get(obj);
+      105                  PARAM_NAMES.add((String) value);
+      106              } catch (InstantiationException | IllegalAccessException e) {
+      107                  // do nothing
+      108              }
+      109          }
+      110      }
+      111  
+      112      public String createStorageVolume(CreateStorageVolumeStmt stmt)
+      113              throws AlreadyExistsException, DdlException {
+      114          Map<String, String> params = new HashMap<>();
+      115          Optional<Boolean> enabled = parseProperties(stmt.getProperties(), params);
+      116          return createStorageVolume(stmt.getName(), stmt.getStorageVolumeType(), stmt.getStorageLocations(), params,
+      117                  enabled, stmt.getComment());
+      118      }
+      119  
+      120      public String createStorageVolume(String name, String svType, List<String> locations, Map<String, String> params,
+      121              Optional<Boolean> enabled, String comment)
+      122              throws DdlException, AlreadyExistsException {
+      123          try (LockCloseable lock = new LockCloseable(rwLock.writeLock())) {
+      124              validateParams(svType, params);
+      125              validateLocations(svType, locations);
+      126              if (exists(name)) {
+      127                  throw new AlreadyExistsException(String.format("Storage volume '%s' already exists", name));
+      128              }
+      129              return createInternalNoLock(name, svType, locations, params, enabled, comment);
+      130          }
+      131      }
+      132  
+      133      public void removeStorageVolume(DropStorageVolumeStmt stmt) throws DdlException, MetaNotFoundException {
+      134          removeStorageVolume(stmt.getName());
+      135      }
+      136  
+      137      public void removeStorageVolume(String name) throws DdlException, MetaNotFoundException {
+      138          try (LockCloseable lock = new LockCloseable(rwLock.writeLock())) {
+      139              StorageVolume sv = getStorageVolumeByName(name);
+      140              if (sv == null) {
+      141                  throw new MetaNotFoundException(String.format("Storage volume '%s' does not exist", name));
+      142              }
+      143              String svName = GlobalStateMgr.getCurrentState().getClusterSnapshotMgr().getAutomatedSnapshotSvName();
+      144              if (svName != null && svName.equals(name)) {
+      145                  throw new DdlException(String.format("Snapshot enabled on storage volume '%s', drop volume failed.", name));
+      146              }
+      147              Preconditions.checkState(!defaultStorageVolumeId.equals(sv.getId()),
+      148                      "default storage volume can not be removed");
+      149              Set<Long> dbs = storageVolumeToDbs.getOrDefault(sv.getId(), new HashSet<>());
+      150              Set<Long> tables = storageVolumeToTables.getOrDefault(sv.getId(), new HashSet<>());
+      151              if (name.equals(BUILTIN_STORAGE_VOLUME)) {
+      152                  List<List<Long>> bindings = getBindingsOfBuiltinStorageVolume();
+      153                  dbs.addAll(bindings.get(0));
+      154                  tables.addAll(bindings.get(1));
+      155              }
+      156              Preconditions.checkState(dbs.isEmpty() && tables.isEmpty(),
+      157                      "Storage volume '%s' is referenced by dbs or tables, dbs: %s, tables: %s",
+      158                      name, dbs.toString(), tables.toString());
+      159              removeInternalNoLock(sv);
+      160          }
+      161      }
+      162  
+      163      public void updateStorageVolume(AlterStorageVolumeStmt stmt) throws DdlException, MetaNotFoundException {
+      164          updateStorageVolume(stmt.getName(), null, null, stmt.getProperties(), stmt.getComment());
+      165      }
+      166  
+      167      public void updateStorageVolume(String name, String svType, List<String> locations,
+      168              Map<String, String> properties, String comment) throws DdlException, MetaNotFoundException {
+      169          Map<String, String> params = new HashMap<>();
+      170          Optional<Boolean> enabled = parseProperties(properties, params);
+      171          updateStorageVolume(name, svType, locations, params, enabled, comment);
+      172      }
+      173  
+      174      public void updateStorageVolume(String name, String svType, List<String> locations,
+      175              Map<String, String> params, Optional<Boolean> enabled, String comment) throws DdlException, MetaNotFoundException {
+      176          List<String> immutableProperties = Lists.newArrayList(CloudConfigurationConstants.AWS_S3_NUM_PARTITIONED_PREFIX,
+      177                  CloudConfigurationConstants.AWS_S3_ENABLE_PARTITIONED_PREFIX);
+      178          for (String param : immutableProperties) {
+      179              if (params.containsKey(param)) {
+      180                  throw new DdlException(String.format("Storage volume property '%s' is immutable!", param));
+      181              }
+      182          }
+      183          try (LockCloseable lock = new LockCloseable(rwLock.writeLock())) {
+      184              StorageVolume sv = getStorageVolumeByName(name);
+      185              if (sv == null) {
+      186                  throw new MetaNotFoundException(String.format("Storage volume '%s' does not exist", name));
+      187              }
+      188              StorageVolume copied = new StorageVolume(sv);
+      189              validateParams(copied.getType(), params);
+      190  
+      191              if (enabled.isPresent()) {
+      192                  boolean enabledValue = enabled.get();
+      193                  if (!enabledValue) {
+      194                      Preconditions.checkState(!copied.getId().equals(defaultStorageVolumeId),
+      195                              "Default volume can not be disabled");
+      196                  }
+      197                  copied.setEnabled(enabledValue);
+      198              }
+      199  
+      200              if (!Strings.isNullOrEmpty(svType)) {
+      201                  copied.setType(svType);
+      202              }
+      203  
+      204              if (locations != null) {
+      205                  copied.setLocations(locations);
+      206              }
+      207  
+      208              if (!Strings.isNullOrEmpty(comment)) {
+      209                  copied.setComment(comment);
+      210              }
+      211  
+      212              if (!params.isEmpty()) {
+      213                  copied.setCloudConfiguration(params);
+      214              }
+      215  
+      216              updateInternalNoLock(copied);
+      217          }
+      218      }
+      219  
+      220      public void replaceStorageVolume(String name, String svType, List<String> locations,
+      221              Map<String, String> properties, String comment) throws DdlException {
+      222          Map<String, String> params = new HashMap<>();
+      223          Optional<Boolean> enabled = parseProperties(properties, params);
+      224          validateParams(svType, params);
+      225  
+      226          String locationChangedStorageVolumeId = null;
+      227          try (LockCloseable lock = new LockCloseable(rwLock.writeLock())) {
+      228              StorageVolume oldStorageVolume = getStorageVolumeByName(name);
+      229              Preconditions.checkState(oldStorageVolume != null, "Storage volume '%s' does not exist", name);
+      230              if (enabled.isPresent()) {
+      231                  if (!enabled.get()) {
+      232                      Preconditions.checkState(!oldStorageVolume.getId().equals(defaultStorageVolumeId),
+      233                              "Default volume can not be disabled");
+      234                  }
+      235              }
+      236  
+      237              StorageVolume newStorageVolume = null;
+      238              if (oldStorageVolume.getType().equalsIgnoreCase(svType)) {
+      239                  newStorageVolume = new StorageVolume(oldStorageVolume);
+      240                  if (enabled.isPresent()) {
+      241                      newStorageVolume.setEnabled(enabled.get());
+      242                  }
+      243  
+      244                  if (!Strings.isNullOrEmpty(svType)) {
+      245                      newStorageVolume.setType(svType);
+      246                  }
+      247  
+      248                  if (locations != null) {
+      249                      if (!oldStorageVolume.getLocations().equals(locations)) {
+      250                          validateLocations(svType, locations);
+      251                          newStorageVolume.setLocations(locations);
+      252                          locationChangedStorageVolumeId = newStorageVolume.getId();
+      253                      }
+      254                  }
+      255  
+      256                  if (!Strings.isNullOrEmpty(comment)) {
+      257                      newStorageVolume.setComment(comment);
+      258                  }
+      259  
+      260                  if (!params.isEmpty()) {
+      261                      newStorageVolume.setCloudConfiguration(params);
+      262                  }
+      263              } else {
+      264                  Preconditions.checkState(locations != null, "Location is null");
+      265                  validateLocations(svType, locations);
+      266                  newStorageVolume = new StorageVolume(oldStorageVolume.getId(), name, svType, locations, params,
+      267                          enabled.orElse(oldStorageVolume.getEnabled()), comment);
+      268  
+      269                  if (oldStorageVolume.getVTabletId() != -1) {
+      270                      newStorageVolume.setVTabletId(oldStorageVolume.getVTabletId());
+      271                  }
+      272  
+      273                  if (oldStorageVolume.getVTabletGroupId() != -1) {
+      274                      newStorageVolume.setVTabletGroupId(oldStorageVolume.getVTabletGroupId());
+      275                  }
+      276  
+      277                  locationChangedStorageVolumeId = newStorageVolume.getId();
+      278              }
+      279  
+      280              replaceInternalNoLock(newStorageVolume);
+      281          }
+      282  
+      283          if (locationChangedStorageVolumeId != null) {
+      284              updateTableStorageInfo(locationChangedStorageVolumeId);
+      285          }
+      286      }
+      287  
+      288      public void updateStorageVolumeVTabletMapping(String name, long vTabletId, long vTabletGroupId)
+      289              throws DdlException {
+      290          throw new DdlException("Not implemented");
+      291      }
+      292  
+      293      public void setDefaultStorageVolume(SetDefaultStorageVolumeStmt stmt) {
+      294          setDefaultStorageVolume(stmt.getName());
+      295      }
+      296  
+      297      public void setDefaultStorageVolume(String svName) {
+      298          try (LockCloseable lock = new LockCloseable(rwLock.writeLock())) {
+      299              StorageVolume sv = getStorageVolumeByName(svName);
+      300              Preconditions.checkState(sv != null, "Storage volume '%s' does not exist", svName);
+      301              Preconditions.checkState(sv.getEnabled(), "Storage volume '%s' is disabled", svName);
+      302              SetDefaultStorageVolumeLog log = new SetDefaultStorageVolumeLog(sv.getId());
+      303              GlobalStateMgr.getCurrentState().getEditLog()
+      304                      .logSetDefaultStorageVolume(log, wal -> this.defaultStorageVolumeId = sv.getId());
+      305          }
+      306      }
+      307  
+      308      public String getDefaultStorageVolumeId() {
+      309          return defaultStorageVolumeId;
+      310      }
+      311  
+      312      public boolean exists(String svName) throws DdlException {
+      313          try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+      314              StorageVolume sv = getStorageVolumeByName(svName);
+      315              return sv != null;
+      316          }
+      317      }
+      318  
+      319      private Optional<Boolean> parseProperties(Map<String, String> properties, Map<String, String> params) {
+      320          params.putAll(properties);
+      321          Optional<Boolean> enabled = Optional.empty();
+      322          if (params.containsKey(ENABLED)) {
+      323              enabled = Optional.of(Boolean.parseBoolean(params.get(ENABLED)));
+      324              params.remove(ENABLED);
+      325          }
+      326          return enabled;
+      327      }
+      328  
+      329      public String getStorageVolumeIdOfTable(long tableId) {
+      330          try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+      331              return tableToStorageVolume.get(tableId);
+      332          }
+      333      }
+      334  
+      335      public String getStorageVolumeIdOfDb(long dbId) {
+      336          try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+      337              return dbToStorageVolume.get(dbId);
+      338          }
+      339      }
+      340  
+      341      public String getStorageVolumeNameOfTable(long tableId) {
+      342          try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+      343              String svId = getStorageVolumeIdOfTable(tableId);
+      344              // If sv id is null, the table is upgraded from old version.
+      345              // Builtin storage volume will be returned.
+      346              return svId != null ? getStorageVolume(svId).getName() : BUILTIN_STORAGE_VOLUME;
+      347          }
+      348      }
+      349  
+      350      public String getStorageVolumeNameOfDb(long dbId) {
+      351          try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+      352              String svId = getStorageVolumeIdOfDb(dbId);
+      353              // If sv id is null, the db is upgraded from old version.
+      354              // Builtin storage volume will be returned.
+      355              return svId != null ? getStorageVolume(svId).getName() : BUILTIN_STORAGE_VOLUME;
+      356          }
+      357      }
+      358  
+      359      public StorageVolume getDefaultStorageVolume() {
+      360          try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+      361              return getStorageVolume(getDefaultStorageVolumeId());
+      362          }
+      363      }
+      364  
+      365      public String getStorageVolumeName(String svId) {
+      366          try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+      367              StorageVolume sv = getStorageVolume(svId);
+      368              if (sv == null) {
+      369                  return "";
+      370              }
+      371              return getStorageVolume(svId).getName();
+      372          }
+      373      }
+      374  
+      375      public void replaySetDefaultStorageVolume(SetDefaultStorageVolumeLog log) {
+      376          try (LockCloseable lock = new LockCloseable(rwLock.writeLock())) {
+      377              defaultStorageVolumeId = log.getId();
+      378          }
+      379      }
+      380  
+      381      public void replayCreateStorageVolume(StorageVolume sv) {
+      382      }
+      383  
+      384      public void replayUpdateStorageVolume(StorageVolume sv) {
+      385      }
+      386  
+      387      public void replayDropStorageVolume(DropStorageVolumeLog log) {
+      388      }
+      389  
+      390      public void replayUpdateTableStorageInfos(TableStorageInfos tableStorageInfos) {
+      391          throw new RuntimeException("Not implemented");
+      392      }
+      393  
+      394      protected void validateParams(String svType, Map<String, String> params) throws DdlException {
+      395          if (svType.equalsIgnoreCase(HDFS)) {
+      396              return;
+      397          }
+      398          for (String key : params.keySet()) {
+      399              if (!PARAM_NAMES.contains(key)) {
+      400                  throw new DdlException("Invalid properties " + key);
+      401              }
+      402          }
+      403  
+      404          // storage volume type specific checks
+      405          if (!svType.equalsIgnoreCase(S3)) {
+      406              // The following two properties can be only set when storage volume type is 'S3'
+      407              List<String> s3Params = Lists.newArrayList(
+      408                      CloudConfigurationConstants.AWS_S3_NUM_PARTITIONED_PREFIX,
+      409                      CloudConfigurationConstants.AWS_S3_ENABLE_PARTITIONED_PREFIX);
+      410              for (String param : s3Params) {
+      411                  if (params.containsKey(param)) {
+      412                      throw new DdlException(
+      413                              String.format("Invalid property '%s' for storage volume type '%s'", param, svType));
+      414                  }
+      415              }
+      416          }
+      417          if (params.containsKey(CloudConfigurationConstants.AWS_S3_NUM_PARTITIONED_PREFIX)) {
+      418              try {
+      419                  int value = Integer.parseInt(params.get(CloudConfigurationConstants.AWS_S3_NUM_PARTITIONED_PREFIX));
+      420                  if (value < 0) {
+      421                      throw new DdlException(String.format(
+      422                              "Invalid property value '%s' for property '%s', expecting a positive integer string.",
+      423                              params.get(CloudConfigurationConstants.AWS_S3_NUM_PARTITIONED_PREFIX),
+      424                              CloudConfigurationConstants.AWS_S3_NUM_PARTITIONED_PREFIX));
+      425                  }
+      426              } catch (NumberFormatException e) {
+      427                  throw new DdlException(String.format(
+      428                          "Invalid property value '%s' for property '%s', expecting a valid integer string.",
+      429                          params.get(CloudConfigurationConstants.AWS_S3_NUM_PARTITIONED_PREFIX),
+      430                          CloudConfigurationConstants.AWS_S3_NUM_PARTITIONED_PREFIX));
+      431              }
+      432          }
+      433      }
+      434  
+      435      private void validateLocations(String svType, List<String> locations) throws DdlException {
+      436          for (String location : locations) {
+      437              try {
+      438                  URI uri = new URI(location);
+      439                  String scheme = uri.getScheme().toLowerCase();
+      440                  switch (svType.toLowerCase()) {
+      441                      case S3:
+      442                      case AZBLOB:
+      443                      case ADLS2:
+      444                      case GS:
+      445                          if (!scheme.equalsIgnoreCase(svType)) {
+      446                              throw new DdlException("Invalid location " + location);
+      447                          }
+      448                          break;
+      449                      case HDFS:
+      450                          String pattern = "[a-z][a-z0-9]*";
+      451                          if (!Pattern.matches(pattern, scheme)) {
+      452                              throw new DdlException("Invalid location " + location);
+      453                          }
+      454                          break;
+      455                      default:
+      456                          throw new DdlException("Unknown storage volume type: " + svType);
+      457                  }
+      458              } catch (URISyntaxException e) {
+      459                  throw new DdlException(String.format("Invalid location %s, error: %s", location, e.getMessage()));
+      460              }
+       ... truncated at 400 lines ...
+
+---------- IMPLEMENTER com.starrocks.server.SharedDataStorageVolumeMgr  stubs=0/19 ----------
+       64  public class SharedDataStorageVolumeMgr extends StorageVolumeMgr {
+       65      private static final Logger LOG = LogManager.getLogger(SharedDataStorageVolumeMgr.class);
+       66  
+       67      private final Map<String, Long> storageVolumeIdToVTabletGroupId = new ConcurrentHashMap<>();
+       68  
+       69      @Override
+       70      public StorageVolume getStorageVolumeByName(String svName) {
+       71          try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+       72              try {
+       73                  FileStoreInfo fileStoreInfo = GlobalStateMgr.getCurrentState().getStarOSAgent().getFileStoreByName(svName);
+       74                  if (fileStoreInfo == null) {
+       75                      return null;
+       76                  }
+       77                  return StorageVolume.fromFileStoreInfo(fileStoreInfo);
+       78              } catch (DdlException e) {
+       79                  throw new SemanticException(e.getMessage());
+       80              }
+       81          }
+       82      }
+       83  
+       84      @Override
+       85      public StorageVolume getStorageVolume(String svId) {
+       86          try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+       87              try {
+       88                  FileStoreInfo fileStoreInfo = GlobalStateMgr.getCurrentState().getStarOSAgent().getFileStore(svId);
+       89                  if (fileStoreInfo == null) {
+       90                      return null;
+       91                  }
+       92                  return StorageVolume.fromFileStoreInfo(fileStoreInfo);
+       93              } catch (DdlException e) {
+       94                  throw new SemanticException(e.getMessage());
+       95              }
+       96          }
+       97      }
+       98  
+       99      @Override
+      100      public List<String> listStorageVolumeNames() throws DdlException {
+      101          try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+      102              return GlobalStateMgr.getCurrentState().getStarOSAgent().listFileStore()
+      103                      .stream().map(FileStoreInfo::getFsName).collect(Collectors.toList());
+      104          }
+      105      }
+      106  
+      107      /**
+      108       * refresh `storageVolumeIdToVTabletGroupId` at startup time of FE leader or after this FE transferred to leader.
+      109       */
+      110      public void restoreStorageVolumeToVTabletGroupMappings() {
+      111          try (LockCloseable lock = new LockCloseable(rwLock.writeLock())) {
+      112              try {
+      113                  List<FileStoreInfo> fileStoreInfos = GlobalStateMgr.getCurrentState().getStarOSAgent().listFileStore();
+      114  
+      115                  Map<String, Long> newMappings = new HashMap<>();
+      116                  for (FileStoreInfo fsInfo : fileStoreInfos) {
+      117                      String vTabletIdGroupId = fsInfo.getPropertiesMap().get(V_SHARD_GROUP_ID);
+      118                      if (StringUtils.isEmpty(vTabletIdGroupId)) {
+      119                          continue;
+      120                      }
+      121                      try {
+      122                          newMappings.put(fsInfo.getFsName(), Long.parseLong(vTabletIdGroupId));
+      123                      } catch (NumberFormatException e) {
+      124                          LOG.warn("found invalid v_shard_group_id" +
+      125                                  " while restoring storage volume to virtual tablet group mapping: {}", vTabletIdGroupId);
+      126                      }
+      127                  }
+      128  
+      129                  storageVolumeIdToVTabletGroupId.clear();
+      130                  storageVolumeIdToVTabletGroupId.putAll(newMappings);
+      131              } catch (DdlException e) {
+      132                  LOG.warn("failed to restore storage volume to tablet, keeping existing mappings", e);
+      133              }
+      134          }
+      135      }
+      136  
+      137      @Override
+      138      protected String createInternalNoLock(String name, String svType, List<String> locations,
+      139              Map<String, String> params, Optional<Boolean> enabled, String comment)
+      140              throws DdlException {
+      141          FileStoreInfo fileStoreInfo = StorageVolume.createFileStoreInfo(name, svType,
+      142                  locations, params, enabled.orElse(true), comment);
+      143          return GlobalStateMgr.getCurrentState().getStarOSAgent().addFileStore(fileStoreInfo);
+      144      }
+      145  
+      146      @Override
+      147      protected void updateInternalNoLock(StorageVolume sv) throws DdlException {
+      148          GlobalStateMgr.getCurrentState().getStarOSAgent().updateFileStore(sv.toFileStoreInfo());
+      149      }
+      150  
+      151      @Override
+      152      protected void replaceInternalNoLock(StorageVolume sv) throws DdlException {
+      153          GlobalStateMgr.getCurrentState().getStarOSAgent().replaceFileStore(sv.toFileStoreInfo());
+      154      }
+      155  
+      156      @Override
+      157      protected void removeInternalNoLock(StorageVolume sv) throws DdlException {
+      158          GlobalStateMgr.getCurrentState().getStarOSAgent().removeFileStoreByName(sv.getName());
+      159  
+      160          // remove virtual tablets
+      161          if (sv.getVTabletId() != -1) {
+      162              GlobalStateMgr.getCurrentState().getStarOSAgent().deleteShards(Collections.singleton(sv.getVTabletId()));
+      163          }
+      164  
+      165          if (sv.getVTabletGroupId() != -1) {
+      166              GlobalStateMgr.getCurrentState().getStarOSAgent().deleteShardGroup(
+      167                      Collections.singletonList(sv.getVTabletGroupId()));
+      168              storageVolumeIdToVTabletGroupId.remove(sv.getName());
+      169          }
+      170      }
+      171  
+      172      @Override
+      173      public StorageVolume getDefaultStorageVolume() {
+      174          try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+      175              if (defaultStorageVolumeId.isEmpty()) {
+      176                  return getStorageVolumeByName(BUILTIN_STORAGE_VOLUME);
+      177              }
+      178              return getStorageVolume(getDefaultStorageVolumeId());
+      179          }
+      180      }
+      181  
+      182      private StorageVolume getStorageVolumeOfDb(String svName) throws DdlException {
+      183          StorageVolume sv = null;
+      184          if (svName.equals(StorageVolumeMgr.DEFAULT)) {
+      185              sv = getDefaultStorageVolume();
+      186              if (sv == null) {
+      187                  throw ErrorReportException.report(ErrorCode.ERR_NO_DEFAULT_STORAGE_VOLUME);
+      188              }
+      189          } else {
+      190              sv = getStorageVolumeByName(svName);
+      191              if (sv == null) {
+      192                  throw new DdlException("Unknown storage volume \"" + svName + "\"");
+      193              }
+      194          }
+      195          return sv;
+      196      }
+      197  
+      198      // In replay phase, the check of storage volume existence can be skipped.
+      199      // Because it has been checked when creating db.
+      200      private boolean bindDbToStorageVolume(String svId, long dbId, boolean isReplay) {
+      201          if (svId == null) {
+      202              return false;
+      203          }
+      204          try (LockCloseable lock = new LockCloseable(rwLock.writeLock())) {
+      205              if (!isReplay && !storageVolumeToDbs.containsKey(svId) && getStorageVolume(svId) == null) {
+      206                  return false;
+      207              }
+      208              // remove existing bind if exists
+      209              unbindDbToStorageVolume(dbId);
+      210  
+      211              Set<Long> dbs = storageVolumeToDbs.getOrDefault(svId, new HashSet<>());
+      212              dbs.add(dbId);
+      213              storageVolumeToDbs.put(svId, dbs);
+      214              dbToStorageVolume.put(dbId, svId);
+      215              return true;
+      216          }
+      217      }
+      218  
+      219      @Override
+      220      public boolean bindDbToStorageVolume(String svName, long dbId) throws DdlException {
+      221          try (LockCloseable lock = new LockCloseable(rwLock.writeLock())) {
+      222              StorageVolume sv = getStorageVolumeOfDb(svName);
+      223              if (!sv.getEnabled()) {
+
+---------- IMPLEMENTER com.starrocks.server.SharedNothingStorageVolumeMgr  stubs=6/19 ----------
+       38  public class SharedNothingStorageVolumeMgr extends StorageVolumeMgr {
+       39      @SerializedName("idToSV")
+       40      private Map<String, StorageVolume> idToSV = new HashMap<>();
+       41  
+       42      @Override
+       43      public StorageVolume getStorageVolumeByName(String svName) {
+       44          try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+       45              for (StorageVolume sv : idToSV.values()) {
+       46                  if (sv.getName().equals(svName)) {
+       47                      return sv;
+       48                  }
+       49              }
+       50          }
+       51          return null;
+       52      }
+       53  
+       54      @Override
+       55      public StorageVolume getStorageVolume(String svId) {
+       56          try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+       57              return idToSV.get(svId);
+       58          }
+       59      }
+       60  
+       61      @Override
+       62      public List<String> listStorageVolumeNames() {
+       63          try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+       64              return idToSV.values().stream().map(StorageVolume::getName).collect(Collectors.toList());
+       65          }
+       66      }
+       67  
+       68      @Override
+       69      protected String createInternalNoLock(String name, String svType, List<String> locations,
+       70                                            Map<String, String> params, Optional<Boolean> enabled,
+       71                                            String comment) throws DdlException {
+       72          String id = UUID.randomUUID().toString();
+       73          StorageVolume sv = new StorageVolume(id, name, svType, locations, params, enabled.orElse(true), comment);
+       74          GlobalStateMgr.getCurrentState().getEditLog().logCreateStorageVolume(sv, wal -> idToSV.put(id, sv));
+       75          return id;
+       76      }
+       77  
+       78      @Override
+       79      protected void updateInternalNoLock(StorageVolume sv) {
+       80          GlobalStateMgr.getCurrentState().getEditLog().logUpdateStorageVolume(sv, wal -> idToSV.put(sv.getId(), sv));
+       81      }
+       82  
+       83      @Override
+       84      protected void replaceInternalNoLock(StorageVolume sv) {
+       85          GlobalStateMgr.getCurrentState().getEditLog().logUpdateStorageVolume(sv, wal -> idToSV.put(sv.getId(), sv));
+       86      }
+       87  
+       88      @Override
+       89      protected void removeInternalNoLock(StorageVolume sv) {
+       90          DropStorageVolumeLog log = new DropStorageVolumeLog(sv.getId());
+       91          GlobalStateMgr.getCurrentState().getEditLog().logDropStorageVolume(log, wal -> idToSV.remove(sv.getId()));
+       92      }
+       93  
+       94      @Override
+       95      public void load(SRMetaBlockReader reader)
+       96              throws SRMetaBlockEOFException, IOException, SRMetaBlockException {
+       97          SharedNothingStorageVolumeMgr data = (SharedNothingStorageVolumeMgr) reader.readJson(StorageVolumeMgr.class);
+       98          this.storageVolumeToDbs = data.storageVolumeToDbs;
+       99          this.storageVolumeToTables = data.storageVolumeToTables;
+      100          this.defaultStorageVolumeId = data.defaultStorageVolumeId;
+      101          this.idToSV = data.idToSV;
+      102      }
+      103  
+      104      @Override
+      105      public void replayCreateStorageVolume(StorageVolume sv) {
+      106          try (LockCloseable lock = new LockCloseable(rwLock.writeLock())) {
+      107              idToSV.put(sv.getId(), sv);
+      108          }
+      109      }
+      110  
+      111      @Override
+      112      public void replayUpdateStorageVolume(StorageVolume sv) {
+      113          try (LockCloseable lock = new LockCloseable(rwLock.writeLock())) {
+      114              idToSV.put(sv.getId(), sv);
+      115          }
+      116      }
+      117  
+      118      @Override
+      119      public void replayDropStorageVolume(DropStorageVolumeLog log) {
+      120          try (LockCloseable lock = new LockCloseable(rwLock.writeLock())) {
+      121              idToSV.remove(log.getId());
+      122          }
+      123      }
+      124  
+      125      @Override
+      126      public boolean bindDbToStorageVolume(String svName, long dbId) {
+      127          return true;
+      128      }
+      129  
+      130      @Override
+      131      public void replayBindDbToStorageVolume(String svId, long dbId) {
+      132  
+      133      }
+      134  
+      135      @Override
+      136      public void unbindDbToStorageVolume(long dbId) {
+      137  
+      138      }
+      139  
+      140      @Override
+      141      public boolean bindTableToStorageVolume(String svName, long dbId, long tableId) {
+      142          return true;
+      143      }
+      144  
+      145      @Override
+      146      public void replayBindTableToStorageVolume(String svId, long tableId) {
+      147  
+      148      }
+      149  
+      150      @Override
+      151      public void unbindTableToStorageVolume(long tableId) {
+      152  
+      153      }
+      154  
+      155      @Override
+      156      public String createBuiltinStorageVolume() {
+      157          return "";
+      158      }
+      159  
+      160      @Override
+      161      public void validateStorageVolumeConfig() throws InvalidConfException {
+      162  
+      163      }
+      164  
+      165      @Override
+      166      protected List<List<Long>> getBindingsOfBuiltinStorageVolume() {
+      167          return new ArrayList<>(Arrays.asList(new ArrayList<Long>(), new ArrayList<Long>()));
+      168      }
+      169  
+      170      @Override
+      171      protected void updateTableStorageInfo(String storageVolumeId) throws DdlException {
+      172  
+      173      }
+      174  
+      175      @Override
+      176      public long getOrCreateVirtualTabletId(String storageVolumeName, String srcServiceId) throws MetaNotFoundException {
+      177          return -1;
+      178      }
+      179  
+      180      @Override
+      181      public boolean hasStorageVolumeBindAsVirtualGroup(long shardGroupId) {
+      182          return false;
+      183      }
+      184  }

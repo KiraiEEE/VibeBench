@@ -1,0 +1,416 @@
+row 61   JetBrains/youtrackdb#687
+============================================================================
+CONTRACT com.jetbrains.youtrackdb.internal.core.command.CommandContext   members=29.0 implementers=4.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       33  public interface CommandContext {
+       34  
+       35    void registerBooleanExpression(SQLBooleanExpression expression);
+       36  
+       37    List<SQLBooleanExpression> getParentWhereExpressions();
+       38  
+       39    enum TIMEOUT_STRATEGY {
+       40      RETURN,
+       41      EXCEPTION
+       42    }
+       43  
+       44    Object getVariable(String iName);
+       45  
+       46    Object getVariable(String iName, Object iDefaultValue);
+       47  
+       48    CommandContext setVariable(String iName, Object iValue);
+       49  
+       50    <T> void setSystemVariable(int id, T value);
+       51  
+       52    boolean hasSystemVariable(int id);
+       53  
+       54    <T> T getSystemVariable(int id);
+       55  
+       56    CommandContext incrementVariable(String getNeighbors);
+       57  
+       58    Map<String, Object> getVariables();
+       59  
+       60    CommandContext getParent();
+       61  
+       62    CommandContext setParent(CommandContext iParentContext);
+       63  
+       64    CommandContext setChild(CommandContext context);
+       65  
+       66    /**
+       67     * Updates a counter. Used to record metrics.
+       68     *
+       69     * @param iName  Metric's name
+       70     * @param iValue delta to add or subtract
+       71     * @return
+       72     */
+       73    long updateMetric(String iName, long iValue);
+       74  
+       75    boolean isRecordingMetrics();
+       76  
+       77    CommandContext setRecordingMetrics(boolean recordMetrics);
+       78  
+       79    void beginExecution(long timeoutMs, TIMEOUT_STRATEGY iStrategy);
+       80  
+       81    /**
+       82     * Check if timeout is elapsed, if defined.
+       83     *
+       84     * @return false if it the timeout is elapsed and strategy is "return"
+       85     * @throws TimeoutException if the strategy is "exception" (default)
+       86     */
+       87    boolean checkTimeout();
+       88  
+       89    Map<Object, Object> getInputParameters();
+       90  
+       91    void setInputParameters(Map<Object, Object> inputParameters);
+       92  
+       93    /**
+       94     * Creates a copy of execution context.
+       95     */
+       96    CommandContext copy();
+       97  
+       98    /**
+       99     * Merges a context with current one.
+      100     *
+      101     * @param iContext
+      102     */
+      103    void merge(CommandContext iContext);
+      104  
+      105    @Nullable
+      106    DatabaseSessionEmbedded getDatabaseSession();
+      107  
+      108    void setDatabaseSession(DatabaseSessionEmbedded session);
+      109  
+      110    void declareScriptVariable(String varName);
+      111  
+      112    boolean isScriptVariableDeclared(String varName);
+      113  
+      114    void startProfiling(ExecutionStep step);
+      115  
+      116    void endProfiling(ExecutionStep step);
+      117  
+      118    StepStats getStats(ExecutionStep step);
+      119  }
+
+---------- IMPLEMENTER com.jetbrains.youtrackdb.internal.core.command.BasicCommandContext  stubs=1/29 ----------
+       45  public class BasicCommandContext implements CommandContext {
+       46    public static final String INVALID_COMPARE_COUNT = "INVALID_COMPARE_COUNT";
+       47  
+       48    protected DatabaseSessionEmbedded session;
+       49    protected Object[] args;
+       50  
+       51    protected boolean recordMetrics = false;
+       52    protected CommandContext parent;
+       53    protected CommandContext child;
+       54    private Map<String, Object> variables;
+       55  
+       56    private final Int2ObjectOpenHashMap<Object> systemVariables = new Int2ObjectOpenHashMap<>();
+       57  
+       58    protected Map<Object, Object> inputParameters;
+       59  
+       60    protected Set<String> declaredScriptVariables = new HashSet<>();
+       61  
+       62    // MANAGES THE TIMEOUT
+       63    private long executionStartedOn;
+       64    private long timeoutMs;
+       65    private CommandContext.TIMEOUT_STRATEGY timeoutStrategy;
+       66  
+       67    private final Map<ExecutionStep, StepStats> stepStats = new IdentityHashMap<>();
+       68    private final LinkedList<StepStats> currentStepStats = new LinkedList<>();
+       69    private final List<SQLBooleanExpression> parentWhereExpressions = new LinkedList<>();
+       70  
+       71    public BasicCommandContext() {
+       72    }
+       73  
+       74    public BasicCommandContext(DatabaseSessionEmbedded session) {
+       75      this.session = session;
+       76    }
+       77  
+       78    @Override
+       79    public <T> void setSystemVariable(int id, T value) {
+       80      if (parent != null) {
+       81        if (parent.hasSystemVariable(id)) {
+       82          parent.setSystemVariable(id, value);
+       83        } else {
+       84          systemVariables.put(id, value);
+       85        }
+       86      } else {
+       87        systemVariables.put(id, value);
+       88      }
+       89    }
+       90  
+       91    @Override
+       92    public boolean hasSystemVariable(int id) {
+       93      if (systemVariables.containsKey(id)) {
+       94        return true;
+       95      } else if (parent != null) {
+       96        return parent.hasSystemVariable(id);
+       97      }
+       98      return false;
+       99    }
+      100  
+      101    @Nullable
+      102    @Override
+      103    public <T> T getSystemVariable(int id) {
+      104      var value = systemVariables.get(id);
+      105      if (value != null) {
+      106        return (T) value;
+      107      } else if (parent != null) {
+      108        return parent.getSystemVariable(id);
+      109      }
+      110      return null;
+      111    }
+      112  
+      113    @Override
+      114    public Object getVariable(String iName) {
+      115      return getVariable(iName, null);
+      116    }
+      117  
+      118    @Override
+      119    public Object getVariable(String iName, final Object iDefault) {
+      120      if (iName == null) {
+      121        return iDefault;
+      122      }
+      123  
+      124      Object result = null;
+      125  
+      126      if (iName.startsWith("$")) {
+      127        iName = iName.substring(1);
+      128      }
+      129  
+      130      var pos = StringSerializerHelper.getLowerIndexOf(iName, 0, ".", "[");
+      131  
+      132      String firstPart;
+      133      String lastPart;
+      134      if (pos > -1) {
+      135        firstPart = iName.substring(0, pos);
+      136        if (iName.charAt(pos) == '.') {
+      137          pos++;
+      138        }
+      139        lastPart = iName.substring(pos);
+      140        if (firstPart.equalsIgnoreCase("PARENT") && parent != null) {
+      141          // UP TO THE PARENT
+      142          if (lastPart.startsWith("$")) {
+      143            result = parent.getVariable(lastPart.substring(1));
+      144          } else {
+      145            result = EntityHelper.getFieldValue(getDatabaseSession(), parent, lastPart);
+      146          }
+      147  
+      148          return result != null ? resolveValue(result) : iDefault;
+      149  
+      150        } else if (firstPart.equalsIgnoreCase("ROOT")) {
+      151          CommandContext p = this;
+      152          while (p.getParent() != null) {
+      153            p = p.getParent();
+      154          }
+      155  
+      156          if (lastPart.startsWith("$")) {
+      157            result = p.getVariable(lastPart.substring(1));
+      158          } else {
+      159            result = EntityHelper.getFieldValue(getDatabaseSession(), p, lastPart, this);
+      160          }
+      161  
+      162          return result != null ? resolveValue(result) : iDefault;
+      163        }
+      164      } else {
+      165        firstPart = iName;
+      166        lastPart = null;
+      167      }
+      168  
+      169      if (firstPart.equalsIgnoreCase("CONTEXT")) {
+      170        result = getVariables();
+      171      } else if (firstPart.equalsIgnoreCase("PARENT")) {
+      172        result = parent;
+      173      } else if (firstPart.equalsIgnoreCase("ROOT")) {
+      174        CommandContext p = this;
+      175        while (p.getParent() != null) {
+      176          p = p.getParent();
+      177        }
+      178        result = p;
+      179      } else {
+      180        if (variables != null && variables.containsKey(firstPart)) {
+      181          result = variables.get(firstPart);
+      182        } else {
+      183          if (child != null) {
+      184            result = child.getVariable(firstPart);
+      185          } else {
+      186            result = getVariableFromParentHierarchy(firstPart);
+      187          }
+      188        }
+      189      }
+      190  
+      191      if (pos > -1) {
+      192        result = EntityHelper.getFieldValue(getDatabaseSession(), result, lastPart, this);
+      193      }
+      194  
+      195      return result != null ? resolveValue(result) : iDefault;
+      196    }
+      197  
+      198    private Object resolveValue(Object value) {
+      199      if (value instanceof DynamicVariable) {
+      200        value = ((DynamicVariable) value).resolve(this);
+      201      }
+      202      return value;
+      203    }
+      204  
+
+---------- IMPLEMENTER com.jetbrains.youtrackdb.internal.core.command.traverse.TraverseContext  stubs=0/2 ----------
+       37  public class TraverseContext extends BasicCommandContext {
+       38  
+       39    private Memory memory = new StackMemory();
+       40    private final Set<RID> history = new HashSet<RID>();
+       41  
+       42    private TraverseAbstractProcess<?> currentProcess;
+       43  
+       44    public void push(final TraverseAbstractProcess<?> iProcess) {
+       45      memory.add(iProcess);
+       46    }
+       47  
+       48    @Override
+       49    public Map<String, Object> getVariables() {
+       50      final var map = new HashMap<String, Object>();
+       51      map.put("depth", getDepth());
+       52      map.put("path", getPath());
+       53      map.put("stack", memory.getUnderlying());
+       54      // DELEGATE
+       55      map.putAll(super.getVariables());
+       56      return map;
+       57    }
+       58  
+       59    @Override
+       60    public Object getVariable(final String iName) {
+       61      final var name = iName.trim().toUpperCase(Locale.ENGLISH);
+       62  
+       63      if ("DEPTH".startsWith(name)) {
+       64        return getDepth();
+       65      } else if (name.startsWith("PATH")) {
+       66        return EntityHelper.getFieldValue(getDatabaseSession(), getPath(),
+       67            iName.substring("PATH".length()));
+       68      } else if (name.startsWith("STACK")) {
+       69  
+       70        var result =
+       71            EntityHelper.getFieldValue(getDatabaseSession(), memory.getUnderlying(),
+       72                iName.substring("STACK".length()));
+       73        if (result instanceof ArrayDeque) {
+       74          result = ((ArrayDeque) result).clone();
+       75        }
+       76        return result;
+       77      } else if (name.startsWith("HISTORY")) {
+       78        return EntityHelper.getFieldValue(getDatabaseSession(), history,
+       79            iName.substring("HISTORY".length()));
+       80      } else
+       81      // DELEGATE
+       82      {
+       83        return super.getVariable(iName);
+       84      }
+       85    }
+       86  
+       87    public void pop(final Identifiable currentRecord) {
+       88      if (currentRecord != null) {
+       89        final var rid = currentRecord.getIdentity();
+       90        if (!history.remove(rid)) {
+       91          LogManager.instance().warn(this, "Element '" + rid + "' not found in traverse history");
+       92        }
+       93      }
+       94  
+       95      try {
+       96        memory.dropFrame();
+       97      } catch (NoSuchElementException e) {
+       98        throw new IllegalStateException("Traverse stack is empty", e);
+       99      }
+      100    }
+      101  
+      102    public TraverseAbstractProcess<?> next() {
+      103      currentProcess = memory.next();
+      104      return currentProcess;
+      105    }
+      106  
+      107    public boolean isEmpty() {
+      108      return memory.isEmpty();
+      109    }
+      110  
+      111    public void reset() {
+      112      memory.clear();
+      113    }
+      114  
+      115    public boolean isAlreadyTraversed(final Identifiable identity, final int iLevel) {
+      116      return history.contains(identity.getIdentity());
+      117  
+      118      // final int[] l = history.get(identity.getIdentity());
+      119      // if (l == null)
+      120      // return false;
+      121      //
+      122      // for (int i = 0; i < l.length && l[i] > -1; ++i)
+      123      // if (l[i] == iLevel)
+      124      // return true;
+      125    }
+      126  
+      127    public void addTraversed(final Identifiable identity, final int iLevel) {
+      128      history.add(identity.getIdentity());
+      129  
+      130      // final int[] l = history.get(identity.getIdentity());
+      131      // if (l == null) {
+      132      // final int[] array = new int[BUCKET_SIZE];
+      133      // array[0] = iLevel;
+      134      // Arrays.fill(array, 1, BUCKET_SIZE, -1);
+      135      // history.put(identity.getIdentity(), array);
+      136      // } else {
+      137      // if (l[l.length - 1] > -1) {
+      138      // // ARRAY FULL, ENLARGE IT
+      139      // final int[] array = Arrays.copyOf(l, l.length + BUCKET_SIZE);
+      140      // array[l.length] = iLevel;
+      141      // Arrays.fill(array, l.length + 1, array.length, -1);
+      142      // history.put(identity.getIdentity(), array);
+      143      // } else {
+      144      // for (int i = l.length - 2; i >= 0; --i) {
+      145      // if (l[i] > -1) {
+      146      // l[i + 1] = iLevel;
+      147      // break;
+      148      // }
+      149      // }
+      150      // }
+      151      // }
+      152    }
+      153  
+      154    public String getPath() {
+      155      return currentProcess == null ? "" : currentProcess.getPath().toString();
+      156    }
+      157  
+      158    public int getDepth() {
+      159      return currentProcess == null ? 0 : currentProcess.getPath().getDepth();
+      160    }
+      161  
+      162    public void setStrategy(final Traverse.STRATEGY strategy) {
+      163      if (strategy == Traverse.STRATEGY.BREADTH_FIRST) {
+      164        memory = new QueueMemory(memory);
+      165      } else {
+      166        memory = new StackMemory(memory);
+      167      }
+      168    }
+      169  
+      170    private interface Memory {
+      171  
+      172      void add(TraverseAbstractProcess<?> iProcess);
+      173  
+      174      TraverseAbstractProcess<?> next();
+      175  
+      176      void dropFrame();
+      177  
+      178      void clear();
+      179  
+      180      Collection<TraverseAbstractProcess<?>> getUnderlying();
+      181  
+      182      boolean isEmpty();
+      183    }
+      184  
+      185    private abstract static class AbstractMemory implements Memory {
+      186  
+      187      protected final Deque<TraverseAbstractProcess<?>> deque;
+      188  
+      189      public AbstractMemory() {
+      190        deque = new ArrayDeque<TraverseAbstractProcess<?>>();
+      191      }
+      192  
+      193      public AbstractMemory(final Memory memory) {
+      194        deque = new ArrayDeque<TraverseAbstractProcess<?>>(memory.getUnderlying());
+      195      }
+      196  

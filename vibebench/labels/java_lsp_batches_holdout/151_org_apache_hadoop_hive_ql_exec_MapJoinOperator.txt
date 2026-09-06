@@ -1,0 +1,121 @@
+row 151   mr3project/hive-mr3#78
+============================================================================
+OVERRIDE  org.apache.hadoop.hive.ql.exec.MapJoinOperator.closeOp(boolean)
+BASE      org.apache.hadoop.hive.ql.exec.AbstractMapJoinOperator.closeOp(boolean)
+QUESTION: can an instance of the SUBCLASS be used anywhere the BASE
+          is expected, without breaking the caller?
+
+---------------- BASE METHOD ----------------
+      114    @Override
+      115    public void closeOp(boolean abort) throws HiveException {
+      116      super.closeOp(abort);
+      117      emptyList = null;
+      118      joinKeys = null;
+      119    }
+
+---------------- OVERRIDE ----------------
+      758    @Override
+      759    public void closeOp(boolean abort) throws HiveException {
+      760  
+      761      if (isFullOuterMapJoin) {
+      762  
+      763        // FULL OUTER MapJoin: After matching the Big Table row keys against the Small Table, we now
+      764        // add any non matched Small Table key and values to the join output result.
+      765  
+      766        // FUTURE: Currently, we only support FULL OUTER MapJoin for single condition MapJoins.
+      767        byte smallTablePos = findSmallTable();
+      768        generateFullOuterSmallTableNoMatches(
+      769            smallTablePos,
+      770            (MapJoinTableContainer) mapJoinTables[smallTablePos]);
+      771      }
+      772  
+      773      boolean spilled = false;
+      774      for (MapJoinTableContainer container : mapJoinTables) {
+      775        if (container != null) {
+      776          spilled = spilled || container.hasSpill();
+      777          container.dumpMetrics();
+      778        }
+      779      }
+      780  
+      781      // For Hybrid Grace Hash Join, we need to see if there is any spilled data to be processed next
+      782      if (spilled) {
+      783        if (!abort) {
+      784          if (hashMapRowGetters == null) {
+      785            hashMapRowGetters = new ReusableGetAdaptor[mapJoinTables.length];
+      786          }
+      787          int numPartitions = 0;
+      788          // Find out number of partitions for each small table (should be same across tables)
+      789          for (byte pos = 0; pos < mapJoinTables.length; pos++) {
+      790            if (pos != conf.getPosBigTable()) {
+      791              firstSmallTable = (HybridHashTableContainer) mapJoinTables[pos];
+      792              numPartitions = firstSmallTable.getHashPartitions().length;
+      793              break;
+      794            }
+      795          }
+      796          assert numPartitions != 0 : "Number of partitions must be greater than 0!";
+      797  
+      798          if (firstSmallTable.hasSpill()) {
+      799            spilledMapJoinTables = new MapJoinBytesTableContainer[mapJoinTables.length];
+      800            hybridMapJoinLeftover = true;
+      801  
+      802            // Clear all in-memory partitions first
+      803            for (byte pos = 0; pos < mapJoinTables.length; pos++) {
+      804              MapJoinTableContainer tableContainer = mapJoinTables[pos];
+      805              if (tableContainer != null && tableContainer instanceof HybridHashTableContainer) {
+      806                HybridHashTableContainer hybridHtContainer = (HybridHashTableContainer) tableContainer;
+      807                hybridHtContainer.dumpStats();
+      808  
+      809                HashPartition[] hashPartitions = hybridHtContainer.getHashPartitions();
+      810                // Clear all in memory partitions first
+      811                for (int i = 0; i < hashPartitions.length; i++) {
+      812                  if (!hashPartitions[i].isHashMapOnDisk()) {
+      813                    hybridHtContainer.setTotalInMemRowCount(
+      814                        hybridHtContainer.getTotalInMemRowCount() -
+      815                            hashPartitions[i].getHashMapFromMemory().getNumValues());
+      816                    hashPartitions[i].getHashMapFromMemory().clear();
+      817                  }
+      818                }
+      819                assert hybridHtContainer.getTotalInMemRowCount() == 0;
+      820              }
+      821            }
+      822  
+      823            // Reprocess the spilled data
+      824            for (int i = 0; i < numPartitions; i++) {
+      825              HashPartition[] hashPartitions = firstSmallTable.getHashPartitions();
+      826              if (hashPartitions[i].isHashMapOnDisk()) {
+      827                try {
+      828                  continueProcess(i);     // Re-process spilled data
+      829                } catch (KryoException ke) {
+      830                  LOG.error("Processing the spilled data failed due to Kryo error!");
+      831                  LOG.error("Cleaning up all spilled data!");
+      832                  cleanupGraceHashJoin();
+      833                  throw new HiveException(ke);
+      834                } catch (Exception e) {
+      835                  throw new HiveException(e);
+      836                }
+      837                for (byte pos = 0; pos < order.length; pos++) {
+      838                  if (pos != conf.getPosBigTable())
+      839                    spilledMapJoinTables[pos] = null;
+      840                }
+      841              }
+      842            }
+      843          }
+      844        }
+      845  
+      846        LOG.info("spilled: " + spilled + " abort: " + abort + ". Clearing spilled partitions.");
+      847  
+      848        // spilled tables are loaded always (no sharing), so clear it
+      849        clearAllTableContainers();
+      850        cache.remove(cacheKey);
+      851      }
+      852  
+      853      // in mapreduce case, we need to always clear up as mapreduce doesn't have object registry.
+      854      if ((this.getExecContext() != null) && (this.getExecContext().getLocalWork() != null)
+      855          && (this.getExecContext().getLocalWork().getInputFileChangeSensitive())) {
+      856        LOG.info("MR: Clearing all map join table containers.");
+      857        clearAllTableContainers();
+      858      }
+      859  
+      860      this.loader = null;
+      861      super.closeOp(abort);
+      862    }

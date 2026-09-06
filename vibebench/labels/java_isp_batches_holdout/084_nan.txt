@@ -1,0 +1,912 @@
+row 84   Adobe-Consulting-Services/acs-aem-commons#3672
+============================================================================
+CONTRACT com.adobe.acs.commons.workflow.bulk.execution.BulkWorkflowRunner   members=13.0 implementers=6.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       32  @ProviderType
+       33  public interface BulkWorkflowRunner {
+       34      /**
+       35       * @param config the Config
+       36       * @return the runnable object that will be used to perform the work.
+       37       */
+       38       Runnable getRunnable(Config config);
+       39  
+       40      /**
+       41       * If a non-null value is returned, the result of run(..) will be scheduled to run w these options. If null the job will be immediately run in the same thread.
+       42       * @param config the Config
+       43       * @return The Sling Scheduler options or null;
+       44       */
+       45      ScheduleOptions getOptions(Config config);
+       46  
+       47      /**
+       48       * Collects and initializes the Workspace JCR structure with the payload nodes.
+       49       * @param queryHelper the QueryHelper
+       50       * @param config the Config
+       51       * @throws PersistenceException
+       52       * @throws RepositoryException
+       53       */
+       54      void initialize(QueryHelper queryHelper, Config config) throws PersistenceException,
+       55              RepositoryException;
+       56  
+       57      /**
+       58       * Initialize the Bulk Workflow Manager workspace w the total count of items to process.
+       59       * @param workspace the Workspace
+       60       * @param totalCount total number of items to process
+       61       * @throws PersistenceException
+       62       */
+       63      void initialize(Workspace workspace, int totalCount) throws PersistenceException;
+       64  
+       65      /**
+       66       * Starts work on the Workspace.
+       67       * @param workspace the Workspace
+       68       * @throws PersistenceException
+       69       */
+       70      void start(Workspace workspace) throws PersistenceException;
+       71  
+       72      /**
+       73       * Used to request stop of a Workspace however workspace may still continue to run in order to allow active payloads to complete.
+       74       * @param workspace the Workspace
+       75       * @throws PersistenceException
+       76       */
+       77      void stopping(Workspace workspace) throws PersistenceException;
+       78  
+       79      /**
+       80       * Stops (or pauses) work in the Workspace.
+       81       * @param workspace the Workspace
+       82       * @throws PersistenceException
+       83       */
+       84      void stop(Workspace workspace) throws PersistenceException;
+       85  
+       86      /**
+       87       * Stops (or pauses) work in the Workspace.
+       88       * @param workspace the Workspace
+       89       * @param subStatus SubStatus used to identify cause of stopping for corner cases
+       90       * @throws PersistenceException
+       91       */
+       92      void stop(Workspace workspace, SubStatus subStatus) throws PersistenceException;
+       93  
+       94      /**
+       95       * Stops (or pauses) work in the Workspace due to Error.
+       96       * @param workspace the Workspace
+       97       * @throws PersistenceException
+       98       */
+       99      void stopWithError(Workspace workspace) throws PersistenceException;
+      100  
+      101      /**
+      102       * Marks a Workspace as being complete, indicating all work has been processed.
+      103       * @param workspace the Workspace
+      104       * @throws PersistenceException
+      105       */
+      106      void complete(Workspace workspace) throws PersistenceException;
+      107  
+      108      /**
+      109       * Marks a payload as being completed.
+      110       * @param workspace the Workspace
+      111       * @param payload the completed Payload
+      112       * @throws Exception
+      113       */
+      114      @SuppressWarnings("squid:S00112")
+      115      void complete(Workspace workspace, Payload payload) throws Exception;
+      116  
+      117      /**
+      118       * Processes a payload under the Workspace.
+      119       * @param workspace the Workspace
+      120       * @param payload the Payload to process
+      121       */
+      122      void run(Workspace workspace, Payload payload);
+      123  
+      124      /**
+      125       * Marks a payload being force terminated.
+      126       * @param workspace the Workspace
+      127       * @param payload the completed Payload
+      128       * @throws Exception
+      129       */
+      130      @SuppressWarnings("squid:S00112")
+      131      void forceTerminate(Workspace workspace, Payload payload) throws Exception;
+      132  }
+
+---------- IMPLEMENTER com.adobe.acs.commons.workflow.bulk.execution.impl.runners.AbstractWorkflowRunner  stubs=0/10 ----------
+       46  public abstract class AbstractWorkflowRunner implements BulkWorkflowRunner {
+       47      private static final Logger log = LoggerFactory.getLogger(AbstractWorkflowRunner.class);
+       48      private static final int SAVE_THRESHOLD = 1000;
+       49  
+       50      protected static final String SERVICE_NAME = "bulk-workflow-runner";
+       51      protected static final Map<String, Object> AUTH_INFO;
+       52  
+       53      static {
+       54          AUTH_INFO = Collections.singletonMap(ResourceResolverFactory.SUBSERVICE, (Object) SERVICE_NAME);
+       55      }
+       56  
+       57      /**
+       58       * {@inheritDoc}
+       59       */
+       60      @Override
+       61      public void initialize(QueryHelper queryHelper, Config config) throws
+       62              PersistenceException, RepositoryException {
+       63  
+       64          // Query for all candidate resources
+       65          final ResourceResolver resourceResolver = config.getResourceResolver();
+       66          final List<Resource> resources = queryHelper.findResources(resourceResolver,
+       67                  config.getQueryType(),
+       68                  config.getQueryStatement(),
+       69                  config.getRelativePath());
+       70  
+       71          int total = 0;
+       72  
+       73          // Create Workspace Node
+       74          Node workspace = JcrUtils.getOrAddNode(config.getResource().adaptTo(Node.class), Workspace.NN_WORKSPACE, Workspace.NT_UNORDERED);
+       75          // Create the PayloadGroups Launchpad node; this simply points to the first to process
+       76          Node currentPayloadGroup = JcrUtils.getOrCreateByPath(workspace, Workspace.NN_PAYLOADS_LAUNCHPAD, true, Workspace.NT_UNORDERED, Workspace.NT_UNORDERED, false);
+       77          // Set the first Payload Group to be the launchpad node
+       78          JcrUtil.setProperty(workspace, Workspace.PN_ACTIVE_PAYLOAD_GROUPS, new String[]{PayloadGroup.dereference(currentPayloadGroup.getPath())});
+       79  
+       80  
+       81          // No begin populating the actual PayloadGroup nodes
+       82          ListIterator<Resource> itr = resources.listIterator();
+       83  
+       84          while (itr.hasNext()) {
+       85              // Increment to a new PayloadGroup as needed
+       86              if (total % config.getBatchSize() == 0 && itr.hasNext()) {
+       87                  // payload group is complete; save...
+       88                  Node nextPayloadGroup = JcrUtils.getOrCreateByPath(workspace, Workspace.NN_PAYLOADS, true, Workspace.NT_UNORDERED, Workspace.NT_UNORDERED, false);
+       89                  JcrUtil.setProperty(currentPayloadGroup, PayloadGroup.PN_NEXT, PayloadGroup.dereference(nextPayloadGroup.getPath()));
+       90                  currentPayloadGroup = nextPayloadGroup;
+       91              }
+       92  
+       93              // Process the payload
+       94              Resource payload = itr.next();
+       95              Node payloadNode = JcrUtils.getOrCreateByPath(currentPayloadGroup, Payload.NN_PAYLOAD, true, Workspace.NT_UNORDERED, Workspace.NT_UNORDERED, false);
+       96              JcrUtil.setProperty(payloadNode, "path", Payload.dereference(payload.getPath()));
+       97              log.debug("Created payload with search result [ {} ]", payload.getPath());
+       98  
+       99              if (++total % SAVE_THRESHOLD == 0 || !itr.hasNext()) {
+      100                  resourceResolver.commit();
+      101              }
+      102          } // while
+      103  
+      104          if (total > 0) {
+      105              config.getWorkspace().getRunner().initialize(config.getWorkspace(), total);
+      106              config.commit();
+      107  
+      108              log.info("Completed initialization of Bulk Workflow Manager");
+      109          } else {
+      110              throw new IllegalArgumentException("Query returned zero results.");
+      111          }
+      112      }
+      113  
+      114  
+      115      public void initialize(Workspace workspace, int totalCount) throws PersistenceException {
+      116          workspace.setInitialized(true);
+      117          workspace.setTotalCount(totalCount);
+      118          workspace.commit();
+      119      }
+      120  
+      121      @Override
+      122      public void start(Workspace workspace) throws PersistenceException {
+      123          workspace.setStatus(Status.RUNNING);
+      124          if (workspace.getStartedAt() == null) {
+      125              workspace.setStartedAt(Calendar.getInstance());
+      126          }
+      127          workspace.commit();
+      128      }
+      129  
+      130      @Override
+      131      public void stopping(Workspace workspace) throws PersistenceException {
+      132          workspace.setStatus(Status.RUNNING, SubStatus.STOPPING);
+      133          workspace.commit();
+      134      }
+      135  
+      136      @Override
+      137      public void stop(Workspace workspace) throws PersistenceException {
+      138          workspace.setStatus(Status.STOPPED);
+      139          workspace.setStoppedAt(Calendar.getInstance());
+      140          workspace.commit();
+      141      }
+      142  
+      143      @Override
+      144      public void stop(Workspace workspace, SubStatus subStatus) throws PersistenceException {
+      145          if (subStatus != null) {
+      146              workspace.setStatus(Status.STOPPED, subStatus);
+      147          } else {
+      148              workspace.setStatus(Status.STOPPED);
+      149          }
+      150          workspace.setStoppedAt(Calendar.getInstance());
+      151          workspace.commit();
+      152      }
+      153  
+      154      @Override
+      155      public void stopWithError(Workspace workspace) throws PersistenceException {
+      156          workspace.setStatus(Status.STOPPED, SubStatus.ERROR);
+      157          workspace.setStoppedAt(Calendar.getInstance());
+      158          workspace.commit();
+      159      }
+      160  
+      161      @Override
+      162      public void complete(Workspace workspace) throws PersistenceException {
+      163          workspace.setStatus(Status.COMPLETED);
+      164          workspace.setCompletedAt(Calendar.getInstance());
+      165          workspace.commit();
+      166      }
+      167  
+      168      @Override
+      169      public void complete(Workspace workspace, Payload payload) throws Exception {
+      170          // Remove active payload
+      171          if (workspace != null) {
+      172              workspace.removeActivePayload(payload);
+      173  
+      174              // Increment the complete count
+      175              workspace.incrementCompleteCount();
+      176          } else {
+      177              log.warn("Unable to processing complete for payload [ {} ~> {} ]", payload.getPath(), payload.getPayloadPath());
+      178          }
+      179      }
+      180  
+      181      @Override
+      182      public void run(Workspace workspace, Payload payload) {
+      183          payload.setStatus(Status.RUNNING);
+      184      }
+      185  
+      186      public void fail(Workspace workspace, Payload payload) throws Exception {
+      187          payload.setStatus(Status.FAILED);
+      188  
+      189          // Remove active payload
+      190          workspace.removeActivePayload(payload);
+      191  
+      192          // Increment the fail count
+      193          workspace.incrementFailCount();
+      194  
+      195          // Track the failure details
+      196          workspace.addFailure(payload);
+      197      }
+      198  
+      199      @Override
+      200      public abstract void forceTerminate(Workspace workspace, Payload payload) throws Exception;
+      201  }
+
+---------- IMPLEMENTER com.adobe.acs.commons.workflow.bulk.execution.impl.runners.AEMTransientWorkflowRunnerImpl  stubs=0/4 ----------
+       48  @Component(service = BulkWorkflowRunner.class)
+       49  public class AEMTransientWorkflowRunnerImpl extends AbstractAEMWorkflowRunner implements BulkWorkflowRunner {
+       50      private static final Logger log = LoggerFactory.getLogger(AEMTransientWorkflowRunnerImpl.class);
+       51  
+       52      private static final String JOB_QUEUE_NAME = "Granite Workflow Queue";
+       53  
+       54      @Reference
+       55      private WorkflowService workflowService;
+       56  
+       57      @Reference
+       58      private Scheduler scheduler;
+       59  
+       60      @Reference
+       61      private ResourceResolverFactory resourceResolverFactory;
+       62  
+       63      @Reference
+       64      private ThrottledTaskRunner throttledTaskRunner;
+       65  
+       66      @Reference
+       67      private JobManager jobManager;
+       68  
+       69      /**
+       70       * {@inheritDoc}
+       71       */
+       72      @Override
+       73      public Runnable getRunnable(final Config config) {
+       74          return new AEMTransientWorkflowRunnable(config, scheduler, resourceResolverFactory, workflowService, throttledTaskRunner, jobManager);
+       75      }
+       76  
+       77      @Override
+       78      public ScheduleOptions getOptions(Config config) {
+       79          ScheduleOptions options = scheduler.NOW(-1, config.getInterval());
+       80          options.canRunConcurrently(false);
+       81          options.onLeaderOnly(true);
+       82          options.name(config.getWorkspace().getJobName());
+       83  
+       84          return options;
+       85      }
+       86  
+       87      @Override
+       88      public void complete(Workspace workspace, Payload payload) throws Exception {
+       89          super.complete(workspace, payload);
+       90      }
+       91  
+       92      @Override
+       93      public void forceTerminate(Workspace workspace, Payload payload) throws Exception {
+       94          log.info("Cannot force terminate Transient Workflow for [ {} ]", payload.getPayloadPath());
+       95      }
+       96  
+       97      /** Runner's Runnable **/
+       98  
+       99      private class AEMTransientWorkflowRunnable implements Runnable {
+      100          private final ResourceResolverFactory resourceResolverFactory;
+      101          private final ThrottledTaskRunner throttledTaskRunner;
+      102          private final WorkflowService workflowService;
+      103          private final Scheduler scheduler;
+      104          private final JobManager jobManager;
+      105          private String configPath ;
+      106          private String jobName;
+      107  
+      108          public AEMTransientWorkflowRunnable(Config config,
+      109                                              Scheduler scheduler,
+      110                                              ResourceResolverFactory resourceResolverFactory,
+      111                                              WorkflowService workflowService,
+      112                                              ThrottledTaskRunner throttledTaskRunner,
+      113                                              JobManager jobManager) {
+      114              this.configPath = config.getPath();
+      115              this.jobName = config.getWorkspace().getJobName();
+      116              this.resourceResolverFactory = resourceResolverFactory;
+      117              this.workflowService = workflowService;
+      118              this.throttledTaskRunner = throttledTaskRunner;
+      119              this.scheduler = scheduler;
+      120              this.jobManager = jobManager;
+      121          }
+      122  
+      123          @SuppressWarnings("squid:S3776")
+      124          public void run() {
+      125              log.debug("Running Bulk AEM Transient Workflow job [ {} ]", jobName);
+      126  
+      127              Resource configResource = null;
+      128              Config config = null;
+      129              Workspace workspace = null;
+      130  
+      131              try (ResourceResolver serviceResourceResolver = resourceResolverFactory.getServiceResourceResolver(AUTH_INFO)){
+      132                  configResource = serviceResourceResolver.getResource(configPath);
+      133  
+      134                  if (configResource != null) {
+      135                      config = configResource.adaptTo(Config.class);
+      136                  }
+      137  
+      138                  if (config == null) {
+      139                      log.error("Bulk workflow process resource [ {} ] could not be found. Removing periodic job.", configPath);
+      140                      scheduler.unschedule(jobName);
+      141                  } else {
+      142                      workspace = config.getWorkspace();
+      143  
+      144                      if (workspace.isStopped() || workspace.isStopping()) {
+      145                          unscheduleJob(scheduler, jobName, configResource, workspace);
+      146                          stop(workspace);
+      147                          return;
+      148                      }
+      149  
+      150                      final List<Payload> priorActivePayloads = workspace.getActivePayloads();
+      151                      final List<Payload> currentActivePayloads = new ArrayList<Payload>();
+      152  
+      153                      long capacity = getCapacity(config);
+      154                      log.debug("Transient workflow capacity of [ {} ] for batch size [ {} ]", capacity, config.getBatchSize());
+      155  
+      156                      int complete = 0;
+      157                      for (Payload payload : priorActivePayloads) {
+      158                          if (complete++ < capacity) {
+      159                              // Mark the #capacity complete, so we can onboard #capacity mode
+      160                              // Because this is Transient we cant check on actual jobs
+      161                              log.trace("Marked [ {} ] as complete", payload.getPayloadPath());
+      162                              complete(workspace, payload);
+      163                          } else {
+      164                              break;
+      165                          }
+      166                      }
+      167  
+      168                      WorkflowSession workflowSession =
+      169                              workflowService.getWorkflowSession(serviceResourceResolver.adaptTo(Session.class));
+      170                      WorkflowModel workflowModel = workflowSession.getModel(config.getWorkflowModelId());
+      171  
+      172                      boolean dirty = false;
+      173                      while (capacity > 0) {
+      174  
+      175                          if (config.isAutoThrottle()) {
+      176                              throttledTaskRunner.waitForLowCpuAndLowMemory();
+      177                          }
+      178  
+      179                          // Bring new payloads into the active workspace
+      180                          Payload payload = onboardNextPayload(workspace);
+      181                          if (payload != null) {
+      182                              log.debug("Onboarding payload w/ Transient WF [ {} ~> {} ]", payload.getPath(), payload.getPayloadPath());
+      183  
+      184                              workflowSession.startWorkflow(workflowModel,
+      185                                      workflowSession.newWorkflowData("JCR_PATH", payload.getPayloadPath()));
+      186  
+      187                              payload.setStatus(Status.RUNNING);
+      188                              currentActivePayloads.add(payload);
+      189                              capacity--;
+      190                              dirty = true;
+      191                          } else {
+      192                              // This means there is nothing left to onboard
+      193                              break;
+      194                          }
+      195                      }
+      196  
+      197                      cleanupActivePayloadGroups(workspace);
+      198  
+      199                      if (!dirty && currentActivePayloads.size() == 0) {
+      200                          // Check if we are in a completed state for the entire workspace.
+      201                          // We are done! Everything is processed and nothing left to onboard.
+      202                          log.debug("No more payloads found to process. No more work to be done.");
+      203                          complete(workspace);
+      204                          unscheduleJob(scheduler, jobName, configResource, workspace);
+      205                          log.info("Completed Bulk Workflow execution for [ {} ]", config.getPath());
+      206                      }
+      207  
+
+---------- IMPLEMENTER com.adobe.acs.commons.workflow.bulk.execution.impl.runners.AEMWorkflowRunnerImpl  stubs=0/4 ----------
+       51  @Component(service = BulkWorkflowRunner.class)
+       52  public class AEMWorkflowRunnerImpl extends AbstractAEMWorkflowRunner implements BulkWorkflowRunner {
+       53      private static final Logger log = LoggerFactory.getLogger(AEMWorkflowRunnerImpl.class);
+       54  
+       55      @Reference
+       56      private WorkflowService workflowService;
+       57  
+       58      @Reference
+       59      private Scheduler scheduler;
+       60  
+       61      @Reference
+       62      private ResourceResolverFactory resourceResolverFactory;
+       63  
+       64      @Reference
+       65      private JobManager jobManager;
+       66  
+       67      /**
+       68       * {@inheritDoc}
+       69       */
+       70      @Override
+       71      public Runnable getRunnable(final Config config) {
+       72          return new AEMWorkflowRunnable(config, scheduler, resourceResolverFactory, workflowService);
+       73      }
+       74  
+       75      @Override
+       76      public ScheduleOptions getOptions(Config config) {
+       77          ScheduleOptions options = scheduler.NOW(-1, config.getInterval());
+       78          options.canRunConcurrently(false);
+       79          options.onLeaderOnly(true);
+       80          options.name(config.getWorkspace().getJobName());
+       81  
+       82          return options;
+       83      }
+       84  
+       85      @SuppressWarnings("squid:S00112")
+       86      @Override
+       87      public void complete(Workspace workspace, Payload payload) throws Exception {
+       88          super.complete(workspace, payload);
+       89  
+       90          if (workspace.getConfig().isPurgeWorkflow()) {
+       91              try {
+       92                  purge(payload);
+       93              } catch (WorkflowException e) {
+       94                  throw new Exception(e);
+       95              }
+       96          }
+       97      }
+       98  
+       99      @SuppressWarnings("squid:S00112")
+      100      @Override
+      101      public void forceTerminate(Workspace workspace, Payload payload) throws Exception {
+      102          final WorkflowSession workflowSession =
+      103                  workflowService.getWorkflowSession(payload.getResourceResolver().adaptTo(Session.class));
+      104  
+      105          Workflow workflow = null;
+      106          fail(workspace, payload);
+      107          try {
+      108              workflow = payload.getWorkflow();
+      109  
+      110              if (workflow != null) {
+      111                  if (workflow.isActive()) {
+      112                      workflowSession.terminateWorkflow(workflow);
+      113  
+      114                      log.info("Force Terminated workflow [ {} ]", workflow.getId());
+      115  
+      116                      payload.setStatus(Status.FORCE_TERMINATED);
+      117  
+      118                      if (workspace.getConfig().isPurgeWorkflow()) {
+      119                          purge(payload);
+      120                      }
+      121                  } else {
+      122                      log.warn("Trying to force terminate an inactive workflow [ {} ]", workflow.getId());
+      123                  }
+      124              } else {
+      125                  payload.setStatus(Status.FORCE_TERMINATED);
+      126              }
+      127          } catch (WorkflowException e) {
+      128              throw new Exception(e);
+      129          }
+      130      }
+      131  
+      132      private void purge(Payload payload) throws PersistenceException, WorkflowException {
+      133          Workflow workflow = payload.getWorkflow();
+      134  
+      135          if (workflow != null) {
+      136              ResourceResolver resourceResolver = payload.getResourceResolver();
+      137              final Resource resource = resourceResolver.getResource(workflow.getId());
+      138  
+      139              if (resource != null) {
+      140                  try {
+      141                      String path = resource.getPath();
+      142                      resource.adaptTo(Node.class).remove();
+      143                      log.info("Purging working instance [ {} ]", path);
+      144                  } catch (RepositoryException e) {
+      145                      throw new PersistenceException("Unable to purge workflow instance node.", e);
+      146                  }
+      147              } else {
+      148                  log.warn("Could not find workflow instance at [ {} ] to purge.", workflow.getId());
+      149              }
+      150          }
+      151      }
+      152  
+      153  
+      154  
+      155      /** Runner's Runnable **/
+      156  
+      157      protected class AEMWorkflowRunnable implements Runnable {
+      158          private final ResourceResolverFactory resourceResolverFactory;
+      159          private final WorkflowService workflowService;
+      160          private final Scheduler scheduler;
+      161          private String configPath ;
+      162          private String jobName;
+      163  
+      164          public AEMWorkflowRunnable(Config config,
+      165                                     Scheduler scheduler,
+      166                                     ResourceResolverFactory resourceResolverFactory,
+      167                                     WorkflowService workflowService) {
+      168              this.configPath = config.getPath();
+      169              this.jobName = config.getWorkspace().getJobName();
+      170              this.resourceResolverFactory = resourceResolverFactory;
+      171              this.workflowService = workflowService;
+      172              this.scheduler = scheduler;
+      173          }
+      174  
+      175          @Override
+      176          @SuppressWarnings({"squid:S3776", "squid:S1141"})
+      177          public void run() {
+      178              log.debug("Running Bulk AEM Workflow job [ {} ]", jobName);
+      179  
+      180              Resource configResource = null;
+      181              Config config = null;
+      182              Workspace workspace = null;
+      183  
+      184              try (ResourceResolver adminResourceResolver = resourceResolverFactory.getServiceResourceResolver(AUTH_INFO)) {
+      185                  configResource = adminResourceResolver.getResource(configPath);
+      186  
+      187                  if (configResource != null) {
+      188                      config = configResource.adaptTo(Config.class);
+      189                  }
+      190  
+      191                  if (config == null) {
+      192                      log.error("Bulk workflow process resource [ {} ] could not be found. Removing periodic job.", configPath);
+      193                      scheduler.unschedule(jobName);
+      194                  } else {
+      195                      workspace = config.getWorkspace();
+      196  
+      197                      if (workspace.isStopped() || workspace.isStopping()) {
+      198                          unscheduleJob(scheduler, jobName, configResource, workspace);
+      199                          stop(workspace);
+      200                          return;
+      201                      }
+      202  
+      203                      final List<Payload> priorActivePayloads = workspace.getActivePayloads();
+      204                      final List<Payload> currentActivePayloads = new ArrayList<Payload>();
+      205  
+      206                      for (Payload payload : priorActivePayloads) {
+      207                          log.debug("Checking status of payload [ {} ~> {} ]", payload.getPath(), payload.getPayloadPath());
+      208                          Workflow workflow;
+      209                          try {
+      210                              workflow = payload.getWorkflow();
+
+---------- IMPLEMENTER com.adobe.acs.commons.workflow.bulk.execution.impl.runners.FastActionManagerRunnerImpl  stubs=2/11 ----------
+       51  @Component(service = BulkWorkflowRunner.class)
+       52  public class FastActionManagerRunnerImpl extends AbstractWorkflowRunner implements BulkWorkflowRunner {
+       53      private static final Logger log = LoggerFactory.getLogger(FastActionManagerRunnerImpl.class);
+       54  
+       55      @Reference
+       56      private ThrottledTaskRunner throttledTaskRunner;
+       57  
+       58      @Reference
+       59      private ResourceResolverFactory resourceResolverFactoryRef;
+       60  
+       61      @Reference
+       62      private QueryHelper queryHelperRef;
+       63  
+       64      @Reference
+       65      private ActionManagerFactory actionManagerFactoryRef;
+       66  
+       67      @Reference
+       68      private SyntheticWorkflowRunner syntheticWorkflowRunnerRef;
+       69  
+       70      /**
+       71       * {@inheritDoc}
+       72       */
+       73      @Override
+       74      public final Runnable getRunnable(final Config config) {
+       75          return new FastActionManagerRunnable(config, resourceResolverFactoryRef, queryHelperRef, actionManagerFactoryRef, syntheticWorkflowRunnerRef);
+       76      }
+       77  
+       78      @Override
+       79      public ScheduleOptions getOptions(Config config) {
+       80          return null;
+       81      }
+       82  
+       83      @Override
+       84      public void initialize(QueryHelper queryHelper, Config config) throws PersistenceException, RepositoryException {
+       85          Workspace workspace = config.getWorkspace();
+       86          initialize(workspace, 0);
+       87          workspace.commit();
+       88      }
+       89  
+       90      @Override
+       91      public void start(Workspace workspace) throws PersistenceException {
+       92          if (!throttledTaskRunner.isRunning()) {
+       93              throttledTaskRunner.resumeExecution();
+       94          }
+       95          super.start(workspace);
+       96      }
+       97  
+       98      @Override
+       99      public void stopping(Workspace workspace) throws PersistenceException {
+      100          stop(workspace);
+      101      }
+      102  
+      103      @Override
+      104      public void stop(Workspace workspace) throws PersistenceException {
+      105          throttledTaskRunner.pauseExecution();
+      106          super.stop(workspace);
+      107      }
+      108  
+      109      @Override
+      110      public void stop(Workspace workspace, SubStatus subStatus) throws PersistenceException {
+      111          throttledTaskRunner.pauseExecution();
+      112          super.stop(workspace, subStatus);
+      113      }
+      114  
+      115      @Override
+      116      public void stopWithError(Workspace workspace) throws PersistenceException {
+      117          throttledTaskRunner.pauseExecution();
+      118          super.stopWithError(workspace);
+      119      }
+      120  
+      121      public void complete(ResourceResolver resourceResolver, String workspacePath, ActionManager manager, int success) throws PersistenceException, RepositoryException {
+      122          Workspace workspace = resourceResolver.getResource(workspacePath).adaptTo(Workspace.class);
+      123  
+      124          workspace.setCompleteCount(success);
+      125          for (com.adobe.acs.commons.fam.Failure f : manager.getFailureList()) {
+      126              workspace.addFailure(f.getNodePath(), null, f.getTime());
+      127              workspace.incrementFailCount();
+      128          }
+      129  
+      130          super.complete(workspace);
+      131  
+      132          manager.closeAllResolvers();
+      133          if (actionManagerFactoryRef != null) {
+      134              actionManagerFactoryRef.purgeCompletedTasks();
+      135          } else {
+      136              log.warn("Action Manager Factory reference is null. Please purge completed tasks via the JMX console.");
+      137          }
+      138      }
+      139  
+      140      @Override
+      141      public void complete(Workspace workspace, Payload payload) throws Exception {
+      142          throw new UnsupportedOperationException("FAM payloads cannot be completed as they are not tracked");
+      143      }
+      144  
+      145      @Override
+      146      public void run(Workspace workspace, Payload payload) {
+      147          if (!throttledTaskRunner.isRunning()) {
+      148              throttledTaskRunner.resumeExecution();
+      149          }
+      150      }
+      151  
+      152      @Override
+      153      public void forceTerminate(Workspace workspace, Payload payload) throws Exception {
+      154          throw new UnsupportedOperationException("FAM jobs cannot be force terminated");
+      155      }
+      156  
+      157      /** Runner's Runnable **/
+      158  
+      159      private class FastActionManagerRunnable implements Runnable {
+      160          private final String configPath;
+      161          private final ResourceResolverFactory resourceResolverFactory;
+      162          private final QueryHelper queryHelper;
+      163          private final ActionManagerFactory actionManagerFactory;
+      164          private final SyntheticWorkflowRunner syntheticWorkflowRunner;
+      165  
+      166          public FastActionManagerRunnable(Config config,
+      167                                           ResourceResolverFactory resourceResolverFactory,
+      168                                           QueryHelper queryHelper,
+      169                                           ActionManagerFactory actionManagerFactory,
+      170                                           SyntheticWorkflowRunner syntheticWorkflowRunner) {
+      171  
+      172              this.configPath = config.getPath();
+      173              this.resourceResolverFactory = resourceResolverFactory;
+      174              this.queryHelper = queryHelper;
+      175              this.actionManagerFactory = actionManagerFactory;
+      176              this.syntheticWorkflowRunner = syntheticWorkflowRunner;
+      177          }
+      178  
+      179          @Override
+      180          @SuppressWarnings({"squid:S3776", "squid:S1141", "squid:S1854"})
+      181          public void run() {
+      182              Resource configResource;
+      183  
+      184              try (ResourceResolver resourceResolver = resourceResolverFactory.getServiceResourceResolver(AUTH_INFO)){
+      185  
+      186                  configResource = resourceResolver.getResource(configPath);
+      187  
+      188                  final Config config = configResource.adaptTo(Config.class);
+      189                  final Workspace workspace = config.getWorkspace();
+      190  
+      191                  if (StringUtils.isNotBlank(workspace.getActionManagerName())
+      192                          && actionManagerFactory.hasActionManager(workspace.getActionManagerName())) {
+      193                      log.warn("Action Manager already exists for [ {} ]", workspace.getActionManagerName());
+      194                      return;
+      195                  }
+      196  
+      197                  if (config.isUserEventData()) {
+      198                      resourceResolver.adaptTo(Session.class).getWorkspace().getObservationManager().setUserData(config.getUserEventData());
+      199                  }
+      200  
+      201                  /** Collect and initialize the workspace **/
+      202  
+      203                  final List<Resource> resources;
+      204                  resources = queryHelper.findResources(resourceResolver,
+      205                          config.getQueryType(),
+      206                          config.getQueryStatement(),
+      207                          config.getRelativePath());
+      208  
+      209                  // Reset FAM tracking
+      210                  actionManagerFactory.purgeCompletedTasks();
+
+---------- IMPLEMENTER com.adobe.acs.commons.workflow.bulk.execution.impl.runners.SyntheticWorkflowRunnerImpl  stubs=0/5 ----------
+       47  @Component(service = BulkWorkflowRunner.class)
+       48  public class SyntheticWorkflowRunnerImpl extends AbstractWorkflowRunner implements BulkWorkflowRunner {
+       49      private static final Logger log = LoggerFactory.getLogger(SyntheticWorkflowRunnerImpl.class);
+       50  
+       51      @Reference
+       52      private ResourceResolverFactory resourceResolverFactory;
+       53  
+       54      @Reference
+       55      private Scheduler scheduler;
+       56  
+       57      @Reference
+       58      private SyntheticWorkflowRunner swr;
+       59  
+       60      @Reference
+       61      private ThrottledTaskRunner throttledTaskRunner;
+       62  
+       63      @Override
+       64      public final Runnable getRunnable(final Config config) {
+       65          return new SyntheticWorkflowRunnable(config, scheduler, resourceResolverFactory, swr, throttledTaskRunner);
+       66      }
+       67  
+       68      @Override
+       69      public ScheduleOptions getOptions(Config config) {
+       70          ScheduleOptions options = scheduler.NOW();
+       71          options.canRunConcurrently(false);
+       72          options.onLeaderOnly(true);
+       73          options.name(config.getWorkspace().getJobName());
+       74  
+       75          return options;
+       76      }
+       77  
+       78      @Override
+       79      public void forceTerminate(Workspace workspace, Payload payload) throws PersistenceException {
+       80          workspace.setStatus(Status.FORCE_TERMINATED);
+       81      }
+       82  
+       83      @Override
+       84      public void complete(Workspace workspace, Payload payload) throws Exception {
+       85          // Remove active payload
+       86          super.complete(workspace, payload);
+       87          payload.setStatus(Status.COMPLETED);
+       88      }
+       89  
+       90      @Override
+       91      public void run(Workspace workspace, Payload payload) {
+       92          super.run(workspace, payload);
+       93      }
+       94  
+       95  
+       96      /** Runner's Runnable **/
+       97  
+       98      private class SyntheticWorkflowRunnable implements Runnable {
+       99          private final ResourceResolverFactory resourceResolverFactory;
+      100          private final SyntheticWorkflowRunner syntheticWorkflowRunner;
+      101          private final ThrottledTaskRunner throttledTaskRunner;
+      102          private final Scheduler scheduler;
+      103          private String configPath;
+      104  
+      105          public SyntheticWorkflowRunnable(Config config,
+      106                                           Scheduler scheduler,
+      107                                           ResourceResolverFactory resourceResolverFactory,
+      108                                           SyntheticWorkflowRunner syntheticWorkflowRunner,
+      109                                           ThrottledTaskRunner throttledTaskRunner) {
+      110              this.configPath = config.getPath();
+      111              this.resourceResolverFactory = resourceResolverFactory;
+      112              this.syntheticWorkflowRunner = syntheticWorkflowRunner;
+      113              this.throttledTaskRunner = throttledTaskRunner;
+      114              this.scheduler = scheduler;
+      115          }
+      116  
+      117          @Override
+      118          @SuppressWarnings({"squid:S3776", "squid:S1141"})
+      119          public void run() {
+      120              Resource configResource;
+      121              long start = System.currentTimeMillis();
+      122              int total = 0;
+      123              boolean stopped = false;
+      124  
+      125              try (ResourceResolver serviceResourceResolver = resourceResolverFactory.getServiceResourceResolver(AUTH_INFO)){
+      126                  configResource = serviceResourceResolver.getResource(configPath);
+      127  
+      128                  final Config config = configResource.adaptTo(Config.class);
+      129                  final Workspace workspace = config.getWorkspace();
+      130  
+      131                  if (workspace.isStopped()) {
+      132                      return;
+      133                  }
+      134  
+      135                  try {
+      136                      SyntheticWorkflowModel model = syntheticWorkflowRunner.getSyntheticWorkflowModel(serviceResourceResolver, config.getWorkflowModelId(), true);
+      137  
+      138                      if (config.isUserEventData()) {
+      139                          serviceResourceResolver.adaptTo(Session.class).getWorkspace().getObservationManager().setUserData(config.getUserEventData());
+      140                          log.debug("Set JCR Sessions user-event-data to [ {} ]", config.getUserEventData());
+      141                      }
+      142  
+      143                      PayloadGroup payloadGroup = null;
+      144                      if (workspace.getActivePayloadGroups().size() > 0) {
+      145                          payloadGroup = workspace.getActivePayloadGroups().get(0);
+      146                      }
+      147  
+      148                      while (payloadGroup != null) {
+      149                          List<Payload> payloads = workspace.getActivePayloads();
+      150  
+      151                          if (payloads.size() == 0) {
+      152                              // payloads size is 0, so onboard next payload group
+      153                              payloadGroup = onboardNextPayloadGroup(workspace, payloadGroup);
+      154  
+      155                              if (payloadGroup != null) {
+      156                                  payloads = onboardNextPayloads(workspace, payloadGroup);
+      157                              }
+      158                          }
+      159  
+      160                          // Safety check; if payloads comes in null then immediately break from loop as there is no work to do
+      161                          if (payloads == null || payloads.size() == 0) {
+      162                              break;
+      163                          }
+      164  
+      165                          for (Payload payload : payloads) {
+      166                              if (workspace.isStopping() || workspace.isStopped()) {
+      167                                  stop(workspace);
+      168                                  stopped = true;
+      169                                  break;
+      170                              }
+      171  
+      172                              try {
+      173                                  if (config.isAutoThrottle()) {
+      174                                      // Wait before starting more work
+      175                                      throttledTaskRunner.waitForLowCpuAndLowMemory();
+      176                                  }
+      177  
+      178                                  long processStart = System.currentTimeMillis();
+      179                                  swr.execute(serviceResourceResolver, payload.getPayloadPath(), model, false, false);
+      180                                  complete(workspace, payload);
+      181                                  log.info("Processed [ {} ] in {} ms", payload.getPayloadPath(), System.currentTimeMillis() - processStart);
+      182                              } catch (WorkflowException e) {
+      183                                  fail(workspace, payload);
+      184                                  log.warn("Synthetic Workflow could not process [ {} ]", payload.getPath(), e);
+      185                              } catch (Exception e) {
+      186                                  // Complete call failed; consider it failed
+      187                                  log.warn("Complete call on [ {} ] failed", payload.getPath(), e);
+      188                                  fail(workspace, payload);
+      189                              }
+      190  
+      191                              total++;
+      192                          } // end for
+      193  
+      194                          workspace.commit();
+      195  
+      196                          if (stopped) {
+      197                              log.info("Bulk Synthetic Workflow run has been stopped.");
+      198                              break;
+      199                          }
+      200                      } // end while
+      201  
+      202                      // Stop check in case a STOP request is made that breaks the while loop
+      203                      if (!stopped) {
+      204                          complete(workspace);
+      205                      }
+      206  

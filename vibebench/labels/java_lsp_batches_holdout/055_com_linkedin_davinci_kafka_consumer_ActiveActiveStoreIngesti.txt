@@ -1,0 +1,160 @@
+row 55   linkedin/venice#2585
+============================================================================
+OVERRIDE  com.linkedin.davinci.kafka.consumer.ActiveActiveStoreIngestionTask.calculateRtConsumptionStartPositions(PartitionConsumptionState,PubSubTopic,List<CharSequence>)
+BASE      com.linkedin.davinci.kafka.consumer.LeaderFollowerStoreIngestionTask.calculateRtConsumptionStartPositions(PartitionConsumptionState,PubSubTopic,List<CharSequence>)
+QUESTION: can an instance of the SUBCLASS be used anywhere the BASE
+          is expected, without breaking the caller?
+
+---------------- BASE METHOD ----------------
+     1141    protected Map<String, PubSubPosition> calculateRtConsumptionStartPositions(
+     1142        PartitionConsumptionState partitionConsumptionState,
+     1143        PubSubTopic newSourceTopic,
+     1144        List<CharSequence> unreachableBrokerList) {
+     1145      /**
+     1146       * In this case, new leader should already been seeing a TopicSwitch, which has the rewind time information for
+     1147       * it to replay from realtime topic.
+     1148       */
+     1149      TopicSwitch topicSwitch = partitionConsumptionState.getTopicSwitch().getTopicSwitch();
+     1150      if (topicSwitch == null) {
+     1151        throw new VeniceException(
+     1152            "New leader does not have topic switch, unable to switch to realtime leader topic: " + newSourceTopic);
+     1153      }
+     1154      final String rtPubSubAddress = topicSwitch.sourceKafkaServers.get(0).toString();
+     1155      final PubSubTopicPartition newSourceTopicPartition =
+     1156          partitionConsumptionState.getSourceTopicPartition(newSourceTopic);
+     1157  
+     1158      PubSubPosition upstreamStartPosition = PubSubSymbolicPosition.EARLIEST;
+     1159      if (topicSwitch.rewindStartTimestamp > 0) {
+     1160        upstreamStartPosition = getRewindStartPositionForRealTimeTopic(
+     1161            rtPubSubAddress,
+     1162            newSourceTopicPartition,
+     1163            topicSwitch.rewindStartTimestamp);
+     1164        LOGGER.info(
+     1165            "Leader replica: {} got rtPosition: {} for rewindTime: {} from pubSubAddress: {}/{}",
+     1166            partitionConsumptionState.getReplicaId(),
+     1167            upstreamStartPosition,
+     1168            topicSwitch.rewindStartTimestamp,
+     1169            rtPubSubAddress,
+     1170            newSourceTopicPartition);
+     1171      }
+     1172      return Collections.singletonMap(NON_AA_REPLICATION_UPSTREAM_OFFSET_MAP_KEY, upstreamStartPosition);
+     1173    }
+
+---------------- OVERRIDE ----------------
+      920    @Override
+      921    protected Map<String, PubSubPosition> calculateRtConsumptionStartPositions(
+      922        PartitionConsumptionState pcs,
+      923        PubSubTopic newSourceTopic,
+      924        List<CharSequence> unreachableBrokerList) {
+      925      TopicSwitch topicSwitch = pcs.getTopicSwitch().getTopicSwitch();
+      926      if (topicSwitch == null) {
+      927        throw new VeniceException(
+      928            "New leader does not have topic switch, unable to switch to realtime leader topic: " + newSourceTopic);
+      929      }
+      930      final PubSubTopicPartition sourceTopicPartition = pcs.getSourceTopicPartition(newSourceTopic);
+      931      long rewindStartTimestamp;
+      932      // calculate the rewind start time here if controller asked to do so by using this sentinel value.
+      933      if (topicSwitch.rewindStartTimestamp == REWIND_TIME_DECIDED_BY_SERVER) {
+      934        rewindStartTimestamp = calculateRewindStartTime(pcs);
+      935        LOGGER.info(
+      936            "Leader replica: {} calculated rewind timestamp: {} for tp: {}",
+      937            pcs.getReplicaId(),
+      938            rewindStartTimestamp,
+      939            sourceTopicPartition);
+      940      } else {
+      941        rewindStartTimestamp = topicSwitch.rewindStartTimestamp;
+      942      }
+      943      Set<String> rtPubSubAddresses = getPubSubBrokerAddressesFromTopicSwitch(pcs.getTopicSwitch());
+      944      Map<String, PubSubPosition> rtPositionsByPubSubAddress = new HashMap<>(rtPubSubAddresses.size());
+      945      rtPubSubAddresses.forEach(pubSubAddress -> {
+      946        // Get the latest processed position for this PubSub address.
+      947        PubSubPosition rtStartPosition = pcs.getLatestProcessedRtPosition(pubSubAddress);
+      948  
+      949        // If the latest processed position is at the earliest point, it means we haven't consumed
+      950        // from the RT topic of this PubSub address before. In that case, we rewind to the timestamp specified
+      951        // in the TopicSwitch (if rewindStartTimestamp > 0); otherwise, we start from the beginning of the topic.
+      952        if (PubSubSymbolicPosition.EARLIEST.equals(rtStartPosition)) {
+      953          if (rewindStartTimestamp > 0) {
+      954            LOGGER.info(
+      955                "Leader replica: {} needs to rewind to timestamp: {} for pubSubAddress: {}, tp: {} since no prior position found",
+      956                pcs.getReplicaId(),
+      957                rewindStartTimestamp,
+      958                pubSubAddress,
+      959                sourceTopicPartition);
+      960            PubSubTopicPartition newSourceTopicPartition =
+      961                resolveTopicPartitionWithPubSubBrokerAddress(newSourceTopic, pcs, pubSubAddress);
+      962            try {
+      963              rtStartPosition =
+      964                  getRewindStartPositionForRealTimeTopic(pubSubAddress, newSourceTopicPartition, rewindStartTimestamp);
+      965              LOGGER.info(
+      966                  "Leader replica: {} got rtPosition: {} for rewindTime: {} from pubSubAddress: {}/{}",
+      967                  pcs.getReplicaId(),
+      968                  rtStartPosition,
+      969                  rewindStartTimestamp,
+      970                  pubSubAddress,
+      971                  newSourceTopicPartition);
+      972              rtPositionsByPubSubAddress.put(pubSubAddress, rtStartPosition);
+      973            } catch (Exception e) {
+      974              /**
+      975               * This is actually tricky. Potentially we could return a -1 value here, but this has the gotcha that if we
+      976               * have a non-symmetrical failure (like, region1 can't talk to the region2 broker) this will result in a remote
+      977               * colo rewinding to a potentially non-deterministic position when the remote becomes available again. So
+      978               * instead, we record the context of this call and commit it to a repair queue to rewind to a
+      979               * consistent place on the RT
+      980               *
+      981               * NOTE: It is possible that the outage is so long and the rewind so large that we fall off retention. If
+      982               * this happens we can detect and repair the inconsistency from the offline DCR validator.
+      983               */
+      984              unreachableBrokerList.add(pubSubAddress);
+      985              rtStartPosition = PubSubSymbolicPosition.EARLIEST;
+      986              LOGGER.error(
+      987                  "Leader replica: {} failed contacting {}/{} when processing topic switch. Setting upstream start position to: {}",
+      988                  pcs.getReplicaId(),
+      989                  pubSubAddress,
+      990                  sourceTopicPartition,
+      991                  rtStartPosition);
+      992              hostLevelIngestionStats.recordIngestionFailure();
+      993              versionedIngestionStats.recordIngestionFailureCount(
+      994                  storeName,
+      995                  versionNumber,
+      996                  VeniceIngestionFailureReason.REMOTE_BROKER_UNREACHABLE);
+      997              /**
+      998               *  Add to repair queue. We won't attempt to resubscribe for brokers we couldn't compute an upstream offset
+      999               *  accurately for. We will not persist the wrong position into OffsetRecord, we'll reattempt subscription later.
+     1000               */
+     1001              if (remoteIngestionRepairService != null) {
+     1002                this.remoteIngestionRepairService.registerRepairTask(
+     1003                    this,
+     1004                    buildRepairTask(pubSubAddress, sourceTopicPartition, rewindStartTimestamp, pcs));
+     1005              } else {
+     1006                // If there isn't an available repair service, then we need to abort in order to make sure the error is
+     1007                // propagated up
+     1008                throw new VeniceException(
+     1009                    String.format(
+     1010                        "Failed contacting (%s/%s) and no repair service available. Aborting topic switch processing for %s. Setting upstream start position to %s",
+     1011                        pubSubAddress,
+     1012                        sourceTopicPartition,
+     1013                        pcs.getReplicaId(),
+     1014                        rtStartPosition));
+     1015              }
+     1016            }
+     1017          } else {
+     1018            LOGGER.warn(
+     1019                "Leader replica: {} got unexpected rewind time: {} for: {}/{}, will start ingesting upstream from the beginning",
+     1020                pcs.getReplicaId(),
+     1021                rewindStartTimestamp,
+     1022                pubSubAddress,
+     1023                sourceTopicPartition);
+     1024            rtStartPosition = PubSubSymbolicPosition.EARLIEST;
+     1025            rtPositionsByPubSubAddress.put(pubSubAddress, rtStartPosition);
+     1026          }
+     1027        } else {
+     1028          rtPositionsByPubSubAddress.put(pubSubAddress, rtStartPosition);
+     1029        }
+     1030      });
+     1031      if (unreachableBrokerList.size() >= ((rtPubSubAddresses.size() + 1) / 2)) {
+     1032        // We couldn't reach a quorum of brokers and that's a red flag, so throw exception and abort!
+     1033        throw new VeniceException("Couldn't reach any broker!! Aborting topic switch triggered consumer subscription!");
+     1034      }
+     1035      return rtPositionsByPubSubAddress;
+     1036    }

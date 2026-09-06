@@ -1,0 +1,934 @@
+row 37   Netflix/hollow#805
+============================================================================
+CONTRACT com.netflix.hollow.core.read.engine.HollowTypeStateListener   members=4.0 implementers=8.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       24  public interface HollowTypeStateListener {
+       25  
+       26      /**
+       27       * Called immediately before a delta update is applied to the state engine
+       28       */
+       29      void beginUpdate();
+       30  
+       31      /**
+       32       * Called once for each record which is added to the registered type.
+       33       * @param ordinal the ordinal of an object that was added
+       34       */
+       35      void addedOrdinal(int ordinal);
+       36  
+       37      /**
+       38       * Called once for each record which is removed from the registered type.
+       39       * @param ordinal the ordinal of an object that was removed
+       40       */
+       41      void removedOrdinal(int ordinal);
+       42  
+       43      /**
+       44       * Called immediately after a delta update is applied to the state engine.
+       45       */
+       46      void endUpdate();
+       47  
+       48  }
+
+---------- IMPLEMENTER com.netflix.hollow.api.objects.provider.HollowObjectCacheProvider  stubs=3/4 ----------
+       37  public class HollowObjectCacheProvider<T> extends HollowObjectProvider<T> implements HollowTypeStateListener {
+       38      private static final Logger log = Logger.getLogger(HollowObjectCacheProvider.class.getName());
+       39      private volatile List<T> cachedItems;
+       40  
+       41      private volatile HollowFactory<T> factory;
+       42      private volatile HollowTypeAPI typeAPI;
+       43      private volatile HollowTypeReadState typeReadState;
+       44  
+       45      public HollowObjectCacheProvider(HollowTypeDataAccess typeDataAccess, HollowTypeAPI typeAPI, HollowFactory<T> factory) {
+       46          this(typeDataAccess, typeAPI, factory, null);
+       47      }
+       48  
+       49      public HollowObjectCacheProvider(HollowTypeDataAccess typeDataAccess, HollowTypeAPI typeAPI, HollowFactory<T> factory, HollowObjectCacheProvider<T> previous) {
+       50          if(typeDataAccess != null) {
+       51              PopulatedOrdinalListener listener = typeDataAccess.getTypeState().getListener(PopulatedOrdinalListener.class);
+       52              BitSet populatedOrdinals = listener.getPopulatedOrdinals();
+       53              BitSet previousOrdinals = listener.getPreviousOrdinals();
+       54  
+       55              int length = Math.max(populatedOrdinals.length(), previousOrdinals.length());
+       56              List<T> arr = new ArrayList<T>(length);
+       57  
+       58              for(int ordinal = 0; ordinal < length; ordinal++) {
+       59                  while(ordinal >= arr.size())
+       60                      arr.add(null);
+       61  
+       62                  if(previous != null && previousOrdinals.get(ordinal) && populatedOrdinals.get(ordinal)) {
+       63                      T cached = previous.getHollowObject(ordinal);
+       64                      arr.set(ordinal, cached);
+       65                      if(cached instanceof HollowRecord)
+       66                          ((HollowCachedDelegate)((HollowRecord)cached).getDelegate()).updateTypeAPI(typeAPI);
+       67                  } else if(populatedOrdinals.get(ordinal)){
+       68                      arr.set(ordinal, instantiateCachedObject(factory, typeDataAccess, typeAPI, ordinal));
+       69                  }
+       70              }
+       71  
+       72              if(typeDataAccess instanceof HollowTypeReadState) {
+       73                  this.factory = factory;
+       74                  this.typeAPI = typeAPI;
+       75                  this.typeReadState = (HollowTypeReadState)typeDataAccess;
+       76                  this.typeReadState.addListener(this);
+       77              }
+       78  
+       79              this.cachedItems = arr;
+       80          } else {
+       81              this.cachedItems = Collections.emptyList();
+       82          }
+       83      }
+       84  
+       85      @Override
+       86      public T getHollowObject(int ordinal) {
+       87          List<T> refCachedItems = cachedItems;
+       88          if (refCachedItems == null) {
+       89              throw new IllegalStateException(String.format("HollowObjectCacheProvider for type %s has been detached or was not initialized", typeReadState == null ? null : typeReadState.getSchema().getName()));
+       90          }
+       91          if (refCachedItems.size() <= ordinal) {
+       92              throw new IllegalStateException(String.format("Ordinal %s is out of bounds for pojo cache array of size %s.", ordinal, refCachedItems.size()));
+       93          }
+       94          return refCachedItems.get(ordinal);
+       95      }
+       96  
+       97      public void detach() {
+       98          cachedItems = null;
+       99          factory = null;
+      100          typeAPI = null;
+      101          typeReadState = null;
+      102      }
+      103  
+      104      @Override
+      105      public void addedOrdinal(int ordinal) {
+      106          // guard against being detached (or constructed without a HollowTypeReadState)
+      107          if (factory == null) {
+      108              return;
+      109          }
+      110  
+      111          for (int i = cachedItems.size(); i <= ordinal; ++i)
+      112              cachedItems.add(null);
+      113          cachedItems.set(ordinal, instantiateCachedObject(factory, typeReadState, typeAPI, ordinal));
+      114      }
+      115  
+      116      private T instantiateCachedObject(HollowFactory<T> factory, HollowTypeDataAccess typeDataAccess, HollowTypeAPI typeAPI, int ordinal) {
+      117          try {
+      118              return factory.newCachedHollowObject(typeDataAccess, typeAPI, ordinal);
+      119          } catch(Throwable th) {
+      120              log.log(Level.SEVERE, "Cached object instantiation failed", th);
+      121              return null;
+      122          }
+      123      }
+      124  
+      125      @Override public void beginUpdate() { }
+      126      @Override public void removedOrdinal(int ordinal) { }
+      127      @Override public void endUpdate() { }
+      128  }
+
+---------- IMPLEMENTER com.netflix.hollow.core.index.HollowHashIndex  stubs=0/4 ----------
+       45  public class HollowHashIndex implements HollowTypeStateListener {
+       46      private static final Logger LOG = Logger.getLogger(HollowHashIndex.class.getName());
+       47  
+       48      private volatile HollowHashIndexState hashStateVolatile;
+       49  
+       50      private final HollowDataAccess hollowDataAccess;
+       51      private final HollowObjectTypeDataAccess typeState;
+       52      private final String type;
+       53      private final String selectField;
+       54      private final String[] matchFields;
+       55      private final boolean supportsNoOpDeltaUpdateSkip;
+       56  
+       57      private boolean deltaHadTypeChanges;
+       58  
+       59      /**
+       60       * This constructor is for binary-compatibility for code compiled against
+       61       * older builds. 
+       62       *
+       63       * @param stateEngine The state engine to index
+       64       * @param type The query starts with the specified type
+       65       * @param selectField The query will select records at this field (specify "" to select the specified type).
+       66       * The selectField may span collection elements and/or map keys or values, which can result in multiple matches per record of the specified start type.
+       67       * @param matchFields The query will match on the specified match fields.  The match fields may span collection elements and/or map keys or values.
+       68       */
+       69      public HollowHashIndex(HollowReadStateEngine stateEngine, String type, String selectField, String... matchFields) {
+       70          this((HollowDataAccess) stateEngine, type, selectField, matchFields);
+       71      }
+       72  
+       73      /**
+       74       * Define a {@link HollowHashIndex}.
+       75       *
+       76       * @param hollowDataAccess The state engine to index
+       77       * @param type The query starts with the specified type
+       78       * @param selectField The query will select records at this field (specify "" to select the specified type).
+       79       * The selectField may span collection elements and/or map keys or values, which can result in multiple matches per record of the specified start type.
+       80       * @param matchFields The query will match on the specified match fields.  The match fields may span collection elements and/or map keys or values.
+       81       */
+       82      public HollowHashIndex(HollowDataAccess hollowDataAccess, String type, String selectField, String... matchFields) {
+       83          requireNonNull(type, "Hollow Hash Index creation failed because type was null");
+       84          requireNonNull(hollowDataAccess, "Hollow Hash Index creation on type [" + type
+       85                  + "] failed because read state wasn't initialized");
+       86  
+       87          this.hollowDataAccess = hollowDataAccess;
+       88          this.type = type;
+       89          this.typeState = (HollowObjectTypeDataAccess) hollowDataAccess.getTypeDataAccess(type);
+       90          this.selectField = selectField;
+       91          this.matchFields = matchFields;
+       92          this.supportsNoOpDeltaUpdateSkip = canSkipNoOpDeltaUpdate();
+       93  
+       94          if (typeState == null) {
+       95              LOG.log(Level.WARNING, "Index initialization for " + this + " failed because type "
+       96                      + type + " was not found in read state");
+       97              return;
+       98          }
+       99          reindexHashIndex();
+      100      }
+      101  
+      102      /**
+      103       * Recreate the hash index entirely
+      104       */
+      105      private void reindexHashIndex() {
+      106          HollowHashIndexBuilder builder;
+      107          try {
+      108              builder = new HollowHashIndexBuilder(hollowDataAccess, type, selectField, matchFields);
+      109          } catch (FieldPaths.FieldPathException e) {
+      110              if (e.error == NOT_BINDABLE) {
+      111                  LOG.log(Level.WARNING, "Index initialization for " + this
+      112                          + " failed because one of the match fields could not be bound to a type in"
+      113                          + " the read state");
+      114                  this.hashStateVolatile = null;
+      115                  return;
+      116              } else {
+      117                  throw e;
+      118              }
+      119          }
+      120  
+      121          builder.buildIndex();
+      122          this.hashStateVolatile = new HollowHashIndexState(builder);
+      123      }
+      124  
+      125      private boolean canSkipNoOpDeltaUpdate() {
+      126          if (typeState == null || !"".equals(selectField)) {
+      127              return false;
+      128          }
+      129  
+      130          for (String matchField : matchFields) {
+      131              if (!isRootLocalField(matchField)) {
+      132                  return false;
+      133              }
+      134          }
+      135  
+      136          return true;
+      137      }
+      138  
+      139      private boolean isRootLocalField(String fieldPath) {
+      140          try {
+      141              FieldPaths.FieldPath<FieldPaths.FieldSegment> path =
+      142                      FieldPaths.createFieldPathForHashIndex(hollowDataAccess, type, fieldPath);
+      143              if (path.getSegments().size() != 1) {
+      144                  return false;
+      145              }
+      146  
+      147              FieldPaths.FieldSegment segment = path.getSegments().get(0);
+      148              if (!(segment instanceof FieldPaths.ObjectFieldSegment)) {
+      149                  return false;
+      150              }
+      151  
+      152              return ((FieldPaths.ObjectFieldSegment) segment).getType() != FieldType.REFERENCE;
+      153          } catch (IllegalArgumentException e) {
+      154              return false;
+      155          }
+      156      }
+      157  
+      158  
+      159      /**
+      160       * Query the index.
+      161       *
+      162       * @param query the query
+      163       * @return the hash index result to gather the matched ordinals. A {@code null} value indicated no matches were
+      164       * found.
+      165       */
+      166      public HollowHashIndexResult findMatches(Object... query) {
+      167          if (hashStateVolatile == null) {
+      168              throw new IllegalStateException(this + " wasn't initialized");
+      169          }
+      170          int hashCode = 0;
+      171  
+      172          for(int i=0;i<query.length;i++) {
+      173              if(query[i] == null)
+      174                  throw new IllegalArgumentException("querying by null unsupported; i=" + i);
+      175              hashCode ^= HashCodes.hashInt(keyHashCode(query[i], i));
+      176          }
+      177  
+      178          HollowHashIndexResult result;
+      179          HollowHashIndexState hashState;
+      180          do {
+      181              result = null;
+      182              hashState = hashStateVolatile;
+      183              long bucket = hashCode & hashState.getMatchHashMask();
+      184              long hashBucketBit = bucket * hashState.getBitsPerMatchHashEntry();
+      185              boolean bucketIsEmpty = hashState.getMatchHashTable().getElementValue(hashBucketBit, hashState.getBitsPerTraverserField()[0]) == 0;
+      186  
+      187              while (!bucketIsEmpty) {
+      188                  if (matchIsEqual(hashState.getMatchHashTable(), hashBucketBit, query)) {
+      189                      int selectSize = (int) hashState.getMatchHashTable().getElementValue(hashBucketBit + hashState.getBitsPerMatchHashKey(), hashState.getBitsPerSelectTableSize());
+      190                      long selectBucketPointer = hashState.getMatchHashTable().getElementValue(hashBucketBit + hashState.getBitsPerMatchHashKey() + hashState.getBitsPerSelectTableSize(), hashState.getBitsPerSelectTablePointer());
+      191  
+      192                      result = new HollowHashIndexResult(hashState, selectBucketPointer, selectSize);
+      193                      break;
+      194                  }
+      195  
+      196                  bucket = (bucket + 1) & hashState.getMatchHashMask();
+      197                  hashBucketBit = bucket * hashState.getBitsPerMatchHashEntry();
+      198                  bucketIsEmpty = hashState.getMatchHashTable().getElementValue(hashBucketBit, hashState.getBitsPerTraverserField()[0]) == 0;
+      199              }
+      200          } while (hashState != hashStateVolatile);
+      201  
+      202          return result;
+      203      }
+      204  
+
+---------- IMPLEMENTER com.netflix.hollow.core.index.HollowPrefixIndex  stubs=1/4 ----------
+       54  @Deprecated
+       55  public class HollowPrefixIndex implements HollowTypeStateListener {
+       56      private static final Logger LOG = Logger.getLogger(HollowPrefixIndex.class.getName());
+       57  
+       58      private final FieldPath fieldPath;
+       59      private final HollowReadStateEngine readStateEngine;
+       60      private final String type;
+       61      private final int estimatedMaxStringDuplicates;
+       62      private final boolean caseSensitive;
+       63  
+       64      private volatile TST prefixIndexVolatile;
+       65      private ArraySegmentRecycler memoryRecycle;
+       66  
+       67      private int totalWords;
+       68      private int averageWordLen;
+       69      private int maxOrdinalOfType;
+       70  
+       71      private boolean buildIndexOnUpdate;
+       72  
+       73      /**
+       74       * Initializes a new prefix index that is case in-sensitive.
+       75       *
+       76       * This constructor defaults the estimatedMaxStringDuplicates to 1, however while building the index it is observed
+       77       * that an indexed key references more than one records in the type then the prefix index dynamically resizes each node
+       78       * to accommodate the multiple references. Note that this has an adverse impact on memory usage, both in terms of
+       79       * memory footprint of prefix index and memory churn when building the index. If the expected number of duplicate
+       80       * strings across the type are specified upfront (see other constructor) then the memory churn due to resizing can be avoided.
+       81       *
+       82       * @param readStateEngine              state engine to read data from
+       83       * @param type                         type in the read state engine. Ordinals for this type
+       84       *                                     will be returned when queried for a prefix.
+       85       * @param fieldPath                    fieldPath should ultimately lead to a string field.
+       86       *                                     The fields in the path could reference another Object,
+       87       *                                     List, Set or a Map. The fields should be separated by ".".
+       88       *
+       89       */
+       90      public HollowPrefixIndex(HollowReadStateEngine readStateEngine, String type, String fieldPath) {
+       91          this(readStateEngine, type, fieldPath, 1, false);
+       92      }
+       93  
+       94      /**
+       95       * Initializes a new prefix index.
+       96       *
+       97       * @param readStateEngine              state engine to read data from
+       98       * @param type                         type in the read state engine. Ordinals for this type
+       99       *                                     will be returned when queried for a prefix.
+      100       * @param fieldPath                    fieldPath should ultimately lead to a string field.
+      101       *                                     The fields in the path could reference another Object,
+      102       *                                     List, Set or a Map. The fields should be separated by ".".
+      103       * @param estimatedMaxStringDuplicates The estimated number of strings that are duplicated
+      104       *                                     across instances of your type. Note that this means an
+      105       *                                     exactly matching string, not a prefix match. A higher value will mean
+      106       *                                     the prefix tree will reserve more memory to reference several elements per node.
+      107       * @param caseSensitive                Specify the case sensitivity for indexing and querying
+      108       */
+      109      public HollowPrefixIndex(HollowReadStateEngine readStateEngine, String type, String fieldPath,
+      110              int estimatedMaxStringDuplicates, boolean caseSensitive) {
+      111          requireNonNull(type, "Hollow Prefix Key Index creation failed because type was null");
+      112          requireNonNull(readStateEngine, "Hollow Prefix Key Index creation for type [" + type
+      113                  + "] failed because read state wasn't initialized");
+      114  
+      115          if (fieldPath == null || fieldPath.isEmpty())
+      116              throw new IllegalArgumentException("fieldPath cannot be null or empty");
+      117          if (estimatedMaxStringDuplicates < 1) {
+      118              throw new IllegalArgumentException("estimatedMaxStringDuplicates cannot be < 1");
+      119          }
+      120  
+      121          this.readStateEngine = readStateEngine;
+      122          this.type = type;
+      123          this.estimatedMaxStringDuplicates = estimatedMaxStringDuplicates;
+      124          this.caseSensitive = caseSensitive;
+      125          this.fieldPath = new FieldPath(readStateEngine, type, fieldPath);
+      126          if (!this.fieldPath.getLastFieldType().equals(HollowObjectSchema.FieldType.STRING))
+      127              throw new IllegalArgumentException("Field path should lead to a string type");
+      128  
+      129          // create memory recycle for using shared memory pools.
+      130          memoryRecycle = WastefulRecycler.DEFAULT_INSTANCE;
+      131          buildIndexOnUpdate = true;
+      132          initialize();
+      133      }
+      134  
+      135      // initialize field positions and field paths.
+      136      private void initialize() {
+      137  
+      138          String lastRefType = this.fieldPath.getLastRefTypeInPath();
+      139  
+      140          // get all cardinality to estimate size of array bits needed.
+      141          totalWords = readStateEngine.getTypeState(lastRefType).getPopulatedOrdinals().cardinality();
+      142          averageWordLen = 0;
+      143          double avg = 0;
+      144          HollowObjectTypeReadState objectTypeReadState = (HollowObjectTypeReadState) readStateEngine.getTypeState(lastRefType);
+      145          BitSet keyBitSet = objectTypeReadState.getPopulatedOrdinals();
+      146          int ordinal = keyBitSet.nextSetBit(0);
+      147          while (ordinal != -1) {
+      148              avg += ((double) objectTypeReadState.readString(ordinal, 0).length()) / ((double) totalWords);
+      149              ordinal = keyBitSet.nextSetBit(ordinal + 1);
+      150          }
+      151          averageWordLen = (int) Math.ceil(avg);
+      152  
+      153          HollowObjectTypeReadState valueState = (HollowObjectTypeReadState) readStateEngine.getTypeDataAccess(type);
+      154          maxOrdinalOfType = valueState.maxOrdinal();
+      155  
+      156          // initialize the prefix index.
+      157          build();
+      158      }
+      159  
+      160      private void build() {
+      161  
+      162          if (!buildIndexOnUpdate) return;
+      163          // tell memory recycler to use current tst's long arrays next time when long array is requested.
+      164          // note reuse only happens once swap is called and bits are reset
+      165          TST current = prefixIndexVolatile;
+      166          if (current != null) current.recycleMemory(memoryRecycle);
+      167  
+      168          // This is a hard limit, and currently assumes worst case unbalanced tree i.e. the total length of all words
+      169          long estimatedMaxNodes = estimateNumNodes(totalWords, averageWordLen);
+      170          TST tst = new TST(estimatedMaxNodes, estimatedMaxStringDuplicates, maxOrdinalOfType, caseSensitive,
+      171                  memoryRecycle);
+      172          BitSet ordinals = readStateEngine.getTypeState(type).getPopulatedOrdinals();
+      173          int ordinal = ordinals.nextSetBit(0);
+      174          while (ordinal != -1) {
+      175              for (String key : getKeys(ordinal, caseSensitive)) {
+      176                  tst.insert(key, ordinal);
+      177              }
+      178              ordinal = ordinals.nextSetBit(ordinal + 1);
+      179          }
+      180  
+      181          prefixIndexVolatile = tst;
+      182          // safe to return previous long arrays on next request for long array.
+      183          memoryRecycle.swap();
+      184          buildIndexOnUpdate = false;
+      185  
+      186          Stats stats = usageStats();
+      187          LOG.info("Prefix index built with stats= [" + stats + "]");
+      188      }
+      189  
+      190      /**
+      191       * Estimates the total number of nodes that will be required to create the index.
+      192       * Override this method if lower/higher estimate is needed as compared to the default implementation, but note that
+      193       * this imposes an underlying hard limit until the backing implementation starts supporting resizing dynamically.
+      194       *
+      195       * @param totalWords the total number of words
+      196       * @param averageWordLen the average word length
+      197       * @return the estimated total number of nodes
+      198       */
+      199      @SuppressWarnings("WeakerAccess")
+      200      protected long estimateNumNodes(long totalWords, long averageWordLen) {
+      201          return totalWords * averageWordLen;
+      202      }
+      203  
+      204      /**
+      205       * Return the key to index in prefix index. Override this method to support tokens for the key. Note that care must
+      206       * be taken to not return null or empty string tokens as the prefix index does not support indexing nulls or empty string.
+      207       * <pre>{@code
+      208       *     String[] keys = super.getKey(ordinal, false);
+      209       *     String[] tokens = keys[0].split(" ")
+      210       *     return tokens;
+      211       * }</pre>
+      212       *
+      213       * @param ordinal ordinal of the parent type.
+
+---------- IMPLEMENTER com.netflix.hollow.core.index.HollowPrimaryKeyIndex  stubs=3/4 ----------
+       58  @SuppressWarnings("override")
+       59  public class HollowPrimaryKeyIndex implements HollowTypeStateListener, TestableUniqueKeyIndex {
+       60      private static final Logger LOG = Logger.getLogger(HollowPrimaryKeyIndex.class.getName());
+       61  
+       62      private final HollowObjectTypeReadState typeState;
+       63      private final int[][] fieldPathIndexes;
+       64      private final FieldType[] fieldTypes;
+       65      private final PrimaryKey primaryKey;
+       66      private final HollowPrimaryKeyValueDeriver keyDeriver;
+       67  
+       68      private final ArraySegmentRecycler memoryRecycler;
+       69  
+       70      private final BitSet specificOrdinalsToIndex;
+       71  
+       72      private volatile PrimaryKeyIndexHashTable hashTableVolatile;
+       73  
+       74      public HollowPrimaryKeyIndex(HollowReadStateEngine stateEngine, String type, String... fieldPaths) {
+       75          this(stateEngine, WastefulRecycler.DEFAULT_INSTANCE, type, fieldPaths);
+       76      }
+       77  
+       78      public HollowPrimaryKeyIndex(HollowReadStateEngine stateEngine, PrimaryKey primaryKey) {
+       79          this(stateEngine, primaryKey, WastefulRecycler.DEFAULT_INSTANCE);
+       80      }
+       81  
+       82      public HollowPrimaryKeyIndex(HollowReadStateEngine stateEngine, ArraySegmentRecycler memoryRecycler, String type, String... fieldPaths) {
+       83          this(stateEngine, PrimaryKey.create(stateEngine, type, fieldPaths), memoryRecycler);
+       84      }
+       85  
+       86      public HollowPrimaryKeyIndex(HollowReadStateEngine stateEngine, PrimaryKey primaryKey, ArraySegmentRecycler memoryRecycler) {
+       87          this(stateEngine, primaryKey, memoryRecycler, null);
+       88      }
+       89  
+       90      /**
+       91       * This initializer can be used to create a HollowPrimaryKeyIndex which will only index a subset of the records in the specified type.
+       92       *
+       93       * @param stateEngine the read state engine
+       94       * @param primaryKey the primary key
+       95       * @param memoryRecycler the memory recycler
+       96       * @param specificOrdinalsToIndex the bit set
+       97       */
+       98      public HollowPrimaryKeyIndex(HollowReadStateEngine stateEngine, PrimaryKey primaryKey, ArraySegmentRecycler memoryRecycler, BitSet specificOrdinalsToIndex) {
+       99          requireNonNull(primaryKey, "Hollow Primary Key Index creation failed because primaryKey was null");
+      100          requireNonNull(stateEngine, "Hollow Primary Key Index creation for type [" + primaryKey.getType()
+      101                  + "] failed because read state wasn't initialized");
+      102  
+      103          this.primaryKey = primaryKey;
+      104          this.fieldPathIndexes = new int[primaryKey.numFields()][];
+      105          this.fieldTypes = new FieldType[primaryKey.numFields()];
+      106  
+      107          this.memoryRecycler = memoryRecycler;
+      108          this.specificOrdinalsToIndex = specificOrdinalsToIndex;
+      109          this.typeState = (HollowObjectTypeReadState) stateEngine.getTypeState(primaryKey.getType());
+      110  
+      111          if (typeState == null) {
+      112              LOG.log(Level.WARNING, "Hollow Primary Key Index creation for type [" + primaryKey.getType()
+      113                      + "] failed because type was not found in read state");
+      114              this.keyDeriver = null;
+      115              return;
+      116          }
+      117  
+      118          int i=0;
+      119          try {
+      120              for(i=0;i<primaryKey.numFields();i++) {
+      121                  fieldPathIndexes[i] = primaryKey.getFieldPathIndex(stateEngine, i);
+      122                  fieldTypes[i] = primaryKey.getFieldType(stateEngine, i);
+      123              }
+      124          } catch (FieldPaths.FieldPathException e) {
+      125              if (e.error == NOT_BINDABLE) {
+      126                  LOG.log(Level.WARNING, "Index initialization for " + primaryKey + " failed because field " +
+      127                          primaryKey.getFieldPath(i) + " could not be bound to a type in the read state");
+      128                  this.keyDeriver = null;
+      129                  return;
+      130              } else {
+      131                  throw e;
+      132              }
+      133          }
+      134          this.keyDeriver = new HollowPrimaryKeyValueDeriver(typeState, fieldPathIndexes, fieldTypes);
+      135          reindex();
+      136      }
+      137  
+      138      /**
+      139       * Once called, this HollowPrimaryKeyIndex will be kept up-to-date when deltas are applied to the indexed state engine.
+      140       * <p>
+      141       * This method should be called <b>before</b> any subsequent deltas occur after the index is created.
+      142       * <p>
+      143       * In order to prevent memory leaks, if this method is called and the index is no longer needed, call detachFromDeltaUpdates() before
+      144       * discarding the index.
+      145       * <p>
+      146       * Note that this index does not listen on snapshot update. If a snapshot update occurs this index will
+      147       * NOT return the latest data in the consumer. Callers must detach this index instance and initialize a new
+      148       * one on snapshot update, or disable double snapshot update for the consumer altogether.
+      149       */
+      150      public void listenForDeltaUpdates() {
+      151          if (typeState == null) {
+      152              return;
+      153          }
+      154          if(specificOrdinalsToIndex != null)
+      155              throw new IllegalStateException("Cannot listen for delta updates when indexing only specified ordinals!");
+      156  
+      157          typeState.addListener(this);
+      158      }
+      159  
+      160      /**
+      161       * Once called, this HollowPrimaryKeyIndex will no longer be kept up-to-date when deltas are applied to the indexed state engine.
+      162       * <p>
+      163       * Call this method before discarding indexes which are currently listening for delta updates.
+      164       */
+      165      public void detachFromDeltaUpdates() {
+      166          if (typeState == null) {
+      167              return;
+      168          }
+      169          typeState.removeListener(this);
+      170      }
+      171  
+      172      public HollowObjectTypeReadState getTypeState() {
+      173          return typeState;
+      174      }
+      175  
+      176      public PrimaryKey getPrimaryKey() {
+      177          return primaryKey;
+      178      }
+      179  
+      180      public List<FieldType> getFieldTypes() {
+      181          return Arrays.asList(fieldTypes);
+      182      }
+      183  
+      184      /**
+      185       * Query an index with a single specified field.  The returned value with be the ordinal of the matching record.
+      186       * <p>
+      187       * Use a generated API or the Generic Object API to use the returned ordinal.
+      188       *
+      189       * @param key the field key
+      190       * @return the matching ordinal for the key, otherwise -1 if the key is not present
+      191       */
+      192      public int getMatchingOrdinal(Object key) {
+      193          if (hashTableVolatile == null) {
+      194              throw new IllegalStateException("Index " + primaryKey.toString()  + " wasn't initialized");
+      195          }
+      196  
+      197          PrimaryKeyIndexHashTable hashTable = hashTableVolatile;
+      198          if(fieldPathIndexes.length != 1 || hashTable.bitsPerElement == 0)
+      199              return -1;
+      200  
+      201          int hashCode = keyHashCode(key, 0);
+      202  
+      203          int ordinal = -1;
+      204  
+      205          do {
+      206              hashTable = this.hashTableVolatile;
+      207              int bucket = hashCode & hashTable.hashMask;
+      208              ordinal = readOrdinal(hashTable, bucket);
+      209              while(ordinal != -1) {
+      210                  if(keyDeriver.keyMatches(key, ordinal, 0))
+      211                      break;
+      212  
+      213                  bucket++;
+      214                  bucket &= hashTable.hashMask;
+      215                  ordinal = readOrdinal(hashTable, bucket);
+      216              }
+      217          } while(hashTableVolatile != hashTable);
+
+---------- IMPLEMENTER com.netflix.hollow.core.index.HollowSparseIntegerSet  stubs=0/4 ----------
+       29  public class HollowSparseIntegerSet implements HollowTypeStateListener {
+       30  
+       31      private final HollowReadStateEngine readStateEngine;
+       32      private final String type;
+       33      private final FieldPath fieldPath;
+       34      private final IndexPredicate predicate;
+       35  
+       36      protected volatile SparseBitSet sparseBitSetVolatile;
+       37  
+       38      private Set<Integer> valuesToSet;
+       39      private Set<Integer> valuesToClear;
+       40      private int maxValueToSet;
+       41  
+       42      public interface IndexPredicate {
+       43          boolean shouldIndex(int ordinal);
+       44      }
+       45  
+       46      private final static IndexPredicate DEFAULT_PREDICATE = new IndexPredicate() {
+       47          @Override
+       48          public boolean shouldIndex(int ordinal) {
+       49              return true;
+       50          }
+       51      };
+       52  
+       53      /**
+       54       * Create a index for integer values pointed by the given field path.
+       55       *
+       56       * @param readStateEngine the read state
+       57       * @param type the type name
+       58       * @param fieldPath the field path
+       59       */
+       60      public HollowSparseIntegerSet(HollowReadStateEngine readStateEngine, String type, String fieldPath) {
+       61          this(readStateEngine, type, fieldPath, DEFAULT_PREDICATE);
+       62      }
+       63  
+       64      /**
+       65       * Create a index for integer values based on the given IndexPredicate.
+       66       *
+       67       * @param readStateEngine HollowReadStateEngine to read data set.
+       68       * @param type            type which contains the path to integer values for indexing.
+       69       * @param fieldPath       path to the integer values
+       70       * @param predicate       implementation of IndexPredicate, indicating if the record passes the condition for indexing.
+       71       */
+       72      public HollowSparseIntegerSet(HollowReadStateEngine readStateEngine, String type, String fieldPath, IndexPredicate predicate) {
+       73  
+       74          // check arguments
+       75          if (readStateEngine == null) throw new IllegalArgumentException("Read state engine cannot be null");
+       76          if (type == null) throw new IllegalArgumentException("type cannot be null");
+       77          if (fieldPath == null || fieldPath.isEmpty())
+       78              throw new IllegalArgumentException("fieldPath cannot be null or empty");
+       79  
+       80          this.readStateEngine = readStateEngine;
+       81          this.type = type;
+       82          this.fieldPath = new FieldPath(readStateEngine, type, fieldPath);
+       83          this.predicate = predicate;
+       84          this.valuesToSet = new HashSet<>();
+       85          this.valuesToClear = new HashSet<>();
+       86          build();
+       87      }
+       88  
+       89      protected void build() {
+       90  
+       91          // initialize an instance of SparseBitSet
+       92          initSet(Integer.MAX_VALUE);
+       93  
+       94          // iterate through all populated ordinals for the type to set the values based on predicate
+       95          BitSet typeBitSet = readStateEngine.getTypeState(type).getPopulatedOrdinals();
+       96          int ordinal = typeBitSet.nextSetBit(0);
+       97          while (ordinal != -1) {
+       98              set(ordinal);
+       99              ordinal = typeBitSet.nextSetBit(ordinal + 1);
+      100          }
+      101  
+      102          // run compaction
+      103          compact();
+      104      }
+      105  
+      106      protected void initSet(int maxValue) {
+      107          sparseBitSetVolatile = new SparseBitSet(maxValue);
+      108      }
+      109  
+      110      protected void set(int ordinal) {
+      111          if (predicate.shouldIndex(ordinal)) {
+      112              Object[] values = fieldPath.findValues(ordinal);
+      113              if (values != null && values.length > 0) {
+      114                  SparseBitSet bitSet = sparseBitSetVolatile;
+      115                  for (Object value : values) {
+      116                      bitSet.set((int) value);
+      117                  }
+      118              }
+      119          }
+      120      }
+      121  
+      122      protected void compact() {
+      123          SparseBitSet current = sparseBitSetVolatile;
+      124          SparseBitSet compactedSet = SparseBitSet.compact(current);
+      125          sparseBitSetVolatile = compactedSet;
+      126      }
+      127  
+      128  
+      129      /**
+      130       * Check if the given value is contained in the set (or if the given value satisfies the predicate condition.)
+      131       *
+      132       * @param i the integer value
+      133       * @return {@code true} if the value is present
+      134       */
+      135      public boolean get(int i) {
+      136          SparseBitSet current;
+      137          boolean result;
+      138          do {
+      139              current = sparseBitSetVolatile;
+      140              result = current.get(i);
+      141          } while (current != sparseBitSetVolatile);
+      142          return result;
+      143      }
+      144  
+      145      /**
+      146       * Estimate the total number of bits used to represent the integer set.
+      147       *
+      148       * @return Calculates the total number of bits used by longs in underlying data structure.
+      149       */
+      150      public long size() {
+      151          SparseBitSet current;
+      152          long size;
+      153          do {
+      154              current = sparseBitSetVolatile;
+      155              size = current.estimateBitsUsed();
+      156          } while (current != sparseBitSetVolatile);
+      157          return size;
+      158      }
+      159  
+      160      /**
+      161       * @return the total number of integers added to the set.
+      162       */
+      163      public int cardinality() {
+      164          SparseBitSet current;
+      165          int cardinality;
+      166          do {
+      167              current = sparseBitSetVolatile;
+      168              cardinality = current.cardinality();
+      169          } while (current != sparseBitSetVolatile);
+      170          return cardinality;
+      171      }
+      172  
+      173      /**
+      174       * Use this method to keep the index updated with delta changes on the read state engine.
+      175       * Remember to call detachFromDeltaUpdates to stop the delta changes.
+      176       * NOTE: Each delta updates creates a new prefix index and swaps the new with current.
+      177       */
+      178      public void listenForDeltaUpdates() {
+      179          readStateEngine.getTypeState(type).addListener(this);
+      180      }
+      181  
+      182      /**
+      183       * Stop delta updates for this index.
+      184       */
+      185      public void detachFromDeltaUpdates() {
+      186          readStateEngine.getTypeState(type).removeListener(this);
+      187      }
+      188  
+
+---------- IMPLEMENTER com.netflix.hollow.core.index.HollowUniqueKeyIndex  stubs=3/4 ----------
+       67  @SuppressWarnings("override")
+       68  public class HollowUniqueKeyIndex implements HollowTypeStateListener, TestableUniqueKeyIndex {
+       69      private static final Logger LOG = Logger.getLogger(HollowUniqueKeyIndex.class.getName());
+       70  
+       71      /**
+       72       * Data access object for the type being indexed. This must be a {@link HollowDataAccess} rather than
+       73       * a {@link com.netflix.hollow.core.HollowStateEngine} to participate in object longevity.
+       74       */
+       75      private final HollowObjectTypeDataAccess objectTypeDataAccess;
+       76  
+       77      /**
+       78       * Each field that is part of this index.
+       79       */
+       80      private final HollowHashIndexField[] fields;
+       81  
+       82      private final PrimaryKey primaryKey;
+       83  
+       84      private final ArraySegmentRecycler memoryRecycler;
+       85  
+       86      private final BitSet specificOrdinalsToIndex;
+       87  
+       88      private volatile PrimaryKeyIndexHashTable hashTableVolatile;
+       89  
+       90      /**
+       91       * <b>To support object longevity, the {@code HollowDataAccess} object must come from {@link HollowAPI#getDataAccess()}.</b>
+       92       * <p>
+       93       * If the index is being built from a {@link HollowConsumer.RefreshListener} method, be sure to use passed in HollowAPI's accessor
+       94       * rather than the state engine. The state engine will change over time rendering this index invalid unless
+       95       * {@link #listenForDeltaUpdates()} is enabled.
+       96       *
+       97       * @param hollowDataAccess hollow data access. <b>For object longevity, this must be from {@link HollowAPI#getDataAccess()}</b>
+       98       * @param type             type of object being indexed
+       99       * @param fieldPaths       paths to fields being indexed
+      100       */
+      101      public HollowUniqueKeyIndex(HollowDataAccess hollowDataAccess, String type, String... fieldPaths) {
+      102          this(hollowDataAccess, WastefulRecycler.DEFAULT_INSTANCE, type, fieldPaths);
+      103      }
+      104  
+      105      /**
+      106       * <b>To support object longevity, the {@code HollowDataAccess} object must come from {@link HollowAPI#getDataAccess()}.</b>
+      107       * <p>
+      108       * If the index is being built from a {@link HollowConsumer.RefreshListener} method, be sure to use passed in HollowAPI's accessor
+      109       * rather than the state engine. The state engine will change over time rendering this index invalid unless
+      110       * {@link #listenForDeltaUpdates()} is enabled.
+      111       *
+      112       * @param hollowDataAccess hollow data access. <b>For object longevity, this must be from {@link HollowAPI#getDataAccess()}</b>
+      113       * @param primaryKey       primary key definition. This does not have to match the primary key defined in the type.
+      114       */
+      115      public HollowUniqueKeyIndex(HollowDataAccess hollowDataAccess, PrimaryKey primaryKey) {
+      116          this(hollowDataAccess, primaryKey, WastefulRecycler.DEFAULT_INSTANCE);
+      117      }
+      118  
+      119      /**
+      120       * <b>To support object longevity, the {@code HollowDataAccess} object must come from {@link HollowAPI#getDataAccess()}.</b>
+      121       * <p>
+      122       * If the index is being built from a {@link HollowConsumer.RefreshListener} method, be sure to use passed in HollowAPI's accessor
+      123       * rather than the state engine. The state engine will change over time rendering this index invalid unless
+      124       * {@link #listenForDeltaUpdates()} is enabled.
+      125       *
+      126       * @param hollowDataAccess hollow data access. <b>For object longevity, this must be from {@link HollowAPI#getDataAccess()}</b>
+      127       * @param type             type of object being indexed
+      128       * @param fieldPaths       paths to fields being indexed
+      129       * @param memoryRecycler   memory recycler implementation
+      130       */
+      131      public HollowUniqueKeyIndex(HollowDataAccess hollowDataAccess, ArraySegmentRecycler memoryRecycler, String type, String... fieldPaths) {
+      132          this(hollowDataAccess, PrimaryKey.create(hollowDataAccess, type, fieldPaths), memoryRecycler);
+      133      }
+      134  
+      135      /**
+      136       * <b>To support object longevity, the {@code HollowDataAccess} object must come from {@link HollowAPI#getDataAccess()}.</b>
+      137       * <p>
+      138       * If the index is being built from a {@link HollowConsumer.RefreshListener} method, be sure to use passed in HollowAPI's accessor
+      139       * rather than the state engine. The state engine will change over time rendering this index invalid unless
+      140       * {@link #listenForDeltaUpdates()} is enabled.
+      141       *
+      142       * @param hollowDataAccess hollow data access. <b>For object longevity, this must be from {@link HollowAPI#getDataAccess()}</b>
+      143       * @param primaryKey       primary key definition. This does not have to match the primary key defined in the type.
+      144       * @param memoryRecycler   memory recycler implementation
+      145       */
+      146      public HollowUniqueKeyIndex(HollowDataAccess hollowDataAccess, PrimaryKey primaryKey, ArraySegmentRecycler memoryRecycler) {
+      147          this(hollowDataAccess, primaryKey, memoryRecycler, null);
+      148      }
+      149  
+      150      /**
+      151       * This initializer can be used to create a HollowUniqueKeyIndex which will only index a subset of the records in the specified type.
+      152       *
+      153       * @param hollowDataAccess        the read state engine
+      154       * @param primaryKey              the primary key
+      155       * @param memoryRecycler          the memory recycler
+      156       * @param specificOrdinalsToIndex the bit set
+      157       */
+      158      public HollowUniqueKeyIndex(HollowDataAccess hollowDataAccess, PrimaryKey primaryKey, ArraySegmentRecycler memoryRecycler, BitSet specificOrdinalsToIndex) {
+      159          requireNonNull(primaryKey, "Hollow Primary Key Index creation failed because primaryKey was null");
+      160          requireNonNull(hollowDataAccess, "Hollow Primary Key Index creation for type [" + primaryKey.getType()
+      161                  + "] failed because read state wasn't initialized");
+      162  
+      163          this.primaryKey = primaryKey;
+      164          //Obviously, the type we're indexing must be an object... no point in indexing primitives, etc.
+      165          this.objectTypeDataAccess = (HollowObjectTypeDataAccess) hollowDataAccess.getTypeDataAccess(primaryKey.getType());
+      166          this.fields = new HollowHashIndexField[primaryKey.numFields()];
+      167  
+      168          this.memoryRecycler = memoryRecycler;
+      169  
+      170          for (int fieldIdx = 0; fieldIdx < primaryKey.numFields(); fieldIdx++) {
+      171              //This is the field type of the final item on the path.
+      172              FieldType fieldType = primaryKey.getFieldType(hollowDataAccess, fieldIdx);
+      173  
+      174              //This always starts at the "root" object that's being indexed
+      175              HollowObjectTypeDataAccess currentDataAccess = this.objectTypeDataAccess;
+      176  
+      177              //For each segment of the path, this returns the field position relative within the containing object.
+      178              //The 0th position is relative to primaryKey.getType().
+      179              int[] fieldPathPositions = primaryKey.getFieldPathIndex(hollowDataAccess, fieldIdx);
+      180              FieldPathSegment[] fieldPathElements = new FieldPathSegment[fieldPathPositions.length];
+      181  
+      182              for (int posIdx = 0; posIdx < fieldPathPositions.length; posIdx++) {
+      183                  if (currentDataAccess == null) {
+      184                      //This gets set to null if the previous segment was a non-reference type (i.e. we can't traverse a primitive, etc).
+      185                      throw new IllegalArgumentException("Path " + primaryKey.getFieldPath(fieldIdx) + " traverses a non-reference type. Non-reference types must be the last element of the path.");
+      186                  }
+      187  
+      188                  int fieldPosition = fieldPathPositions[posIdx];
+      189                  fieldPathElements[posIdx] = new FieldPathSegment(fieldPosition, currentDataAccess);
+      190  
+      191                  //Using schema.getReferencedTypeState(...) will always use the *current* version and not necessarily
+      192                  //the version associated with the hollowDataAccess used to create this. This will break object longevity.
+      193                  //As such, we have to do this indirect lookup that reaches data access objects through
+      194                  //hollowDataAccess. There is a non-zero cost to performing these lookups so we do them here rather than
+      195                  //at the place where we access the data.
+      196                  String referencedType = currentDataAccess.getSchema().getReferencedType(fieldPosition);
+      197                  if (referencedType != null) {
+      198                      //This is instead of currentDataAccess.getSchema().getReferencedTypeState()
+      199                      currentDataAccess = (HollowObjectTypeDataAccess) hollowDataAccess.getTypeDataAccess(referencedType);
+      200                  } else {
+      201                      currentDataAccess = null;
+      202                  }
+      203              }
+      204              fields[fieldIdx] = new HollowHashIndexField(fieldIdx, fieldPathElements, currentDataAccess, fieldType);
+      205          }
+      206  
+      207          this.specificOrdinalsToIndex = specificOrdinalsToIndex;
+      208  
+      209          reindex();
+      210      }
+      211  
+      212      /**
+      213       * Once called, this HollowUniqueKeyIndex will be kept up-to-date when deltas are applied to the indexed state engine.
+      214       * <p>
+      215       * This method should be called <b>before</b> any subsequent deltas occur after the index is created.
+      216       * <p>
+      217       * In order to prevent memory leaks, if this method is called and the index is no longer needed, call detachFromDeltaUpdates() before
+      218       * discarding the index.
+      219       */
+      220      public void listenForDeltaUpdates() {
+      221          if (specificOrdinalsToIndex != null)
+      222              throw new IllegalStateException("Cannot listen for delta updates when indexing only specified ordinals!");
+      223          if (!(objectTypeDataAccess instanceof HollowObjectTypeReadState))
+      224              throw new IllegalStateException("Cannot listen for delta updates when objectTypeDataAccess is a "
+      225                      + objectTypeDataAccess.getClass().getSimpleName() + ". You may have created this index from a Data Access instance that has object longevity enabled.");
+      226  

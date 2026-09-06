@@ -1,0 +1,176 @@
+row 48   StarRocks/starrocks#70983
+============================================================================
+CONTRACT com.starrocks.scheduler.mv.MVRefreshExecutor   members=1.0 implementers=1.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       22  public interface MVRefreshExecutor {
+       23      /**
+       24       * Refresh the materialized view based on the provided execution plan and insert statement.
+       25       * @param execPlan the execution plan that contains the necessary information for refreshing the materialized view
+       26       * @param insertStmt the insert statement that specifies how to insert data into the materialized view
+       27       * @throws Exception if an error occurs during the refresh process
+       28       */
+       29      void executePlan(ExecPlan execPlan, InsertStmt insertStmt) throws Exception;
+       30  }
+
+---------- IMPLEMENTER com.starrocks.scheduler.MVTaskRunProcessor  stubs=0/1 ----------
+       66  public class MVTaskRunProcessor extends BaseTaskRunProcessor implements MVRefreshExecutor {
+       67      // used to generate unique statement IDs for the MV refresh task
+       68      private static final AtomicLong STMT_ID_GENERATOR = new AtomicLong(0);
+       69  
+       70      private Logger logger;
+       71      private Database db;
+       72      private MaterializedView mv;
+       73  
+       74      // used to store the mv task run context
+       75      private MvTaskRunContext mvTaskRunContext;
+       76      // used to store the mv refresh processor
+       77      private BaseMVRefreshProcessor mvRefreshProcessor;
+       78      // used to store the old transaction visible wait timeout to be restored after mv refresh task run
+       79      private long oldTransactionVisibleWaitTimeout;
+       80      // metrics entity for the mv
+       81      private IMaterializedViewMetricsEntity mvMetricsEntity;
+       82      // only trigger to post process when mv has been refreshed successfully
+       83      private Constants.TaskRunState taskRunState = Constants.TaskRunState.FAILED;
+       84      // runtime profile
+       85      @VisibleForTesting
+       86      private RuntimeProfile runtimeProfile;
+       87  
+       88      public MVTaskRunProcessor() {
+       89      }
+       90  
+       91      @VisibleForTesting
+       92      @Override
+       93      public TaskRunContext prepare(TaskRunContext context) throws Exception {
+       94          // NOTE: mvId is set in Task's properties when creating
+       95          final Map<String, String> properties = context.getProperties();
+       96          final long mvId = Long.parseLong(properties.get(MV_ID));
+       97          this.db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(context.ctx.getDatabase());
+       98          if (this.db == null) {
+       99              throw new DmlException("database " + context.ctx.getDatabase() + " do not exist.");
+      100          }
+      101  
+      102          final Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getId(), mvId);
+      103          if (table == null || !(table instanceof MaterializedView)) {
+      104              throw new DmlException(String.format("materialized view:%s in database:%s do not exist when refreshing",
+      105                      mvId, context.ctx.getDatabase()));
+      106          }
+      107          this.mv = (MaterializedView) table;
+      108          // refresh mv until mv is reloaded.
+      109          mv.waitForReloaded();
+      110          this.logger = MVTraceUtils.getLogger(mv, MVTaskRunProcessor.class);
+      111  
+      112          // NOTE: mvId is set in Task's properties when creating
+      113          if (!mv.isActive()) {
+      114              MVActiveChecker.tryToActivate(mv);
+      115              logger.info("Activated the MV before refreshing: {}", mv.getName());
+      116          }
+      117  
+      118          // metrics entity
+      119          this.mvMetricsEntity = MaterializedViewMetricsRegistry.getInstance().getMetricsEntity(mv.getMvId());
+      120          if (!mv.isActive()) {
+      121              String errorMsg = String.format("Materialized view: %s/%d is not active due to %s.",
+      122                      mv.getName(), mvId, mv.getInactiveReason());
+      123              logger.warn(errorMsg);
+      124              mvMetricsEntity.increaseRefreshJobStatus(Constants.TaskRunState.FAILED);
+      125              throw new DmlException(errorMsg);
+      126          }
+      127  
+      128          // wait util transaction is visible for mv refresh task
+      129          // because mv will update base tables' visible version after insert, the mv's visible version
+      130          // should keep up with the base tables, or it will return outdated result.
+      131          final ConnectContext connectContext = context.getCtx();
+      132          this.oldTransactionVisibleWaitTimeout = connectContext.getSessionVariable().getTransactionVisibleWaitTimeout();
+      133          connectContext.getSessionVariable().setTransactionVisibleWaitTimeout(Long.MAX_VALUE / 1000);
+      134  
+      135          // Initialize status's job id which is used to track a batch of task runs.
+      136          final String jobId = properties.containsKey(TaskRun.START_TASK_RUN_ID) ?
+      137                  properties.get(TaskRun.START_TASK_RUN_ID) : context.getTaskRunId();
+      138          if (context.getStatus() != null) {
+      139              context.getStatus().setStartTaskRunId(jobId);
+      140          }
+      141  
+      142          // prepare mv context
+      143          this.mvTaskRunContext = new MvTaskRunContext(context);
+      144          // prepare partition ttl number
+      145          int partitionTTLNumber = mv.getTableProperty().getPartitionTTLNumber();
+      146          this.mvTaskRunContext.setPartitionTTLNumber(partitionTTLNumber);
+      147  
+      148          this.mvRefreshProcessor = MVRefreshProcessorFactory.INSTANCE.newProcessor(db, mv, mvTaskRunContext, mvMetricsEntity);
+      149          logger.info("finish prepare refresh mv:{}, jobId: {}", mvId, jobId);
+      150          return mvTaskRunContext;
+      151      }
+      152  
+      153      /**
+      154       * Get the execution plan for refreshing the materialized view.
+      155       * @return the execution plan for refreshing the materialized view, or null if no refresh is needed.
+      156       * @throws Exception if an error occurs while getting the execution plan.
+      157       */
+      158      public ExecPlan getMVRefreshExecPlan() throws Exception {
+      159          Preconditions.checkNotNull(mvTaskRunContext);
+      160          Preconditions.checkNotNull(mvRefreshProcessor);
+      161  
+      162          // get exec plan
+      163          mvTaskRunContext.getRefreshRuntimeState().reset();
+      164          mvTaskRunContext.setIsExplain(true);
+      165          BaseMVRefreshProcessor.ProcessExecPlan processExecPlan =
+      166                  mvRefreshProcessor.getProcessExecPlan(mvTaskRunContext);
+      167          if (processExecPlan == null || processExecPlan.state() != Constants.TaskRunState.SUCCESS) {
+      168              logger.info("No need to refresh mv: {}, because the materialized view is up to date.", mv.getName());
+      169              return null;
+      170          }
+      171          return processExecPlan.execPlan();
+      172      }
+      173  
+      174      @Override
+      175      public Constants.TaskRunState processTaskRun(TaskRunContext context) throws Exception {
+      176          // init to collect the base timer for refresh profile
+      177          Tracers.register(context.getCtx());
+      178          final QueryDebugOptions queryDebugOptions = context.getCtx().getSessionVariable().getQueryDebugOptions();
+      179          final Tracers.Mode mvRefreshTraceMode = queryDebugOptions.getTraceMode();
+      180          final Tracers.Module mvRefreshTraceModule = queryDebugOptions.getTraceModule();
+      181          Tracers.init(mvRefreshTraceMode, mvRefreshTraceModule, true, false);
+      182  
+      183          ConnectContext connectContext = context.getCtx();
+      184          // Set query source to MV for materialized view refresh
+      185          connectContext.setQuerySource(com.starrocks.qe.QueryDetail.QuerySource.MV);
+      186          final QueryMaterializationContext queryMVContext = new QueryMaterializationContext();
+      187          connectContext.setQueryMVContext(queryMVContext);
+      188              
+      189          try (ConnectContext.ContextScope scope = ConnectContext.enterOnlyReadIcebergCacheScope(connectContext)) {
+      190              // do refresh
+      191              try (Timer ignored = Tracers.watchScope("MVRefreshDoWholeRefresh")) {
+      192                  // refresh mv
+      193                  Preconditions.checkState(mv != null);
+      194                  mvMetricsEntity = MaterializedViewMetricsRegistry.getInstance().getMetricsEntity(mv.getMvId());
+      195                  this.taskRunState = retryProcessTaskRun(context);
+      196                  if (this.taskRunState == Constants.TaskRunState.SUCCESS) {
+      197                      logger.info("Refresh materialized view {} finished successfully.", mv.getName());
+      198                      // if success, try to generate next task run
+      199                      mvRefreshProcessor.generateNextTaskRunIfNeeded();
+      200                  } else {
+      201                      logger.info("Refresh materialized view {} failed with state: {}.", mv.getName(), taskRunState);
+      202                  }
+      203                  // update metrics
+      204                  mvMetricsEntity.increaseRefreshJobStatus(taskRunState);
+      205                  connectContext.getState().setOk();
+      206              }
+      207          } catch (Exception e) {
+      208              if (mvMetricsEntity != null) {
+      209                  mvMetricsEntity.increaseRefreshJobStatus(Constants.TaskRunState.FAILED);
+      210              }
+      211              connectContext.getState().setError(e.getMessage());
+      212              throw e;
+      213          } finally {
+      214              try {
+      215                  // If mv's not active, mvContext may be null.
+      216                  if (mvTaskRunContext != null && connectContext != null) {
+      217                      connectContext.getSessionVariable().setTransactionVisibleWaitTimeout(oldTransactionVisibleWaitTimeout);
+      218                  }
+      219                  // reset query mv context to avoid affecting other tasks
+      220                  queryMVContext.clear();
+      221                  connectContext.setQueryMVContext(null);
+      222  
+      223                  if (FeConstants.runningUnitTest) {
+      224                      runtimeProfile = new RuntimeProfile();
+      225                      Tracers.toRuntimeProfile(runtimeProfile);

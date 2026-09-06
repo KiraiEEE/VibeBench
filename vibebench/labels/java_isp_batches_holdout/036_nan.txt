@@ -1,0 +1,787 @@
+row 36   spring-projects/spring-ai#5549
+============================================================================
+CONTRACT org.springframework.ai.chat.memory.ChatMemoryRepository   members=4.0 implementers=6.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       29  public interface ChatMemoryRepository {
+       30  
+       31  	List<String> findConversationIds();
+       32  
+       33  	List<Message> findByConversationId(String conversationId);
+       34  
+       35  	/**
+       36  	 * Replaces all the existing messages for the given conversation ID with the provided
+       37  	 * messages.
+       38  	 */
+       39  	void saveAll(String conversationId, List<Message> messages);
+       40  
+       41  	void deleteByConversationId(String conversationId);
+       42  
+       43  }
+
+---------- IMPLEMENTER org.springframework.ai.chat.memory.repository.cassandra.CassandraChatMemoryRepository  stubs=0/4 ----------
+       50  public final class CassandraChatMemoryRepository implements ChatMemoryRepository {
+       51  
+       52  	public static final String CONVERSATION_TS = CassandraChatMemoryRepository.class.getSimpleName()
+       53  			+ "_message_timestamp";
+       54  
+       55  	final CassandraChatMemoryRepositoryConfig conf;
+       56  
+       57  	private final PreparedStatement allStmt;
+       58  
+       59  	private final PreparedStatement addStmt;
+       60  
+       61  	private final PreparedStatement getStmt;
+       62  
+       63  	private CassandraChatMemoryRepository(CassandraChatMemoryRepositoryConfig conf) {
+       64  		Assert.notNull(conf, "conf cannot be null");
+       65  		this.conf = conf;
+       66  		this.conf.ensureSchemaExists();
+       67  		this.allStmt = prepareAllStatement();
+       68  		this.addStmt = prepareAddStmt();
+       69  		this.getStmt = prepareGetStatement();
+       70  	}
+       71  
+       72  	public static CassandraChatMemoryRepository create(CassandraChatMemoryRepositoryConfig conf) {
+       73  		return new CassandraChatMemoryRepository(conf);
+       74  	}
+       75  
+       76  	@Override
+       77  	public List<String> findConversationIds() {
+       78  		List<String> conversationIds = new ArrayList<>();
+       79  		long token = Long.MIN_VALUE;
+       80  		boolean emptyQuery = false;
+       81  
+       82  		while (!emptyQuery && token < Long.MAX_VALUE) {
+       83  			BoundStatement stmt = this.allStmt.boundStatementBuilder().setLong("after_token", token).build();
+       84  			emptyQuery = true;
+       85  			for (Row r : this.conf.session.execute(stmt)) {
+       86  				emptyQuery = false;
+       87  				conversationIds.add(r.getString(CassandraChatMemoryRepositoryConfig.DEFAULT_SESSION_ID_NAME));
+       88  				token = r.getLong("t");
+       89  			}
+       90  		}
+       91  		return List.copyOf(conversationIds);
+       92  	}
+       93  
+       94  	@Override
+       95  	public List<Message> findByConversationId(String conversationId) {
+       96  		return findByConversationIdWithLimit(conversationId, 1);
+       97  	}
+       98  
+       99  	List<Message> findByConversationIdWithLimit(String conversationId, int limit) {
+      100  		Assert.hasText(conversationId, "conversationId cannot be null or empty");
+      101  
+      102  		List<Object> primaryKeys = this.conf.primaryKeyTranslator.apply(conversationId);
+      103  		BoundStatementBuilder builder = this.getStmt.boundStatementBuilder();
+      104  
+      105  		for (int k = 0; k < primaryKeys.size(); ++k) {
+      106  			CassandraChatMemoryRepositoryConfig.SchemaColumn keyColumn = this.conf.getPrimaryKeyColumn(k);
+      107  			builder = builder.set(keyColumn.name(), primaryKeys.get(k), keyColumn.javaType());
+      108  		}
+      109  		builder = builder.setInt("legacy_limit", limit);
+      110  
+      111  		List<Message> messages = new ArrayList<>();
+      112  		for (Row r : this.conf.session.execute(builder.build())) {
+      113  			for (UdtValue udt : r.getList(this.conf.messagesColumn, UdtValue.class)) {
+      114  				messages.add(getMessage(udt));
+      115  			}
+      116  		}
+      117  		return messages;
+      118  	}
+      119  
+      120  	@Override
+      121  	public void saveAll(String conversationId, List<Message> messages) {
+      122  		Assert.hasText(conversationId, "conversationId cannot be null or empty");
+      123  		Assert.notNull(messages, "messages cannot be null");
+      124  		Assert.noNullElements(messages, "messages cannot contain null elements");
+      125  
+      126  		Instant instant = Instant.now();
+      127  		List<Object> primaryKeys = this.conf.primaryKeyTranslator.apply(conversationId);
+      128  		BoundStatementBuilder builder = this.addStmt.boundStatementBuilder();
+      129  
+      130  		for (int k = 0; k < primaryKeys.size(); ++k) {
+      131  			CassandraChatMemoryRepositoryConfig.SchemaColumn keyColumn = this.conf.getPrimaryKeyColumn(k);
+      132  			builder = builder.set(keyColumn.name(), primaryKeys.get(k), keyColumn.javaType());
+      133  		}
+      134  
+      135  		List<UdtValue> msgs = new ArrayList<>();
+      136  		for (Message msg : messages) {
+      137  
+      138  			Preconditions.checkArgument(
+      139  					!msg.getMetadata().containsKey(CONVERSATION_TS)
+      140  							|| msg.getMetadata().get(CONVERSATION_TS) instanceof Instant,
+      141  					"messages only accept metadata '%s' entries of type Instant", CONVERSATION_TS);
+      142  
+      143  			msg.getMetadata().putIfAbsent(CONVERSATION_TS, instant);
+      144  
+      145  			UdtValue udt = this.conf.session.getMetadata()
+      146  				.getKeyspace(this.conf.schema.keyspace())
+      147  				.get()
+      148  				.getUserDefinedType(this.conf.messageUDT)
+      149  				.get()
+      150  				.newValue()
+      151  				.setInstant(this.conf.messageUdtTimestampColumn, (Instant) msg.getMetadata().get(CONVERSATION_TS))
+      152  				.setString(this.conf.messageUdtTypeColumn, msg.getMessageType().name())
+      153  				.setString(this.conf.messageUdtContentColumn, msg.getText());
+      154  
+      155  			msgs.add(udt);
+      156  		}
+      157  		builder = builder.setInstant(CassandraChatMemoryRepositoryConfig.DEFAULT_EXCHANGE_ID_NAME, instant)
+      158  			.setList("msgs", msgs, UdtValue.class);
+      159  
+      160  		this.conf.session.execute(builder.build());
+      161  	}
+      162  
+      163  	@Override
+      164  	public void deleteByConversationId(String conversationId) {
+      165  		saveAll(conversationId, List.of());
+      166  	}
+      167  
+      168  	private PreparedStatement prepareAddStmt() {
+      169  		RegularInsert stmt = null;
+      170  		InsertInto stmtStart = QueryBuilder.insertInto(this.conf.schema.keyspace(), this.conf.schema.table());
+      171  		for (var c : this.conf.schema.partitionKeys()) {
+      172  			stmt = (null != stmt ? stmt : stmtStart).value(c.name(), QueryBuilder.bindMarker(c.name()));
+      173  		}
+      174  		for (var c : this.conf.schema.clusteringKeys()) {
+      175  			stmt = stmt.value(c.name(), QueryBuilder.bindMarker(c.name()));
+      176  		}
+      177  		stmt = stmt.value(this.conf.messagesColumn, QueryBuilder.bindMarker("msgs"));
+      178  		return this.conf.session.prepare(stmt.build());
+      179  	}
+      180  
+      181  	private PreparedStatement prepareAllStatement() {
+      182  		Select stmt = QueryBuilder.selectFrom(this.conf.schema.keyspace(), this.conf.schema.table())
+      183  			.distinct()
+      184  			.raw(String.format("token(%s)", CassandraChatMemoryRepositoryConfig.DEFAULT_SESSION_ID_NAME))
+      185  			.as("t")
+      186  			.column(CassandraChatMemoryRepositoryConfig.DEFAULT_SESSION_ID_NAME)
+      187  			.whereToken(CassandraChatMemoryRepositoryConfig.DEFAULT_SESSION_ID_NAME)
+      188  			.isGreaterThan(QueryBuilder.bindMarker("after_token"))
+      189  			.limit(10000);
+      190  
+      191  		return this.conf.session.prepare(stmt.build());
+      192  	}
+      193  
+      194  	private PreparedStatement prepareGetStatement() {
+      195  		Select stmt = QueryBuilder.selectFrom(this.conf.schema.keyspace(), this.conf.schema.table()).all();
+      196  		for (var c : this.conf.schema.partitionKeys()) {
+      197  			stmt = stmt.whereColumn(c.name()).isEqualTo(QueryBuilder.bindMarker(c.name()));
+      198  		}
+      199  		for (int i = 0; i + 1 < this.conf.schema.clusteringKeys().size(); ++i) {
+      200  			String columnName = this.conf.schema.clusteringKeys().get(i).name();
+      201  			stmt = stmt.whereColumn(columnName).isEqualTo(QueryBuilder.bindMarker(columnName));
+      202  		}
+      203  		stmt = stmt.limit(QueryBuilder.bindMarker("legacy_limit"));
+      204  		return this.conf.session.prepare(stmt.build());
+      205  	}
+      206  
+      207  	private Message getMessage(UdtValue udt) {
+      208  		String content = udt.getString(this.conf.messageUdtContentColumn);
+      209  		Map<String, Object> props = Map.of(CONVERSATION_TS, udt.getInstant(this.conf.messageUdtTimestampColumn));
+
+---------- IMPLEMENTER org.springframework.ai.chat.memory.repository.cosmosdb.CosmosDBChatMemoryRepository  stubs=0/4 ----------
+       56  public final class CosmosDBChatMemoryRepository implements ChatMemoryRepository {
+       57  
+       58  	public static final String CONVERSATION_TS = CosmosDBChatMemoryRepository.class.getSimpleName()
+       59  			+ "_message_timestamp";
+       60  
+       61  	private static final Logger logger = LoggerFactory.getLogger(CosmosDBChatMemoryRepository.class);
+       62  
+       63  	private final CosmosAsyncContainer container;
+       64  
+       65  	private CosmosDBChatMemoryRepository(CosmosDBChatMemoryRepositoryConfig config) {
+       66  		Assert.notNull(config, "config cannot be null");
+       67  		this.container = config.getContainer();
+       68  	}
+       69  
+       70  	public static CosmosDBChatMemoryRepository create(CosmosDBChatMemoryRepositoryConfig config) {
+       71  		return new CosmosDBChatMemoryRepository(config);
+       72  	}
+       73  
+       74  	@Override
+       75  	public List<String> findConversationIds() {
+       76  		logger.info("Finding all conversation IDs from Cosmos DB");
+       77  
+       78  		String query = "SELECT DISTINCT c.conversationId FROM c";
+       79  		SqlQuerySpec querySpec = new SqlQuerySpec(query);
+       80  
+       81  		CosmosPagedFlux<Object> results = this.container.queryItems(querySpec, new CosmosQueryRequestOptions(),
+       82  				Object.class);
+       83  
+       84  		List<Object> conversationDocs = results.byPage()
+       85  			.flatMapIterable(FeedResponse::getResults)
+       86  			.collectList()
+       87  			.block();
+       88  
+       89  		if (conversationDocs == null) {
+       90  			return Collections.emptyList();
+       91  		}
+       92  
+       93  		return conversationDocs.stream()
+       94  			.filter(Map.class::isInstance)
+       95  			.map(doc -> (Map<?, ?>) doc)
+       96  			.map(doc -> (String) doc.get("conversationId"))
+       97  			.distinct()
+       98  			.collect(Collectors.toList());
+       99  	}
+      100  
+      101  	@Override
+      102  	public List<Message> findByConversationId(String conversationId) {
+      103  		Assert.hasText(conversationId, "conversationId cannot be null or empty");
+      104  		logger.info("Finding messages for conversation: {}", conversationId);
+      105  
+      106  		String query = "SELECT * FROM c WHERE c.conversationId = @conversationId ORDER BY c._ts ASC";
+      107  		SqlParameter param = new SqlParameter("@conversationId", conversationId);
+      108  		SqlQuerySpec querySpec = new SqlQuerySpec(query, List.of(param));
+      109  
+      110  		CosmosQueryRequestOptions options = new CosmosQueryRequestOptions()
+      111  			.setPartitionKey(new PartitionKey(conversationId));
+      112  
+      113  		CosmosPagedFlux<Object> results = this.container.queryItems(querySpec, options, Object.class);
+      114  
+      115  		List<Object> messageDocs = results.byPage().flatMapIterable(FeedResponse::getResults).collectList().block();
+      116  
+      117  		if (messageDocs == null) {
+      118  			return Collections.emptyList();
+      119  		}
+      120  
+      121  		@SuppressWarnings("unchecked")
+      122  		List<Message> messages = messageDocs.stream()
+      123  			.filter(Map.class::isInstance)
+      124  			.map(doc -> (Map<String, Object>) doc)
+      125  			.map(this::mapToMessage)
+      126  			.collect(Collectors.toList());
+      127  
+      128  		return messages;
+      129  	}
+      130  
+      131  	@Override
+      132  	public void saveAll(String conversationId, List<Message> messages) {
+      133  		Assert.hasText(conversationId, "conversationId cannot be null or empty");
+      134  		Assert.notNull(messages, "messages cannot be null");
+      135  		Assert.noNullElements(messages, "messages cannot contain null elements");
+      136  
+      137  		logger.info("Saving {} messages for conversation: {}", messages.size(), conversationId);
+      138  
+      139  		// First delete existing messages for this conversation
+      140  		deleteByConversationId(conversationId);
+      141  
+      142  		// Then save the new messages
+      143  		Instant timestamp = Instant.now();
+      144  
+      145  		for (int i = 0; i < messages.size(); i++) {
+      146  			Message message = messages.get(i);
+      147  			Map<String, Object> doc = createMessageDocument(conversationId, message, timestamp, i);
+      148  
+      149  			this.container.createItem(doc, new PartitionKey(conversationId), new CosmosItemRequestOptions()).block();
+      150  		}
+      151  	}
+      152  
+      153  	@Override
+      154  	public void deleteByConversationId(String conversationId) {
+      155  		Assert.hasText(conversationId, "conversationId cannot be null or empty");
+      156  		logger.info("Deleting messages for conversation: {}", conversationId);
+      157  
+      158  		String query = "SELECT c.id FROM c WHERE c.conversationId = @conversationId";
+      159  		SqlParameter param = new SqlParameter("@conversationId", conversationId);
+      160  		SqlQuerySpec querySpec = new SqlQuerySpec(query, List.of(param));
+      161  
+      162  		CosmosQueryRequestOptions options = new CosmosQueryRequestOptions()
+      163  			.setPartitionKey(new PartitionKey(conversationId));
+      164  
+      165  		CosmosPagedFlux<Object> results = this.container.queryItems(querySpec, options, Object.class);
+      166  
+      167  		List<Object> items = results.byPage().flatMapIterable(FeedResponse::getResults).collectList().block();
+      168  
+      169  		if (items == null || items.isEmpty()) {
+      170  			return;
+      171  		}
+      172  
+      173  		@SuppressWarnings("unchecked")
+      174  		List<CosmosItemOperation> operations = items.stream()
+      175  			.filter(Map.class::isInstance)
+      176  			.map(item -> (Map<String, Object>) item)
+      177  			.map(item -> CosmosBulkOperations.getDeleteItemOperation((String) item.get("id"),
+      178  					new PartitionKey(conversationId)))
+      179  			.collect(Collectors.toList());
+      180  
+      181  		this.container.executeBulkOperations(Flux.fromIterable(operations)).collectList().block();
+      182  	}
+      183  
+      184  	private Map<String, Object> createMessageDocument(String conversationId, Message message, Instant timestamp,
+      185  			int sequenceNumber) {
+      186  		Map<String, Object> doc = new HashMap<>();
+      187  		doc.put("id", UUID.randomUUID().toString());
+      188  		doc.put("conversationId", conversationId);
+      189  		doc.put("messageType", message.getMessageType().name());
+      190  		doc.put("content", message.getText());
+      191  		doc.put("sequenceNumber", sequenceNumber);
+      192  
+      193  		// Add timestamp from metadata or use provided timestamp
+      194  		Instant messageTimestamp = (Instant) message.getMetadata().get(CONVERSATION_TS);
+      195  		if (messageTimestamp == null) {
+      196  			messageTimestamp = timestamp;
+      197  			message.getMetadata().put(CONVERSATION_TS, messageTimestamp);
+      198  		}
+      199  		doc.put("messageTimestamp", messageTimestamp.toEpochMilli());
+      200  
+      201  		// Store any additional metadata
+      202  		Map<String, Object> filteredMetadata = message.getMetadata()
+      203  			.entrySet()
+      204  			.stream()
+      205  			.filter(entry -> !CONVERSATION_TS.equals(entry.getKey()))
+      206  			.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+      207  
+      208  		if (!filteredMetadata.isEmpty()) {
+      209  			doc.put("metadata", filteredMetadata);
+      210  		}
+      211  
+      212  		return doc;
+      213  	}
+      214  
+      215  	private Message mapToMessage(Map<String, Object> doc) {
+
+---------- IMPLEMENTER org.springframework.ai.chat.memory.repository.jdbc.JdbcChatMemoryRepository  stubs=0/4 ----------
+       58  public final class JdbcChatMemoryRepository implements ChatMemoryRepository {
+       59  
+       60  	private final JdbcTemplate jdbcTemplate;
+       61  
+       62  	private final TransactionTemplate transactionTemplate;
+       63  
+       64  	private final JdbcChatMemoryRepositoryDialect dialect;
+       65  
+       66  	private static final Logger logger = LoggerFactory.getLogger(JdbcChatMemoryRepository.class);
+       67  
+       68  	private JdbcChatMemoryRepository(JdbcTemplate jdbcTemplate, JdbcChatMemoryRepositoryDialect dialect,
+       69  			PlatformTransactionManager txManager) {
+       70  		Assert.notNull(jdbcTemplate, "jdbcTemplate cannot be null");
+       71  		Assert.notNull(dialect, "dialect cannot be null");
+       72  		this.jdbcTemplate = jdbcTemplate;
+       73  		this.dialect = dialect;
+       74  		this.transactionTemplate = new TransactionTemplate(
+       75  				txManager != null ? txManager : new DataSourceTransactionManager(jdbcTemplate.getDataSource()));
+       76  	}
+       77  
+       78  	@Override
+       79  	public List<String> findConversationIds() {
+       80  		return this.jdbcTemplate.queryForList(this.dialect.getSelectConversationIdsSql(), String.class);
+       81  	}
+       82  
+       83  	@Override
+       84  	public List<Message> findByConversationId(String conversationId) {
+       85  		Assert.hasText(conversationId, "conversationId cannot be null or empty");
+       86  		return this.jdbcTemplate.query(this.dialect.getSelectMessagesSql(), new MessageRowMapper(), conversationId);
+       87  	}
+       88  
+       89  	@Override
+       90  	public void saveAll(String conversationId, List<Message> messages) {
+       91  		Assert.hasText(conversationId, "conversationId cannot be null or empty");
+       92  		Assert.notNull(messages, "messages cannot be null");
+       93  		Assert.noNullElements(messages, "messages cannot contain null elements");
+       94  
+       95  		this.transactionTemplate.execute(status -> {
+       96  			deleteByConversationId(conversationId);
+       97  			this.jdbcTemplate.batchUpdate(this.dialect.getInsertMessageSql(),
+       98  					new AddBatchPreparedStatement(conversationId, messages));
+       99  			return null;
+      100  		});
+      101  	}
+      102  
+      103  	@Override
+      104  	public void deleteByConversationId(String conversationId) {
+      105  		Assert.hasText(conversationId, "conversationId cannot be null or empty");
+      106  		this.jdbcTemplate.update(this.dialect.getDeleteMessagesSql(), conversationId);
+      107  	}
+      108  
+      109  	public static Builder builder() {
+      110  		return new Builder();
+      111  	}
+      112  
+      113  	private record AddBatchPreparedStatement(String conversationId, List<Message> messages,
+      114  			AtomicLong sequenceId) implements BatchPreparedStatementSetter {
+      115  
+      116  		private AddBatchPreparedStatement(String conversationId, List<Message> messages) {
+      117  			// Use second-level granularity to ensure compatibility with all database
+      118  			// timestamp precisions. The timestamp serves as a sequence number for
+      119  			// message ordering, not as a precise temporal record.
+      120  			this(conversationId, messages, new AtomicLong(Instant.now().getEpochSecond()));
+      121  		}
+      122  
+      123  		@Override
+      124  		public void setValues(PreparedStatement ps, int i) throws SQLException {
+      125  			var message = this.messages.get(i);
+      126  
+      127  			ps.setString(1, this.conversationId);
+      128  			ps.setString(2, message.getText());
+      129  			ps.setString(3, message.getMessageType().name());
+      130  			// Convert seconds to milliseconds for Timestamp constructor.
+      131  			// Each message gets a unique second value, ensuring proper ordering.
+      132  			ps.setTimestamp(4, new Timestamp(this.sequenceId.getAndIncrement() * 1000L));
+      133  		}
+      134  
+      135  		@Override
+      136  		public int getBatchSize() {
+      137  			return this.messages.size();
+      138  		}
+      139  	}
+      140  
+      141  	private static class MessageRowMapper implements RowMapper<Message> {
+      142  
+      143  		@Override
+      144  		@Nullable
+      145  		public Message mapRow(ResultSet rs, int i) throws SQLException {
+      146  			var content = rs.getString(1);
+      147  			var type = MessageType.valueOf(rs.getString(2));
+      148  
+      149  			return switch (type) {
+      150  				case USER -> new UserMessage(content);
+      151  				case ASSISTANT -> new AssistantMessage(content);
+      152  				case SYSTEM -> new SystemMessage(content);
+      153  				// The content is always stored empty for ToolResponseMessages.
+      154  				// If we want to capture the actual content, we need to extend
+      155  				// AddBatchPreparedStatement to support it.
+      156  				case TOOL -> ToolResponseMessage.builder().responses(List.of()).build();
+      157  			};
+      158  		}
+      159  
+      160  	}
+      161  
+      162  	public static final class Builder {
+      163  
+      164  		private JdbcTemplate jdbcTemplate;
+      165  
+      166  		private JdbcChatMemoryRepositoryDialect dialect;
+      167  
+      168  		private DataSource dataSource;
+      169  
+      170  		private PlatformTransactionManager platformTransactionManager;
+      171  
+      172  		private static final Logger logger = LoggerFactory.getLogger(Builder.class);
+      173  
+      174  		private Builder() {
+      175  		}
+      176  
+      177  		public Builder jdbcTemplate(JdbcTemplate jdbcTemplate) {
+      178  			this.jdbcTemplate = jdbcTemplate;
+      179  			return this;
+      180  		}
+      181  
+      182  		public Builder dialect(JdbcChatMemoryRepositoryDialect dialect) {
+      183  			this.dialect = dialect;
+      184  			return this;
+      185  		}
+      186  
+      187  		public Builder dataSource(DataSource dataSource) {
+      188  			this.dataSource = dataSource;
+      189  			return this;
+      190  		}
+      191  
+      192  		public Builder transactionManager(PlatformTransactionManager txManager) {
+      193  			this.platformTransactionManager = txManager;
+      194  			return this;
+      195  		}
+      196  
+      197  		public JdbcChatMemoryRepository build() {
+      198  			DataSource effectiveDataSource = resolveDataSource();
+      199  			JdbcChatMemoryRepositoryDialect effectiveDialect = resolveDialect(effectiveDataSource);
+      200  			return new JdbcChatMemoryRepository(resolveJdbcTemplate(), effectiveDialect,
+      201  					this.platformTransactionManager);
+      202  		}
+      203  
+      204  		private JdbcTemplate resolveJdbcTemplate() {
+      205  			if (this.jdbcTemplate != null) {
+      206  				return this.jdbcTemplate;
+      207  			}
+      208  			if (this.dataSource != null) {
+      209  				return new JdbcTemplate(this.dataSource);
+      210  			}
+      211  			throw new IllegalArgumentException("DataSource must be set (either via dataSource() or jdbcTemplate())");
+      212  		}
+      213  
+      214  		private DataSource resolveDataSource() {
+      215  			if (this.dataSource != null) {
+      216  				return this.dataSource;
+      217  			}
+
+---------- IMPLEMENTER org.springframework.ai.chat.memory.repository.mongo.MongoChatMemoryRepository  stubs=0/4 ----------
+       42  public final class MongoChatMemoryRepository implements ChatMemoryRepository {
+       43  
+       44  	private static final Logger logger = LoggerFactory.getLogger(MongoChatMemoryRepository.class);
+       45  
+       46  	private final MongoTemplate mongoTemplate;
+       47  
+       48  	private MongoChatMemoryRepository(MongoTemplate mongoTemplate) {
+       49  		this.mongoTemplate = mongoTemplate;
+       50  	}
+       51  
+       52  	@Override
+       53  	public List<String> findConversationIds() {
+       54  		return this.mongoTemplate.query(Conversation.class).distinct("conversationId").as(String.class).all();
+       55  	}
+       56  
+       57  	@Override
+       58  	public List<Message> findByConversationId(String conversationId) {
+       59  		var messages = this.mongoTemplate.query(Conversation.class)
+       60  			.matching(Query.query(Criteria.where("conversationId").is(conversationId))
+       61  				.with(Sort.by("timestamp").ascending()));
+       62  		return messages.stream().map(MongoChatMemoryRepository::mapMessage).collect(Collectors.toList());
+       63  	}
+       64  
+       65  	@Override
+       66  	public void saveAll(String conversationId, List<Message> messages) {
+       67  		deleteByConversationId(conversationId);
+       68  		var conversations = messages.stream()
+       69  			.map(message -> new Conversation(conversationId,
+       70  					new Conversation.Message(message.getText(), message.getMessageType().name(), message.getMetadata()),
+       71  					Instant.now()))
+       72  			.toList();
+       73  		this.mongoTemplate.insert(conversations, Conversation.class);
+       74  
+       75  	}
+       76  
+       77  	@Override
+       78  	public void deleteByConversationId(String conversationId) {
+       79  		this.mongoTemplate.remove(Query.query(Criteria.where("conversationId").is(conversationId)), Conversation.class);
+       80  	}
+       81  
+       82  	public static Message mapMessage(Conversation conversation) {
+       83  		return switch (conversation.message().type()) {
+       84  			case "USER" -> UserMessage.builder()
+       85  				.text(conversation.message().content())
+       86  				.metadata(conversation.message().metadata())
+       87  				.build();
+       88  			case "ASSISTANT" -> AssistantMessage.builder()
+       89  				.content(conversation.message().content())
+       90  				.properties(conversation.message().metadata())
+       91  				.build();
+       92  			case "SYSTEM" -> SystemMessage.builder()
+       93  				.text(conversation.message().content())
+       94  				.metadata(conversation.message().metadata())
+       95  				.build();
+       96  			default -> {
+       97  				logger.warn("Unsupported message type: {}", conversation.message().type());
+       98  				throw new IllegalStateException("Unsupported message type: " + conversation.message().type());
+       99  			}
+      100  		};
+      101  	}
+      102  
+      103  	public static Builder builder() {
+      104  		return new Builder();
+      105  	}
+      106  
+      107  	public final static class Builder {
+      108  
+      109  		private MongoTemplate mongoTemplate;
+      110  
+      111  		private Builder() {
+      112  		}
+      113  
+      114  		public Builder mongoTemplate(MongoTemplate mongoTemplate) {
+      115  			this.mongoTemplate = mongoTemplate;
+      116  			return this;
+      117  		}
+      118  
+      119  		public MongoChatMemoryRepository build() {
+      120  			return new MongoChatMemoryRepository(this.mongoTemplate);
+      121  		}
+      122  
+      123  	}
+      124  
+      125  }
+
+---------- IMPLEMENTER org.springframework.ai.chat.memory.repository.neo4j.Neo4jChatMemoryRepository  stubs=0/4 ----------
+       52  public final class Neo4jChatMemoryRepository implements ChatMemoryRepository {
+       53  
+       54  	private final Neo4jChatMemoryRepositoryConfig config;
+       55  
+       56  	public Neo4jChatMemoryRepository(Neo4jChatMemoryRepositoryConfig config) {
+       57  		this.config = config;
+       58  	}
+       59  
+       60  	@Override
+       61  	public List<String> findConversationIds() {
+       62  		return this.config.getDriver()
+       63  			.executableQuery("MATCH (conversation:$($sessionLabel)) RETURN conversation.id")
+       64  			.withParameters(Map.of("sessionLabel", this.config.getSessionLabel()))
+       65  			.execute(Collectors.mapping(r -> r.get("conversation.id").asString(), Collectors.toList()));
+       66  	}
+       67  
+       68  	@Override
+       69  	public List<Message> findByConversationId(String conversationId) {
+       70  		String statement = """
+       71  				MATCH (s:$($sessionLabel) {id:$conversationId})-[r:HAS_MESSAGE]->(m:$($messageLabel))
+       72  				WITH m
+       73  				OPTIONAL MATCH (m)-[:HAS_METADATA]->(metadata:$($metadataLabel))
+       74  				OPTIONAL MATCH (m)-[:HAS_MEDIA]->(media:$($mediaLabel)) WITH m, metadata, media ORDER BY media.idx ASC
+       75  				OPTIONAL MATCH (m)-[:HAS_TOOL_RESPONSE]-(tr:$($toolResponseLabel)) WITH m, metadata, media, tr ORDER BY tr.idx ASC
+       76  				OPTIONAL MATCH (m)-[:HAS_TOOL_CALL]->(tc:$($toolCallLabel))
+       77  				WITH m, metadata, media, tr, tc ORDER BY tc.idx ASC
+       78  				RETURN m, metadata, collect(tr) as toolResponses, collect(tc) as toolCalls, collect(media) as medias
+       79  				ORDER BY m.idx ASC
+       80  				""";
+       81  
+       82  		return this.config.getDriver()
+       83  			.executableQuery(statement)
+       84  			.withParameters(Map.of("conversationId", conversationId, "sessionLabel", this.config.getSessionLabel(),
+       85  					"messageLabel", this.config.getMessageLabel(), "metadataLabel", this.config.getMetadataLabel(),
+       86  					"mediaLabel", this.config.getMediaLabel(), "toolResponseLabel", this.config.getToolResponseLabel(),
+       87  					"toolCallLabel", this.config.getToolCallLabel()))
+       88  			.execute(Collectors.mapping(record -> {
+       89  				Map<String, Object> messageMap = record.get("m").asMap();
+       90  				String msgType = messageMap.get(MessageAttributes.MESSAGE_TYPE.getValue()).toString();
+       91  				Message message = null;
+       92  				List<Media> mediaList = List.of();
+       93  				if (!record.get("medias").isNull()) {
+       94  					mediaList = getMedia(record);
+       95  				}
+       96  				if (msgType.equals(MessageType.USER.getValue())) {
+       97  					message = buildUserMessage(record, messageMap, mediaList);
+       98  				}
+       99  				if (msgType.equals(MessageType.ASSISTANT.getValue())) {
+      100  					message = buildAssistantMessage(record, messageMap, mediaList);
+      101  				}
+      102  				if (msgType.equals(MessageType.SYSTEM.getValue())) {
+      103  					SystemMessage.Builder systemMessageBuilder = SystemMessage.builder()
+      104  						.text(messageMap.get(MessageAttributes.TEXT_CONTENT.getValue()).toString());
+      105  					if (!record.get("metadata").isNull()) {
+      106  						Map<String, Object> retrievedMetadata = record.get("metadata").asMap();
+      107  						systemMessageBuilder.metadata(retrievedMetadata);
+      108  					}
+      109  					message = systemMessageBuilder.build();
+      110  				}
+      111  				if (msgType.equals(MessageType.TOOL.getValue())) {
+      112  					message = buildToolMessage(record);
+      113  				}
+      114  				if (message == null) {
+      115  					throw new IllegalArgumentException("%s messages are not supported"
+      116  						.formatted(record.get(MessageAttributes.MESSAGE_TYPE.getValue()).asString()));
+      117  				}
+      118  				message.getMetadata().put("messageType", message.getMessageType());
+      119  				return message;
+      120  			}, Collectors.toList()));
+      121  
+      122  	}
+      123  
+      124  	@Override
+      125  	public void saveAll(String conversationId, List<Message> messages) {
+      126  		// First delete existing messages for this conversation
+      127  		deleteByConversationId(conversationId);
+      128  
+      129  		// Then add the new messages
+      130  		try (Session s = this.config.getDriver().session()) {
+      131  			s.executeWriteWithoutResult(tx -> {
+      132  				for (Message m : messages) {
+      133  					addMessageToTransaction(tx, conversationId, m);
+      134  				}
+      135  			});
+      136  		}
+      137  	}
+      138  
+      139  	@Override
+      140  	public void deleteByConversationId(String conversationId) {
+      141  		// First delete all messages and related nodes
+      142  		String deleteMessagesStatement = """
+      143  				MATCH (s:%s {id:$conversationId})-[r:HAS_MESSAGE]->(m:%s)
+      144  				OPTIONAL MATCH (m)-[:HAS_METADATA]->(metadata:%s)
+      145  				OPTIONAL MATCH (m)-[:HAS_MEDIA]->(media:%s)
+      146  				OPTIONAL MATCH (m)-[:HAS_TOOL_RESPONSE]-(tr:%s)
+      147  				OPTIONAL MATCH (m)-[:HAS_TOOL_CALL]->(tc:%s)
+      148  				DETACH DELETE m, metadata, media, tr, tc
+      149  				""".formatted(this.config.getSessionLabel(), this.config.getMessageLabel(),
+      150  				this.config.getMetadataLabel(), this.config.getMediaLabel(), this.config.getToolResponseLabel(),
+      151  				this.config.getToolCallLabel());
+      152  
+      153  		// Then delete the conversation node itself
+      154  		String deleteConversationStatement = """
+      155  				MATCH (s:%s {id:$conversationId})
+      156  				DETACH DELETE s
+      157  				""".formatted(this.config.getSessionLabel());
+      158  
+      159  		try (Session s = this.config.getDriver().session()) {
+      160  			try (Transaction t = s.beginTransaction()) {
+      161  				// First delete messages
+      162  				t.run(deleteMessagesStatement, Map.of("conversationId", conversationId));
+      163  				// Then delete the conversation node
+      164  				t.run(deleteConversationStatement, Map.of("conversationId", conversationId));
+      165  				t.commit();
+      166  			}
+      167  		}
+      168  	}
+      169  
+      170  	public Neo4jChatMemoryRepositoryConfig getConfig() {
+      171  		return this.config;
+      172  	}
+      173  
+      174  	private Message buildToolMessage(org.neo4j.driver.Record record) {
+      175  		Message message;
+      176  		message = ToolResponseMessage.builder().responses(record.get("toolResponses").asList(v -> {
+      177  			Map<String, Object> trMap = v.asMap();
+      178  			return new ToolResponse((String) trMap.get(ToolResponseAttributes.ID.getValue()),
+      179  					(String) trMap.get(ToolResponseAttributes.NAME.getValue()),
+      180  					(String) trMap.get(ToolResponseAttributes.RESPONSE_DATA.getValue()));
+      181  		})).metadata(record.get("metadata").asMap()).build();
+      182  		return message;
+      183  	}
+      184  
+      185  	private Message buildAssistantMessage(org.neo4j.driver.Record record, Map<String, Object> messageMap,
+      186  			List<Media> mediaList) {
+      187  		Message message = AssistantMessage.builder()
+      188  			.content(messageMap.get(MessageAttributes.TEXT_CONTENT.getValue()).toString())
+      189  			.properties(record.get("metadata").asMap(Map.of()))
+      190  			.toolCalls(record.get("toolCalls").asList(v -> {
+      191  				var toolCallMap = v.asMap();
+      192  				return new AssistantMessage.ToolCall((String) toolCallMap.get("id"), (String) toolCallMap.get("type"),
+      193  						(String) toolCallMap.get("name"), (String) toolCallMap.get("arguments"));
+      194  			}))
+      195  			.media(mediaList)
+      196  			.build();
+      197  		return message;
+      198  	}
+      199  
+      200  	private Message buildUserMessage(org.neo4j.driver.Record record, Map<String, Object> messageMap,
+      201  			List<Media> mediaList) {
+      202  		Message message;
+      203  		Map<String, Object> metadata = record.get("metadata").asMap();
+      204  		message = UserMessage.builder()
+      205  			.text(messageMap.get(MessageAttributes.TEXT_CONTENT.getValue()).toString())
+      206  			.media(mediaList)
+      207  			.metadata(metadata)
+      208  			.build();
+      209  		return message;
+      210  	}
+      211  
+
+---------- IMPLEMENTER org.springframework.ai.chat.memory.InMemoryChatMemoryRepository  stubs=0/4 ----------
+       33  public final class InMemoryChatMemoryRepository implements ChatMemoryRepository {
+       34  
+       35  	Map<String, List<Message>> chatMemoryStore = new ConcurrentHashMap<>();
+       36  
+       37  	@Override
+       38  	public List<String> findConversationIds() {
+       39  		return new ArrayList<>(this.chatMemoryStore.keySet());
+       40  	}
+       41  
+       42  	@Override
+       43  	public List<Message> findByConversationId(String conversationId) {
+       44  		Assert.hasText(conversationId, "conversationId cannot be null or empty");
+       45  		List<Message> messages = this.chatMemoryStore.get(conversationId);
+       46  		return messages != null ? new ArrayList<>(messages) : List.of();
+       47  	}
+       48  
+       49  	@Override
+       50  	public void saveAll(String conversationId, List<Message> messages) {
+       51  		Assert.hasText(conversationId, "conversationId cannot be null or empty");
+       52  		Assert.notNull(messages, "messages cannot be null");
+       53  		Assert.noNullElements(messages, "messages cannot contain null elements");
+       54  		this.chatMemoryStore.put(conversationId, messages);
+       55  	}
+       56  
+       57  	@Override
+       58  	public void deleteByConversationId(String conversationId) {
+       59  		Assert.hasText(conversationId, "conversationId cannot be null or empty");
+       60  		this.chatMemoryStore.remove(conversationId);
+       61  	}
+       62  
+       63  }

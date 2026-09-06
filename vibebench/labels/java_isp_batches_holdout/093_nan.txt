@@ -1,0 +1,245 @@
+row 93   StarRocks/starrocks#70342
+============================================================================
+CONTRACT com.starrocks.analysis.AggregateInfoBase   members=1.0 implementers=1.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       47  public abstract class AggregateInfoBase {
+       48  
+       49      // For aggregations: All unique grouping expressions from a select block.
+       50      // For analytics: Empty.
+       51      protected ArrayList<Expr> groupingExprs_;
+       52  
+       53      // For aggregations: All unique aggregate expressions from a select block.
+       54      // For analytics: The results of AnalyticExpr.getFnCall() for the unique
+       55      // AnalyticExprs of a select block.
+       56      protected ArrayList<FunctionCallExpr> aggregateExprs_;
+       57  
+       58      // The tuple into which the intermediate output of an aggregation is materialized.
+       59      // Contains groupingExprs.size() + aggregateExprs.size() slots, the first of which
+       60      // contain the values of the grouping exprs, followed by slots into which the
+       61      // aggregateExprs' update()/merge() symbols materialize their output, i.e., slots
+       62      // of the aggregate functions' intermediate types.
+       63      // Identical to outputTupleDesc_ if no aggregateExpr has an output type that is
+       64      // different from its intermediate type.
+       65      protected TupleDescriptor intermediateTupleDesc_;
+       66  
+       67      // The tuple into which the final output of the aggregation is materialized.
+       68      // Contains groupingExprs.size() + aggregateExprs.size() slots, the first of which
+       69      // contain the values of the grouping exprs, followed by slots into which the
+       70      // aggregateExprs' finalize() symbol write its result, i.e., slots of the aggregate
+       71      // functions' output types.
+       72      protected TupleDescriptor outputTupleDesc_;
+       73  
+       74      // For aggregation: indices into aggregate exprs for that need to be materialized
+       75      // For analytics: indices into the analytic exprs and their corresponding aggregate
+       76      // exprs that need to be materialized.
+       77      // Populated in materializeRequiredSlots() which must be implemented by subclasses.
+       78      protected ArrayList<Integer> materializedAggSlots = Lists.newArrayList();
+       79  
+       80      protected AggregateInfoBase(ArrayList<Expr> groupingExprs,
+       81                                  ArrayList<FunctionCallExpr> aggExprs) {
+       82          Preconditions.checkState(groupingExprs != null || aggExprs != null);
+       83          groupingExprs_ =
+       84                  groupingExprs != null ? Expr.cloneList(groupingExprs) : new ArrayList<Expr>();
+       85          aggregateExprs_ =
+       86                  aggExprs != null ? Expr.cloneList(aggExprs) : new ArrayList<FunctionCallExpr>();
+       87      }
+       88  
+       89      /**
+       90       * C'tor for cloning.
+       91       */
+       92      protected AggregateInfoBase(AggregateInfoBase other) {
+       93          groupingExprs_ =
+       94                  (other.groupingExprs_ != null) ? Expr.cloneList(other.groupingExprs_) : null;
+       95          aggregateExprs_ =
+       96                  (other.aggregateExprs_ != null) ? Expr.cloneList(other.aggregateExprs_) : null;
+       97          intermediateTupleDesc_ = other.intermediateTupleDesc_;
+       98          outputTupleDesc_ = other.outputTupleDesc_;
+       99          materializedAggSlots = Lists.newArrayList(other.materializedAggSlots);
+      100      }
+      101  
+      102      public ArrayList<Expr> getGroupingExprs() {
+      103          return groupingExprs_;
+      104      }
+      105  
+      106      public ArrayList<FunctionCallExpr> getAggregateExprs() {
+      107          return aggregateExprs_;
+      108      }
+      109  
+      110      public TupleId getIntermediateTupleId() {
+      111          return intermediateTupleDesc_.getId();
+      112      }
+      113  
+      114      public TupleId getOutputTupleId() {
+      115          return outputTupleDesc_.getId();
+      116      }
+      117  
+      118      public void setOutputTupleDesc(TupleDescriptor tupleDesc) {
+      119          this.outputTupleDesc_ = tupleDesc;
+      120      }
+      121  
+      122      public boolean requiresIntermediateTuple() {
+      123          Preconditions.checkNotNull(intermediateTupleDesc_);
+      124          Preconditions.checkNotNull(outputTupleDesc_);
+      125          return intermediateTupleDesc_ != outputTupleDesc_;
+      126      }
+      127  
+      128      public String debugString() {
+      129          StringBuilder out = new StringBuilder();
+      130          out.append(MoreObjects.toStringHelper(this)
+      131                  .add("grouping_exprs", Expr.debugString(groupingExprs_))
+      132                  .add("aggregate_exprs", Expr.debugString(aggregateExprs_))
+      133                  .add("intermediate_tuple", (intermediateTupleDesc_ == null)
+      134                          ? "null" : intermediateTupleDesc_.debugString())
+      135                  .add("output_tuple", (outputTupleDesc_ == null)
+      136                          ? "null" : outputTupleDesc_.debugString())
+      137                  .toString());
+      138          return out.toString();
+      139      }
+      140  
+      141      protected abstract String tupleDebugName();
+      142  }
+
+---------- IMPLEMENTER com.starrocks.analysis.AggregateInfo  stubs=0/1 ----------
+       45  public final class AggregateInfo extends AggregateInfoBase {
+       46  
+       47      public enum AggPhase {
+       48          FIRST,
+       49          FIRST_MERGE,
+       50          SECOND,
+       51          SECOND_MERGE;
+       52  
+       53          public boolean isMerge() {
+       54              return this == FIRST_MERGE || this == SECOND_MERGE;
+       55          }
+       56      }
+       57  
+       58      // created by createMergeAggInfo()
+       59      private AggregateInfo mergeAggInfo_;
+       60  
+       61      // created by createDistinctAggInfo()
+       62      private AggregateInfo secondPhaseDistinctAggInfo_;
+       63  
+       64      private final AggPhase aggPhase_;
+       65  
+       66      // Map from all grouping and aggregate exprs to a SlotRef referencing the corresp. slot
+       67      // in the intermediate tuple. Identical to outputTupleSmap_ if no aggregateExpr has an
+       68      // output type that is different from its intermediate type.
+       69      protected ExprSubstitutionMap intermediateTupleSmap_ = new ExprSubstitutionMap();
+       70  
+       71      // Map from all grouping and aggregate exprs to a SlotRef referencing the corresp. slot
+       72      // in the output tuple.
+       73      protected ExprSubstitutionMap outputTupleSmap_ = new ExprSubstitutionMap();
+       74  
+       75      // if set, a subset of groupingExprs_; set and used during planning
+       76      private List<Expr> partitionExprs_;
+       77  
+       78      private List<Expr> intermediateAggrExprs = Lists.newArrayList();
+       79  
+       80      // C'tor creates copies of groupingExprs and aggExprs.
+       81      @VisibleForTesting
+       82      public AggregateInfo(ArrayList<Expr> groupingExprs,
+       83                           ArrayList<FunctionCallExpr> aggExprs, AggPhase aggPhase) {
+       84          this(groupingExprs, aggExprs, aggPhase, false);
+       85      }
+       86  
+       87      private AggregateInfo(ArrayList<Expr> groupingExprs,
+       88                            ArrayList<FunctionCallExpr> aggExprs, AggPhase aggPhase, boolean isMultiDistinct) {
+       89          super(groupingExprs, aggExprs);
+       90          aggPhase_ = aggPhase;
+       91      }
+       92  
+       93      /**
+       94       * C'tor for cloning.
+       95       */
+       96      private AggregateInfo(AggregateInfo other) {
+       97          super(other);
+       98          if (other.mergeAggInfo_ != null) {
+       99              mergeAggInfo_ = other.mergeAggInfo_.clone();
+      100          }
+      101          if (other.secondPhaseDistinctAggInfo_ != null) {
+      102              secondPhaseDistinctAggInfo_ = other.secondPhaseDistinctAggInfo_.clone();
+      103          }
+      104          aggPhase_ = other.aggPhase_;
+      105          outputTupleSmap_ = other.outputTupleSmap_.clone();
+      106          if (other.requiresIntermediateTuple()) {
+      107              intermediateTupleSmap_ = other.intermediateTupleSmap_.clone();
+      108          } else {
+      109              Preconditions.checkState(other.intermediateTupleDesc_ == other.outputTupleDesc_);
+      110              intermediateTupleSmap_ = outputTupleSmap_;
+      111          }
+      112          partitionExprs_ =
+      113                  (other.partitionExprs_ != null) ? Expr.cloneList(other.partitionExprs_) : null;
+      114      }
+      115  
+      116      public List<Expr> getPartitionExprs() {
+      117          return partitionExprs_;
+      118      }
+      119  
+      120      public void setPartitionExprs(List<Expr> exprs) {
+      121          partitionExprs_ = exprs;
+      122      }
+      123  
+      124  
+      125      public ArrayList<FunctionCallExpr> getMaterializedAggregateExprs() {
+      126          ArrayList<FunctionCallExpr> result = Lists.newArrayList();
+      127          for (Integer i : materializedAggSlots) {
+      128              result.add(aggregateExprs_.get(i));
+      129          }
+      130          return result;
+      131      }
+      132  
+      133      public boolean isMerge() {
+      134          return aggPhase_.isMerge();
+      135      }
+      136  
+      137      public void setIntermediateAggrExprs(List<Expr> intermediateAggrExprs) {
+      138          this.intermediateAggrExprs = intermediateAggrExprs;
+      139      }
+      140  
+      141      public List<Expr> getIntermediateAggrExprs() { return intermediateAggrExprs; }
+      142  
+      143      public String debugString() {
+      144          StringBuilder out = new StringBuilder(super.debugString());
+      145          out.append(MoreObjects.toStringHelper(this)
+      146                  .add("phase", aggPhase_)
+      147                  .add("intermediate_smap", intermediateTupleSmap_.debugString())
+      148                  .add("output_smap", outputTupleSmap_.debugString())
+      149                  .toString());
+      150          if (mergeAggInfo_ != this && mergeAggInfo_ != null) {
+      151              out.append("\nmergeAggInfo:\n" + mergeAggInfo_.debugString());
+      152          }
+      153          if (secondPhaseDistinctAggInfo_ != null) {
+      154              out.append("\nsecondPhaseDistinctAggInfo:\n"
+      155                      + secondPhaseDistinctAggInfo_.debugString());
+      156          }
+      157          return out.toString();
+      158      }
+      159  
+      160      @Override
+      161      protected String tupleDebugName() {
+      162          return "agg-tuple";
+      163      }
+      164  
+      165      @Override
+      166      public AggregateInfo clone() {
+      167          return new AggregateInfo(this);
+      168      }
+      169  
+      170      /**
+      171       * Below function is added by new analyzer
+      172       */
+      173      public static AggregateInfo create(
+      174              ArrayList<Expr> groupingExprs, ArrayList<FunctionCallExpr> aggExprs,
+      175              TupleDescriptor tupleDesc, TupleDescriptor intermediateTupleDesc, AggPhase phase) {
+      176          AggregateInfo result = new AggregateInfo(groupingExprs, aggExprs, phase);
+      177          result.outputTupleDesc_ = tupleDesc;
+      178          result.intermediateTupleDesc_ = intermediateTupleDesc;
+      179  
+      180          for (int i = 0; i < result.getAggregateExprs().size(); ++i) {
+      181              result.materializedAggSlots.add(i);
+      182          }
+      183  
+      184          return result;
+      185      }
+      186  }

@@ -1,0 +1,480 @@
+row 46   line/centraldogma#1258
+============================================================================
+CONTRACT com.linecorp.centraldogma.server.storage.StorageManager   members=11.0 implementers=7.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       31  public interface StorageManager<T> {
+       32      /**
+       33       * Closes this manager.
+       34       *
+       35       * @param failureCauseSupplier the supplier which provides a reason why it is closed
+       36       */
+       37      void close(Supplier<CentralDogmaException> failureCauseSupplier);
+       38  
+       39      /**
+       40       * Returns {@code true} if an element with the specified {@code name} exists.
+       41       *
+       42       * @param name the name of an element
+       43       */
+       44      boolean exists(String name);
+       45  
+       46      /**
+       47       * Returns an element with the specified {@code name}.
+       48       *
+       49       * @param name the name of an element
+       50       * @throws CentralDogmaException if no element with the specified {@code name} exists
+       51       */
+       52      T get(String name);
+       53  
+       54      /**
+       55       * Returns a newly-created element with the specified {@code name} by the specified {@link Author}.
+       56       *
+       57       * @param name the name of an element which is supposed to be created
+       58       * @param author the author who is creating the new element
+       59       */
+       60      default T create(String name, Author author) {
+       61          return create(name, System.currentTimeMillis(), author, false);
+       62      }
+       63  
+       64      /**
+       65       * Returns a newly-created element with the specified {@code name} and the specified
+       66       * {@code creationTimeMillis} by the specified {@link Author}.
+       67       *
+       68       * @param name the name of an element which is supposed to be created
+       69       * @param creationTimeMillis the creation time in milliseconds
+       70       * @param author the author who is creating the new element
+       71       * @param encrypt whether to enable encryption for the created element
+       72       */
+       73      T create(String name, long creationTimeMillis, Author author, boolean encrypt);
+       74  
+       75      /**
+       76       * Returns all elements as a {@link Map} of the name and the element.
+       77       */
+       78      Map<String, T> list();
+       79  
+       80      /**
+       81       * Returns all removed elements as a {@link Map} of the name and the removal timestamp.
+       82       */
+       83      Map<String, Instant> listRemoved();
+       84  
+       85      /**
+       86       * Removes an element with the specified {@code name}.
+       87       *
+       88       * @param name the name of an element which is supposed to be removed
+       89       */
+       90      void remove(String name);
+       91  
+       92      /**
+       93       * Restores an element with the specified {@code name}.
+       94       *
+       95       * @param name the name of an element which is supposed to be restored
+       96       */
+       97      T unremove(String name);
+       98  
+       99      /**
+      100       * Purges a set of names for the elements which have been marked for purge.
+      101       */
+      102      void purgeMarked();
+      103  
+      104      /**
+      105       * Marks the specified {@code name} element for purge.
+      106       *
+      107       * @param name the name of an element which is supposed to be purged
+      108       */
+      109      void markForPurge(String name);
+      110  
+      111      /**
+      112       * Ensures that this manager is open.
+      113       *
+      114       * @throws IllegalStateException if this manager is not initialized yet
+      115       * @throws CentralDogmaException if this manager has already been closed with a cause.
+      116       *                               See {@link #close(Supplier)} method.
+      117       */
+      118      void ensureOpen();
+      119  }
+
+---------- IMPLEMENTER com.linecorp.centraldogma.server.internal.storage.DirectoryBasedStorageManager  stubs=0/11 ----------
+       55  public abstract class DirectoryBasedStorageManager<T> implements StorageManager<T> {
+       56  
+       57      private static final Logger logger = LoggerFactory.getLogger(DirectoryBasedStorageManager.class);
+       58  
+       59      public static final String SUFFIX_REMOVED = ".removed";
+       60      public static final String SUFFIX_PURGED = ".purged";
+       61      private static final String GIT_EXTENSION = ".git";
+       62  
+       63      private final String childTypeName;
+       64      private final File rootDir;
+       65      private final StorageRemovalManager storageRemovalManager = new StorageRemovalManager();
+       66      private final ConcurrentMap<String, T> children = new ConcurrentHashMap<>();
+       67      private final AtomicReference<Supplier<CentralDogmaException>> closed = new AtomicReference<>();
+       68      private final Executor purgeWorker;
+       69      private final EncryptionStorageManager encryptionStorageManager;
+       70      private boolean initialized;
+       71  
+       72      protected DirectoryBasedStorageManager(File rootDir, Class<? extends T> childType,
+       73                                             Executor purgeWorker,
+       74                                             EncryptionStorageManager encryptionStorageManager) {
+       75          requireNonNull(rootDir, "rootDir");
+       76          this.purgeWorker = requireNonNull(purgeWorker, "purgeWorker");
+       77          this.encryptionStorageManager = requireNonNull(encryptionStorageManager, "encryptionStorageManager");
+       78  
+       79          if (!rootDir.exists()) {
+       80              if (!rootDir.mkdirs()) {
+       81                  throw new StorageException("failed to create root directory at " + rootDir);
+       82              }
+       83          }
+       84  
+       85          try {
+       86              rootDir = rootDir.getCanonicalFile();
+       87          } catch (IOException e) {
+       88              throw new StorageException("failed to get the canonical path of: " + rootDir, e);
+       89          }
+       90  
+       91          if (!rootDir.isDirectory()) {
+       92              throw new StorageException("not a directory: " + rootDir);
+       93          }
+       94  
+       95          this.rootDir = rootDir;
+       96          childTypeName = Util.simpleTypeName(requireNonNull(childType, "childTypeName"), true);
+       97      }
+       98  
+       99      protected Executor purgeWorker() {
+      100          return purgeWorker;
+      101      }
+      102  
+      103      protected EncryptionStorageManager encryptionStorageManager() {
+      104          return encryptionStorageManager;
+      105      }
+      106  
+      107      /**
+      108       * Initializes this {@link StorageManager} by loading all children.
+      109       */
+      110      protected final void init() {
+      111          checkState(!initialized, "initialized already");
+      112          Throwable cause = null;
+      113          try {
+      114              final File[] childFiles = rootDir.listFiles();
+      115              if (childFiles != null) {
+      116                  for (File f : childFiles) {
+      117                      loadChild(f);
+      118                  }
+      119              }
+      120              initialized = true;
+      121          } catch (Throwable t) {
+      122              cause = t;
+      123          }
+      124  
+      125          if (cause != null) {
+      126              final CentralDogmaException finalCause;
+      127              if (cause instanceof CentralDogmaException) {
+      128                  finalCause = (CentralDogmaException) cause;
+      129              } else {
+      130                  finalCause = new CentralDogmaException("Failed to load a child: " + cause, cause);
+      131              }
+      132              close(() -> finalCause);
+      133              throw finalCause;
+      134          }
+      135      }
+      136  
+      137      @Nullable
+      138      private T loadChild(File f) {
+      139          final String name = f.getName();
+      140          if (!isValidChildName(name)) {
+      141              return null;
+      142          }
+      143  
+      144          if (!f.isDirectory()) {
+      145              return null;
+      146          }
+      147  
+      148          if (new File(f + SUFFIX_REMOVED).exists()) {
+      149              return null;
+      150          }
+      151  
+      152          try {
+      153              final T child = openChild(f);
+      154              children.put(name, child);
+      155              return child;
+      156          } catch (RuntimeException e) {
+      157              throw e;
+      158          } catch (Exception e) {
+      159              throw new StorageException("failed to open " + childTypeName + ": " + f, e);
+      160          }
+      161      }
+      162  
+      163      protected boolean replaceChild(String name, T oldChild, T newChild) {
+      164          return children.replace(name, oldChild, newChild);
+      165      }
+      166  
+      167      protected abstract T openChild(File childDir) throws Exception;
+      168  
+      169      protected abstract T createChild(
+      170              File childDir, Author author, long creationTimeMillis, boolean encrypt) throws Exception;
+      171  
+      172      private void closeChild(String name, T child, Supplier<CentralDogmaException> failureCauseSupplier) {
+      173          closeChild(new File(rootDir, name), child, failureCauseSupplier);
+      174      }
+      175  
+      176      protected void closeChild(File childDir, T child, Supplier<CentralDogmaException> failureCauseSupplier) {}
+      177  
+      178      protected abstract CentralDogmaException newStorageExistsException(String name);
+      179  
+      180      protected abstract CentralDogmaException newStorageNotFoundException(String name);
+      181  
+      182      protected abstract void deletePurged(File file);
+      183  
+      184      @Override
+      185      public void close(Supplier<CentralDogmaException> failureCauseSupplier) {
+      186          requireNonNull(failureCauseSupplier, "failureCauseSupplier");
+      187          if (!closed.compareAndSet(null, failureCauseSupplier)) {
+      188              return;
+      189          }
+      190  
+      191          // Close all children.
+      192          for (Map.Entry<String, T> e : children.entrySet()) {
+      193              closeChild(e.getKey(), e.getValue(), failureCauseSupplier);
+      194          }
+      195      }
+      196  
+      197      @Override
+      198      public boolean exists(String name) {
+      199          ensureOpen();
+      200          return children.containsKey(validateChildName(name));
+      201      }
+      202  
+      203      @Override
+      204      public T get(String name) {
+      205          ensureOpen();
+      206          final T child = children.get(validateChildName(name));
+      207          if (child == null) {
+      208              throw newStorageNotFoundException(name);
+      209          }
+      210  
+      211          return child;
+      212      }
+      213  
+      214      @Override
+
+---------- IMPLEMENTER com.linecorp.centraldogma.server.internal.storage.project.DefaultProjectManager  stubs=0/1 ----------
+       45  public final class DefaultProjectManager extends DirectoryBasedStorageManager<Project>
+       46          implements ProjectManager {
+       47  
+       48      private static final Logger logger = LoggerFactory.getLogger(DefaultProjectManager.class);
+       49  
+       50      private final Executor repositoryWorker;
+       51      @Nullable
+       52      private final RepositoryCache cache;
+       53  
+       54      public DefaultProjectManager(File rootDir, Executor repositoryWorker, Executor purgeWorker,
+       55                                   MeterRegistry meterRegistry, @Nullable String cacheSpec,
+       56                                   EncryptionStorageManager encryptionStorageManager) {
+       57          super(rootDir, Project.class, purgeWorker, encryptionStorageManager);
+       58  
+       59          requireNonNull(meterRegistry, "meterRegistry");
+       60          requireNonNull(repositoryWorker, "repositoryWorker");
+       61  
+       62          this.repositoryWorker = repositoryWorker;
+       63          cache = cacheSpec != null ? new RepositoryCache(cacheSpec, meterRegistry) : null;
+       64  
+       65          init();
+       66      }
+       67  
+       68      @Override
+       69      public void close(Supplier<CentralDogmaException> failureCauseSupplier) {
+       70          super.close(failureCauseSupplier);
+       71          if (cache != null) {
+       72              cache.clear();
+       73          }
+       74      }
+       75  
+       76      @Override
+       77      protected Project openChild(File childDir) throws Exception {
+       78          return new DefaultProject(childDir, repositoryWorker, purgeWorker(), cache, encryptionStorageManager());
+       79      }
+       80  
+       81      @Override
+       82      protected Project createChild(
+       83              File childDir, Author author, long creationTimeMillis, boolean encrypt) throws Exception {
+       84          return new DefaultProject(childDir, repositoryWorker, purgeWorker(),
+       85                                    creationTimeMillis, author, cache, encryptionStorageManager(), encrypt);
+       86      }
+       87  
+       88      @Override
+       89      protected void closeChild(File childDir, Project child,
+       90                                Supplier<CentralDogmaException> failureCauseSupplier) {
+       91          final DefaultProject c = (DefaultProject) child;
+       92          c.repos.close(failureCauseSupplier);
+       93      }
+       94  
+       95      @Override
+       96      protected CentralDogmaException newStorageExistsException(String name) {
+       97          return ProjectExistsException.of(name);
+       98      }
+       99  
+      100      @Override
+      101      protected CentralDogmaException newStorageNotFoundException(String name) {
+      102          return ProjectNotFoundException.of(name);
+      103      }
+      104  
+      105      @Override
+      106      protected void deletePurged(File file) {
+      107          final String projectName = removeInterfixAndPurgedSuffix(file.getName());
+      108          logger.info("Deleting a purged project: {} ..", projectName);
+      109          try {
+      110              final File[] childFiles = file.listFiles();
+      111              if (childFiles != null) {
+      112                  for (File child : childFiles) {
+      113                      if (child.isDirectory() && isEncryptedRepository(child)) {
+      114                          final String name = child.getName();
+      115                          final String repoName;
+      116                          if (name.endsWith(SUFFIX_REMOVED))  {
+      117                              repoName = name.substring(0, name.length() - SUFFIX_REMOVED.length());
+      118                          } else if (name.endsWith(SUFFIX_PURGED)) {
+      119                              repoName = removeInterfixAndPurgedSuffix(name);
+      120                          } else {
+      121                              repoName = name;
+      122                          }
+      123                          encryptionStorageManager().deleteRepositoryData(projectName, repoName);
+      124                      }
+      125                  }
+      126              }
+      127              deleteFileTree(file);
+      128              logger.info("Deleted a purged project: {}.", projectName);
+      129          } catch (IOException e) {
+      130              logger.warn("Failed to delete a purged project: {}", projectName, e);
+      131          }
+      132      }
+      133  }
+
+---------- IMPLEMENTER com.linecorp.centraldogma.server.internal.storage.repository.RepositoryManagerWrapper  stubs=0/11 ----------
+       40  public class RepositoryManagerWrapper implements RepositoryManager {
+       41      private final RepositoryManager delegate;
+       42      private final Function<Repository, Repository> repoWrapper;
+       43      private final ConcurrentMap<String, Repository> repos = new ConcurrentHashMap<>();
+       44  
+       45      public RepositoryManagerWrapper(RepositoryManager repoManager,
+       46                                      Function<Repository, Repository> repoWrapper) {
+       47  
+       48          delegate = requireNonNull(repoManager, "repoManager");
+       49          this.repoWrapper = requireNonNull(repoWrapper, "repoWrapper");
+       50          for (Map.Entry<String, Repository> entry : delegate.list().entrySet()) {
+       51              repos.computeIfAbsent(entry.getKey(), n -> repoWrapper.apply(entry.getValue()));
+       52          }
+       53      }
+       54  
+       55      @Override
+       56      public Project parent() {
+       57          return delegate.parent();
+       58      }
+       59  
+       60      @Override
+       61      public void migrateToEncryptedRepository(String repositoryName) {
+       62          delegate.migrateToEncryptedRepository(repositoryName);
+       63          repos.replace(repositoryName, repoWrapper.apply(delegate.get(repositoryName)));
+       64      }
+       65  
+       66      @Override
+       67      public void close(Supplier<CentralDogmaException> failureCauseSupplier) {
+       68          delegate.close(failureCauseSupplier);
+       69      }
+       70  
+       71      @Override
+       72      public boolean exists(String name) {
+       73          return delegate.exists(name);
+       74      }
+       75  
+       76      @Override
+       77      public Repository get(String name) {
+       78          ensureOpen();
+       79          final Repository r = repos.get(name);
+       80          if (r == null) {
+       81              throw RepositoryNotFoundException.of(parent().name(), name);
+       82          }
+       83          return r;
+       84      }
+       85  
+       86      @Override
+       87      public Repository create(String name, long creationTimeMillis, Author author, boolean encrypt) {
+       88          return repos.compute(
+       89                  name, (n, v) -> repoWrapper.apply(delegate.create(name, creationTimeMillis, author, encrypt)));
+       90      }
+       91  
+       92      @Override
+       93      public Map<String, Repository> list() {
+       94          ensureOpen();
+       95          final int estimatedSize = repos.size();
+       96          final String[] names = repos.keySet().toArray(new String[estimatedSize]);
+       97          Arrays.sort(names);
+       98  
+       99          final Map<String, Repository> ret = new LinkedHashMap<>(names.length);
+      100          for (String name : names) {
+      101              final Repository repo = repos.get(name);
+      102              if (repo != null) {
+      103                  ret.put(name, repo);
+      104              }
+      105          }
+      106          return Collections.unmodifiableMap(ret);
+      107      }
+      108  
+      109      @Override
+      110      public Map<String, Instant> listRemoved() {
+      111          return delegate.listRemoved();
+      112      }
+      113  
+      114      @Override
+      115      public void remove(String name) {
+      116          repos.compute(name, (n, v) -> {
+      117              delegate.remove(n);
+      118              return null;
+      119          });
+      120      }
+      121  
+      122      @Override
+      123      public Repository unremove(String name) {
+      124          ensureOpen();
+      125          return repos.computeIfAbsent(name, n -> repoWrapper.apply(delegate.unremove(n)));
+      126      }
+      127  
+      128      @Override
+      129      public void purgeMarked() {
+      130          delegate.purgeMarked();
+      131      }
+      132  
+      133      @Override
+      134      public void markForPurge(String name) {
+      135          repos.compute(name, (n, v) -> {
+      136              delegate.markForPurge(name);
+      137              return null;
+      138          });
+      139      }
+      140  
+      141      @Override
+      142      public void ensureOpen() {
+      143          delegate.ensureOpen();
+      144      }
+      145  
+      146      @Override
+      147      public String toString() {
+      148          final StringBuilder sb = new StringBuilder(128);
+      149          sb.append(Util.simpleTypeName(getClass()) + '{');
+      150          sb.append("repositoryManager=");
+      151          sb.append(delegate);
+      152          sb.append(", repos={");
+      153          final Iterator<Map.Entry<String, Repository>> iterator = repos.entrySet().iterator();
+      154          Map.Entry<String, Repository> entry;
+      155          if (iterator.hasNext()) {
+      156              for (;;) {
+      157                  entry = iterator.next();
+      158                  sb.append(entry.getKey());
+      159                  sb.append('=');
+      160                  sb.append(Util.simpleTypeName(entry.getValue()));
+      161                  if (!iterator.hasNext()) {
+      162                      break;
+      163                  }
+      164                  sb.append(", ");
+      165              }
+      166          }
+      167          sb.append("}}");
+      168          return sb.toString();
+      169      }
+      170  }

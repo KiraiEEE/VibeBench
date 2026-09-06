@@ -1,0 +1,396 @@
+row 32   JetBrains/youtrackdb#649
+============================================================================
+CONTRACT com.jetbrains.youtrackdb.internal.core.db.SchedulerInternal   members=2.0 implementers=4.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+        5  public interface SchedulerInternal {
+        6  
+        7    void schedule(TimerTask task, long delay, long period);
+        8  
+        9    void scheduleOnce(TimerTask task, long delay);
+       10  }
+
+---------- IMPLEMENTER com.jetbrains.youtrackdb.internal.core.db.YouTrackDBInternalEmbedded  stubs=0/2 ----------
+       78  public class YouTrackDBInternalEmbedded implements YouTrackDBInternal {
+       79  
+       80    /**
+       81     * Keeps track of next possible storage id.
+       82     */
+       83    private static final AtomicInteger nextStorageId = new AtomicInteger();
+       84  
+       85    /**
+       86     * Storage IDs current assigned to the storage.
+       87     */
+       88    private static final Set<Integer> currentStorageIds =
+       89        Collections.newSetFromMap(new ConcurrentHashMap<>());
+       90  
+       91    private final Map<String, AbstractStorage> storages = new ConcurrentHashMap<>();
+       92    private final Map<String, SharedContext> sharedContexts = new ConcurrentHashMap<>();
+       93    private final Set<DatabasePoolInternal> pools = Collections.newSetFromMap(
+       94        new ConcurrentHashMap<>());
+       95    private final YouTrackDBConfigImpl configuration;
+       96    private final Path basePath;
+       97    private final Engine memory;
+       98    private final Engine disk;
+       99    private final YouTrackDBEnginesManager youTrack;
+      100    private final boolean serverMode;
+      101    private final CachedDatabasePoolFactory cachedPoolFactory;
+      102    private volatile boolean open = true;
+      103    private final ExecutorService executor;
+      104    private final ExecutorService ioExecutor;
+      105    private final Timer timer;
+      106    private TimerTask autoCloseTimer = null;
+      107    private final ScriptManager scriptManager = new ScriptManager();
+      108    private final SystemDatabase systemDatabase;
+      109    private final DefaultSecuritySystem securitySystem;
+      110    private final CommandTimeoutChecker timeoutChecker;
+      111  
+      112    private volatile long maxWALSegmentSize = -1;
+      113    private volatile long doubleWriteLogMaxSegSize = -1;
+      114  
+      115    private final ReentrantLock fileMetadataLock = new ReentrantLock();
+      116  
+      117    public YouTrackDBInternalEmbedded(String directoryPath, YouTrackDBConfig configuration,
+      118        YouTrackDBEnginesManager youTrack, boolean serverMode) {
+      119      super();
+      120  
+      121      this.youTrack = youTrack;
+      122      this.serverMode = serverMode;
+      123      youTrack.onEmbeddedFactoryInit(this);
+      124      memory = youTrack.getEngine("memory");
+      125      disk = youTrack.getEngine("disk");
+      126      basePath = Path.of(directoryPath.trim()).toAbsolutePath().normalize();
+      127  
+      128      this.configuration =
+      129          (YouTrackDBConfigImpl) (configuration != null ? configuration
+      130              : YouTrackDBConfig.defaultConfig());
+      131  
+      132      MemoryAndLocalPaginatedEnginesInitializer.INSTANCE.initialize();
+      133  
+      134      youTrack.addYouTrackDB(this);
+      135      executor = newExecutor();
+      136      ioExecutor = newIoExecutor();
+      137      var timerName = "embedded:" + basePath;
+      138      timer = new Timer("YouTrackDB Timer[" + timerName + "]");
+      139  
+      140      cachedPoolFactory = createCachedDatabasePoolFactory();
+      141  
+      142      initAutoClose();
+      143  
+      144      var timeout = getLongConfig(GlobalConfiguration.COMMAND_TIMEOUT);
+      145      timeoutChecker = new CommandTimeoutChecker(timeout, this);
+      146      systemDatabase = new SystemDatabase(this);
+      147      securitySystem = new DefaultSecuritySystem();
+      148  
+      149      securitySystem.activate(this, this.configuration.getSecurityConfig());
+      150    }
+      151  
+      152    private void initAutoClose() {
+      153  
+      154      var autoClose = getBoolConfig(GlobalConfiguration.AUTO_CLOSE_AFTER_DELAY);
+      155      if (autoClose) {
+      156        var autoCloseDelay = getIntConfig(GlobalConfiguration.AUTO_CLOSE_DELAY);
+      157        final var delay = (long) autoCloseDelay * 60 * 1000;
+      158        initAutoClose(delay);
+      159      }
+      160    }
+      161  
+      162    @Nullable
+      163    private ExecutorService newIoExecutor() {
+      164      if (getBoolConfig(GlobalConfiguration.EXECUTOR_POOL_IO_ENABLED)) {
+      165        var ioSize = excutorMaxSize(GlobalConfiguration.EXECUTOR_POOL_IO_MAX_SIZE);
+      166        var exec =
+      167            ThreadPoolExecutors.newScalingThreadPool(
+      168                "YouTrackDB-IO", 1, excutorBaseSize(ioSize), ioSize, 30, TimeUnit.MINUTES);
+      169        if (getBoolConfig(GlobalConfiguration.EXECUTOR_DEBUG_TRACE_SOURCE)) {
+      170          exec = new SourceTraceExecutorService(exec);
+      171        }
+      172        return exec;
+      173      } else {
+      174        return null;
+      175      }
+      176    }
+      177  
+      178    private ExecutorService newExecutor() {
+      179      var size = excutorMaxSize(GlobalConfiguration.EXECUTOR_POOL_MAX_SIZE);
+      180      var exec =
+      181          ThreadPoolExecutors.newScalingThreadPool(
+      182              "YouTrackDBEmbedded", 1, excutorBaseSize(size), size, 30, TimeUnit.MINUTES);
+      183      if (getBoolConfig(GlobalConfiguration.EXECUTOR_DEBUG_TRACE_SOURCE)) {
+      184        exec = new SourceTraceExecutorService(exec);
+      185      }
+      186      return exec;
+      187    }
+      188  
+      189    private boolean getBoolConfig(GlobalConfiguration config) {
+      190      return this.configuration.getConfiguration().getValueAsBoolean(config);
+      191    }
+      192  
+      193    private int getIntConfig(GlobalConfiguration config) {
+      194      return this.configuration.getConfiguration().getValueAsInteger(config);
+      195    }
+      196  
+      197    private long getLongConfig(GlobalConfiguration config) {
+      198      return this.configuration.getConfiguration().getValueAsLong(config);
+      199    }
+      200  
+      201    private int excutorMaxSize(GlobalConfiguration config) {
+      202      var size = getIntConfig(config);
+      203      if (size == 0) {
+      204        LogManager.instance()
+      205            .warn(
+      206                this,
+      207                "Configuration "
+      208                    + config.getKey()
+      209                    + " has a value 0 using number of CPUs as base value");
+      210        size = Runtime.getRuntime().availableProcessors();
+      211      } else if (size <= -1) {
+      212        size = Runtime.getRuntime().availableProcessors();
+      213      }
+      214      return size;
+      215    }
+      216  
+      217    private static int excutorBaseSize(int size) {
+      218      int baseSize;
+      219  
+      220      if (size > 10) {
+      221        baseSize = size / 10;
+      222      } else if (size > 4) {
+      223        baseSize = size / 2;
+      224      } else {
+      225        baseSize = size;
+      226      }
+      227      return baseSize;
+      228    }
+      229  
+      230    private CachedDatabasePoolFactory createCachedDatabasePoolFactory() {
+      231      var capacity = getIntConfig(GlobalConfiguration.DB_CACHED_POOL_CAPACITY);
+      232      long timeout = getIntConfig(GlobalConfiguration.DB_CACHED_POOL_CLEAN_UP_TIMEOUT);
+      233      return new CachedDatabasePoolFactoryImpl(this, capacity, timeout);
+      234    }
+      235  
+      236    public void initAutoClose(long delay) {
+      237      final var scheduleTime = delay / 3;
+
+---------- IMPLEMENTER com.jetbrains.youtrackdb.internal.core.db.CommandTimeoutCheckerTest  stubs=1/2 ----------
+       11  public class CommandTimeoutCheckerTest implements SchedulerInternal {
+       12  
+       13    private final Timer timer = new Timer();
+       14  
+       15    @Override
+       16    public void schedule(TimerTask task, long delay, long period) {
+       17      timer.scheduleAtFixedRate(task, delay, period);
+       18    }
+       19  
+       20    @Override
+       21    public void scheduleOnce(TimerTask task, long delay) {
+       22      throw new UnsupportedOperationException();
+       23    }
+       24  
+       25    @Test
+       26    public void testTimeout() throws InterruptedException {
+       27      var checker = new CommandTimeoutChecker(100, this);
+       28      var latch = new CountDownLatch(10);
+       29      for (var i = 0; i < 10; i++) {
+       30        new Thread(
+       31            () -> {
+       32              checker.startCommand(null);
+       33              try {
+       34                Thread.sleep(1000);
+       35              } catch (InterruptedException e) {
+       36                latch.countDown();
+       37              }
+       38              checker.endCommand();
+       39            })
+       40            .start();
+       41      }
+       42  
+       43      assertTrue(latch.await(2, TimeUnit.SECONDS));
+       44      checker.close();
+       45    }
+       46  
+       47    @Test
+       48    public void testNoTimeout() throws InterruptedException {
+       49      var checker = new CommandTimeoutChecker(1000, this);
+       50      var latch = new CountDownLatch(10);
+       51      for (var i = 0; i < 10; i++) {
+       52        new Thread(
+       53            () -> {
+       54              checker.startCommand(null);
+       55              try {
+       56                Thread.sleep(100);
+       57              } catch (InterruptedException e) {
+       58                throw new RuntimeException(e);
+       59              }
+       60              latch.countDown();
+       61              checker.endCommand();
+       62            })
+       63            .start();
+       64      }
+       65  
+       66      assertTrue(latch.await(2, TimeUnit.SECONDS));
+       67      checker.close();
+       68    }
+       69  }
+
+---------- IMPLEMENTER com.jetbrains.youtrackdb.internal.server.YouTrackDBServer.YTDBInternalProxy  stubs=0/2 ----------
+      617    public final class YTDBInternalProxy implements YouTrackDBInternal, ServerAware {
+      618  
+      619      private final YouTrackDBInternalEmbedded internal;
+      620  
+      621      private YTDBInternalProxy(YouTrackDBInternalEmbedded internal) {
+      622        this.internal = internal;
+      623      }
+      624  
+      625      @Override
+      626      public YouTrackDBImpl newYouTrackDb() {
+      627        return YTDBGraphFactory.ytdbInstance(internal.getBasePath(), () -> this);
+      628      }
+      629  
+      630      @Override
+      631      public DatabaseSessionEmbedded open(String name, String user, String password) {
+      632        return internal.open(name, user, password);
+      633      }
+      634  
+      635      @Override
+      636      public DatabaseSessionEmbedded open(String name, String user, String password,
+      637          YouTrackDBConfig config) {
+      638        return internal.open(name, user, password, config);
+      639      }
+      640  
+      641      @Override
+      642      public DatabaseSessionEmbedded open(AuthenticationInfo authenticationInfo,
+      643          YouTrackDBConfig config) {
+      644        return internal.open(authenticationInfo, config);
+      645      }
+      646  
+      647      @Override
+      648      public void create(String name, String user, String password, DatabaseType type) {
+      649        dbNamesCacheLock.lock();
+      650        try {
+      651          internal.create(name, user, password, type);
+      652          dbNamesCache.add(name);
+      653        } finally {
+      654          dbNamesCacheLock.unlock();
+      655        }
+      656  
+      657      }
+      658  
+      659      @Override
+      660      public void create(String name, String user, String password, DatabaseType type,
+      661          YouTrackDBConfig config) {
+      662        dbNamesCacheLock.lock();
+      663        try {
+      664          internal.create(name, user, password, type, config);
+      665          dbNamesCache.add(name);
+      666        } finally {
+      667          dbNamesCacheLock.unlock();
+      668        }
+      669  
+      670      }
+      671  
+      672  
+      673      @Override
+      674      public boolean exists(String name) {
+      675        //system database is managed inside of embedded instance autonomously
+      676        if (SystemDatabase.SYSTEM_DB_NAME.equals(name)) {
+      677          return internal.exists(name);
+      678        }
+      679  
+      680        return dbNamesCache.contains(name);
+      681      }
+      682  
+      683      @Override
+      684      public void drop(String name, String user, String password) {
+      685        dbNamesCacheLock.lock();
+      686        try {
+      687          internal.drop(name, user, password);
+      688          dbNamesCache.remove(name);
+      689        } finally {
+      690          dbNamesCacheLock.unlock();
+      691        }
+      692  
+      693      }
+      694  
+      695      @Override
+      696      public Set<String> listDatabases(String user, String password) {
+      697        return Collections.unmodifiableSet(dbNamesCache);
+      698      }
+      699  
+      700      @Override
+      701      public DatabasePoolInternal openPool(String name, String user,
+      702          String password) {
+      703        return internal.openPool(name, user, password);
+      704      }
+      705  
+      706      @Override
+      707      public DatabasePoolInternal openPool(String name, String user, String password,
+      708          YouTrackDBConfig config) {
+      709        return internal.openPool(name, user, password, config);
+      710      }
+      711  
+      712      @Override
+      713      public DatabasePoolInternal cachedPool(String database, String user,
+      714          String password) {
+      715        return internal.cachedPool(database, user, password);
+      716      }
+      717  
+      718      @Override
+      719      public DatabasePoolInternal cachedPool(String database, String user,
+      720          String password, YouTrackDBConfig config) {
+      721        return internal.cachedPool(database, user, password, config);
+      722      }
+      723  
+      724      @Override
+      725      public DatabasePoolInternal cachedPoolNoAuthentication(String database,
+      726          String user, YouTrackDBConfig config) {
+      727        return internal.cachedPoolNoAuthentication(database, user, config);
+      728      }
+      729  
+      730      @Override
+      731      public DatabaseSessionEmbedded poolOpen(String name, String user, String password,
+      732          DatabasePoolInternal pool) {
+      733        return internal.poolOpen(name, user, password, pool);
+      734      }
+      735  
+      736      @Override
+      737      public void restore(String name, String path,
+      738          YouTrackDBConfig config) {
+      739        dbNamesCacheLock.lock();
+      740        try {
+      741          internal.restore(name, path, config);
+      742          dbNamesCache.add(name);
+      743        } finally {
+      744          dbNamesCacheLock.unlock();
+      745        }
+      746      }
+      747  
+      748      @Override
+      749      public void restore(String name, String path,
+      750          @Nullable String expectedUUID, YouTrackDBConfig config) {
+      751        dbNamesCacheLock.lock();
+      752        try {
+      753          internal.restore(name, path, expectedUUID, config);
+      754          dbNamesCache.add(name);
+      755        } finally {
+      756          dbNamesCacheLock.unlock();
+      757        }
+      758      }
+      759  
+      760      @Override
+      761      public void restore(String name, Supplier<Iterator<String>> ibuFilesSupplier,
+      762          Function<String, InputStream> ibuInputStreamSupplier, @Nullable String expectedUUID,
+      763          YouTrackDBConfig config) {
+      764        dbNamesCacheLock.lock();
+      765        try {
+      766          internal.restore(name, ibuFilesSupplier, ibuInputStreamSupplier, expectedUUID, config);
+      767          dbNamesCache.add(name);
+      768        } finally {
+      769          dbNamesCacheLock.unlock();
+      770        }
+      771      }
+      772  
+      773      @Override
+      774      public void close() {
+      775        internal.close();
+      776      }

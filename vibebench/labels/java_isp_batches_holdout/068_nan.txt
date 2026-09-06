@@ -1,0 +1,627 @@
+row 68   questdb/questdb#6903
+============================================================================
+CONTRACT io.questdb.mp.AbstractQueueConsumerJob   members=1.0 implementers=15.0
+QUESTION: are clients FORCED to depend on members they do not use?
+
+       30  public abstract class AbstractQueueConsumerJob<T> implements Job {
+       31      protected final RingQueue<T> queue;
+       32      protected final Sequence subSeq;
+       33  
+       34      public AbstractQueueConsumerJob(RingQueue<T> queue, Sequence subSeq) {
+       35          this.queue = queue;
+       36          this.subSeq = subSeq;
+       37      }
+       38  
+       39      @Override
+       40      public boolean run(int workerId, @NotNull RunStatus runStatus) {
+       41          if (!canRun()) {
+       42              return false;
+       43          }
+       44          while (true) {
+       45              final long cursor = subSeq.next();
+       46              if (cursor == -1) {
+       47                  return false;
+       48              }
+       49              if (cursor > -1) {
+       50                  return doRun(workerId, cursor, runStatus);
+       51              }
+       52              Os.pause();
+       53          }
+       54      }
+       55  
+       56      protected boolean canRun() {
+       57          return true;
+       58      }
+       59  
+       60      protected abstract boolean doRun(int workerId, long cursor, RunStatus runStatus);
+       61  }
+
+---------- IMPLEMENTER io.questdb.cairo.ColumnIndexerJob  stubs=0/1 ----------
+       32  public class ColumnIndexerJob extends AbstractQueueConsumerJob<ColumnIndexerTask> {
+       33  
+       34      public ColumnIndexerJob(MessageBus messageBus) {
+       35          super(messageBus.getIndexerQueue(), messageBus.getIndexerSubSequence());
+       36      }
+       37  
+       38      protected boolean doRun(int workerId, long cursor, RunStatus runStatus) {
+       39          final ColumnIndexerTask queueItem = queue.get(cursor);
+       40          // copy values and release queue item
+       41          final ColumnIndexer indexer = queueItem.indexer;
+       42          final long lo = queueItem.lo;
+       43          final long hi = queueItem.hi;
+       44          final long indexSequence = queueItem.sequence;
+       45          final SOCountDownLatch latch = queueItem.countDownLatch;
+       46          subSeq.done(cursor);
+       47  
+       48          // On the face of it main thread could have consumed same sequence as
+       49          // child workers. The reason it is undesirable is that all writers
+       50          // share the same queue and main thread end up indexing content for other writers.
+       51          // Using CAS allows main thread to steal only parts of its own job.
+       52          if (indexer.tryLock(indexSequence)) {
+       53              TableWriter.indexAndCountDown(indexer, lo, hi, latch);
+       54              return true;
+       55          }
+       56          // This is hard to test. Condition occurs when main thread successfully steals
+       57          // work from under nose of this worker.
+       58          return false;
+       59      }
+       60  }
+
+---------- IMPLEMENTER io.questdb.cairo.ColumnTaskJob  stubs=0/1 ----------
+       34  public class ColumnTaskJob extends AbstractQueueConsumerJob<ColumnTask> {
+       35      public ColumnTaskJob(MessageBus messageBus) {
+       36          super(messageBus.getColumnTaskQueue(), messageBus.getColumnTaskSubSeq());
+       37      }
+       38  
+       39      public static void processColumnTask(ColumnTask task, long cursor, @NotNull Sequence subSeq) {
+       40          final int columnIndex = task.getColumnIndex();
+       41          final int columnType = task.getColumnType();
+       42          final long timestampColumnIndex = task.getTimestampColumnIndex();
+       43          final long lon0 = task.getLong0();
+       44          final long long1 = task.getLong1();
+       45          final long long2 = task.getLong2();
+       46          final long long3 = task.getLong3();
+       47          final long long4 = task.getLong4();
+       48          final TableWriter.ColumnTaskHandler taskHandler = task.getTaskHandler();
+       49          final CountDownLatchSPI countDownLatchSPI = task.getCountDownLatchSPI();
+       50          subSeq.done(cursor);
+       51  
+       52          try {
+       53              taskHandler.run(
+       54                      columnIndex,
+       55                      columnType,
+       56                      timestampColumnIndex,
+       57                      lon0,
+       58                      long1,
+       59                      long2,
+       60                      long3,
+       61                      long4
+       62              );
+       63          } finally {
+       64              countDownLatchSPI.countDown();
+       65          }
+       66      }
+       67  
+       68      @Override
+       69      protected boolean doRun(int workerId, long cursor, RunStatus runStatus) {
+       70          ColumnTask task = queue.get(cursor);
+       71          processColumnTask(task, cursor, subSeq);
+       72          return true;
+       73      }
+       74  }
+
+---------- IMPLEMENTER io.questdb.cairo.FlushQueryCacheJob  stubs=0/1 ----------
+       35  public class FlushQueryCacheJob extends AbstractQueueConsumerJob<Object> {
+       36      private static final Log LOG = LogFactory.getLog(FlushQueryCacheJob.class);
+       37      private final HttpServer httpServer;
+       38      private final PGServer pgServer;
+       39  
+       40      public FlushQueryCacheJob(MessageBus messageBus, @Nullable HttpServer httpServer, PGServer pgServer) {
+       41          super(null, messageBus.getQueryCacheEventSubSeq());
+       42          this.httpServer = httpServer;
+       43          this.pgServer = pgServer;
+       44      }
+       45  
+       46      @Override
+       47      protected boolean doRun(int workerId, long cursor, RunStatus runStatus) {
+       48          try {
+       49              if (httpServer != null) {
+       50                  LOG.info().$("flushing HTTP server select cache").$();
+       51                  httpServer.clearSelectCache();
+       52              }
+       53              if (pgServer != null) {
+       54                  LOG.info().$("flushing PGWire server select cache").$();
+       55                  pgServer.clearSelectCache();
+       56              }
+       57          } finally {
+       58              subSeq.done(cursor);
+       59          }
+       60          return false;
+       61      }
+       62  }
+
+---------- IMPLEMENTER io.questdb.cairo.O3CopyJob  stubs=0/1 ----------
+       44  public class O3CopyJob extends AbstractQueueConsumerJob<O3CopyTask> {
+       45      private static final Log LOG = LogFactory.getLog(O3CopyJob.class);
+       46  
+       47      public O3CopyJob(MessageBus messageBus) {
+       48          super(messageBus.getO3CopyQueue(), messageBus.getO3CopySubSeq());
+       49      }
+       50  
+       51      public static void copy(
+       52              AtomicInteger columnCounter,
+       53              @Nullable AtomicInteger partCounter,
+       54              int columnType,
+       55              int blockType,
+       56              long timestampMergeIndexAddr,
+       57              long timestampMergeIndexSize,
+       58              long srcDataFixFd,
+       59              long srcDataFixAddr,
+       60              long srcDataFixOffset,
+       61              long srcDataFixSize,
+       62              long srcDataVarFd,
+       63              long srcDataVarAddr,
+       64              long srcDataVarOffset,
+       65              long srcDataVarSize,
+       66              long srcDataLo,
+       67              long srcDataHi,
+       68              long srcDataTop,
+       69              long srcDataMax,
+       70              long srcOooFixAddr,
+       71              long srcOooVarAddr,
+       72              long srcOooLo,
+       73              long srcOooHi,
+       74              long srcOooMax,
+       75              long srcOooPartitionLo,
+       76              long srcOooPartitionHi,
+       77              long timestampMin,
+       78              long partitionTimestamp, // <-- this is used to determine if partition is last or not as well as partition dir
+       79              long dstFixFd,
+       80              long dstAuxAddr,
+       81              long dstFixOffset,
+       82              long dstFixFileOffset,
+       83              long dstFixSize,
+       84              long dstVarFd,
+       85              long dstVarAddr,
+       86              long dstVarOffset,
+       87              long dstVarAdjust,
+       88              long dstVarSize,
+       89              long dstKFd,
+       90              long dstVFd,
+       91              long dstIndexOffset,
+       92              long dstIndexAdjust,
+       93              int indexBlockCapacity,
+       94              long srcTimestampFd,
+       95              long srcTimestampAddr,
+       96              long srcTimestampSize,
+       97              boolean partitionMutates,
+       98              long srcDataNewPartitionSize,
+       99              long srcDataOldPartitionSize,
+      100              long o3SplitPartitionSize,
+      101              TableWriter tableWriter,
+      102              BitmapIndexWriter indexWriter,
+      103              long partitionUpdateSinkAddr
+      104      ) {
+      105          final boolean mixedIOFlag = tableWriter.allowMixedIO();
+      106          LOG.debug().$("o3 copy [blockType=").$(blockType)
+      107                  .$(", columnType=").$(columnType)
+      108                  .$(", dstFixFd=").$(dstFixFd)
+      109                  .$(", dstFixSize=").$(dstFixSize)
+      110                  .$(", dstFixOffset=").$(dstFixOffset)
+      111                  .$(", dstVarFd=").$(dstVarFd)
+      112                  .$(", dstVarSize=").$(dstVarSize)
+      113                  .$(", dstVarOffset=").$(dstVarOffset)
+      114                  .$(", srcDataLo=").$(srcDataLo)
+      115                  .$(", srcDataHi=").$(srcDataHi)
+      116                  .$(", srcDataMax=").$(srcDataMax)
+      117                  .$(", srcOooLo=").$(srcOooLo)
+      118                  .$(", srcOooHi=").$(srcOooHi)
+      119                  .$(", srcOooMax=").$(srcOooMax)
+      120                  .$(", srcOooPartitionLo=").$(srcOooPartitionLo)
+      121                  .$(", srcOooPartitionHi=").$(srcOooPartitionHi)
+      122                  .$(", mixedIOFlag=").$(mixedIOFlag)
+      123                  .$(", srcDataNewPartitionSize=").$(srcDataNewPartitionSize)
+      124                  .$(", srcDataOldPartitionSize=").$(srcDataOldPartitionSize)
+      125                  .$(", o3SplitPartitionSize=").$(o3SplitPartitionSize)
+      126                  .I$();
+      127  
+      128          try {
+      129              switch (blockType) {
+      130                  case O3_BLOCK_MERGE:
+      131                      mergeCopy(
+      132                              columnType,
+      133                              timestampMergeIndexAddr,
+      134                              timestampMergeIndexSize / TIMESTAMP_MERGE_ENTRY_BYTES,
+      135                              // this is a hack, when we have column top we can have only of the two:
+      136                              // srcDataFixOffset, when we had to shift data to back-fill nulls or
+      137                              // srcDataTopOffset - if we kept the column top
+      138                              // when one value is present the other will be 0
+      139                              srcDataFixAddr + srcDataFixOffset - srcDataTop,
+      140                              srcDataVarAddr + srcDataVarOffset,
+      141                              srcOooFixAddr,
+      142                              srcOooVarAddr,
+      143                              dstAuxAddr + dstFixOffset,
+      144                              dstVarAddr,
+      145                              dstVarOffset
+      146                      );
+      147                      break;
+      148                  case O3_BLOCK_O3:
+      149                      copyO3(
+      150                              tableWriter.getFilesFacade(),
+      151                              columnType,
+      152                              srcOooFixAddr,
+      153                              srcOooVarAddr,
+      154                              srcOooLo,
+      155                              srcOooHi,
+      156                              dstFixFd,
+      157                              dstAuxAddr + dstFixOffset,
+      158                              Math.abs(dstFixSize) - dstFixOffset,
+      159                              dstFixFileOffset,
+      160                              dstVarAddr,
+      161                              dstVarFd,
+      162                              dstVarOffset,
+      163                              dstVarAdjust,
+      164                              dstVarSize,
+      165                              mixedIOFlag
+      166                      );
+      167                      break;
+      168                  case O3_BLOCK_DATA:
+      169                      if (srcDataLo <= srcDataHi) {
+      170                          copyData(
+      171                                  tableWriter.getFilesFacade(),
+      172                                  columnType,
+      173                                  srcDataFixAddr + srcDataFixOffset,
+      174                                  srcDataVarAddr + srcDataVarOffset,
+      175                                  srcDataLo,
+      176                                  srcDataHi,
+      177                                  dstAuxAddr + dstFixOffset,
+      178                                  Math.abs(dstFixSize) - dstFixOffset,
+      179                                  dstFixFd,
+      180                                  dstFixFileOffset,
+      181                                  dstVarAddr,
+      182                                  dstVarFd,
+      183                                  dstVarOffset,
+      184                                  dstVarAdjust,
+      185                                  dstVarSize,
+      186                                  mixedIOFlag
+      187                          );
+      188                      }
+      189                      break;
+      190                  default:
+      191                      break;
+      192              }
+      193          } catch (Throwable th) {
+      194              // Notify table writer of error before clocking down done counters
+      195              tableWriter.o3BumpErrorCount(CairoException.isCairoOomError(th));
+      196  
+      197              // We cannot close / unmap fds here. Other copy jobs may still be running and using them.
+      198              // exception handling code of the stack will check if all the parts are finished before closing the memory / fds.
+      199              if (partCounter == null || partCounter.decrementAndGet() == 0) {
+      200                  unmapAndCloseAllPartsComplete(
+      201                          columnCounter,
+      202                          timestampMergeIndexAddr,
+      203                          timestampMergeIndexSize,
+
+---------- IMPLEMENTER io.questdb.cairo.O3OpenColumnJob  stubs=0/1 ----------
+       48  public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> {
+       49      public static final int OPEN_LAST_PARTITION_FOR_APPEND = 2;
+       50      public static final int OPEN_LAST_PARTITION_FOR_MERGE = 4;
+       51      public static final int OPEN_MID_PARTITION_FOR_APPEND = 1;
+       52      public static final int OPEN_MID_PARTITION_FOR_MERGE = 3;
+       53      public static final int OPEN_NEW_PARTITION_FOR_APPEND = 5;
+       54      private final static Log LOG = LogFactory.getLog(O3OpenColumnJob.class);
+       55  
+       56      public O3OpenColumnJob(MessageBus messageBus) {
+       57          super(messageBus.getO3OpenColumnQueue(), messageBus.getO3OpenColumnSubSeq());
+       58      }
+       59  
+       60      public static void appendLastPartition(
+       61              Path pathToPartition,
+       62              int plen,
+       63              CharSequence columnName,
+       64              AtomicInteger columnCounter,
+       65              int columnType,
+       66              long srcOooFixAddr,
+       67              long srcOooVarAddr,
+       68              long srcOooLo,
+       69              long srcOooHi,
+       70              long srcOooMax,
+       71              long timestampMin,
+       72              long partitionTimestamp,
+       73              long srcDataTop,
+       74              long srcDataMax,
+       75              int indexBlockCapacity,
+       76              MemoryMA dstFixMem,
+       77              MemoryMA dstVarMem,
+       78              long srcDataNewPartitionSize,
+       79              long srcDataOldPartitionSize,
+       80              long o3SplitPartitionSize,
+       81              TableWriter tableWriter,
+       82              BitmapIndexWriter indexWriter,
+       83              long columnNameTxn,
+       84              long partitionUpdateSinkAddr
+       85      ) {
+       86          final long dstLen = srcOooHi - srcOooLo + 1 + srcDataMax - srcDataTop;
+       87          if (ColumnType.isVarSize(columnType)) {
+       88              o3VarSizePartitionAppend(
+       89                      columnCounter,
+       90                      columnType,
+       91                      srcOooFixAddr,
+       92                      srcOooVarAddr,
+       93                      srcOooLo,
+       94                      srcOooHi,
+       95                      srcOooMax,
+       96                      timestampMin,
+       97                      partitionTimestamp,
+       98                      srcDataTop,
+       99                      srcDataMax,
+      100                      indexBlockCapacity,
+      101                      0,
+      102                      0,
+      103                      0,
+      104                      -dstFixMem.getFd(),
+      105                      -dstVarMem.getFd(),
+      106                      dstFixMem,
+      107                      dstVarMem,
+      108                      dstLen,
+      109                      srcDataNewPartitionSize,
+      110                      srcDataOldPartitionSize,
+      111                      o3SplitPartitionSize,
+      112                      tableWriter,
+      113                      partitionUpdateSinkAddr
+      114              );
+      115          } else if (ColumnType.isDesignatedTimestamp(columnType)) {
+      116              appendTimestampColumn(
+      117                      columnCounter,
+      118                      columnType,
+      119                      srcOooFixAddr,
+      120                      srcOooVarAddr,
+      121                      srcOooLo,
+      122                      srcOooHi,
+      123                      srcOooMax,
+      124                      timestampMin,
+      125                      partitionTimestamp,
+      126                      srcDataMax,
+      127                      indexBlockCapacity,
+      128                      -dstFixMem.getFd(),
+      129                      0,
+      130                      0,
+      131                      dstFixMem,
+      132                      dstLen,
+      133                      srcDataNewPartitionSize,
+      134                      srcDataOldPartitionSize,
+      135                      o3SplitPartitionSize,
+      136                      tableWriter,
+      137                      partitionUpdateSinkAddr
+      138              );
+      139          } else {
+      140              appendFixColumn(
+      141                      pathToPartition,
+      142                      plen,
+      143                      columnName,
+      144                      columnCounter,
+      145                      columnType,
+      146                      srcOooFixAddr,
+      147                      srcOooVarAddr,
+      148                      srcOooLo,
+      149                      srcOooHi,
+      150                      srcOooMax,
+      151                      timestampMin,
+      152                      partitionTimestamp,
+      153                      srcDataTop,
+      154                      srcDataMax,
+      155                      indexBlockCapacity,
+      156                      0,
+      157                      0,
+      158                      0,
+      159                      -dstFixMem.getFd(),
+      160                      dstFixMem,
+      161                      dstLen,
+      162                      tableWriter,
+      163                      srcDataNewPartitionSize,
+      164                      srcDataOldPartitionSize,
+      165                      o3SplitPartitionSize,
+      166                      indexWriter,
+      167                      columnNameTxn,
+      168                      partitionUpdateSinkAddr
+      169              );
+      170          }
+      171      }
+      172  
+      173      public static void freeTimestampIndex(
+      174              AtomicInteger columnCounter,
+      175              long timestampMergeIndexAddr,
+      176              long timestampMergeIndexSize,
+      177              long srcTimestampFd,
+      178              long srcTimestampAddr,
+      179              long srcTimestampSize,
+      180              TableWriter tableWriter,
+      181              FilesFacade ff,
+      182              boolean isOom
+      183      ) {
+      184          tableWriter.o3BumpErrorCount(isOom);
+      185          if (columnCounter.decrementAndGet() == 0) {
+      186              O3Utils.unmap(ff, srcTimestampAddr, srcTimestampSize);
+      187              O3Utils.close(ff, srcTimestampFd);
+      188              tableWriter.o3ClockDownPartitionUpdateCount();
+      189              tableWriter.o3CountDownDoneLatch();
+      190              if (timestampMergeIndexAddr != 0) {
+      191                  Unsafe.free(timestampMergeIndexAddr, timestampMergeIndexSize, MemoryTag.NATIVE_O3);
+      192              }
+      193          }
+      194      }
+      195  
+      196      public static boolean isOpenColumnModeForAppend(int openColumnMode) {
+      197          return switch (openColumnMode) {
+      198              case OPEN_MID_PARTITION_FOR_APPEND, OPEN_LAST_PARTITION_FOR_APPEND, OPEN_NEW_PARTITION_FOR_APPEND -> true;
+      199              default -> false;
+      200          };
+      201      }
+      202  
+      203      public static void mergeVarColumn(
+      204              Path pathToNewPartition,
+      205              int pplen,
+      206              CharSequence columnName,
+      207              AtomicInteger columnCounter,
+
+---------- IMPLEMENTER io.questdb.cairo.O3PartitionJob  stubs=0/1 ----------
+       66  public class O3PartitionJob extends AbstractQueueConsumerJob<O3PartitionTask> {
+       67  
+       68      private static final Log LOG = LogFactory.getLog(O3PartitionJob.class);
+       69      private static final io.questdb.std.ThreadLocal<O3ParquetMergeContext> PARQUET_MERGE_CONTEXT =
+       70              new io.questdb.std.ThreadLocal<>(O3ParquetMergeContext::new);
+       71      public static final Closeable THREAD_LOCAL_CLEANER = PARQUET_MERGE_CONTEXT;
+       72  
+       73      public O3PartitionJob(MessageBus messageBus) {
+       74          super(messageBus.getO3PartitionQueue(), messageBus.getO3PartitionSubSeq());
+       75      }
+       76  
+       77      public static void processParquetPartition(
+       78              Path pathToTable,
+       79              int timestampType,
+       80              int partitionBy,
+       81              ReadOnlyObjList<? extends MemoryCR> oooColumns,
+       82              long srcOooLo,
+       83              long srcOooHi,
+       84              long partitionTimestamp,
+       85              long sortedTimestampsAddr,
+       86              TableWriter tableWriter,
+       87              long srcNameTxn,
+       88              long txn,
+       89              long partitionUpdateSinkAddr,
+       90              long dedupColSinkAddr,
+       91              long o3TimestampMin,
+       92              O3Basket o3Basket,
+       93              long newPartitionSize,
+       94              long oldPartitionSize
+       95      ) {
+       96          // Number of rows to insert from the O3 segment into this partition.
+       97          final TableRecordMetadata tableWriterMetadata = tableWriter.getMetadata();
+       98          Path path = Path.getThreadLocal(pathToTable);
+       99          setPathForParquetPartition(path, timestampType, partitionBy, partitionTimestamp, srcNameTxn);
+      100  
+      101          final int partitionIndex = tableWriter.getPartitionIndexByTimestamp(partitionTimestamp);
+      102          final long parquetSize = tableWriter.getPartitionParquetFileSize(partitionIndex);
+      103          long duplicateCount = 0;
+      104          long newParquetSize;
+      105          boolean isRewrite = false;
+      106          CairoConfiguration cairoConfiguration = tableWriter.getConfiguration();
+      107          FilesFacade ff = tableWriter.getFilesFacade();
+      108          final O3ParquetMergeContext ctx = PARQUET_MERGE_CONTEXT.get();
+      109          ctx.clear();
+      110          final PartitionDecoder partitionDecoder = ctx.getPartitionDecoder();
+      111          final RowGroupBuffers rowGroupBuffers = ctx.getRowGroupBuffers();
+      112          final DirectIntList parquetColumns = ctx.getParquetColumns();
+      113          final RowGroupStatBuffers rowGroupStatBuffers = ctx.getRowGroupStatBuffers();
+      114          final PartitionUpdater partitionUpdater = ctx.getPartitionUpdater();
+      115          final PartitionDescriptor partitionDescriptor = ctx.getPartitionDescriptor();
+      116          try {
+      117              long parquetAddr = 0;
+      118              try {
+      119                  parquetAddr = TableUtils.mapRO(ff, path.$(), LOG, parquetSize, MemoryTag.MMAP_PARQUET_PARTITION_DECODER);
+      120                  partitionDecoder.of(
+      121                          parquetAddr,
+      122                          parquetSize,
+      123                          MemoryTag.NATIVE_PARQUET_PARTITION_UPDATER
+      124                  );
+      125  
+      126                  // Validate that the Parquet file's column count matches the current table schema.
+      127                  // O3 merge does not support column remapping, so ADD/DROP COLUMN after
+      128                  // converting to Parquet requires reconverting the partition first.
+      129                  final int parquetColumnCount = partitionDecoder.metadata().getColumnCount();
+      130                  final int columnCount = tableWriterMetadata.getColumnCount();
+      131                  int activeColumnCount = 0;
+      132                  for (int i = 0; i < columnCount; i++) {
+      133                      if (tableWriterMetadata.getColumnType(i) >= 0) {
+      134                          activeColumnCount++;
+      135                      }
+      136                  }
+      137                  if (activeColumnCount != parquetColumnCount) {
+      138                      throw CairoException.critical(0)
+      139                              .put("O3 merge requires Parquet partition column count to match table schema")
+      140                              .put(" [table=").put(tableWriter.getTableToken())
+      141                              .put(", parquetColumns=").put(parquetColumnCount)
+      142                              .put(", tableColumns=").put(activeColumnCount)
+      143                              .put(']');
+      144                  }
+      145  
+      146                  final int rowGroupCount = partitionDecoder.metadata().getRowGroupCount();
+      147                  assert rowGroupCount > 0;
+      148                  final int timestampIndex = tableWriterMetadata.getTimestampIndex();
+      149                  final int timestampColumnType = tableWriterMetadata.getColumnType(timestampIndex);
+      150                  assert ColumnType.isTimestamp(timestampColumnType);
+      151  
+      152                  // for API completeness, we'll use the same configuration as the initial partition encoder.
+      153                  final int compressionCodec = cairoConfiguration.getPartitionEncoderParquetCompressionCodec();
+      154                  final int compressionLevel = cairoConfiguration.getPartitionEncoderParquetCompressionLevel();
+      155                  final int rowGroupSize = cairoConfiguration.getPartitionEncoderParquetRowGroupSize();
+      156                  assert rowGroupSize >= 4;
+      157                  final int dataPageSize = cairoConfiguration.getPartitionEncoderParquetDataPageSize();
+      158                  final boolean statisticsEnabled = cairoConfiguration.isPartitionEncoderParquetStatisticsEnabled();
+      159                  final boolean rawArrayEncoding = cairoConfiguration.isPartitionEncoderParquetRawArrayEncoding();
+      160                  final double bloomFilterFpp = cairoConfiguration.getPartitionEncoderParquetBloomFilterFpp();
+      161                  final double minCompressionRatio = cairoConfiguration.getPartitionEncoderParquetMinCompressionRatio();
+      162  
+      163                  // Decide whether to rewrite the file or update in-place.
+      164                  // A single-row-group file always triggers a rewrite: any O3 merge
+      165                  // replaces its only row group, leaving 100% of the original payload
+      166                  // as dead bytes.
+      167                  final long unusedBytes = partitionDecoder.metadata().getUnusedBytes();
+      168                  isRewrite = rowGroupCount == 1
+      169                          || (parquetSize > 0 && (double) unusedBytes / parquetSize > cairoConfiguration.getPartitionEncoderParquetO3RewriteUnusedRatio())
+      170                          || unusedBytes > cairoConfiguration.getPartitionEncoderParquetO3RewriteUnusedMaxBytes();
+      171  
+      172                  if (isRewrite) {
+      173                      LOG.info().$("parquet o3 partition rewrite [table=").$(tableWriter.getTableToken())
+      174                              .$(", partition=").$ts(partitionTimestamp)
+      175                              .$(", fileSize=").$size(parquetSize)
+      176                              .$(", unusedBytes=").$size(unusedBytes)
+      177                              .$(", unusedPct=").$(parquetSize > 0 ? (100.0 * unusedBytes / parquetSize) : 0)
+      178                              .I$();
+      179                  }
+      180  
+      181                  final int opts = cairoConfiguration.getWriterFileOpenOpts();
+      182                  // Two separate file descriptors are required: one for reading (metadata,
+      183                  // row group slicing) and one for writing (appending new row groups).
+      184                  // They must be distinct OS fds even when pointing to the same file,
+      185                  // because the reader and writer maintain independent cursor positions.
+      186                  // Rust closes both fds when the ParquetUpdater is dropped.
+      187                  int readerFdOs = -1, writerFdOs = -1;
+      188                  long readerFd = -1, writerFd = -1;
+      189                  final long writeFileSize;
+      190                  try {
+      191                      readerFd = TableUtils.openRONoCache(ff, path.$(), LOG);
+      192                      readerFdOs = Files.detach(readerFd);
+      193                      readerFd = -1;
+      194                      if (isRewrite) {
+      195                          // Rewrite mode: write to a new partition directory named by txn.
+      196                          // The old directory (srcNameTxn) is left intact and queued for removal on commit.
+      197                          Path newPath = Path.getThreadLocal2(pathToTable);
+      198                          setPathForNativePartition(newPath, timestampType, partitionBy, partitionTimestamp, txn);
+      199                          ff.mkdirs(newPath.slash(), cairoConfiguration.getMkDirMode());
+      200                          newPath.concat(PARQUET_PARTITION_NAME).$();
+      201                          writerFd = TableUtils.openRW(ff, newPath.$(), LOG, opts);
+      202                          writerFdOs = Files.detach(writerFd);
+      203                          writerFd = -1;
+      204                          writeFileSize = 0;
+      205                      } else {
+      206                          writerFd = TableUtils.openRW(ff, path.$(), LOG, opts);
+      207                          writerFdOs = Files.detach(writerFd);
+      208                          writerFd = -1;
+      209                          writeFileSize = parquetSize;
+      210                      }
+      211                  } catch (Throwable e) {
+      212                      O3Utils.close(ff, readerFd);
+      213                      if (readerFdOs != -1) {
+      214                          Files.closeDetached(readerFdOs);
+      215                      }
+      216                      O3Utils.close(ff, writerFd);
+      217                      // writerFdOs is not closed on error because in this catch is always -1;
+      218                      //noinspection ConstantValue
+      219                      assert writerFdOs == -1;
+      220                      throw e;
+      221                  }
+      222  
+      223                  // partitionUpdater.of() transfers fd ownership to Rust.
+      224                  // Rust closes both fds when destroy() is called (via close()).
+      225                  // The outer catch calls partitionUpdater.close() on error.
