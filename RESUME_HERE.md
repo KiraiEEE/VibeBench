@@ -1,106 +1,19 @@
-# RESUME HERE — VibeBench, state as of 2026-09-06 evening
+# RESUME HERE, VibeBench worklog
 
 **Read `CLAUDE.md` first for the finished results.** This file is the live worklog.
 
-## Everything through the thesis is DONE and PUSHED
+## STATE (2026-09-07): Java study, thesis AND defence deck all finished
 
-Java experiment, 1,000-row validation, cross-check, thesis (85 pages), all committed
-and on **https://github.com/KiraiEEE/VibeBench** (private). `CLAUDE.md` is now
-tracked too. Working tree was clean at the last push.
+Everything is committed and pushed to **https://github.com/KiraiEEE/VibeBench**.
 
-## IN PROGRESS: the holdout round (ISP and LSP only)
+| | |
+|---|---|
+| Thesis | 89 pages, 9 figures, 23 tables, XeLaTeX, 0 undefined refs |
+| Deck | 20 slides, `thesis/presentation/main.tex`, XeLaTeX |
+| Verifier | `verify_thesis_numbers.py`, **28 checks, 0 FAIL** |
+| Judged | 1,400 entities (1,000 round 2 + 400 holdout) |
 
-**Why only two.** The five shipped detectors had thresholds set from corpus
-percentiles *before* any label existed, so their P/R was already out-of-sample.
-Two refinements were not: LSP restricted to `refused_bequest`, and ISP restricted
-to `members>=30`, were both derived by reading false positives in the sample they
-are scored on. Those are the only fitted quantities in the study.
-
-**Samples drawn, seed 424242, both 100 flagged + 100 unflagged:**
-
-```
-LSP  from 310 fresh flagged rows   (563 previously judged rows burned)
-ISP  from 538 fresh flagged rows   (575 previously judged rows burned)
-```
-
-**Bug fixed while drawing them:** `--holdout` used to exclude rows only from the
-current sample file, so round 1's 400 judged rows per principle (which live in
-`labels/VOID_ROUND1_2026-09-05/`) were eligible for redraw. That would have
-reported an in-sample estimate as out-of-sample. The sampler now burns every
-judged round it can find and prints which files it burned from.
-
-### Progress
-
-```
-LSP  extraction 200/200 DONE   audit gate 0 FAIL   judged 200/200 COMPLETE
-ISP  extraction 200/200 DONE   audit gate 0 FAIL   judged 200/200 COMPLETE
-```
-
-### Commands
-
-```bash
-# finish extraction + gate (resumable, --only-missing is wired in)
-bash vibebench/extract_holdout.sh <scratchdir>
-
-# gate alone
-python vibebench/07_verify/audit_label_batches.py --principle isp --round _holdout
-
-# record labels: the tools are ROUND-AWARE now, call use_round first
-cd vibebench/labels && python -c "
-import record_labels as R
-R.use_round('_holdout')
-R.record('lsp', {8:(False,'reason at least 12 chars')})
-"
-
-# score when done
-python vibebench/labels/score_labels.py --file java_lsp_labeling_sample_holdout.csv \
-    --pred-col violation --label-col llm_lsp_risk
-```
-
-`record_labels.py`, `audit_label_batches.py` and the batch extractor all take a
-round suffix, so the holdout gets identical guards and its batch directory
-(`java_X_batches_holdout`) cannot overwrite round 2's material.
-
-### Judging rules (keep these consistent with round 2)
-
-**LSP not a violation when:** the override calls `super` first; the base already
-DECLARES the exception the override throws; both methods are `private` (no
-polymorphic override at all); both are `@Nullable`; the override reports a
-STRONGER guarantee; it is a protected template hook only the base calls; the base
-itself can return null.
-**IS a violation when:** the base does real work and the override is a bare
-`throw new UnsupportedOperationException`; the override narrows accepted inputs;
-the override returns null where the base guarantees a value.
-
-**ISP decision rule actually applied in the holdout** (written down because it
-must NOT be the width threshold under test, or the validation is circular). A
-contract is a violation when any of these holds, and otherwise is not:
-
-* **(A)** the contract has >= 10 members AND at least one implementer is forced
-  to stub one of them;
-* **(B)** the contract is very wide (>= 35 members) and its members fall into
-  clearly separable groups serving different clients, even with no stub present;
-* **(C)** at least two implementers each stub half or more of what they declare,
-  which is systematic carving rather than one class that cannot cope.
-
-Stubs inside a TEST DOUBLE do not count as evidence, since a mock stubs what the
-test does not exercise rather than what the contract forces on production code.
-An implementer that stubs EVERYTHING it declares is a substitutability problem,
-not a fat interface, so that alone is not counted. Tiny contracts are not fat by
-construction. The original round 2 wording follows.
-
-**ISP (round 2 wording):** width plus whether implementers carve it up. Violation when the contract
-is wide (>=30 members) and implementers take wildly different slices, or when an
-adapter exists purely to stub most of it. Not a violation when every implementer
-implements the whole surface, when defaults let implementers override only what
-they need, or when it is a fluent builder or query DSL.
-
-## HOLDOUT ROUND: COMPLETE, FOLDED INTO THE THESIS, VERIFIED (2026-09-06)
-
-400 further entities judged, 200 LSP + 200 ISP, drawn with seed 424242 and
-excluding every row judged in any earlier round. Both gates passed 0 FAIL.
-
-### The two refinements behaved in OPPOSITE ways, and that is the result
+### What the holdout round settled
 
 ```
                                    fitted sample     HOLDOUT      pooled
@@ -108,20 +21,13 @@ LSP restricted to refused_bequest   1.000 (31/31)  1.000 (33/33)  1.000 (64/64)
 ISP restricted to >=30 members      0.862 (25/29)  0.704 (19/27)  0.786 (44/56)
 ```
 
-The Liskov restriction held exactly, no false positive in 64 flags over two
-independent samples. The width condition lost 16 points and its fitted 0.862 is
-OUTSIDE the holdout interval [0.515, 0.841]. Refused bequest is categorical, so
-there is no quantity to overfit; 30 members is a numeric threshold read off the
-false positives it was then scored against. Broad flags reproduced closely
-(LSP 0.400 -> 0.440, ISP 0.320 -> 0.350), so the shipped numbers are stable.
+A **categorical** rule survived being fitted; a **numeric threshold** did not.
+The ISP fitted value falls outside its own holdout interval [0.515, 0.841].
 
-### The holdout also found a real error in the thesis. NOW FIXED.
+### The recall error the holdout exposed, now fixed everywhere
 
-Ch4 reported recall as raw TP/(TP+FN) on a sample that is half flagged, and
-concluded every flag rate is "an upper bound". The corpus is nowhere near half
-flagged: for LSP it is 1,546 flagged against 79,689 unflagged, so a sampled
-unflagged row stands for 797 entities and a flagged one for 15. Weighting each
-stratum back to its population size:
+Recall was computed raw on a 50/50 sample while the corpus is nowhere near
+50/50. Weighted (each stratum scaled to its population, Wilson CI):
 
 ```
         raw R   weighted R      95% CI          judged
@@ -132,32 +38,62 @@ ISP     0.914     0.552     [0.400, 0.700]        400
 LSP     0.966     0.352     [0.159, 0.614]        400
 ```
 
-The upper-bound claim survives for SRP, OCP and DIP and does NOT for LSP and
-ISP. Flag rates, agent comparison and merged-vs-rejected are unaffected: one
-detector applied uniformly, so the ratios stand.
+Flag rates, the agent comparison and merged-vs-rejected are UNAFFECTED: one
+detector applied uniformly, so the ratios stand. What broke was the claim that
+every flag rate is an upper bound, which now holds only for SRP, OCP and DIP.
 
-The three LSP violations the detector missed say what its blind spot is made of,
-and all three are silent rather than declared refusals:
-* Vaadin `StateTree.RootNode.setParent` throws `IllegalStateException` for every
-  non-null parent where the base accepts any.
-* CommCare `BlankLoginActivityUIController.setPermissionDeniedState` is an
-  EMPTY body where the base disables the login button and shows the error.
-* nd4j `Linspace.setY` assigns `this.y = null`, a setter that discards its input.
+### The V1 Python residue that was still in the proxy chapters (fixed)
 
-### What was changed in the thesis
+The thesis described the **Python** evaluators in a Java-only study:
 
-* ch3: the in-sample paragraph now describes the holdout design.
-* ch4 `sec:validation`: "no holdout was drawn" replaced by how it was drawn.
-* ch4 `tab:validation`: pooled over every round, weighted recall with CIs, plus
-  a new paragraph on why weighting is required and what it costs.
-* ch4: new `tab:holdout` and the categorical-vs-numeric explanation.
-* ch4 summary table cells, ch5 RQ2, and all three abstracts (EN, FR, AR).
-* `07_verify/verify_thesis_numbers.py` now pools every judged round, weights
-  recall against the parquet populations, and checks the holdout figures.
-  Its stale-number check respects digit boundaries, so a real 1,546 is no
-  longer reported as the superseded 546.
+* LSP claimed five signals "mirroring mypy's `[override]` rule". The Java
+  detector computes **three**. `javac` already rejects a changed parameter
+  list (an overload), narrowed parameter types (invariance) and reduced
+  visibility, so those faults cannot exist in code that compiles.
+* OCP described `if/elif` and `match` ladders, `isinstance`, and a closed-set
+  rule over Python builtins and `ast.*`. Java: `instanceof`/`switch`, and the
+  closed set is **the subject resolving to an enum** (6,073 chains).
+* ISP described `Protocol`s and implicit interfaces. Java: interfaces and
+  abstract classes, 20,705 contracts, >=13 members (86th percentile).
+* The toolchain ruled out `grimp`, `import-linter` and `Pyright`. The tools
+  that actually needed ruling out are ArchUnit, jdeps, SonarQube and Error
+  Prone, all of which read bytecode and would need 1,010 repos to build.
 
-**Verifier: 21 checks, 0 FAIL. Thesis builds clean, 86 pages.**
+Verified thresholds now in the thesis: OCP type >=3 (62nd pct), tag >=8 (86th),
+41,880 chains; ISP >=13 members, 2,944 flagged, 744 forced stubs; LSP 1,546
+flagged / 79,689 unflagged pairs. All guarded by the verifier.
+
+### Other fixes this round
+
+* Three finished figures were in `figures/` but never `\input` anywhere. Now
+  placed as Figures 3.2, 4.3 and 4.4; the validation one was rebuilt on pooled
+  and weighted numbers.
+* Figure 4.2 is the three-band TikZ pipeline, not the old PNG. Collisions fixed.
+* Abstracts (AR/EN/FR) cut ~40% to fit ONE page. Budget: ~11 lines each.
+* Research-question table lost its `Status` column, every row of which said
+  "Answered".
+* All 21 remaining em dashes gone.
+* Per-agent precision table pooled over both rounds, with flag counts, and its
+  caption no longer claims a recall range the weighting invalidated.
+* Sign-off robot in the appendix redrawn; chest LEDs are the five principle
+  colours.
+* Tools table now lists the local toolchain (MiKTeX 25.12, XeTeX 4.16,
+  latexmk 4.88) beside Overleaf.
+
+### Defence deck, rewritten from scratch
+
+The old one was V1: "Instrument validation, Python", the cut ML experiment,
+V1 numbers. 20 new slides. **Beamer traps recorded in the file header:**
+do NOT load `enumitem` (its `leftmargin=*` recurses against beamer's
+`\labelenumi` and overflows TeX's input stack), and the pipeline figure must
+be fitted to frame HEIGHT, not width.
+
+## What is left
+
+1. **Python V2**, if wanted. New corpus, new fact extractor; the framework is
+   language-parameterised so only the extraction layer is language-specific.
+2. Optional: three figures never design-reviewed (`fig_martin_plane`,
+   `fig_delta_harness`, `fig_solid_wheel`).
 
 ## Disk: decision recorded 2026-09-06
 
