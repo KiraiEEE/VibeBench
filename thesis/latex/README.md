@@ -17,11 +17,11 @@ should be needed.
 ## Layout
 
 ```
-main.tex                  master file — preamble, metadata, \input order
+main.tex                  master file , preamble, metadata, \input order
 front/
   cover.tex                title page (edit \topiccode, \defencedate, jury names here or in main.tex)
-  dedication.tex           placeholder — personalise
-  acknowledgments.tex      placeholder — personalise
+  dedication.tex           placeholder , personalise
+  acknowledgments.tex      placeholder , personalise
   abstract_en.tex          English abstract + keywords
   abstract_fr.tex          French résumé + mots-clés
   abstract_ar.tex          Arabic ملخص + كلمات مفتاحية
@@ -31,7 +31,7 @@ chapters/
   chapter2_literature.tex
   chapter3_methodology.tex
   chapter4_results.tex
-  chapter5_conclusion.tex  (new — synthesises Chapters 3-4's findings; Chapter 5 did not exist before)
+  chapter5_conclusion.tex  (new , synthesises Chapters 3-4's findings; Chapter 5 did not exist before)
   appendix.tex
 figures/                   one .tex per TikZ/pgfplots figure, \input by the chapters
 ../references.bib          unchanged; only entries actually cited in the source chapters are used
@@ -41,10 +41,10 @@ figures/                   one .tex per TikZ/pgfplots figure, \input by the chap
 
 Search for these placeholders (all in `main.tex` or `front/cover.tex`):
 
-- `\topiccode` — topic code / ID, still unknown per your message
-- `\defencedate` — defence date, still unknown
+- `\topiccode` , topic code / ID, still unknown per your message
+- `\defencedate` , defence date, still unknown
 - jury president / examiner names in `front/cover.tex`
-- `front/dedication.tex` and `front/acknowledgments.tex` — personalise both
+- `front/dedication.tex` and `front/acknowledgments.tex` , personalise both
 - a real institutional crest, if you obtain one: replace the TikZ-drawn emblem at the top of
   `front/cover.tex` with `\includegraphics[width=2.6cm]{front/emblem.pdf}`
 
@@ -53,11 +53,11 @@ Search for these placeholders (all in `main.tex` or `front/cover.tex`):
 Chapters 1–4 are a structural conversion of `thesis/Chapter 1.md`–`Chapter 4.md`: section
 headings, tables, and inline citations were mapped onto `\citep`/`\citet` keys already present in
 `references.bib` (only entries that source text actually cites are pulled into the printed
-bibliography — three background entries, `perry2023security`, `vaithilingam2022usability`,
+bibliography , three background entries, `perry2023security`, `vaithilingam2022usability`,
 `barke2023grounded`, are verified but uncited in the source, so they are left out rather than
 force-cited). Chapter 5 (Conclusion) did not exist before this conversion; it is new text that
 directly answers RQ1–RQ3 and states contributions/limitations/future work using only findings
-already established in Chapters 3–4 — no new claims or numbers were introduced.
+already established in Chapters 3–4 , no new claims or numbers were introduced.
 
 Nine original figures were added (none existed in the Markdown source): a tool-evolution timeline,
 a SOLID-principles wheel, the before/after delta-harness diagram, the five-stage pipeline diagram,
