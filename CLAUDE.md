@@ -1,47 +1,61 @@
-# CLAUDE.md — session orientation
+# CLAUDE.md, session orientation
 
 **Rule #1. THE CODE AND THE DATA ARE THE SOURCE OF TRUTH. This file is a map, and maps go stale.**
 
 Use it to find things quickly, then verify anything you are about to depend on against the file or
 the parquet itself. Any number quoted here without a measurement date should be re-measured before
-it is used. This rule has earned its place twice: an earlier version of this document was wrong on
-eight separate claims, and the correction table that replaced them was itself wrong within three
-weeks. `python vibebench/07_verify/verify_thesis_numbers.py` exists because of it.
+it is used. This rule has earned its place three times now: an earlier version of this document was
+wrong on eight separate claims, the correction table that replaced it was wrong within three weeks,
+and in September 2026 the *thesis itself* was still describing the Python detectors in a Java-only
+study. `python vibebench/07_verify/verify_thesis_numbers.py` exists because of it. Run it.
 
 ---
 
-## STATE: the Java experiment is FINISHED. The thesis is written. (2026-09-06)
+## STATE (2026-09-07): Java study, thesis and defence deck are FINISHED
 
 | | |
 |---|---|
-| Corpus | **6,956 curated → 4,245 analysable** pull requests over **1,010 repositories** |
-| Agents | Claude_Code, Copilot, OpenAI_Codex |
-| Outcomes | merged, rejected, open, balanced on agent × outcome |
-| Language | Java only. Python V2 is possible and not started. |
-| Validation | **1,000 rows judged**, 200 per principle (100 flagged + 100 unflagged), seed 777 |
-| Cross-check | CK + PMD + DesigniteJava over 150 sampled repositories, 111,029 shared types |
-| Thesis | 85 pages, compiles under **XeLaTeX** (not pdflatex, fontspec), 0 undefined refs |
-| GitHub | **https://github.com/KiraiEEE/VibeBench** — PRIVATE. Code AND thesis are pushed. |
+| Title | **Evaluating Coding Agent Quality: Application to Software Design Principles** |
+| Corpus | **6,956 curated -> 4,245 analysable** pull requests over **1,010 repositories** |
+| Agents | Claude_Code (1,109), Copilot (2,366), OpenAI_Codex (770) analysable PRs |
+| Outcomes | merged, rejected, open, balanced on agent x outcome |
+| Language | Java only. Python V2 possible, NOT started. |
+| Validation | **1,400 rows judged**: 200 per principle, plus a 200-row holdout for LSP and ISP |
+| Cross-check | CK + PMD + DesigniteJava over 150 repositories, 111,029 shared types |
+| Thesis | **94 pages**, `thesis/latex/`, **XeLaTeX only** (fontspec), 0 undefined refs |
+| Deck | **20 slides**, `thesis/presentation/`, XeLaTeX |
+| Verifier | `verify_thesis_numbers.py`, **28 checks, 0 FAIL** |
+| GitHub | **https://github.com/KiraiEEE/VibeBench**, PRIVATE. Code, thesis and deck all pushed. |
 
-`REDESIGN_V2.md` is now a **historical record of how V2 was planned**, not an authority. Where it
-disagrees with this file or with the data, it is wrong. `archive/PROJECT.md` and
-`archive/RERUN_LOG.md` describe V1 and are superseded.
+`REDESIGN_V2.md` is a **historical record of how V2 was planned**, not an authority.
+`archive/PROJECT.md` and `archive/RERUN_LOG.md` describe V1 and are superseded.
 
-### Results
+### Headline results
 
-| principle | flag rate | validated P | validated R |
+| principle | flag rate | precision | weighted recall |
 |---|---|---|---|
-| SRP | 7.7% of authored classes (5.6% macro) | 0.350 | 0.972 |
-| OCP | 6.7% of PRs | 0.330 | 0.943 |
-| ISP | 6.5% of PRs | 0.320 | 0.914 |
-| DIP | 4.6% of PRs | **0.890** | 1.000 |
-| LSP | 0.4% of PRs | 0.400 | 1.000 |
+| SRP | 7.7% of authored classes (5.6% macro) | 0.350 | 0.875 [0.562, 0.975] |
+| OCP | 6.7% of PRs | 0.330 | 0.733 [0.440, 0.909] |
+| ISP | 6.5% of PRs | 0.335 | 0.552 [0.400, 0.700] |
+| DIP | 4.6% of PRs | **0.890** | 1.000 [0.410, 1.000] |
+| LSP | 0.4% of PRs | 0.420 | 0.352 [0.159, 0.614] |
 
-**Two refinements, both derived from the labels they are scored on, so both IN-SAMPLE:**
-LSP restricted to `refused_bequest` → P=**1.000** (31/31), R=0.775. ISP with `members>=30` →
-P=**0.862**, R=0.714.
+**RECALL IS STRATUM-WEIGHTED.** The samples are 100 flagged + 100 unflagged; the corpus is nowhere
+near 50/50 (LSP: 1,546 flagged against 79,689 unflagged). Counting the strata as equally common
+gives LSP recall 0.966 instead of 0.352. Never quote a raw recall from this study.
 
-**Per agent** (pooled, macro/repo in brackets):
+**The two refinements, and what the holdout did to them:**
+
+```
+                                   fitted sample     HOLDOUT      pooled
+LSP restricted to refused_bequest   1.000 (31/31)  1.000 (33/33)  1.000 (64/64)
+ISP restricted to >=30 members      0.862 (25/29)  0.704 (19/27)  0.786 (44/56)
+```
+
+A categorical rule survived being fitted; a numeric threshold did not. ISP's fitted 0.862 falls
+outside its own holdout interval [0.515, 0.841].
+
+**Per agent, pooled (macro/repo in brackets):**
 
 | principle | Claude_Code | Copilot | OpenAI_Codex |
 |---|---|---|---|
@@ -51,69 +65,122 @@ P=**0.862**, R=0.714.
 | DIP | 6.5 (5.1) | 4.1 (2.8) | 3.2 (5.4) |
 | LSP | 0.7 (0.3) | 0.3 (0.1) | 0.0 (0.0) |
 
-**The ordering is conditional on change size.** Mean Java files touched: Claude_Code 46.4, Copilot
-18.5, Codex 10.9. Within size bands the pooled ordering holds only for the largest (11+ files);
-in the smallest band Copilot leads on OCP and ISP and Codex leads on DIP. Never quote the pooled
-per-agent table without this.
+**DO NOT QUOTE THAT TABLE AS AN AGENT RANKING.** `vibebench/06_model/fit_mixed_model.py` fits
+agent + log1p(files) + months + repository jointly (GEE, cluster-robust). Result:
 
-**Merged vs rejected, tier-matched (tiers 2+3+4):** OCP 8.3/8.0, ISP 7.5/6.6, DIP 4.6/6.6,
-LSP 0.5/0.5. No consistent difference. Review does not select on SOLID adherence.
+* change size dominates, OR **1.9 per doubling of files touched**, every principle, p < 1e-4;
+* only **OCP** survives adjustment (Claude_Code OR 2.22, 1.21-4.07, p=0.010). ISP and DIP fall to
+  1.11 and 1.29 with intervals straddling 1;
+* **era is inert** (OR 1.00-1.03, all p > 0.5), so the seven-month date spread is a confound in
+  principle and not in fact. It is no longer carried as a limitation.
+* LSP is not fitted: 16 flagged PRs cannot support four parameters.
 
-**Locus of risk:** ~4,100 genuine SRP violations and 270 LSP violations are *present* in touched
-code; PRs *introduced* a violation in 2-4% of cases. 681 refused-bequest relationships exist, 16
-were introduced.
+**Outcome axis, REPORTED BY STRATUM, never as one merged-vs-rejected number:**
 
-**Cross-check (2026-09-06, 150 repos, production types):**
-ours~PMD κ=**0.574**, ours~Designite κ=**0.531**, PMD~Designite κ=**0.384**. 68.0% of our flags
-corroborated by ≥1 independent tool. Spearman vs CK: wmc 0.977, methods 0.969, loc 0.944; cohesion
-weak (0.288) but CK's own variants agree only 0.490 with each other. LSP κ=0.000 because Designite
-charges the supertype and we charge the subclass. DIP κ=0.389 at file level, 0.080 at package level.
-*(The older figures 0.625/0.539/0.430 were V1, 27 repos. Do not quote them.)*
+| stratum | n | OCP | ISP | DIP | LSP |
+|---|---|---|---|---|---|
+| merged | 1,521 | 8.3 | 7.5 | 4.6 | 0.5 |
+| changes_requested | 36 | 5.6 | 16.7 | 13.9 | 0.0 |
+| reviewed_then_closed | 135 | 12.6 | 12.6 | 12.6 | 0.7 |
+| closed_unreviewed | 1,006 | 7.5 | 5.5 | 5.6 | 0.5 |
+| open | 490 | 8.8 | 9.2 | 5.9 | 0.2 |
 
-### Known weaknesses, to keep stating
+Only **171** of the 1,177 not-merged PRs were ever reviewed. Against the 1,006 unreviewed ones
+merged code is indistinguishable, which is the claim the corpus supports. The two reviewed strata
+run HIGHER on ISP and DIP, which is suggestive only (n=36 and 135; 6 of 17 flagged
+`reviewed_then_closed` come from one repo).
 
-* Labels are model-produced, not human ground truth. Judge and one agent are both Claude; the
-  cross-check is the defence, and it covers SRP only, since no published source-only Java tool has
-  an OCP or ISP rule.
-* **No holdout.** Both refinements are in-sample. ISP's width threshold has no independent support;
-  LSP's has partial support from an earlier round on a different sample (51/62).
-* Agent and era confounded: median PR dates seven months apart.
-* "Rejected" is mostly `closed_unreviewed` (superseded/stale), not refusal on quality.
-* Codex's validation slice is 15-28 rows per principle.
+**Locus of risk:** ~4,100 genuine SRP violations *present* in touched code; PRs *introduced* one in
+2-4% of cases. 681 refused-bequest relationships exist, 16 were introduced. Attribution is
+**touched, not authored**, for the three relation-level principles.
+
+**Cross-check (150 repos, production types):** ours~PMD k=0.574, ours~Designite k=0.531,
+PMD~Designite k=0.384. 68.0% of our flags corroborated by >=1 independent tool. Spearman vs CK:
+wmc 0.977, methods 0.969, loc 0.944; cohesion weak (0.288) but CK's own variants agree only 0.490.
+
+### Weaknesses that stay stated
+
+* Agreement is **rubric vs reading judge**, and the judge can err in the same direction as the
+  rubric. LLM judging of SOLID is a validated technique (Pehlivan et al. 2025, 240 manually checked
+  examples), so this is the design, NOT a missing human study. **The author and supervisor have
+  ruled that human labelling is out of scope; do not reintroduce it as a limitation.**
+* Judge and one agent are both Claude. Tested in Table 4.9: on 4 of 5 principles Claude_Code's
+  flags are confirmed MORE often, the opposite of leniency. DIP is the exception (0.778 vs 0.943).
+* Source-only analysis: median supertype resolution 87.0%, so LSP and ISP under-count in the 718
+  PRs below 50%. Direction is favourable (a missed candidate, never an invented one).
+* `repo_too_large` drops 150 PRs, non-randomly: the biggest repositories.
+* "Rejected" is mostly `closed_unreviewed`, superseded or stale, not refusal on quality.
+* SOLID adherence is not design quality. Nothing here observes an outcome.
 
 ---
 
+## IN PROGRESS, PAUSED (2026-09-07)
+
+**DIP census.** DIP flags only 195 PRs in the whole corpus and 100 are judged. Judging the
+remaining 95 makes DIP precision **exact** instead of an estimate. No other principle can do this
+(SRP would need 28,756 more rows).
+
+```
+state: 23 / 95 batches extracted, NO _manifest.json (correct for a paused run)
+resume:
+  python vibebench/labels/extract_java_label_batches.py --principle dip \
+      --file java_dip_labeling_sample_census.csv --only-missing
+  python vibebench/07_verify/audit_label_batches.py --principle dip --round _census
+  # then judge via record_labels.py with use_round('_census')
+```
+
+Extraction costs ~1 minute per PR (before AND after tree reconstructed and parsed). If it is
+resumed and finished, rescore DIP over all 195 and update the thesis, the deck and the verifier.
+The exact value may move off 0.890 in either direction; report whatever it is.
+
 ## What to do next
 
-1. **Targeted holdout, ISP and LSP only.** ~400 rows, ~2h. The other three detectors had their
-   thresholds set from corpus percentiles *before* labelling, so there is nothing fitted to
-   re-test. 310 fresh LSP and 538 fresh ISP flagged rows are available.
-2. **Python V2**, if wanted. The framework is language-parameterised: only the fact-extraction
-   layer is language-specific, so it is a new extractor rather than a second study.
-3. `java_crosscheck_classes.csv` is 63 MB and regenerable. Consider untracking it.
+1. **Finish the DIP census** (above), or drop it. Nothing depends on it.
+2. **Python V2**, if asked. See the section below.
+3. Optional: three figures never design-reviewed (`fig_martin_plane`, `fig_delta_harness`,
+   `fig_solid_wheel`).
+
+## Python V2, if the author asks for it
+
+The framework is **language-parameterised**: only fact extraction is language-specific. A V2 is a
+new extractor plus a re-run, not a second study.
+
+* **Reuse unchanged:** `01_curate/curate.py` (takes `--lang`), the delta harness
+  (`03_principles/gitsnap.py`), all five detector *shapes*, `04_report/report_java.py` as a
+  template, the whole `labels/` guard chain, `06_model/fit_mixed_model.py`, `07_verify/`.
+* **Write new:** a Python fact extractor producing the same fact stream the Java sidecar emits
+  (`03_principles/java_sidecar/Facts.java` is the contract to match). No JVM needed; use `ast`.
+* **Recalibrate:** every threshold. Java's numbers (OCP 3/8 branches, ISP >=13 members, SRP
+  loc 362 / wmc 45 / methods 20) are Java percentiles and mean nothing in Python. Calibrate from
+  corpus percentiles BEFORE labelling, then DELETE the parquets and re-run so no flag predates its
+  threshold.
+* **Expect a different LSP signal set.** Java's three signals exist because `javac` already rejects
+  the other faults. Python has no such compiler, so the Python detector legitimately needs the
+  signature/variance signals that would be dead weight in Java. The V1 Python evaluator had five.
+* **Disk:** the Java corpus alone is ~350 GB of clones. Check free space first.
+* **Do NOT** touch the thesis until Python results exist and are validated. The thesis is currently
+  a correct, complete, Java-only document.
 
 ---
 
 ## House rules (author's, non-negotiable)
 
-* **Never write an em dash.** Use a comma. This applies to the thesis too; a pass took it from 212
-  to 21.
+* **Never write an em dash.** Not `---`, not the character. Use a comma, or a colon for label
+  pairs. En dashes in numeric ranges (`0.330--0.890`) are correct and stay. **Check `figures/`
+  too**, that directory was missed once and printed nine of them.
 * **Report all FIVE principles in every table.** Leaving SRP out was a repeated complaint.
 * Lead with macro-per-repo, print counts beside rates.
-* Every caveat goes in ONE limitations section after the conclusion, never scattered through the
-  body.
-* No citation enters the thesis without its arXiv or publisher page being read first: author list,
-  year, and the specific claim. This caught two errors in a user-supplied summary on 2026-09-06.
+* Every caveat goes in ONE limitations section after the conclusion, never scattered.
+* No citation enters the thesis without its arXiv or publisher page being read first.
 * Do not stop for permission on routine steps.
-* Tone: lead with the result, not the journey. Bugs fixed are not results. The author is not a
-  native English speaker and is under exam stress; be concrete and never patronise.
-
----
+* Tone: lead with the result, not the journey. Bugs fixed are not results. Do not let the prose
+  argue for its own design; let the numbers do it. The author is not a native English speaker and
+  is under exam stress. Be concrete, never patronise.
 
 ## Setup
 
-No `requirements.txt`. The pipeline needs `pandas`, `pyarrow`, plus `git` and a JDK on PATH.
-`pip install pandas pyarrow`. No test framework: pure modules self-check when run as scripts.
+No `requirements.txt`. Needs `pandas`, `pyarrow`, `statsmodels`, plus `git` and a JDK on PATH.
+No test framework: pure modules self-check when run as scripts.
 
 Stage scripts do `sys.path.insert(0, <vibebench dir>); import config as C`. Run from the repo root
 as `python vibebench/<stage>/<script>.py`, never with `-m`.
@@ -127,67 +194,68 @@ mvn -o package -f vibebench/03_principles/java_sidecar/pom.xml
 java -cp .../java-sidecar-1.0-jar-with-dependencies.jar vb.Facts --self-check
 python vibebench/03_principles/java_lang/detectors.py      # self-check
 python vibebench/03_principles/java_lang/run_java.py --workers 6
-#   thresholds are calibrated from printed percentiles, then the parquets are
+#   thresholds calibrated from printed percentiles, then the parquets are
 #   DELETED and the pass re-run, so no flag predates its threshold
 python vibebench/04_report/report_java.py
+python vibebench/06_model/fit_mixed_model.py               # the joint model for RQ1
 python vibebench/labels/make_java_labeling_sample.py --principle X --n-per-stratum 100 --seed N
-python vibebench/labels/extract_java_label_batches.py --principle X --file java_X_labeling_sample.csv --only-missing
+python vibebench/labels/extract_java_label_batches.py --principle X --file <sample.csv> --only-missing
 python vibebench/07_verify/audit_label_batches.py          # GATE, must be 0 FAIL before judging
-python vibebench/labels/score_labels.py --file java_X_labeling_sample.csv --pred-col <col> --label-col llm_X_risk
+python vibebench/labels/score_labels.py --file <sample.csv> --pred-col <col> --label-col llm_X_risk
 python vibebench/05_crosscheck/run_crosscheck_java.py --sample 150 --workers 6
 python vibebench/07_verify/verify_v2_java.py               # whole-corpus invariants
 python vibebench/07_verify/verify_thesis_numbers.py        # thesis text vs the data
 ```
 
-**A threshold change requires DELETING the parquets.** Resume keeps permanent-status rows, so a
-re-run alone will not recompute old flags.
+**A threshold change requires DELETING the parquets.** Resume keeps permanent-status rows.
 
-## The validation guards (these are why round 2 is trustworthy)
+## The validation guards (why the rounds are trustworthy)
 
 Round 1 was voided on 2026-09-05: 294 of 400 ISP labels had been written for rows whose batch file
-did not exist, and 200 more at 3 seconds a row. The `notes` column was empty for all 1,995 rows, so
-none of it was visible on disk. Three guards now make that impossible rather than merely discouraged.
+did not exist, and 200 more at 3 seconds a row. Three guards now make that impossible.
 
-* **`vibebench/labels/record_labels.py`** — the ONLY sanctioned way to write a label. Refuses a row
-  with no source on disk, refuses a label with no written reason, writes atomically per call.
-* **`vibebench/07_verify/audit_label_batches.py`** — six mechanical checks per principle, exit 1 on
-  any FAIL. Run it as a gate between extraction and judging.
-* **`extract_java_label_batches.py`** — writes `_manifest.json` LAST and only on a clean exit, so a
-  killed run cannot pass for a finished one; names a source-less batch `UNJUDGEABLE_*`.
+* **`vibebench/labels/record_labels.py`**, the ONLY sanctioned way to write a label. Refuses a row
+  with no source on disk, refuses a label with no written reason, writes atomically. Round-aware:
+  call `use_round('_holdout')` or `use_round('_census')` first.
+* **`vibebench/07_verify/audit_label_batches.py`**, six mechanical checks, exit 1 on any FAIL.
+  Takes `--round`. Run it as a gate between extraction and judging.
+* **`extract_java_label_batches.py`** writes `_manifest.json` LAST and only on a clean exit, so a
+  killed run cannot pass for a finished one. `--only-missing` makes resumption cheap.
 
 ## Java file cheat sheet
 
-* `03_principles/java_sidecar/` — Maven, JavaParser+SymbolSolver 3.25.10. `Facts.java` is the single
-  fact source for all five principles. Self-check: `java -cp target/...jar vb.Facts --self-check`.
-  **`Facts.sourceRoots()` infers roots from the files' own `package` lines.** Rooting the solver at
-  the repo root instead drops resolution from 93% to 17% on a real project.
-* `03_principles/java_bridge.py` — `analyze_tree(files) -> dict`, one JVM per tree, gzipped cache
+* `03_principles/java_sidecar/`, Maven, JavaParser+SymbolSolver 3.25.10. `Facts.java` is the single
+  fact source for all five principles. **`Facts.sourceRoots()` infers roots from the files' own
+  `package` lines.** Rooting at the repo root drops resolution from 93% to 17%.
+* `03_principles/java_bridge.py`, `analyze_tree(files) -> dict`, one JVM per tree, gzipped cache
   keyed by tree CONTENT hash. `VB_SIDECAR_TIMEOUT_S` env override.
-* `03_principles/java_lang/detectors.py` — all five principles as pure functions over facts.
-* `03_principles/java_lang/run_java.py` — ONE delta pass for all five (a tree costs 10-20s to parse).
-* `03_principles/gitsnap.py` — four-tier before/after recovery. **Tier 1 is merge-commit only, which
-  is why the outcome contrast must be tier-matched.**
-* `05_crosscheck/run_crosscheck_java.py` — `--sample N` is the SEEDED RANDOM draw; `--limit N` takes
-  the alphabetical head and is biased. **`DESIGNITE_CONCURRENCY` defaults to 1 and every repo needs
-  Designite, so `--workers` alone does nothing.** Use `VB_DESIGNITE_CONCURRENCY=2 VB_DESIGNITE_HEAP=4g`.
-  No resume: it writes its CSV only at the end.
+* `03_principles/java_lang/detectors.py`, all five principles as pure functions over facts.
+  **LSP has THREE signals, not five**: `javac` already rejects a changed parameter list (that is an
+  overload), narrowed parameter types (invariance) and reduced visibility.
+* `03_principles/java_lang/run_java.py`, ONE delta pass for all five (a tree costs 10-20s to parse).
+* `03_principles/gitsnap.py`, four-tier before/after recovery. **Tier 1 is merge-commit only**,
+  which is why the outcome contrast must be tier-matched.
+* `05_crosscheck/run_crosscheck_java.py`, `--sample N` is the SEEDED RANDOM draw; `--limit N` takes
+  the alphabetical head and is biased. **`DESIGNITE_CONCURRENCY` defaults to 1**, so `--workers`
+  alone does nothing. Use `VB_DESIGNITE_CONCURRENCY=2 VB_DESIGNITE_HEAP=4g`. No resume.
 
 ## Traps this project has paid for
 
-* `ps -W` reports ZERO python processes while several run. Use PowerShell `Get-Process`, and
+* `ps -W` reports ZERO python processes while several run. **`pgrep` does not exist here either**,
+  and a shell loop using it exits instantly. Use PowerShell `Get-Process`, and
   `Get-CimInstance Win32_Process` for command lines.
-* Killing a background bash script does NOT kill its child python, and the script advances to the
-  next stage.
-* **`cd` in a Bash tool call PERSISTS** into later calls and breaks relative paths. It has twice
-  looked exactly like data loss.
+* Killing a python parent does NOT kill its **java sidecar child**. Kill both.
+* **`cd` in a Bash tool call PERSISTS** into later calls and breaks relative paths. Twice looked
+  exactly like data loss.
 * **Bash heredocs mangle backslashes.** Write patch scripts to a file with the Write tool and run
-  them; `python - <<'PY'` corrupts LaTeX and regex.
+  them; `python - <<'PY'` corrupts LaTeX and regex. This cost several retries in one session alone.
 * When rewriting LaTeX programmatically, never capitalise "the first word on a line". Source wraps
   mid-sentence, so it capitalises the whole document.
+* **Beamer + enumitem**: do NOT load `enumitem` in the deck. Beamer defines `\labelenumi` through
+  its own templates, so `leftmargin=*` recurses while measuring the label and overflows TeX's input
+  stack. The pipeline figure must be fitted to frame HEIGHT, not width.
 * RAM is the ceiling, not CPU. 15.4 GB total; five to six workers.
-* **A partial result that looks complete is THE recurring bug here**: an empty diff, an empty file
-  list, a truncated API page, a partial batch directory, a status counter reporting 200/200 notes
-  on a file with none. Every one cost real data.
+* **A partial result that looks complete is THE recurring bug here.** Every one cost real data.
 
 ## Dataset trap
 
@@ -202,10 +270,10 @@ every agent alike.
 
 ## Superseded, kept only as record
 
-* **V1** (Python 546 PRs / 147 repos; Java 867 PRs / 27 repos, Codex only) — every number
+* **V1** (Python 546 PRs / 147 repos; Java 867 PRs / 27 repos, Codex only), every number
   superseded. `archive/`.
-* **TypeScript** — cancelled by the author. A class appears in only 27% of its PRs, so the
-  class-scoped proxies have no surface. Code stays in the tree, is not run, do not delete it.
-* **Machine-learning precision experiments** (GraphCodeBERT embeddings, trained SRP classifier) —
-  run in V1, all failed their gate, removed from the thesis. Do not re-propose without new evidence.
-* **Validation round 1** — archived at `vibebench/labels/VOID_ROUND1_2026-09-05/`, not deleted.
+* **TypeScript**, cancelled by the author. A class appears in only 27% of its PRs. Code stays in
+  the tree, is not run, do not delete it. **Never mention TS in the thesis or the deck.**
+* **Machine-learning precision experiments** (GraphCodeBERT embeddings, trained SRP classifier),
+  run in V1, all failed their gate, removed from the thesis. Do not re-propose.
+* **Validation round 1**, archived at `vibebench/labels/VOID_ROUND1_2026-09-05/`, not deleted.
