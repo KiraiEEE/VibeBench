@@ -169,6 +169,26 @@ for name, stem, labcol, mask in [
     check(f"{name} precision, HOLDOUT", f"{h[2]:.3f}")
     check(f"{name} precision, pooled", f"{tp/max(tp+fp,1):.3f}")
 
+# ------------------------------------------------- proxy scope populations
+print("\n-- the populations the proxy sections quote --")
+_lsp = pd.read_parquet(C.CORPUS_DIR / "lsp_results_java.parquet")
+_lv = _lsp["violation"].fillna(False).astype(bool)
+check("LSP flagged override pairs", f"{int(_lv.sum()):,}")
+check("LSP unflagged override pairs", f"{int((~_lv).sum()):,}")
+
+_ocp = pd.read_parquet(C.CORPUS_DIR / "ocp_results_java.parquet")
+check("OCP in-scope dispatch chains", f"{len(_ocp):,}")
+check("OCP chains suppressed as a closed enum set",
+      f"{int(_ocp['closed_set'].fillna(False).astype(bool).sum()):,}")
+
+_isp = pd.read_parquet(C.CORPUS_DIR / "isp_results_java.parquet")
+_ifc = _isp[_isp.row_type == "interface"]
+_imp = _isp[_isp.row_type == "implementer"]
+check("ISP contracts in scope", f"{len(_ifc):,}")
+check("ISP contracts flagged as fat", f"{int(_ifc['flagged'].fillna(False).astype(bool).sum()):,}")
+check("ISP implementer relationships with a forced stub",
+      f"{int(_imp['forced_stub'].fillna(False).astype(bool).sum()):,}")
+
 # ------------------------------------------------------- forbidden text
 print("\n-- residue from the superseded study --")
 # Bare numbers are matched on a DIGIT BOUNDARY, so a V1 figure like 546 is not
