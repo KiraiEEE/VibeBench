@@ -1,7 +1,37 @@
 # RESUME HERE
 
-**`CLAUDE.md` loads automatically in every session and holds the full picture.**
-This file is only the live worklog: what is half-done right now.
+## Starting a new session? You do not need to explain anything.
+
+`CLAUDE.md` sits in the project root and is loaded **automatically** into every
+session here. It carries the finished results, the current state, the house
+rules, the traps, and the Python V2 plan. This file carries only what is
+half-done right now.
+
+Paste one of these as your first message, depending on what you want:
+
+**Just continuing / a small task**
+> Read CLAUDE.md and RESUME_HERE.md first. The Java thesis is finished, do not
+> change any result unless I ask. Then: <your task>
+
+**Finish the paused DIP census**
+> Read CLAUDE.md and RESUME_HERE.md. Resume the paused DIP census from 23/95
+> using --only-missing, run the audit gate, judge the remaining rows, rescore
+> DIP over all 195, then update the thesis, the deck and the verifier.
+
+**Start the Python experiment (V2)**
+> Read CLAUDE.md including the "Python V2" section. Start V2: write the Python
+> fact extractor that produces the same fact stream the Java sidecar emits, then
+> recalibrate every threshold from Python corpus percentiles before any
+> labelling. Do not touch the thesis, it is a finished Java-only document.
+
+**Working on the thesis or the deck**
+> Read CLAUDE.md, especially the house rules. Never use an em dash, check
+> figures/ too. Report all five principles in every table. Then: <your task>
+
+If a new session ever tells you something that contradicts `CLAUDE.md`, believe
+the code and the data, not either document. Run
+`python vibebench/07_verify/verify_thesis_numbers.py`; it should print 28
+checks, 0 FAIL.
 
 ## Paused mid-task (2026-09-07)
 
