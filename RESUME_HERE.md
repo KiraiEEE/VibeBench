@@ -1,37 +1,31 @@
 # RESUME HERE
 
-## Starting a new session? You do not need to explain anything.
+## Starting a new session? Paste this. It works whatever the state is.
 
-`CLAUDE.md` sits in the project root and is loaded **automatically** into every
-session here. It carries the finished results, the current state, the house
-rules, the traps, and the Python V2 plan. This file carries only what is
-half-done right now.
+```
+Read CLAUDE.md and RESUME_HERE.md before doing anything else.
 
-Paste one of these as your first message, depending on what you want:
+CLAUDE.md describes a FINISHED Java-only thesis and defence deck. Do not change
+any published result, number, or wording unless I ask you to.
 
-**Just continuing / a small task**
-> Read CLAUDE.md and RESUME_HERE.md first. The Java thesis is finished, do not
-> change any result unless I ask. Then: <your task>
+Verify the state from the DATA, not from those documents, which go stale:
+  python vibebench/07_verify/verify_thesis_numbers.py     -> expect 28 checks, 0 FAIL
+  ls vibebench/labels/java_dip_batches_census | wc -l     -> DIP census progress, of 95
+  cd thesis/latex && latexmk -xelatex main.tex            -> expect 0 undefined refs
 
-**Finish the paused DIP census**
-> Read CLAUDE.md and RESUME_HERE.md. Resume the paused DIP census from 87/95
-> using --only-missing, run the audit gate, judge the remaining rows, rescore
-> DIP over all 195, then update the thesis, the deck and the verifier.
+Then continue whatever RESUME_HERE.md lists as in progress, and tell me what you
+found before you change anything.
 
-**Start the Python experiment (V2)**
-> Read CLAUDE.md including the "Python V2" section. Start V2: write the Python
-> fact extractor that produces the same fact stream the Java sidecar emits, then
-> recalibrate every threshold from Python corpus percentiles before any
-> labelling. Do not touch the thesis, it is a finished Java-only document.
+House rules that are not negotiable:
+  never write an em dash, and check figures/ too, not only chapters/
+  report all five principles in every table
+  do not reintroduce human labelling as a limitation, the supervisor ruled it out
+  do not mention TypeScript or the V1 Python study anywhere in the thesis
+```
 
-**Working on the thesis or the deck**
-> Read CLAUDE.md, especially the house rules. Never use an em dash, check
-> figures/ too. Report all five principles in every table. Then: <your task>
-
-If a new session ever tells you something that contradicts `CLAUDE.md`, believe
-the code and the data, not either document. Run
-`python vibebench/07_verify/verify_thesis_numbers.py`; it should print 28
-checks, 0 FAIL.
+Add one line at the end if you want something specific, for example
+"then start Python V2, see the Python V2 section of CLAUDE.md" or
+"then finish the DIP census".
 
 ## Paused mid-task (2026-09-07)
 
