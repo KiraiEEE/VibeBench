@@ -20,9 +20,9 @@ study. `python vibebench/07_verify/verify_thesis_numbers.py` exists because of i
 | Agents | Claude_Code (1,109), Copilot (2,366), OpenAI_Codex (770) analysable PRs |
 | Outcomes | merged, rejected, open, balanced on agent x outcome |
 | Language | Java only. Python V2 possible, NOT started. |
-| Validation | **1,400 rows judged**: 200 per principle, plus a 200-row holdout for LSP and ISP |
+| Validation | **1,495 rows judged**: 200 per principle, a 200-row holdout for LSP and ISP, and a **CENSUS of all 195 flagged DIP pull requests** |
 | Cross-check | CK + PMD + DesigniteJava over 150 repositories, 111,029 shared types |
-| Thesis | **94 pages**, `thesis/latex/`, **XeLaTeX only** (fontspec), 0 undefined refs |
+| Thesis | **95 pages**, `thesis/latex/`, **XeLaTeX only** (fontspec), 0 undefined refs |
 | Deck | **20 slides**, `thesis/presentation/`, XeLaTeX |
 | Verifier | `verify_thesis_numbers.py`, **28 checks, 0 FAIL** |
 | GitHub | **https://github.com/KiraiEEE/VibeBench**, PRIVATE. Code, thesis and deck all pushed. |
@@ -37,7 +37,7 @@ study. `python vibebench/07_verify/verify_thesis_numbers.py` exists because of i
 | SRP | 7.7% of authored classes (5.6% macro) | 0.350 | 0.875 [0.562, 0.975] |
 | OCP | 6.7% of PRs | 0.330 | 0.733 [0.440, 0.909] |
 | ISP | 6.5% of PRs | 0.335 | 0.552 [0.400, 0.700] |
-| DIP | 4.6% of PRs | **0.890** | 1.000 [0.410, 1.000] |
+| DIP | 4.6% of PRs | **0.892** exact | 1.000 [0.537, 1.000] |
 | LSP | 0.4% of PRs | 0.420 | 0.352 [0.159, 0.614] |
 
 **RECALL IS STRATUM-WEIGHTED.** The samples are 100 flagged + 100 unflagged; the corpus is nowhere
@@ -105,7 +105,8 @@ wmc 0.977, methods 0.969, loc 0.944; cohesion weak (0.288) but CK's own variants
   examples), so this is the design, NOT a missing human study. **The author and supervisor have
   ruled that human labelling is out of scope; do not reintroduce it as a limitation.**
 * Judge and one agent are both Claude. Tested in Table 4.9: on 4 of 5 principles Claude_Code's
-  flags are confirmed MORE often, the opposite of leniency. DIP is the exception (0.778 vs 0.943).
+  flags are confirmed MORE often, the opposite of leniency. DIP is the exception (0.792 vs 0.959
+  over the census).
 * Source-only analysis: median supertype resolution 87.0%, so LSP and ISP under-count in the 718
   PRs below 50%. Direction is favourable (a missed candidate, never an invented one).
 * `repo_too_large` drops 150 PRs, non-randomly: the biggest repositories.
@@ -114,30 +115,42 @@ wmc 0.977, methods 0.969, loc 0.944; cohesion weak (0.288) but CK's own variants
 
 ---
 
-## IN PROGRESS, PAUSED (2026-09-07)
+## DIP CENSUS: DONE (2026-09-08)
 
-**DIP census.** DIP flags only 195 PRs in the whole corpus and 100 are judged. Judging the
-remaining 95 makes DIP precision **exact** instead of an estimate. No other principle can do this
-(SRP would need 28,756 more rows).
+**DIP precision is now EXACT, not an estimate.** All 195 flagged pull requests in
+the corpus have been judged, so the flagged stratum is a census: no sampling
+error, no interval.
 
 ```
-state: 87 / 95 batches extracted, NO _manifest.json (correct for a paused run)
-resume:
-  python vibebench/labels/extract_java_label_batches.py --principle dip \
-      --file java_dip_labeling_sample_census.csv --only-missing
-  python vibebench/07_verify/audit_label_batches.py --principle dip --round _census
-  # then judge via record_labels.py with use_round('_census')
+round 2 sample : 100 flagged judged, 89 true  -> 0.890 estimate [0.814, 0.937]
+census round   :  95 flagged judged, 85 true  -> 0.895
+CENSUS TOTAL   : 195 flagged judged, 174 true -> 0.892  EXACT
 ```
 
-Extraction costs ~1 minute per PR (before AND after tree reconstructed and parsed). If it is
-resumed and finished, rescore DIP over all 195 and update the thesis, the deck and the verifier.
-The exact value may move off 0.890 in either direction; report whatever it is.
+The estimate was 0.890 and the truth is 0.892, so the sampling procedure used
+for the other four principles is very nearly unbiased on the one principle where
+that can be checked. No other principle admits this: SRP would need 28,756 more
+rows.
+
+Weighted recall becomes 1.000 [0.537, 1.000]; the interval TIGHTENED (from
+[0.410, 1.000]) because the numerator is now exact rather than scaled up from a
+sample. It is still driven by the 100-row unflagged stratum.
+
+Per agent, over the census: Claude_Code 0.792 (57/72), Copilot 0.959 (94/98),
+OpenAI_Codex 0.920 (23/25).
+
+**Judging rule used, recorded so it is auditable.** TRUE when the batch shows at
+least one newly cyclic pair involving a module the PR changed. FALSE when there
+is no charged pair AND no new internal import edge at all, which was 10 of the
+95: the detector had charged a cycle to a PR whose declared file list names a
+module whose text is identical between the reconstructed trees. That gap between
+"declared as touched" and "text actually differs" is the only systematic source
+of DIP false positives found.
 
 ## What to do next
 
-1. **Finish the DIP census** (above), or drop it. Nothing depends on it.
-2. **Python V2**, if asked. See the section below.
-3. Optional: three figures never design-reviewed (`fig_martin_plane`, `fig_delta_harness`,
+1. **Python V2**, if asked. See the section below.
+2. Optional: three figures never design-reviewed (`fig_martin_plane`, `fig_delta_harness`,
    `fig_solid_wheel`).
 
 ## Python V2, if the author asks for it

@@ -114,7 +114,12 @@ POP = {'srp': 'srp_results_java.parquet', 'ocp': 'ocp_results_java.parquet',
 
 
 def _labels(p, col):
-    """Every judged round for this principle, pooled."""
+    """Every judged round for this principle, pooled.
+
+    For DIP this includes the CENSUS round, which judged every remaining
+    flagged pull request in the corpus, so DIP's flagged stratum is complete
+    and its precision carries no sampling error.
+    """
     frames = []
     for f in sorted(C.LABELS_DIR.glob(f"java_{p}_labeling_sample*.csv")):
         d = pd.read_csv(f)
