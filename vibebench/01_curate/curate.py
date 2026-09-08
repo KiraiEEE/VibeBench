@@ -66,6 +66,12 @@ LANG_PROFILES = {
         # Java. Without this the run silently included all 6 agents in the
         # dataset (including the unvalidated Google_Jules).
         "only_agents": C.PY_ONLY_AGENTS,
+        # V2: same repo-stratified draw as Java. Python's pool is ~7x larger,
+        # so the natural draw concentrates harder still.
+        "repo_stratified": C.PY_REPO_STRATIFIED_DRAW,
+        "rejected_cap": C.PY_REJECTED_CELL_CAP,
+        "hard_cap": C.PY_CELL_HARD_CAP,
+        "open_cap": C.PY_OPEN_CELL_CAP,
         # Python's eligible pool is an order of magnitude larger than Java's
         # (smallest cell 3,716 vs 315), so it gets its own, higher cell cap.
         # See the CELL_PR_CAP block in config.py for why 750 and not the ceiling.
@@ -493,13 +499,21 @@ def balanced_sample(df: pd.DataFrame, gold_path: Path,
     # `changes_requested` PR that exists rather than sampling for a stratum far
     # too small to sample.
     if getattr(C, "V2_WITHIN_AGENT_BALANCE", False):
-        hard = getattr(C, "CELL_HARD_CAP", 1500)
+        # Both caps are profile-level so a language whose pools are shaped
+        # differently from Java's can be sized deliberately rather than
+        # inheriting Java's constants. See PY_CELL_HARD_CAP in config.py.
+        hard = (profile or {}).get("hard_cap") or getattr(C, "CELL_HARD_CAP", 1500)
+        open_cap = (profile or {}).get("open_cap")
+        rej_cap = (profile or {}).get("rejected_cap")
         parts = []
         for agent, ag in df.groupby("agent"):
             rej = ag[ag["outcome"] == "rejected"]
             mer = ag[ag["outcome"] == "merged"]
             opn = ag[ag["outcome"] == "open"]
-            n = min(len(rej), hard)
+            # The rejected ceiling is separate from `hard`, which bounds the
+            # merged draw. One shared ceiling would clamp merged down to the
+            # rejected count and cancel the over-draw below.
+            n = min(len(rej), rej_cap or hard)
             take_rej = rej if len(rej) <= n else _draw(rej, n, profile)
             # Over-draw merged so within-agent balance survives Step-2 attrition
             # (the rejected pool is exhausted and cannot be over-drawn). See
@@ -510,7 +524,13 @@ def balanced_sample(df: pd.DataFrame, gold_path: Path,
             take_mer = _draw(mer, n_mer, profile) if len(mer) > n_mer else mer
             parts += [take_rej, take_mer]
             if len(opn):
-                parts.append(opn)          # supplementary, never in the headline
+                # `open` is supplementary and never enters the headline
+                # contrast, so it does not need to match the rejected ceiling;
+                # it does need a cap, or a large open pool silently doubles the
+                # corpus (Python's is 5,240 against Java's 740).
+                if open_cap and len(opn) > open_cap:
+                    opn = _draw(opn, open_cap, profile)
+                parts.append(opn)
             print("[curate]   %-13s rejected %d (whole pool) + merged %d "
                   "(%.1fx over-drawn from %d)%s"
                   % (agent, len(take_rej), len(take_mer),

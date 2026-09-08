@@ -501,6 +501,38 @@ JAVA_PER_REPO_PR_CAP = None
 # than sampled away. Set to False to recover the natural draw.
 JAVA_REPO_STRATIFIED_DRAW = True
 
+# Python V2 takes the same stratified draw, for the same reason. Its eligible
+# pool is roughly seven times Java's (65,121 PRs against 9,193), so the natural
+# draw would concentrate even harder on the few repositories each agent works in
+# most. A per-repo cap is still NOT used: as argued above, macro-per-repo
+# averaging already stops one repository dominating a rate, and a cap would
+# discard corpus to buy a control the report already has.
+PY_REPO_STRATIFIED_DRAW = True
+
+# CORPUS SIZE FOR PYTHON V2.
+#
+# The within-agent balance path uses n = min(rejected pool, hard cap) and draws
+# 2n merged, then appends the whole `open` pool. Those constants were tuned on
+# Java, where every rejected pool sits below the 2,600 hard cap so the cap never
+# binds, and where the open pool is only 740 PRs. Python is a different shape:
+# rejected pools of 3,716 to 6,566 and an open pool of 5,240. Left alone the
+# same code draws 20,840 PRs, three times the Java corpus.
+#
+# That is not worth having. Java's 4,245 ANALYSABLE pull requests supported
+# every result in the thesis, including the mixed model, and a corpus three
+# times larger costs three times the fetch, the parse and the disk while making
+# the two studies harder to compare. These caps land Python at roughly 7,000
+# curated, which is Java's 6,956, so the two are like for like.
+# Two ceilings, not one. The balance path clamps BOTH the rejected draw and the
+# merged draw with the same `hard` value. In Java that was harmless because
+# every rejected pool sits below the cap, so merged could still be drawn at 2x
+# rejected. In Python the rejected pools exceed any sane cap, so a single
+# ceiling forces merged down to the rejected count and destroys the 2x
+# over-draw the design relies on to survive Step-2 attrition.
+PY_REJECTED_CELL_CAP = 700   # rejected drawn per agent
+PY_CELL_HARD_CAP = 1400      # ceiling for the merged draw, i.e. 2x the above
+PY_OPEN_CELL_CAP = 250       # per agent, matching Java's ~247 average
+
 # Java scopes by FILE, not by the repository's headline language. The unit of
 # analysis is "Java the agent wrote", and a repo whose primary language is Kotlin
 # or Go can still contain real Java. Measured on Python, the primary-language
