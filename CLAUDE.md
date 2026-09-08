@@ -19,7 +19,7 @@ study. `python vibebench/07_verify/verify_thesis_numbers.py` exists because of i
 | Corpus | **6,956 curated -> 4,245 analysable** pull requests over **1,010 repositories** |
 | Agents | Claude_Code (1,109), Copilot (2,366), OpenAI_Codex (770) analysable PRs |
 | Outcomes | merged, rejected, open, balanced on agent x outcome |
-| Language | Java only. Python V2 possible, NOT started. |
+| Language | Java study COMPLETE. **Python V2 IN PROGRESS** since 2026-09-08, phase 2 of 7. |
 | Validation | **1,495 rows judged**: 200 per principle, a 200-row holdout for LSP and ISP, and a **CENSUS of all 195 flagged DIP pull requests** |
 | Cross-check | CK + PMD + DesigniteJava over 150 repositories, 111,029 shared types |
 | Thesis | **95 pages**, `thesis/latex/`, **XeLaTeX only** (fontspec), 0 undefined refs |
