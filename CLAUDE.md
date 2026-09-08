@@ -149,9 +149,10 @@ of DIP false positives found.
 
 ## What to do next
 
-1. **Python V2**, if asked. See the section below.
-2. Optional: three figures never design-reviewed (`fig_martin_plane`, `fig_delta_harness`,
-   `fig_solid_wheel`).
+**Python V2 is in progress.** See `PROMPT.txt` section 1 for the full prompt,
+`RESUME_HERE.md` for the phase list, and the section below for the design.
+Phase 1 (curate) is done: 7,050 PRs / 3,974 repos. Phase 2 (clone + extract) has
+run only a 20-PR smoke test.
 
 ## Python V2, if the author asks for it
 
@@ -173,6 +174,27 @@ new extractor plus a re-run, not a second study.
 * **Disk:** the Java corpus alone is ~350 GB of clones. Check free space first.
 * **Do NOT** touch the thesis until Python results exist and are validated. The thesis is currently
   a correct, complete, Java-only document.
+
+### V2 progress and the traps already paid for (2026-09-08)
+
+* Phase 1 done. `PY_REJECTED_CELL_CAP` 700, `PY_CELL_HARD_CAP` 1400 (the MERGED
+  ceiling, deliberately 2x), `PY_OPEN_CELL_CAP` 250, repo-stratified draw on.
+  Left at Java's constants the same code drew **20,840** PRs and silently
+  cancelled the merged over-draw.
+* `V2_WITHIN_AGENT_BALANCE` **ignores `cell_cap`**. Read that branch, not the
+  cell loop above it, before changing any size.
+* Sticky sampling re-inherits the gold set on disk, so a bad draw perpetuates
+  itself until the file is moved aside.
+* **`record_labels.py` and `audit_label_batches.py` default to `java`.** Python
+  V2 must call `R.use_lang('py2')` and pass `--lang py2`, or it writes labels
+  into the finished Java study.
+* Four separate V1 delta passes exist (ocp, lsp, isp, dip). Replace them with
+  ONE `run_python.py`, both for speed and because four resume states means four
+  chances at a partial result that looks complete.
+* Calibration exists only in `run_ocp.py` and `run_lsp.py`; SRP, ISP and DIP
+  have none, and phase 4 cannot happen without it.
+* V1 artefacts are preserved as `gold_set.V1.parquet`,
+  `clone_manifest.V1.parquet` and `*_results.V1.parquet`.
 
 ---
 

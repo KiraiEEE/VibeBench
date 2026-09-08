@@ -26,42 +26,67 @@ Add one line at the end if you want something specific, for example
 "then start Python V2, see the Python V2 section of CLAUDE.md" or
 "then finish the DIP census".
 
-## Nothing is half-done. The Java study is complete.
+## IN PROGRESS: Python V2 (started 2026-09-08)
 
-The DIP census finished on 2026-09-08. All 195 flagged pull requests in the
-corpus have been judged, so DIP precision is **exact** rather than an estimate:
+**`PROMPT.txt` section 1 is the prompt to paste into a new session.** It carries
+the phase list, the resume commands and the traps. This is the summary.
 
 ```
-round 2 sample : 100 flagged, 89 true   -> 0.890 estimate [0.814, 0.937]
-census round   :  95 flagged, 85 true   -> 0.895
-CENSUS TOTAL   : 195 flagged, 174 true  -> 0.892  EXACT, no interval
+PHASE 1 curate ................ DONE   7,050 PRs / 3,974 repos
+PHASE 2 clone + extract ....... 357 of 7,050 PRs done (smoke test only)
+PHASE 3 run_python.py ......... NOT WRITTEN, the main build task
+PHASE 4 calibrate thresholds .. NOT STARTED
+PHASE 5 report + joint model .. NOT STARTED
+PHASE 6 label extract + gate .. NOT STARTED
+PHASE 7 judge ~1,000 rows ..... NOT STARTED, the long pole
 ```
 
-The estimate was 0.890 and the truth is 0.892, which also says the sampling used
-for the other four principles is very nearly unbiased on the one principle where
-it can be checked against the whole population.
+Resume phase 2 with:
+```
+python vibebench/02_clone/clone_and_extract.py --lang py --workers 8
+```
 
-| | |
-|---|---|
-| Thesis | 95 pages, 0 undefined refs, XeLaTeX |
-| Deck | 20 slides |
-| Verifier | 28 checks, 0 FAIL |
-| Judged rows | 1,495 |
-| Title | Evaluating Coding Agent Quality: Application to Software Design Principles |
-| Remote | https://github.com/KiraiEEE/VibeBench, working tree clean |
+### Bugs found and fixed on 2026-09-08, do not reintroduce
 
-## Two decisions the author has already made, do not reopen
+1. **The corpus came out at 20,840 PRs**, three times Java. The balance path
+   `V2_WITHIN_AGENT_BALANCE` ignores `cell_cap` entirely and uses
+   `CELL_HARD_CAP`. Java's rejected pools sit below that cap so it never bound;
+   Python's are 3,716 to 6,566 so it bound three times.
+2. **`open` was appended uncapped**, 5,240 PRs against Java's 740.
+3. **One ceiling clamped both** the rejected and the merged draw, cancelling the
+   2x merged over-draw that exists so balance survives Step-2 attrition.
+   Fixed with `PY_REJECTED_CELL_CAP` 700 and `PY_CELL_HARD_CAP` 1400.
+4. **Sticky sampling re-inherits whatever gold set is on disk**, so a bad draw
+   perpetuates itself across reruns until the file is moved aside.
+5. **The label guards hardcoded a `java_` prefix.** Judging Python through
+   `record_labels.py` would have written labels into the finished Java study's
+   CSVs, and the audit gate would have reported clean over the wrong files.
+   Both now take a language and default to `java`; Python V2 must use
+   `R.use_lang('py2')` and `--lang py2`.
+
+### Checked and deliberately NOT changed
+
+* Vendored and generated Python is under 0.5% of files, so no path exclusions
+  were added. Java needed them (protoc output was 5.8% and agent-biased).
+* Test code is 28% of files and `report.py` already separates it.
+* Python keeps FIVE LSP signals. Java has three only because `javac` rejects
+  the other two; Python has no compiler.
+
+### Watch this at scale
+
+The 20-PR smoke test produced 130 `fetch_failed` rows, **all on Claude_Code**.
+If that persists it is agent-biased attrition and must be measured and
+disclosed, not silently dropped.
+
+## The Java study is finished and must not be touched
+
+95-page thesis, 20-slide deck, verifier 28 checks 0 FAIL, DIP precision exact at
+0.892 over a census of all 195 flagged requests. Do not change any Java result
+while Python V2 is in progress. See `PROMPT.txt` section 3.
+
+## Two decisions already made, do not reopen
 
 * **No human labelling.** The supervisor ruled it out of scope. LLM judging of
-  SOLID is cited as a validated technique (Pehlivan et al. 2025). Do not
-  reintroduce "no human ground truth" as a limitation anywhere.
-* **The title is settled** as above. Do not revert it to "Software Architectures".
-
-## What is left
-
-1. **Python V2**, if asked. `CLAUDE.md` has the plan and `PROMPT.txt` has the
-   prompt: new fact extractor matching the Java sidecar's contract, every
-   threshold recalibrated from Python percentiles before labelling, and expect a
-   larger LSP signal set than Java's three.
-2. Optional polish: three figures never design-reviewed (`fig_martin_plane`,
-   `fig_delta_harness`, `fig_solid_wheel`).
+  SOLID is cited as validated (Pehlivan et al. 2025).
+* **The title is settled**: Evaluating Coding Agent Quality: Application to
+  Software Design Principles.
