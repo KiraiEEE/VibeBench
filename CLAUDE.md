@@ -121,7 +121,7 @@ remaining 95 makes DIP precision **exact** instead of an estimate. No other prin
 (SRP would need 28,756 more rows).
 
 ```
-state: 23 / 95 batches extracted, NO _manifest.json (correct for a paused run)
+state: 87 / 95 batches extracted, NO _manifest.json (correct for a paused run)
 resume:
   python vibebench/labels/extract_java_label_batches.py --principle dip \
       --file java_dip_labeling_sample_census.csv --only-missing

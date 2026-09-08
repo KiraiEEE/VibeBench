@@ -14,7 +14,7 @@ Paste one of these as your first message, depending on what you want:
 > change any result unless I ask. Then: <your task>
 
 **Finish the paused DIP census**
-> Read CLAUDE.md and RESUME_HERE.md. Resume the paused DIP census from 23/95
+> Read CLAUDE.md and RESUME_HERE.md. Resume the paused DIP census from 87/95
 > using --only-missing, run the audit gate, judge the remaining rows, rescore
 > DIP over all 195, then update the thesis, the deck and the verifier.
 
@@ -35,14 +35,14 @@ checks, 0 FAIL.
 
 ## Paused mid-task (2026-09-07)
 
-**DIP census, 23 of 95 batches extracted.**
+**DIP census, 87 of 95 batches extracted.**
 
 DIP flags only 195 pull requests in the whole corpus; 100 are already judged.
 Judging the last 95 makes DIP precision **exact** rather than an estimate with
 an interval. No other principle can do this: SRP would need 28,756 more rows.
 
 ```
-state   23/95 batches, NO _manifest.json  (correct: a paused run must not look finished)
+state   87/95 batches, NO _manifest.json  (correct: a paused run must not look finished)
 cost    ~1 minute per PR, so ~70 minutes remain
 
 resume  python vibebench/labels/extract_java_label_batches.py --principle dip \
