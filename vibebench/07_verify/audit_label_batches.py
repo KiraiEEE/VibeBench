@@ -74,9 +74,12 @@ def ok(msg: str) -> None:
     print(f"  ok    {msg}")
 
 
-def audit(p: str, rnd: str = "") -> None:
-    csv = C.LABELS_DIR / f"java_{p}_labeling_sample{rnd}.csv"
-    bdir = C.LABELS_DIR / f"java_{p}_batches{rnd}"
+def audit(p: str, rnd: str = "", lang: str = "java") -> None:
+    # `lang` used to be a hardcoded "java" here. Auditing the Java round while a
+    # different language was being judged would have reported a clean gate over
+    # the wrong files, which is worse than no gate.
+    csv = C.LABELS_DIR / f"{lang}_{p}_labeling_sample{rnd}.csv"
+    bdir = C.LABELS_DIR / f"{lang}_{p}_batches{rnd}"
     print(f"\n=== {p.upper()} ===")
     if not csv.exists():
         warn(f"no sample CSV at {csv.name}, nothing to audit")
@@ -185,12 +188,14 @@ def main() -> None:
     ap.add_argument("--principle", choices=PRINCIPLES)
     ap.add_argument("--round", default="",
                     help="suffix identifying the round, e.g. _holdout")
+    ap.add_argument("--lang", default="java",
+                    help="language prefix on the sample files (default: java)")
     a = ap.parse_args()
     print("=" * 70)
     print("LABEL BATCH AUDIT -- can every label be traced to source the judge saw?")
     print("=" * 70)
     for p in ([a.principle] if a.principle else PRINCIPLES):
-        audit(p, a.round)
+        audit(p, a.round, a.lang)
     print("\n" + "=" * 70)
     print(f"{len(fails)} FAIL, {len(warns)} warn")
     print("=" * 70)

@@ -61,9 +61,22 @@ def use_round(suffix: str) -> None:
     ROUND = suffix
 
 
+# The language prefix is a variable, not a literal. It used to be hardcoded to
+# "java", which meant a Python V2 judging session would have written its labels
+# INTO the Java sample CSVs and silently corrupted a finished study. Default
+# stays "java" so every existing call site and archived round is unaffected.
+LANG = "java"
+
+
+def use_lang(prefix: str) -> None:
+    """Point every path at a language, e.g. use_lang('py2')."""
+    global LANG
+    LANG = prefix
+
+
 def _paths(p: str) -> tuple[Path, Path]:
-    return (C.LABELS_DIR / f"java_{p}_labeling_sample{ROUND}.csv",
-            C.LABELS_DIR / f"java_{p}_batches{ROUND}")
+    return (C.LABELS_DIR / f"{LANG}_{p}_labeling_sample{ROUND}.csv",
+            C.LABELS_DIR / f"{LANG}_{p}_batches{ROUND}")
 
 
 def batch_index(p: str) -> dict[int, Path]:
