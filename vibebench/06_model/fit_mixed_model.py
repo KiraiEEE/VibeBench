@@ -16,10 +16,25 @@ association, not a causal effect. Repositories are a random intercept because
 the same repository contributes many pull requests and its conventions are not
 of interest in themselves.
 
-Run:  python vibebench/06_model/fit_mixed_model.py
+LANGUAGE. `--lang java` (the default) is the finished study and is byte-for-byte
+what it always printed apart from a one-line banner. `--lang py` models the
+Python V2 corpus. The switch exists because this file used to hardcode the Java
+parquet: run from the Python chain it did not fail, it quietly fitted and
+printed the JAVA model at the end of a Python log, which is precisely the kind of
+result that looks complete and is wrong. The banner names the corpus on the first
+line so a log can never be misread again.
+
+SRP is modelled for Python only. Java's PR table carries no PR-level SRP flag
+(SRP is scored per type), so the Python SRP row has no Java counterpart and is
+labelled as such; the four delta principles are identical in both languages and
+are the ones to compare.
+
+Run:  python vibebench/06_model/fit_mixed_model.py              # Java
+      python vibebench/06_model/fit_mixed_model.py --lang py    # Python V2
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -38,18 +53,36 @@ PRINCIPLES = [("OCP", "ocp_risk"), ("ISP", "isp_risk"),
               ("DIP", "dip_risk"), ("LSP", "lsp_flag")]
 
 
-def load() -> pd.DataFrame:
-    pr = pd.read_parquet(C.CORPUS_DIR / "java_pr_results.parquet")
+SOURCES = {
+    "java": {"pr": "java_pr_results.parquet", "gold": "gold_set_java.parquet",
+             "label": "JAVA (the finished study)"},
+    "py": {"pr": "py_pr_results.parquet", "gold": "gold_set.parquet",
+           "label": "PYTHON V2"},
+}
+
+
+def load(lang: str = "java") -> pd.DataFrame:
+    src = SOURCES[lang]
+    pr = pd.read_parquet(C.CORPUS_DIR / src["pr"])
     d = pr[pr.status == "ok"].copy()
 
     # The PR-level Liskov flag applies the refused-bequest restriction, exactly
     # as report_java.py does. Using the raw lsp_risk here would model a
-    # different quantity from the one Chapter 4 reports.
-    strong = {"new_" + s for s in C.LSP_JAVA_STRONG_SIGNALS}
+    # different quantity from the one Chapter 4 reports. Python keeps its own
+    # FIVE strong signals (it has no compiler to reject two of them).
+    strong_src = (C.LSP_JAVA_STRONG_SIGNALS if lang == "java"
+                  else C.LSP_THRESHOLDS["strong_signals"])
+    strong = {"new_" + s for s in strong_src}
     d["lsp_flag"] = d.lsp_risk_reasons.fillna("").map(
         lambda x: bool(strong & {p for p in str(x).split("|") if p}))
 
-    gold = pd.read_parquet(C.CORPUS_DIR / "gold_set_java.parquet")
+    # A calibration parquet has every flag NULL. Modelling it would fit
+    # "no violations anywhere" and print odds ratios that look like findings.
+    if lang == "py" and "ocp_risk" in d.columns and d["ocp_risk"].isna().all():
+        sys.exit("py_pr_results.parquet is a CALIBRATION parquet (flags null). "
+                 "Run the flagged pass first; refusing to model it.")
+
+    gold = pd.read_parquet(C.CORPUS_DIR / src["gold"])
     dates = gold[["pr_id", "created_at"]].drop_duplicates("pr_id")
     d = d.merge(dates, on="pr_id", how="left")
 
@@ -108,13 +141,24 @@ def fit(d: pd.DataFrame, name: str, col: str) -> None:
 
 
 def main() -> None:
-    d = load()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--lang", choices=sorted(SOURCES), default="java")
+    lang = ap.parse_args().lang
+    print(f"CORPUS: {SOURCES[lang]['label']}")
+    d = load(lang)
+    principles = list(PRINCIPLES)
+    if lang == "py" and "srp_risk" in d.columns:
+        # PR-level: the PR touched at least one flagged class. No Java
+        # counterpart exists, so this row is NOT part of the cross-language
+        # comparison. Present in touched code, not authored.
+        principles = [("SRP (PR-level, Python only, no Java counterpart)",
+                       "srp_risk")] + principles
     print(f"loaded {len(d):,} analysable pull requests, "
           f"{d.full_name.nunique():,} repositories")
     print(f"reference agent: {REFERENCE_AGENT}")
     print("agent cells:", dict(d.agent.value_counts()))
     print(f"date span: {d.created_at.min().date()} to {d.created_at.max().date()}")
-    for name, col in PRINCIPLES:
+    for name, col in principles:
         fit(d, name, col)
     print("\nOdds ratios are adjusted for change size (log files touched), era "
           "(months) and\nrepository. An OR above 1 means higher odds of a flag "

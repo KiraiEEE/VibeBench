@@ -1,0 +1,132 @@
+row 100   vllm-project/vllm#38455
+============================================================================
+OVERRIDE  vllm.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe.BatchedDeepGemmExperts.apply
+BASE      vllm.model_executor.layers.fused_moe.modular_kernel.FusedMoEExpertsModular.apply
+QUESTION: can an instance of the SUBCLASS be used anywhere the BASE
+          is expected, without breaking the caller?
+
+---------------- BASE CLASS HEADER (vllm/model_executor/layers/fused_moe/modular_kernel.py) ----------------
+      752  class FusedMoEExpertsModular(FusedMoEExperts):
+---------------- BASE METHOD ----------------
+      881      @abstractmethod
+      882      def apply(
+      883          self,
+      884          output: torch.Tensor,
+      885          hidden_states: torch.Tensor,
+      886          w1: torch.Tensor,
+      887          w2: torch.Tensor,
+      888          topk_weights: torch.Tensor,
+      889          topk_ids: torch.Tensor,
+      890          activation: MoEActivation,
+      891          global_num_experts: int,
+      892          expert_map: torch.Tensor | None,
+      893          a1q_scale: torch.Tensor | None,
+      894          a2_scale: torch.Tensor | None,
+      895          workspace13: torch.Tensor,
+      896          workspace2: torch.Tensor,
+      897          expert_tokens_meta: ExpertTokensMetadata | None,
+      898          apply_router_weight_on_input: bool,
+      899      ) -> None:
+      900          """
+      901          This function computes the intermediate result of a Mixture of Experts
+      902          (MoE) layer using two sets of weights, w1 and w2.
+      903  
+      904          Parameters:
+      905          - output: (torch.Tensor): The unweighted, unreduced output tensor.
+      906          - hidden_states: (torch.Tensor): The (quantized) input tensor to the MoE
+      907            layer.
+      908          - w1 (torch.Tensor): The first set of expert weights.
+      909          - w2 (torch.Tensor): The second set of expert weights.
+      910          - topk_weights: A map of row to expert weights. Some implementations
+      911            choose to do weight application.
+      912          - topk_ids (torch.Tensor): A map of row to expert id.
+      913          - activation (str): The activation function to apply after the first
+      914            MoE layer.
+      915          - global_num_experts (int): The total number of experts in the global
+      916            expert space.
+      917          - expert_map (Optional[torch.Tensor]):  A tensor mapping expert indices
+      918            from the global expert space to the local expert space of the expert
+      919            parallel shard.
+      920          - a1q_scale (Optional[torch.Tensor]): Optional quantized scale to be
+      921            used for a1.  Result of quantization from prepare/finalize and not
+      922            from the FusedMoEQuantConfig.
+      923          - workspace13 (torch.Tensor): A scratch tensor used for gemm outputs
+      924            must be large enough to hold output of either MoE gemm.
+      925          - workspace2 (torch.Tensor): A scratch tensor used for the activation
+      926            function.
+      927          - expert_tokens_meta (Optional[ExpertTokensMetadata]) - An optional
+      928            ExpertTokensMetadata object containing gpu/cpu tensors
+      929            as big as the number of local experts with the information about the
+      930            number of tokens assigned to each local expert.
+      931          - apply_router_weight_on_input: True if router weights are already
+      932            applied on the input. This is relevant if the implementation
+      933            chooses to do weight application.
+      934          """
+      935          raise NotImplementedError
+
+---------------- SUBCLASS HEADER (vllm/model_executor/layers/fused_moe/experts/batched_deep_gemm_moe.py) ----------------
+      269  class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
+---------------- OVERRIDE ----------------
+      387      def apply(
+      388          self,
+      389          output: torch.Tensor,
+      390          hidden_states: torch.Tensor,
+      391          w1: torch.Tensor,
+      392          w2: torch.Tensor,
+      393          topk_weights: torch.Tensor,
+      394          topk_ids: torch.Tensor,
+      395          activation: MoEActivation,
+      396          global_num_experts: int,
+      397          expert_map: torch.Tensor | None,
+      398          a1q_scale: torch.Tensor | None,
+      399          a2_scale: torch.Tensor | None,
+      400          workspace13: torch.Tensor,
+      401          workspace2: torch.Tensor,
+      402          expert_tokens_meta: mk.ExpertTokensMetadata | None,
+      403          apply_router_weight_on_input: bool,
+      404      ):
+      405          assert expert_tokens_meta is not None
+      406          expert_num_tokens = expert_tokens_meta.expert_num_tokens
+      407  
+      408          assert hidden_states.ndim == 3
+      409          assert self.block_shape is not None
+      410  
+      411          a1q = hidden_states
+      412          _, N, K = w1.size()
+      413  
+      414          assert w2.size(1) == K
+      415  
+      416          E, max_num_tokens, N, K, _ = self.moe_problem_size(
+      417              hidden_states, w1, w2, topk_ids
+      418          )
+      419  
+      420          workspace1 = _resize_cache(workspace13, (E, max_num_tokens, N))
+      421  
+      422          expected_m = self.estimate_expected_m(
+      423              global_num_experts=global_num_experts,
+      424              max_tokens_per_expert=max_num_tokens,
+      425              topk=topk_ids.size(-1),
+      426          )
+      427  
+      428          fp8_m_grouped_gemm_nt_masked(
+      429              (a1q, a1q_scale),
+      430              (w1, self.w1_scale),
+      431              workspace1,
+      432              expert_num_tokens,
+      433              expected_m,
+      434          )
+      435  
+      436          quant_scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
+      437          a2q, a2q_scale = persistent_masked_m_silu_mul_quant(
+      438              workspace1,
+      439              expert_num_tokens,
+      440              quant_scale_fmt=quant_scale_fmt,
+      441          )
+      442  
+      443          fp8_m_grouped_gemm_nt_masked(
+      444              (a2q, a2q_scale),
+      445              (w2, self.w2_scale),
+      446              output,
+      447              expert_num_tokens,
+      448              expected_m,
+      449          )

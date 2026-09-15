@@ -1,0 +1,321 @@
+row 104   rabbitmq-community/rstream#263
+============================================================================
+CLASS Client in rstream/client.py   loc=316 methods=23 wmc=39 lcom=0.0454545454545454
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      383  class Client(BaseClient):
+      384      async def close(self) -> None:
+      385          await self.stop_task("heartbeat_sender")
+      386          await super().close()
+      387  
+      388      async def peer_properties(self) -> dict[str, str]:
+      389          resp = await self.sync_request(
+      390              schema.PeerProperties(
+      391                  correlation_id=self._corr_id_seq.next(),
+      392                  properties=[schema.Property(key, value) for key, value in self._client_properties.items()],
+      393              ),
+      394              resp_schema=schema.PeerPropertiesResponse,
+      395          )
+      396          return {prop.key: prop.value for prop in resp.properties}
+      397  
+      398      async def open(self, vhost: str) -> dict[str, str]:
+      399          resp = await self.sync_request(
+      400              schema.Open(
+      401                  self._corr_id_seq.next(),
+      402                  virtual_host=vhost,
+      403              ),
+      404              resp_schema=schema.OpenResponse,
+      405          )
+      406          return {prop.key: prop.value for prop in resp.properties}
+      407  
+      408      async def authenticate(self, vhost: str, username: str, password: str) -> dict[str, str]:
+      409          self.server_properties = await self.peer_properties()
+      410  
+      411          handshake_resp = await self.sync_request(
+      412              schema.SaslHandshake(
+      413                  correlation_id=self._corr_id_seq.next(),
+      414              ),
+      415              resp_schema=schema.SaslHandshakeResponse,
+      416          )
+      417          assert self._sasl_configuration_mechanism in handshake_resp.mechanisms
+      418  
+      419          auth_data = b"".join(
+      420              (
+      421                  b"\0",
+      422                  username.encode("utf-8"),
+      423                  b"\0",
+      424                  password.encode("utf-8"),
+      425              )
+      426          )
+      427          waiter = self.wait_frame(schema.Tune)
+      428          await self.sync_request(
+      429              schema.SaslAuthenticate(
+      430                  self._corr_id_seq.next(),
+      431                  mechanism=self._sasl_configuration_mechanism,
+      432                  data=auth_data,
+      433              ),
+      434              resp_schema=schema.SaslAuthenticateResponse,
+      435          )
+      436          tune_req = await waiter
+      437  
+      438          self._frame_max = min(self._frame_max, tune_req.frame_max)
+      439          self._heartbeat = min(self._heartbeat, tune_req.heartbeat)
+      440  
+      441          await self.send_frame(
+      442              schema.Tune(
+      443                  frame_max=self._frame_max,
+      444                  heartbeat=self._heartbeat,
+      445              ),
+      446          )
+      447          self._start_heartbeat()
+      448  
+      449          open_response = await self.open(vhost)
+      450          self.server_properties.update(open_response)
+      451          return open_response
+      452  
+      453      async def create_stream(self, stream: str, arguments: Optional[dict[str, Any]] = None) -> None:
+      454          if arguments is None:
+      455              arguments = {}
+      456  
+      457          await self.sync_request(
+      458              schema.Create(
+      459                  self._corr_id_seq.next(),
+      460                  stream=stream,
+      461                  arguments=[schema.Property(key, str(val)) for key, val in arguments.items()],
+      462              ),
+      463              resp_schema=schema.CreateResponse,
+      464          )
+      465  
+      466      async def create_super_stream(
+      467          self,
+      468          super_stream: str,
+      469          partitions: list[str],
+      470          binding_keys: list[str],
+      471          arguments: Optional[dict[str, Any]] = None,
+      472      ) -> None:
+      473          if arguments is None:
+      474              arguments = {}
+      475  
+      476          await self.sync_request(
+      477              schema.CreateSuperStream(
+      478                  self._corr_id_seq.next(),
+      479                  super_stream=super_stream,
+      480                  partitions=partitions,
+      481                  binding_keys=binding_keys,
+      482                  arguments=[schema.Property(key, str(val)) for key, val in arguments.items()],
+      483              ),
+      484              resp_schema=schema.CreateSuperStreamResponse,
+      485          )
+      486  
+      487      async def delete_stream(self, stream: str) -> None:
+      488          await self.sync_request(
+      489              schema.Delete(
+      490                  self._corr_id_seq.next(),
+      491                  stream=stream,
+      492              ),
+      493              resp_schema=schema.DeleteResponse,
+      494          )
+      495  
+      496      async def delete_super_stream(self, super_stream: str) -> None:
+      497          await self.sync_request(
+      498              schema.DeleteSuperStream(
+      499                  self._corr_id_seq.next(),
+      500                  super_stream=super_stream,
+      501              ),
+      502              resp_schema=schema.DeleteSuperStreamResponse,
+      503          )
+      504  
+      505      async def stream_exists(self, stream: str) -> bool:
+      506          try:
+      507              await self.sync_request(
+      508                  schema.Metadata(
+      509                      self._corr_id_seq.next(),
+      510                      streams=[stream],
+      511                  ),
+      512                  resp_schema=schema.MetadataResponse,
+      513              )
+      514          except exceptions.StreamDoesNotExist:
+      515              return False
+      516          return True
+      517  
+      518      async def query_leader_and_replicas(
+      519          self,
+      520          stream: str,
+      521      ) -> tuple[Broker, list[Broker]]:
+      522          while True:
+      523              metadata_resp = await self.sync_request(
+      524                  schema.Metadata(
+      525                      self._corr_id_seq.next(),
+      526                      streams=[stream],
+      527                  ),
+      528                  resp_schema=schema.MetadataResponse,
+      529              )
+      530              assert len(metadata_resp.metadata) == 1
+      531              metadata = metadata_resp.metadata[0]
+      532              assert metadata.name == stream
+      533  
+      534              if metadata.leader_ref == 65535:
+      535                  logger.warning("Leader not yet elected for stream %s, retrying...", stream)
+      536                  raise exceptions.LeaderNotAvailable(f"Leader not yet elected for stream {stream}")
+      537  
+      538              brokers = {broker.reference: broker for broker in metadata_resp.brokers}
+      539              leader = brokers[metadata.leader_ref]
+      540              replicas = [brokers[replica_ref] for replica_ref in metadata.replicas_refs]
+      541  
+      542              return leader, replicas
+      543  
+      544      async def subscribe(
+      545          self,
+      546          stream: str,
+      547          subscription_id: int,
+      548          offset_spec: schema.OffsetSpec = schema.OffsetSpec(constants.OffsetType.FIRST),
+      549          initial_credit: int = 10,
+      550          properties: Optional[dict[str, Any]] = None,
+      551      ) -> None:
+      552          await self.sync_request(
+      553              schema.Subscribe(
+      554                  self._corr_id_seq.next(),
+      555                  subscription_id=subscription_id,
+      556                  stream=stream,
+      557                  offset_spec=offset_spec,
+      558                  credit=initial_credit,
+      559                  properties=[schema.Property(key, str(value)) for key, value in (properties or {}).items()],
+      560              ),
+      561              resp_schema=schema.SubscribeResponse,
+      562          )
+      563  
+      564      async def unsubscribe(self, subscription_id: int) -> None:
+      565          await self.sync_request(
+      566              schema.Unsubscribe(
+      567                  self._corr_id_seq.next(),
+      568                  subscription_id=subscription_id,
+      569              ),
+      570              resp_schema=schema.UnsubscribeResponse,
+      571          )
+      572  
+      573      async def credit(self, subscription_id: int, credit: int) -> None:
+      574          await self.send_frame(
+      575              schema.Credit(
+      576                  subscription_id=subscription_id,
+      577                  credit=credit,
+      578              )
+      579          )
+      580  
+      581      async def query_offset(self, stream: str, reference: str) -> int:
+      582          resp = await self.sync_request(
+      583              schema.QueryOffset(
+      584                  self._corr_id_seq.next(),
+      585                  reference=reference,
+      586                  stream=stream,
+      587              ),
+      588              resp_schema=schema.QueryOffsetResponse,
+      589          )
+      590          resp.check_response_code(True)
+      591          return resp.offset
+      592  
+      593      async def store_offset(self, stream: str, reference: str, offset: int) -> None:
+      594          await self.send_frame(
+      595              schema.StoreOffset(
+      596                  reference=reference,
+      597                  stream=stream,
+      598                  offset=offset,
+      599              )
+      600          )
+      601  
+      602      async def declare_publisher(self, stream: str, reference: Optional[str], publisher_id: int) -> None:
+      603          if reference is None:
+      604              reference = ""
+      605          await self.sync_request(
+      606              schema.DeclarePublisher(
+      607                  self._corr_id_seq.next(),
+      608                  publisher_id=publisher_id,
+      609                  stream=stream,
+      610                  reference=reference,
+      611              ),
+      612              resp_schema=schema.DeclarePublisherResponse,
+      613              raise_exception=True,
+      614          )
+      615  
+      616      async def delete_publisher(self, publisher_id: int) -> None:
+      617          if self._conn is None:
+      618              return
+      619          await self.sync_request(
+      620              schema.DeletePublisher(
+      621                  self._corr_id_seq.next(),
+      622                  publisher_id=publisher_id,
+      623              ),
+      624              resp_schema=schema.DeletePublisherResponse,
+      625          )
+      626  
+      627      async def query_publisher_sequence(self, stream: str, reference: str) -> int:
+      628          resp = await self.sync_request(
+      629              schema.QueryPublisherSequence(
+      630                  self._corr_id_seq.next(),
+      631                  publisher_ref=reference,
+      632                  stream=stream,
+      633              ),
+      634              resp_schema=schema.QueryPublisherSequenceResponse,
+      635              raise_exception=False,
+      636          )
+      637          return resp.sequence
+      638  
+      639      async def publish(self, messages: list[schema.Message], publisher_id: int) -> None:
+      640          await self.send_frame(
+      641              schema.Publish(
+      642                  publisher_id=publisher_id,
+      643                  messages=messages,
+      644              ),
+      645          )
+      646  
+      647      async def partitions(self, super_stream: str) -> list[str]:
+      648          resp = await self.sync_request(
+      649              schema.SuperStreamPartitions(
+      650                  self._corr_id_seq.next(),
+      651                  super_stream=super_stream,
+      652              ),
+      653              resp_schema=schema.SuperStreamPartitionsResponse,
+      654              raise_exception=False,
+      655          )
+      656          return resp.streams
+      657  
+      658      async def consumer_update(self, correlation_id: int, offset_specification: OffsetSpecification) -> None:
+      659          await self.send_frame(
+      660              schema.ConsumerUpdateServerResponse(
+      661                  correlation_id=correlation_id,
+      662                  response_code=1,
+      663                  offset_specification=offset_specification,
+      664              ),
+      665          )
+      666  
+      667      async def route(self, routing_key: str, super_stream: str) -> list[str]:
+      668          resp = await self.sync_request(
+      669              schema.SuperStreamRoute(
+      670                  self._corr_id_seq.next(),
+      671                  routing_key=routing_key,
+      672                  super_stream=super_stream,
+      673              ),
+      674              resp_schema=schema.SuperStreamRouteResponse,
+      675              raise_exception=False,
+      676          )
+      677          return resp.streams
+      678  
+      679      async def exchange_command_version(
+      680          self, command_info: schema.FrameHandlerInfo
+      681      ) -> schema.FrameHandlerInfo:
+      682          command_versions_input = [command_info]
+      683          resp = await self.sync_request(
+      684              schema.ExchangeCommandVersionRequest(
+      685                  self._corr_id_seq.next(),
+      686                  command_versions=command_versions_input,
+      687              ),
+      688              resp_schema=schema.ExchangeCommandVersionResponse,
+      689              raise_exception=False,
+      690          )
+      691  
+      692          command_version = schema.FrameHandlerInfo(
+      693              resp.command_versions[command_info.key_command - 1].key_command,
+      694              resp.command_versions[command_info.key_command - 1].min_version,
+      695              resp.command_versions[command_info.key_command - 1].max_version,
+      696          )
+      697  
+      698          return command_version

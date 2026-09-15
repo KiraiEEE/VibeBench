@@ -1,0 +1,373 @@
+row 179   mims-harvard/ToolUniverse#154
+============================================================================
+OVERRIDE  tooluniverse.core_tool.CorePDFSnippetsTool.run
+BASE      tooluniverse.base_tool.BaseTool.run
+QUESTION: can an instance of the SUBCLASS be used anywhere the BASE
+          is expected, without breaking the caller?
+
+---------------- BASE CLASS HEADER (src/tooluniverse/base_tool.py) ----------------
+       41  class BaseTool:
+---------------- BASE METHOD ----------------
+      149      @no_type_check
+      150      def run(self, arguments=None, stream_callback=None, use_cache=False, validate=True):
+      151          """Execute the tool.
+      152  
+      153          The default BaseTool implementation accepts an optional arguments
+      154          mapping to align with most concrete tool implementations which expect
+      155          a dictionary of inputs.
+      156  
+      157          Args:
+      158              arguments (dict, optional): Tool-specific arguments
+      159              stream_callback (callable, optional): Callback for streaming responses
+      160              use_cache (bool, optional): Whether result caching is enabled
+      161              validate (bool, optional): Whether parameter validation was performed
+      162  
+      163          Note:
+      164              These additional parameters (stream_callback, use_cache, validate) are
+      165              passed from run_one_function() to provide context about the execution.
+      166              Tools can use these for optimization or special handling.
+      167  
+      168              For backward compatibility, tools that don't accept these parameters
+      169              will still work - they will only receive the arguments parameter.
+      170          """
+
+---------------- SUBCLASS HEADER (src/tooluniverse/core_tool.py) ----------------
+      213  @register_tool("CorePDFSnippetsTool")
+      214  class CorePDFSnippetsTool(BaseTool):
+---------------- OVERRIDE ----------------
+      236      def run(self, arguments) -> Dict[str, Any]:
+      237          pdf_url = arguments.get("pdf_url") or arguments.get("url")
+      238          terms = arguments.get("terms")
+      239          extractor = str(arguments.get("extractor") or "auto").strip().lower()
+      240  
+      241          if not isinstance(terms, list) or not [
+      242              t for t in terms if isinstance(t, str) and t.strip()
+      243          ]:
+      244              return {
+      245                  "status": "error",
+      246                  "error": "`terms` must be a non-empty list of strings.",
+      247                  "retryable": False,
+      248              }
+      249  
+      250          if not isinstance(pdf_url, str) or not pdf_url.strip():
+      251              return {
+      252                  "status": "error",
+      253                  "error": "Provide `pdf_url` (preferred) or `url` (alias) pointing to a PDF.",
+      254                  "retryable": False,
+      255              }
+      256          pdf_url = pdf_url.strip()
+      257  
+      258          if extractor not in {"auto", "fitz", "pypdf", "markitdown"}:
+      259              return {
+      260                  "status": "error",
+      261                  "error": "`extractor` must be one of: auto, fitz, pypdf, markitdown.",
+      262                  "retryable": False,
+      263              }
+      264  
+      265          # Fail fast on missing extractors to avoid unnecessary PDF downloads.
+      266          if extractor == "markitdown" and not MARKITDOWN_AVAILABLE:
+      267              return {
+      268                  "status": "error",
+      269                  "error": "markitdown library not available. Install with: pip install 'markitdown[all]'",
+      270                  "retryable": False,
+      271              }
+      272          if extractor == "fitz" and not FITZ_AVAILABLE:
+      273              return {
+      274                  "status": "error",
+      275                  "error": "PyMuPDF (fitz) not available. Install with: pip install pymupdf",
+      276                  "retryable": False,
+      277              }
+      278          if extractor == "pypdf" and not PYPDF_AVAILABLE:
+      279              return {
+      280                  "status": "error",
+      281                  "error": "pypdf not available. Install with: pip install pypdf",
+      282                  "retryable": False,
+      283              }
+      284          if extractor == "auto" and not (
+      285              FITZ_AVAILABLE or PYPDF_AVAILABLE or MARKITDOWN_AVAILABLE
+      286          ):
+      287              return {
+      288                  "status": "error",
+      289                  "error": "No PDF text extractor available (need pymupdf, pypdf, or markitdown).",
+      290                  "retryable": False,
+      291              }
+      292  
+      293          window_chars = _parse_int_param(arguments, "window_chars", 220, 20, 2000)
+      294          max_snippets_per_term = _parse_int_param(
+      295              arguments, "max_snippets_per_term", 3, 1, 10
+      296          )
+      297          max_total_chars = _parse_int_param(
+      298              arguments, "max_total_chars", 8000, 1000, 50000
+      299          )
+      300          download_timeout = _parse_int_param(arguments, "timeout", 20, 5, 55)
+      301          max_pdf_bytes = _parse_int_param(
+      302              arguments, "max_pdf_bytes", 20_000_000, 1_000_000, 100_000_000
+      303          )
+      304          max_pages = _parse_int_param(arguments, "max_pages", 12, 1, 200)
+      305          max_text_chars = _parse_int_param(
+      306              arguments, "max_text_chars", 400_000, 50_000, 2_000_000
+      307          )
+      308  
+      309          retrieval_trace: list[dict[str, Any]] = []
+      310  
+      311          final_url = pdf_url
+      312          extractor_used: Optional[str] = None
+      313          pages_scanned: Optional[int] = None
+      314  
+      315          def _looks_like_pdf(content_type: Optional[str], body: Optional[bytes]) -> bool:
+      316              ct = (content_type or "").lower()
+      317              if "application/pdf" in ct or ct.startswith("application/x-pdf"):
+      318                  return True
+      319              if isinstance(body, (bytes, bytearray)) and body[:4] == b"%PDF":
+      320                  return True
+      321              return False
+      322  
+      323          def _extract_pdf_url_from_html(base: str, html: str) -> Optional[str]:
+      324              if not isinstance(html, str) or ".pdf" not in html.lower():
+      325                  return None
+      326              # Prefer explicit href/src ending with .pdf
+      327              m = re.search(r'(?is)(?:href|src)=["\']([^"\']+\.pdf[^"\']*)["\']', html)
+      328              if not m:
+      329                  return None
+      330              return urljoin(base, m.group(1))
+      331  
+      332          try:
+      333              # Some CORE PDF URLs redirect to filesXX.core.ac.uk and can be unstable.
+      334              # If a CORE numeric id is present, try a few variants.
+      335              candidates = [pdf_url]
+      336              m = re.search(r"/download/(?:pdf/)?(\\d+)\\.pdf", pdf_url)
+      337              if m:
+      338                  pid = m.group(1)
+      339                  candidates.extend(
+      340                      [
+      341                          f"https://core.ac.uk/download/{pid}.pdf",
+      342                          f"https://core.ac.uk/download/pdf/{pid}.pdf",
+      343                      ]
+      344                  )
+      345  
+      346              resp = None
+      347              pdf_bytes: Optional[bytes] = None
+      348  
+      349              seen: set[str] = set()
+      350              i = 0
+      351              while i < len(candidates):
+      352                  u = candidates[i]
+      353                  i += 1
+      354                  if u in seen:
+      355                      continue
+      356                  seen.add(u)
+      357                  # HEAD to check size quickly when possible.
+      358                  try:
+      359                      head = request_with_retry(
+      360                          self.session,
+      361                          "HEAD",
+      362                          u,
+      363                          timeout=min(10, download_timeout),
+      364                          max_attempts=2,
+      365                      )
+      366                      retrieval_trace.append(
+      367                          {
+      368                              "attempt": "head_pdf",
+      369                              "url": getattr(head, "url", None) or u,
+      370                              "status_code": getattr(head, "status_code", None),
+      371                              "content_type": (getattr(head, "headers", {}) or {}).get(
+      372                                  "content-type"
+      373                              ),
+      374                              "content_length": (getattr(head, "headers", {}) or {}).get(
+      375                                  "content-length"
+      376                              ),
+      377                              "note": None,
+      378                          }
+      379                      )
+      380                      if head.status_code in (200, 206):
+      381                          cl = (head.headers or {}).get("content-length")
+      382                          if cl and str(cl).isdigit() and int(cl) > max_pdf_bytes:
+      383                              return {
+      384                                  "status": "error",
+      385                                  "error": "PDF too large to download within tool limits.",
+      386                                  "pdf_url": pdf_url,
+      387                                  "candidate_url": u,
+      388                                  "content_length": int(cl),
+      389                                  "max_pdf_bytes": max_pdf_bytes,
+      390                                  "retryable": False,
+      391                                  "retrieval_trace": retrieval_trace,
+      392                              }
+      393                  except Exception:
+      394                      pass
+      395  
+      396                  resp = request_with_retry(
+      397                      self.session, "GET", u, timeout=download_timeout, max_attempts=2
+      398                  )
+      399                  final_url = getattr(resp, "url", None) or u
+      400                  content_type = (getattr(resp, "headers", {}) or {}).get("content-type")
+      401                  retrieval_trace.append(
+      402                      {
+      403                          "attempt": "download_pdf",
+      404                          "url": final_url,
+      405                          "status_code": getattr(resp, "status_code", None),
+      406                          "content_type": content_type,
+      407                          "note": None,
+      408                      }
+      409                  )
+      410                  if resp.status_code == 200:
+      411                      # Some "PDF" URLs (e.g., PMC /pdf/ endpoints) return an HTML page
+      412                      # that contains the real .pdf link. Detect and follow once.
+      413                      if not _looks_like_pdf(content_type, resp.content):
+      414                          try:
+      415                              html_text = (
+      416                                  resp.text
+      417                                  if hasattr(resp, "text")
+      418                                  else resp.content.decode("utf-8", "ignore")
+      419                              )
+      420                          except Exception:
+      421                              html_text = ""
+      422                          next_pdf = _extract_pdf_url_from_html(final_url, html_text)
+      423                          if next_pdf:
+      424                              candidates.append(next_pdf)
+      425                              retrieval_trace.append(
+      426                                  {
+      427                                      "attempt": "html_to_pdf_link",
+      428                                      "url": next_pdf,
+      429                                      "status_code": None,
+      430                                      "content_type": "application/pdf",
+      431                                      "note": "Followed PDF link extracted from HTML response.",
+      432                                  }
+      433                              )
+      434                              continue
+      435  
+      436                      pdf_bytes = resp.content
+      437                      if pdf_bytes is not None and len(pdf_bytes) > max_pdf_bytes:
+      438                          return {
+      439                              "status": "error",
+      440                              "error": "Downloaded PDF exceeds tool size cap.",
+      441                              "pdf_url": pdf_url,
+      442                              "candidate_url": u,
+      443                              "downloaded_bytes": len(pdf_bytes),
+      444                              "max_pdf_bytes": max_pdf_bytes,
+      445                              "retryable": False,
+      446                              "retrieval_trace": retrieval_trace,
+      447                          }
+      448                      break
+      449  
+      450              if resp is None or resp.status_code != 200 or pdf_bytes is None:
+      451                  sc = getattr(resp, "status_code", None)
+      452                  return {
+      453                      "status": "error",
+      454                      "error": f"PDF download failed (HTTP {sc})",
+      455                      "pdf_url": pdf_url,
+      456                      "status_code": sc,
+      457                      "retryable": sc in (408, 429, 500, 502, 503, 504),
+      458                      "retrieval_trace": retrieval_trace,
+      459                  }
+      460  
+      461              text = ""
+      462              if extractor in {"auto", "fitz"} and FITZ_AVAILABLE:
+      463                  extractor_used = "fitz"
+      464                  doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+      465                  try:
+      466                      parts = []
+      467                      n = min(len(doc), max_pages)
+      468                      for i in range(n):
+      469                          parts.append(doc.load_page(i).get_text("text"))
+      470                      pages_scanned = n
+      471                      text = "\n".join(parts)
+      472                  finally:
+      473                      try:
+      474                          doc.close()
+      475                      except Exception:
+      476                          pass
+      477              elif extractor in {"auto", "pypdf"} and PYPDF_AVAILABLE:
+      478                  extractor_used = "pypdf"
+      479                  reader = PdfReader(io.BytesIO(pdf_bytes))
+      480                  parts = []
+      481                  n = min(len(reader.pages), max_pages)
+      482                  for i in range(n):
+      483                      try:
+      484                          parts.append(reader.pages[i].extract_text() or "")
+      485                      except Exception:
+      486                          parts.append("")
+      487                  pages_scanned = n
+      488                  text = "\n".join(parts)
+      489              else:
+      490                  # Specific extractor unavailability is caught by the fail-fast
+      491                  # checks at the top of run(). This else branch is only reachable
+      492                  # when extractor="auto" and both fitz and pypdf are unavailable,
+      493                  # so we fall through to markitdown as a last resort.
+      494                  if not MARKITDOWN_AVAILABLE:
+      495                      return {
+      496                          "status": "error",
+      497                          "error": "No PDF text extractor available (need pymupdf, pypdf, or markitdown).",
+      498                          "retryable": False,
+      499                          "retrieval_trace": retrieval_trace,
+      500                      }
+      501                  extractor_used = "markitdown"
+      502                  with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+      503                      tmp.write(pdf_bytes)
+      504                      tmp_path = tmp.name
+      505                  try:
+      506                      result = self.md_converter.convert(tmp_path)
+      507                      text = (
+      508                          result.text_content
+      509                          if hasattr(result, "text_content")
+      510                          else str(result)
+      511                      )
+      512                  finally:
+      513                      try:
+      514                          os.unlink(tmp_path)
+      515                      except Exception:
+      516                          pass
+      517          except Exception as e:
+      518              retrieval_trace.append(
+      519                  {
+      520                      "attempt": "download_pdf_exception",
+      521                      "url": final_url,
+      522                      "status_code": None,
+      523                      "content_type": None,
+      524                      "note": str(e),
+      525                  }
+      526              )
+      527              return {
+      528                  "status": "error",
+      529                  "error": f"PDF download/processing failed: {str(e)}",
+      530                  "pdf_url": pdf_url,
+      531                  "retryable": True,
+      532                  "retrieval_trace": retrieval_trace,
+      533              }
+      534  
+      535          snippets: list[dict[str, str]] = []
+      536          total_chars = 0
+      537          text_scanned = (text or "")[:max_text_chars]
+      538          low = text_scanned.lower()
+      539  
+      540          for raw_term in terms:
+      541              if not isinstance(raw_term, str):
+      542                  continue
+      543              term = raw_term.strip()
+      544              if not term:
+      545                  continue
+      546  
+      547              needle = term.lower()
+      548              found = 0
+      549              for m in re.finditer(re.escape(needle), low):
+      550                  if found >= max_snippets_per_term:
+      551                      break
+      552                  start = max(0, m.start() - window_chars)
+      553                  end = min(len(text_scanned), m.end() + window_chars)
+      554                  snippet = text_scanned[start:end].strip()
+      555                  if total_chars + len(snippet) > max_total_chars:
+      556                      break
+      557                  snippets.append({"term": term, "snippet": snippet})
+      558                  total_chars += len(snippet)
+      559                  found += 1
+      560  
+      561          return {
+      562              "status": "success",
+      563              "pdf_url": final_url,
+      564              "retrieval_trace": retrieval_trace,
+      565              "snippets": snippets,
+      566              "snippets_count": len(snippets),
+      567              "truncated": total_chars >= max_total_chars,
+      568              "extractor_used": extractor_used,
+      569              "pages_scanned": pages_scanned,
+      570              "text_chars_scanned": len(text_scanned),
+      571          }

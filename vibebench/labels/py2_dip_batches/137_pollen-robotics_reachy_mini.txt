@@ -1,0 +1,272 @@
+row 137   pollen-robotics/reachy_mini#534
+============================================================================
+PR pollen-robotics/reachy_mini#534   cycles touched before=2.0 after=2.0
+QUESTION: does this PR make a module depend on a CONCRETE module in a
+          way that closes an import cycle, or otherwise invert the
+          dependency direction?
+
+NEWLY CYCLIC PAIRS involving a module this PR changed (6):
+    reachy_mini  <->  reachy_mini.media.audio_gstreamer
+    reachy_mini.apps.app  <->  reachy_mini.media.audio_gstreamer
+    reachy_mini.media.audio_gstreamer  <->  reachy_mini.media.audio_sounddevice
+    reachy_mini.media.audio_gstreamer  <->  reachy_mini.media.media_manager
+    reachy_mini.media.audio_gstreamer  <->  reachy_mini.reachy_mini
+    reachy_mini.media.audio_gstreamer  <->  reachy_mini.utils.constants
+pre-existing cyclic pairs (NOT this PR): 18
+
+NEW IMPORT EDGES (absent from the before tree; target marked abstract or CONCRETE):
+  reachy_mini.daemon.app.main -> reachy_mini.media.audio_utils   [CONCRETE]
+  reachy_mini.daemon.backend.abstract -> reachy_mini.media.media_manager   [CONCRETE]
+  reachy_mini.media.audio_gstreamer -> reachy_mini.utils.constants   [CONCRETE]
+  reachy_mini.tools.reflash_motors -> reachy_mini   [CONCRETE]
+  reachy_mini.tools.reflash_motors -> reachy_mini.daemon.utils   [CONCRETE]
+  reachy_mini.tools.reflash_motors -> reachy_mini.tools.setup_motor   [CONCRETE]
+  reachy_mini.tools.reflash_motors -> reachy_mini.utils.hardware_config.parser   [CONCRETE]
+  reachy_mini.tools.setup_motor -> reachy_mini.utils.hardware_config.parser   [CONCRETE]
+  tests.test_audio -> reachy_mini.media.audio_utils   [CONCRETE]
+
+---------- CHANGED MODULE reachy_mini.media.audio_gstreamer (src/reachy_mini/media/audio_gstreamer.py) ----------
+        1  """GStreamer camera backend.
+        2  
+        3  This module provides an implementation of the CameraBase class using GStreamer.
+        4  By default the module directly returns JPEG images as output by the camera.
+        5  """
+        6  
+        7  import os
+        8  from threading import Thread
+        9  from typing import Optional
+       10  
+       11  import numpy as np
+       12  import numpy.typing as npt
+       13  
+       14  from reachy_mini.media.audio_utils import (
+       15      get_respeaker_card_number,
+       16      has_reachymini_asoundrc,
+       17  )
+       18  from reachy_mini.utils.constants import ASSETS_ROOT_PATH
+       19  
+       20  try:
+       21      import gi
+       22  except ImportError as e:
+       23      raise ImportError(
+       24          "The 'gi' module is required for GStreamerCamera but could not be imported. \
+       25                        Please install the GStreamer backend: pip install .[gstreamer]."
+       26      ) from e
+       27  
+       28  gi.require_version("Gst", "1.0")
+       29  gi.require_version("GstApp", "1.0")
+       30  
+       31  
+       32  from gi.repository import GLib, Gst, GstApp  # noqa: E402
+       33  
+       34  from .audio_base import AudioBase  # noqa: E402
+       35  
+       36  
+       37  class GStreamerAudio(AudioBase):
+       38      """Audio implementation using GStreamer."""
+       39  
+       40      def __init__(self, log_level: str = "INFO") -> None:
+       41          """Initialize the GStreamer audio."""
+       42          super().__init__(log_level=log_level)
+       43          Gst.init(None)
+       44          self._loop = GLib.MainLoop()
+       45          self._thread_bus_calls = Thread(target=lambda: self._loop.run(), daemon=True)
+       46          self._thread_bus_calls.start()
+       47  
+       48          self._id_audio_card = get_respeaker_card_number()
+       49  
+       50          self._pipeline_record = Gst.Pipeline.new("audio_recorder")
+       51          self._appsink_audio: Optional[GstApp] = None
+       52          self._init_pipeline_record(self._pipeline_record)
+       53          self._bus_record = self._pipeline_record.get_bus()
+       54          self._bus_record.add_watch(
+       55              GLib.PRIORITY_DEFAULT, self._on_bus_message, self._loop
+       56          )
+       57  
+       58          self._pipeline_playback = Gst.Pipeline.new("audio_player")
+       59          self._appsrc: Optional[GstApp] = None
+       60          self._init_pipeline_playback(self._pipeline_playback)
+       61          self._bus_playback = self._pipeline_playback.get_bus()
+       62          self._bus_playback.add_watch(
+       63              GLib.PRIORITY_DEFAULT, self._on_bus_message, self._loop
+       64          )
+       65  
+       66      def _init_pipeline_record(self, pipeline: Gst.Pipeline) -> None:
+       67          self._appsink_audio = Gst.ElementFactory.make("appsink")
+       68          caps = Gst.Caps.from_string(
+       69              f"audio/x-raw,rate={self.SAMPLE_RATE},channels={self.CHANNELS},format=F32LE,layout=interleaved"
+       70          )
+       71          self._appsink_audio.set_property("caps", caps)
+       72          self._appsink_audio.set_property("drop", True)  # avoid overflow
+       73          self._appsink_audio.set_property("max-buffers", 200)
+       74  
+       75          audiosrc: Optional[Gst.Element] = None
+       76          if self._id_audio_card == -1:
+       77              audiosrc = Gst.ElementFactory.make("autoaudiosrc")  # use default mic
+       78          elif has_reachymini_asoundrc():
+       79              # reachy mini wireless has a preconfigured asoundrc
+       80              audiosrc = Gst.ElementFactory.make("alsasrc")
+       81              audiosrc.set_property("device", "reachymini_audio_src")
+       82          else:
+       83              audiosrc = Gst.ElementFactory.make("alsasrc")
+       84              audiosrc.set_property("device", f"hw:{self._id_audio_card},0")
+       85  
+       86          queue = Gst.ElementFactory.make("queue")
+       87          audioconvert = Gst.ElementFactory.make("audioconvert")
+       88          audioresample = Gst.ElementFactory.make("audioresample")
+       89  
+       90          if not all([audiosrc, queue, audioconvert, audioresample, self._appsink_audio]):
+       91              raise RuntimeError("Failed to create GStreamer elements")
+       92  
+       93          pipeline.add(audiosrc)
+       94          pipeline.add(queue)
+       95          pipeline.add(audioconvert)
+       96          pipeline.add(audioresample)
+       97          pipeline.add(self._appsink_audio)
+       98  
+       99          audiosrc.link(queue)
+      100          queue.link(audioconvert)
+      101          audioconvert.link(audioresample)
+      102          audioresample.link(self._appsink_audio)
+      103  
+      104      def __del__(self) -> None:
+      105          """Destructor to ensure gstreamer resources are released."""
+      106          super().__del__()
+      107          self._loop.quit()
+      108          self._bus_record.remove_watch()
+      109          self._bus_playback.remove_watch()
+      110  
+      111      def _init_pipeline_playback(self, pipeline: Gst.Pipeline) -> None:
+      112          self._appsrc = Gst.ElementFactory.make("appsrc")
+      113          self._appsrc.set_property("format", Gst.Format.TIME)
+      114          self._appsrc.set_property("is-live", True)
+      115          caps = Gst.Caps.from_string(
+      116              f"audio/x-raw,format=F32LE,channels={self.CHANNELS},rate={self.SAMPLE_RATE},layout=interleaved"
+      117          )
+      118          self._appsrc.set_property("caps", caps)
+      119  
+      120          audioconvert = Gst.ElementFactory.make("audioconvert")
+       ... truncated at 120 lines ...
+
+---------- CHANGED MODULE reachy_mini.apps.app (src/reachy_mini/apps/app.py) ----------
+        1  """Reachy Mini Application Base Class.
+        2  
+        3  This module provides a base class for creating Reachy Mini applications.
+        4  It includes methods for running the application, stopping it gracefully,
+        5  and creating a new app project with a specified name and path.
+        6  
+        7  It uses Jinja2 templates to generate the necessary files for the app project.
+        8  """
+        9  
+       10  import argparse
+       11  import importlib
+       12  import logging
+       13  import platform
+       14  import subprocess
+       15  import threading
+       16  import traceback
+       17  from abc import ABC, abstractmethod
+       18  from pathlib import Path
+       19  from typing import Any
+       20  from urllib.parse import urlparse
+       21  
+       22  from fastapi import FastAPI
+       23  from fastapi.responses import FileResponse
+       24  from fastapi.staticfiles import StaticFiles
+       25  
+       26  from reachy_mini.reachy_mini import ReachyMini
+       27  
+       28  
+       29  class ReachyMiniApp(ABC):
+       30      """Base class for Reachy Mini applications."""
+       31  
+       32      custom_app_url: str | None = None
+       33      dont_start_webserver: bool = False
+       34      request_media_backend: str | None = None
+       35  
+       36      def __init__(self, running_on_wireless: bool = False) -> None:
+       37          """Initialize the Reachy Mini app."""
+       38          self.stop_event = threading.Event()
+       39          self.error: str = ""
+       40          self.logger = logging.getLogger("reachy_mini.app")
+       41  
+       42          # If we're running with wireless, we assume systemd service is used
+       43          running_on_wireless = self._check_systemd_service_exists()
+       44          self.logger.info(f"Running on wireless: {running_on_wireless}")
+       45  
+       46          self.media_backend = (
+       47              self.request_media_backend
+       48              if self.request_media_backend is not None
+       49              else ("gstreamer" if running_on_wireless else "default")
+       50          )
+       51  
+       52          self.settings_app: FastAPI | None = None
+       53          if self.custom_app_url is not None and not self.dont_start_webserver:
+       54              self.settings_app = FastAPI()
+       55  
+       56              static_dir = self._get_instance_path().parent / "static"
+       57              if static_dir.exists():
+       58                  self.settings_app.mount(
+       59                      "/static", StaticFiles(directory=static_dir), name="static"
+       60                  )
+       61  
+       62                  index_file = static_dir / "index.html"
+       63                  if index_file.exists():
+       64  
+       65                      @self.settings_app.get("/")
+       66                      async def index() -> FileResponse:
+       67                          """Serve the settings app index page."""
+       68                          return FileResponse(index_file)
+       69  
+       70      @staticmethod
+       71      def _check_systemd_service_exists(service_name: str = "reachy-mini-daemon") -> bool:
+       72          """Check if a systemd service exists (Linux only).
+       73  
+       74          Args:
+       75              service_name: Name of the systemd service to check
+       76  
+       77          Returns:
+       78              True if the service exists, False otherwise
+       79  
+       80          """
+       81          if platform.system() != "Linux":
+       82              return False
+       83  
+       84          try:
+       85              result = subprocess.run(
+       86                  ["systemctl", "status", service_name],
+       87                  capture_output=True,
+       88                  timeout=2,
+       89              )
+       90              # Return code 0 = running, 3 = stopped but exists, 4 = doesn't exist
+       91              return result.returncode != 4
+       92          except (subprocess.TimeoutExpired, FileNotFoundError):
+       93              return False
+       94  
+       95      def wrapped_run(self, *args: Any, **kwargs: Any) -> None:
+       96          """Wrap the run method with Reachy Mini context management."""
+       97          settings_app_t: threading.Thread | None = None
+       98          if self.settings_app is not None:
+       99              import uvicorn
+      100  
+      101              assert self.custom_app_url is not None
+      102              url = urlparse(self.custom_app_url)
+      103              assert url.hostname is not None and url.port is not None
+      104  
+      105              config = uvicorn.Config(
+      106                  self.settings_app,
+      107                  host=url.hostname,
+      108                  port=url.port,
+      109              )
+      110              server = uvicorn.Server(config)
+      111  
+      112              def _server_run() -> None:
+      113                  """Run the settings FastAPI app."""
+      114                  t = threading.Thread(target=server.run)
+      115                  t.start()
+      116                  self.stop_event.wait()
+      117                  server.should_exit = True
+      118                  t.join()
+      119  
+      120              settings_app_t = threading.Thread(target=_server_run)
+       ... truncated at 120 lines ...

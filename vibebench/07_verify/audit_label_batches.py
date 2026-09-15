@@ -56,6 +56,9 @@ VERDICT_TOKENS = [
     r"\bflagged\s*=\s*(True|False)", r"\bdip_risk\s*=", r"\bhits\s*=",
 ]
 
+# a rendered source line: optional ">>>" marker, the line number, two spaces
+SRC_LINE = re.compile(r"^\s*(>>>)?\s*\d+  ")
+
 fails: list[str] = []
 warns: list[str] = []
 
@@ -154,10 +157,14 @@ def audit(p: str, rnd: str = "", lang: str = "java") -> None:
             want = str(df.iloc[i].get("full_name", ""))
             if want and want not in txt:
                 mismatched.append(i)
+        # A leak is something the RENDERER printed, never the repository's own
+        # code: line-numbered source lines are excluded, or a project variable
+        # named `hits = ...` fails the gate (py2 ISP row 32 did exactly that).
+        meta = "\n".join(l for l in txt.split("\n") if not SRC_LINE.match(l))
         for pat in VERDICT_TOKENS:
             # the header legitimately prints size metrics; only a printed
             # BOOLEAN verdict is a leak
-            if re.search(pat, txt):
+            if re.search(pat, meta):
                 leaked.append((i, pat))
                 break
 

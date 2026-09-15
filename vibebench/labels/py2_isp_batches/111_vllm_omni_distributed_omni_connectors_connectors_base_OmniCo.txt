@@ -1,0 +1,607 @@
+row 111   heiervang-technologies/ht-vllm-omni#36
+============================================================================
+CONTRACT vllm_omni.distributed.omni_connectors.connectors.base:OmniConnectorBase   kind=abc abstract_methods=5.0 implementers=4.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file vllm_omni/distributed/omni_connectors/connectors/base.py
+       12  class OmniConnectorBase(ABC):
+       13      """Base class for all OmniConnectors."""
+       14  
+       15      # Whether the connector can handle raw bytes/torch.Tensor natively
+       16      # without going through OmniSerializer.  Connectors that copy raw
+       17      # payloads directly (e.g. RDMA) should override this to True.
+       18      supports_raw_data: bool = False
+       19  
+       20      @abstractmethod
+       21      def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
+       22          """Store Python object, internal serialization handled by connector.
+       23  
+       24          Args:
+       25              from_stage: Source stage identifier
+       26              to_stage: Destination stage identifier
+       27              put_key: Unique request identifier
+       28              data: Python object to store
+       29  
+       30          Returns:
+       31              tuple: (success: bool, serialized_size: int, metadata: Optional[dict])
+       32                     Metadata may contain transport-specific handles or inline data.
+       33          """
+       34          pass
+       35  
+       36      @abstractmethod
+       37      def get(self, from_stage: str, to_stage: str, get_key: str, metadata=None) -> tuple[Any, int] | None:
+       38          """Retrieve Python object and payload size (bytes).
+       39  
+       40          Args:
+       41              from_stage: Source stage identifier
+       42              to_stage: Destination stage identifier
+       43              get_key: Unique request identifier
+       44  
+       45          Returns:
+       46              Tuple of (Python object, serialized byte size) if found, None otherwise
+       47          """
+       48          pass
+       49  
+       50      @abstractmethod
+       51      def cleanup(self, request_id: str) -> None:
+       52          """Clean up resources for a request."""
+       53          pass
+       54  
+       55      @abstractmethod
+       56      def health(self) -> dict[str, Any]:
+       57          """Return health status and metrics."""
+       58          pass
+       59  
+       60      @abstractmethod
+       61      def close(self) -> None:
+       62          """Release resources held by this connector.
+       63  
+       64          Subclasses must implement this to clean up transport-specific
+       65          resources (connections, memory pools, threads, etc.).
+       66          Implementations should be idempotent (safe to call multiple times).
+       67          """
+       68          pass
+       69  
+       70      # --- Default resource-management protocol ---
+       71      # Subclasses get context-manager and destructor support for free;
+       72      # they only need to implement close().
+       73  
+       74      def __del__(self):
+       75          self.close()
+       76  
+       77      def __enter__(self):
+       78          return self
+       79  
+       80      def __exit__(self, exc_type, exc_val, exc_tb):
+       81          self.close()
+       82  
+       83      @staticmethod
+       84      def serialize_obj(obj: Any) -> bytes:
+       85          """Serialize a Python object to bytes using centralized serializer."""
+       86          from ..utils.serialization import OmniSerializer
+       87  
+       88          return OmniSerializer.serialize(obj)
+       89  
+       90      @staticmethod
+       91      def deserialize_obj(data: bytes) -> Any:
+       92          """Deserialize bytes to Python object using centralized serializer."""
+       93          from ..utils.serialization import OmniSerializer
+       94  
+       95          return OmniSerializer.deserialize(data)
+       96  
+       97      @staticmethod
+       98      def _make_key(key: str, from_stage: str, to_stage: str, separator: str = "@") -> str:
+       99          """Generate internal key with stage routing info.
+      100  
+      101          Default format: ``{key}@{from_stage}_{to_stage}``.
+      102          Connectors with different key conventions can override this method.
+      103          """
+      104          return f"{key}{separator}{from_stage}_{to_stage}"
+
+---------- IMPLEMENTER vllm_omni.distributed.omni_connectors.connectors.mooncake_store_connector:MooncakeStoreConnector  stubs=0/5 ----------
+       22  class MooncakeStoreConnector(OmniConnectorBase):
+       73      def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
+       74          if not self.store:
+       75              logger.error("Store not initialized")
+       76              return False, 0, None
+       77  
+       78          try:
+       79              serialized_data = self.serialize_obj(data)
+       80              key = self._make_key(put_key, from_stage, to_stage)
+       81              self.store.put(key, serialized_data, self.pin)
+       82  
+       83              self._metrics["puts"] += 1
+       84              self._metrics["bytes_transferred"] += len(serialized_data)
+       85  
+       86              logger.debug(
+       87                  "MooncakeStoreConnector: stored %s (%s -> %s) %d bytes",
+       88                  key,
+       89                  from_stage,
+       90                  to_stage,
+       91                  len(serialized_data),
+       92              )
+       93              return True, len(serialized_data), None
+       94  
+       95          except Exception as e:
+       96              self._metrics["errors"] += 1
+       97              logger.error("MooncakeStoreConnector put failed: %s", e)
+       98              return False, 0, None
+      100      def get(
+      101          self, from_stage: str, to_stage: str, get_key: str, metadata: dict[str, Any] | None = None
+      102      ) -> tuple[Any, int] | None:
+      103          if not self.store:
+      104              logger.error("Store not initialized")
+      105              return None
+      106  
+      107          import time as _time
+      108  
+      109          _t0 = _time.perf_counter()
+      110  
+      111          retries = 20
+      112          sleep_s = 0.05
+      113          key = self._make_key(get_key, from_stage, to_stage)
+      114  
+      115          for attempt in range(retries):
+      116              try:
+      117                  _t_fetch_start = _time.perf_counter()
+      118                  raw_data = self.store.get(key)
+      119                  _t_fetch_end = _time.perf_counter()
+      120  
+      121                  if raw_data:
+      122                      _fetch_ms = (_t_fetch_end - _t_fetch_start) * 1000
+      123  
+      124                      _t_deser_start = _time.perf_counter()
+      125                      data = self.deserialize_obj(raw_data)
+      126                      _t_deser_end = _time.perf_counter()
+      127                      _deser_ms = (_t_deser_end - _t_deser_start) * 1000
+      128  
+      129                      self._metrics["gets"] += 1
+      130                      payload_size = len(raw_data)
+      131  
+      132                      _total_ms = (_t_deser_end - _t0) * 1000
+      133                      _mbps = (payload_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
+      134                      logger.info(
+      135                          f"[TCP GET] {get_key}: fetch={_fetch_ms:.1f}ms, deser={_deser_ms:.1f}ms, "
+      136                          f"total={_total_ms:.1f}ms, {payload_size} bytes, {_mbps:.1f} MB/s"
+      137                      )
+      138                      return data, payload_size
+      139  
+      140              except Exception as e:
+      141                  logger.debug("MooncakeStoreConnector get attempt %s failed: %s", attempt, e)
+      142  
+      143              if attempt < retries - 1:
+      144                  time.sleep(sleep_s)
+      145  
+      146          self._metrics["timeouts"] += 1
+      147          logger.warning("MooncakeStoreConnector: timeout waiting for %s", key)
+      148          return None
+      150      def cleanup(self, request_id: str) -> None:
+      151          if not self.store:
+      152              return
+      153  
+      154          # Note: Mooncake doesn't have explicit delete, data will be garbage collected
+      155          # We could implement a cleanup mechanism by storing deletion markers
+      156          logger.debug("MooncakeStoreConnector: cleanup requested for %s (no-op)", request_id)
+      158      def health(self) -> dict[str, Any]:
+      159          if not self.store:
+      160              return {"status": "unhealthy", "error": "Store not initialized"}
+      161  
+      162          return {
+      163              "status": "healthy",
+      164              "host": self.host,
+      165              "metadata_server": self.metadata,
+      166              "master": self.master,
+      167              "protocol": None,
+      168              "pool_device": None,
+      169              "pool_size": 0,
+      170              **self._metrics,
+      171          }
+      173      def close(self):
+      174          """Clean shutdown."""
+      175          if self.store:
+      176              try:
+      177                  self.store.close()
+      178                  self.store = None
+      179                  logger.info("MooncakeStoreConnector closed")
+      180              except Exception as e:
+      181                  logger.error("Error closing Mooncake store: %s", e)
+
+---------- IMPLEMENTER vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector:MooncakeTransferEngineConnector  stubs=0/5 ----------
+      223  class MooncakeTransferEngineConnector(OmniConnectorBase):
+      486      def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
+      487          """
+      488          Producer Side.
+      489          Exposes data for RDMA transfer.
+      490  
+      491          Behavior by data type:
+      492          - ManagedBuffer (from this pool): Zero-copy, is_fast_path=True
+      493          - ManagedBuffer (different pool): Fallback to tensor copy path
+      494          - torch.Tensor / bytes: Copy to pool, is_fast_path=True
+      495          - Other (dict, etc.): Serialize to bytes, copy to pool, is_fast_path=False
+      496            (receiver will deserialize automatically)
+      497          """
+      498          if self._closed:
+      499              raise RuntimeError("Cannot put data: MooncakeTransferEngineConnector is closed")
+      500  
+      501          if not self.can_put:
+      502              logger.warning(
+      503                  f"Rejecting put for {put_key}: connector is in receiver mode "
+      504                  f"(sender fallback occurred, ZMQ port likely occupied by another instance)"
+      505              )
+      506              return False, 0, None
+      507  
+      508          put_key = self._make_key(put_key, from_stage, to_stage)
+      509  
+      510          try:
+      511              src_addr = 0
+      512              size = 0
+      513              holder = None
+      514              is_fast_path = True
+      515              should_release_holder = False
+      516  
+      517              # Reject empty data early — alloc(0) has undefined behaviour and
+      518              # would leave a zombie entry in _local_buffers that the receiver
+      519              # side can never consume (get() returns None for data_size==0).
+      520              if isinstance(data, bytes) and len(data) == 0:
+      521                  logger.warning(f"Rejecting put for {put_key}: empty bytes payload")
+      522                  return False, 0, None
+      523              if isinstance(data, torch.Tensor) and data.nbytes == 0:
+      524                  logger.warning(f"Rejecting put for {put_key}: zero-size tensor")
+      525                  return False, 0, None
+      526  
+      527              # Pre-process: serialize non-raw types before entering the copy path.
+      528              # This avoids the previous recursive put() pattern and keeps
+      529              # _local_buffers writes atomic (single write, no override needed).
+      530              if not isinstance(data, (ManagedBuffer, torch.Tensor, bytes)):
+      531                  data = OmniSerializer.serialize(data)
+      532                  is_fast_path = False  # Receiver must deserialize
+      533  
+      534              if isinstance(data, ManagedBuffer):
+      535                  # Zero-Copy Path
+      536                  # Validate that the buffer belongs to this connector's pool.
+      537                  if data.pool_tensor.data_ptr() != self.pool.data_ptr():
+      538                      # Fallback to copy path: extract tensor and let the
+      539                      # torch.Tensor branch below handle the copy.
+      540                      logger.warning("ManagedBuffer from different pool detected. Falling back to copy path.")
+      541                      data = data.tensor.contiguous()
+      542                      # Fall through to torch.Tensor branch
+      543                  else:
+      544                      src_addr = self.base_ptr + data.offset
+      545                      size = data.size
+       ... truncated at 60 lines ...
+      708      def get(
+      709          self,
+      710          from_stage: str,
+      711          to_stage: str,
+      712          get_key: str,
+      713          metadata: dict[str, Any] | None = None,
+      714      ) -> tuple[Any, int] | None:
+      715          """
+      716          Consumer Side.
+      717          Allocates from local pool and pulls data via RDMA.
+      718  
+      719          If metadata is not provided, will attempt to query it from sender
+      720          using configured sender_host/sender_zmq_port.
+      721  
+      722          Returns:
+      723              ``(data, size)`` on success, ``None`` on failure.
+      724  
+      725              - **is_fast_path=True** (tensor *or* bytes payload):
+      726                  Returns ``(ManagedBuffer, size)``.
+      727                  **CALLER MUST call ``ManagedBuffer.release()`` after consuming.**
+      728                  Note: even if the producer ``put()`` raw ``bytes``, the consumer
+      729                  receives a ``ManagedBuffer`` — use ``buf.to_bytes()`` to obtain
+      730                  a ``bytes`` copy, or ``buf.tensor`` for zero-copy access.
+      731              - **is_fast_path=False** (serialized Python object):
+      732                  Returns ``(DeserializedObject, size)``.
+      733                  Buffer is auto-released internally after deserialization.
+      734          """
+      735          if self._closed:
+      736              raise RuntimeError("Cannot get data: MooncakeTransferEngineConnector is closed")
+      737  
+      738          get_key = self._make_key(get_key, from_stage, to_stage)
+      739  
+      740          _t0 = _time_mod.perf_counter()
+      741  
+      742          # If no metadata provided, try to query from sender
+      743          if not metadata:
+      744              # Must insert sender info before using get() without metadata.
+      745              if not self.sender_host or not self.sender_zmq_port or str(self.sender_host).lower() == "auto":
+      746                  raise RuntimeError(
+      747                      f"get(metadata=None) requires sender info to be resolved, "
+      748                      f"but sender_host={self.sender_host!r}, sender_zmq_port={self.sender_zmq_port!r}. "
+      749                      f"Call update_sender_info(host, port) before using get() without metadata."
+      750                  )
+      751              metadata = self._query_metadata_from_sender(get_key)
+      752              if not metadata:
+      753                  return None
+      754  
+      755          _t1 = _time_mod.perf_counter()
+      756          _query_ms = (_t1 - _t0) * 1000
+      757  
+      758          src_host = metadata.get("source_host")
+      759          src_port = metadata.get("source_port")
+      760          data_size = metadata.get("data_size", 0)
+      761          is_fast_path = metadata.get("is_fast_path", False)
+      762  
+      763          if not src_host or not src_port or str(src_host).lower() == "auto":
+      764              logger.error(
+      765                  f"Invalid metadata for {get_key}: source_host={src_host!r}, "
+      766                  f"source_port={src_port!r}. Cannot establish RDMA connection."
+      767              )
+       ... truncated at 60 lines ...
+      888      def cleanup(self, request_id: str, from_stage: str | None = None, to_stage: str | None = None) -> None:
+      889          """Release the producer-side buffer associated with the request.
+      890  
+      891          Args:
+      892              request_id: The key used in ``put()``.
+      893              from_stage: Optional source stage.  When both *from_stage* and
+      894                  *to_stage* are provided the method applies ``_make_key()``
+      895                  internally, so callers can pass the same raw key they used
+      896                  in ``put()`` / ``get()`` without knowing the internal format.
+      897                  When omitted the *request_id* is used as-is (suitable for
+      898                  internal callers that already hold the transformed key).
+      899              to_stage: Optional destination stage (see *from_stage*).
+      900          """
+      901          if (from_stage is None) != (to_stage is None):
+      902              raise ValueError(
+      903                  f"cleanup() requires both from_stage and to_stage, or neither. "
+      904                  f"Got from_stage={from_stage!r}, to_stage={to_stage!r}"
+      905              )
+      906          if from_stage is not None and to_stage is not None:
+      907              request_id = self._make_key(request_id, from_stage, to_stage)
+      908          with self._local_buffers_lock:
+      909              item = self._local_buffers.pop(request_id, None)
+      910              if item:
+      911                  # item is (src_addrs, lengths, holder, should_release, is_fast_path, created_at)
+      912                  _, _, holder, should_release, _, _ = item
+      913                  if should_release and isinstance(holder, ManagedBuffer):
+      914                      # We own this buffer (created internally), so we must release it.
+      915                      holder.release()
+      919      def health(self) -> dict[str, Any]:
+      920          if self._closed:
+      921              return {"status": "unhealthy", "error": "Connector is closed"}
+      922  
+      923          return {
+      924              "status": "healthy",
+      925              "host": self.host,
+      926              "metadata_server": None,
+      927              "master": None,
+      928              "protocol": self.protocol,
+      929              "pool_device": self.pool_device,
+      930              "pool_size": self.pool_size,
+      931              **self._metrics,
+      932          }
+      934      def close(self) -> None:
+      935          """
+      936          Gracefully shutdown the connector and release all resources.
+      937          This method should be called when the connector is no longer needed.
+      938          Idempotent: safe to call multiple times.
+      939          """
+      940          # Idempotent guard — use getattr for safety: if __init__ raised before
+      941          # setting _closed, __del__ → close() would hit AttributeError.
+      942          if getattr(self, "_closed", True):
+      943              return
+      944          self._closed = True
+      945  
+      946          logger.info("Closing MooncakeTransferEngineConnector...")
+      947  
+      948          # 1. Signal listener thread to stop
+      949          self._stop_event.set()
+      950  
+      951          # 2. Wait for listener thread to finish (only if sender mode)
+      952          if self._listener_thread is not None and self._listener_thread.is_alive():
+      953              self._listener_thread.join(timeout=2.0)
+      954              if self._listener_thread.is_alive():
+      955                  logger.warning("Listener thread did not stop gracefully")
+      956  
+      957          # 3. Shutdown sender executor (may be None if __init__ failed early)
+      958          if self._sender_executor is not None:
+      959              self._sender_executor.shutdown(wait=True, cancel_futures=False)
+      960  
+      961          # 4. Release all pending buffers
+      962          with self._local_buffers_lock:
+      963              for req_id, item in list(self._local_buffers.items()):
+      964                  _, _, holder, should_release, _, _ = item
+      965                  if should_release and isinstance(holder, ManagedBuffer):
+      966                      holder.release()
+      967              self._local_buffers.clear()
+      968  
+      969          # 5. Close thread-local cached REQ sockets (for the calling thread).
+      970          #    Sockets cached in *other* threads are not directly accessible here
+      971          #    because they live in per-thread ``threading.local()`` storage.
+      972          #    They will be forcefully closed when ``zmq_ctx.term()`` is called
+      973          #    in step 7 below, which is the intended cleanup path.
+      974          cache: dict[str, zmq.Socket] = getattr(self._req_local, "cache", None)  # type: ignore[assignment]
+      975          if cache:
+      976              for addr, sock in cache.items():
+      977                  try:
+      978                      sock.close(linger=0)
+      979                  except Exception:
+      980                      pass  # Best-effort; zmq_ctx.term() below will reclaim
+      981              cache.clear()
+      982  
+      983          # 6. Unregister memory from engine (if supported)
+      984          try:
+      985              if hasattr(self, "engine") and hasattr(self.engine, "unregister_memory"):
+      986                  # Mooncake API only takes address, not size
+      987                  self.engine.unregister_memory(self.base_ptr)
+      988          except Exception as e:
+      989              logger.warning(f"Failed to unregister memory: {e}")
+      990  
+      991          # 7. Close ZMQ contexts (also reclaims sockets cached in other threads)
+      992          try:
+      993              if hasattr(self, "zmq_ctx"):
+       ... truncated at 60 lines ...
+
+---------- IMPLEMENTER vllm_omni.distributed.omni_connectors.connectors.shm_connector:SharedMemoryConnector  stubs=2/5 ----------
+       17  class SharedMemoryConnector(OmniConnectorBase):
+       36      def put(
+       37          self,
+       38          from_stage: str,
+       39          to_stage: str,
+       40          put_key: str,
+       41          data: Any,
+       42      ) -> tuple[bool, int, dict[str, Any] | None]:
+       43          try:
+       44              # Always serialize first to check size (and for SHM writing)
+       45              # Note: For extremely large objects in "inline" mode (e.g. Ray),
+       46              # we might double-serialize if we're not careful, but here we assume
+       47              # if it's huge we use SHM, or if Ray, threshold is maxsize.
+       48              payload = self.serialize_obj(data)
+       49              size = len(payload)
+       50  
+       51              if True:
+       52                  # Use Shared Memory
+       53                  lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
+       54                  with open(lock_file, "wb+") as lockf:
+       55                      fcntl.flock(lockf, fcntl.LOCK_EX)
+       56                      meta = shm_write_bytes(payload, name=put_key)
+       57                      fcntl.flock(lockf, fcntl.LOCK_UN)
+       58  
+       59                  # meta contains {'name': ..., 'size': ...}
+       60                  metadata = {"shm": meta, "size": size}
+       61                  self._metrics["shm_writes"] += 1
+       62              else:
+       63                  # Inline - pass bytes directly to avoid double serialization of the object
+       64                  # We already serialized it to check size, so we pass the bytes.
+       65                  # The Queue will pickle these bytes (fast), avoiding re-serializing the complex object.
+       66                  metadata = {"inline_bytes": payload, "size": size}
+       67                  self._metrics["inline_writes"] += 1
+       68  
+       69              self._metrics["puts"] += 1
+       70              self._metrics["bytes_transferred"] += size
+       71  
+       72              return True, size, metadata
+       73  
+       74          except Exception as e:
+       75              logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
+       76              return False, 0, None
+       95      def get(
+       96          self,
+       97          from_stage: str,
+       98          to_stage: str,
+       99          get_key: str,
+      100          metadata=None,
+      101      ) -> tuple[Any, int] | None:
+      102          if metadata is not None:
+      103              # Some callers may wrap metadata by request id.
+      104              if isinstance(metadata, dict) and get_key in metadata:
+      105                  metadata = metadata.get(get_key)
+      106  
+      107              if not isinstance(metadata, dict):
+      108                  return None
+      109  
+      110              if "inline_bytes" in metadata:
+      111                  try:
+      112                      obj = self.deserialize_obj(metadata["inline_bytes"])
+      113                      return obj, int(metadata.get("size", 0))
+      114                  except Exception as e:
+      115                      logger.error(f"SharedMemoryConnector inline get failed for req {get_key}: {e}")
+      116                      return None
+      117  
+      118              if "shm" in metadata:
+      119                  shm_handle = metadata["shm"]
+      120                  lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
+      121                  return self._get_data_with_lock(lock_file, shm_handle)
+      122  
+      123              return None
+      124          shm = None
+      125          try:
+      126              shm = shm_pkg.SharedMemory(name=get_key)
+      127              if shm is None or shm.size == 0:
+      128                  return None
+      129              lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
+      130              shm_handle = {"name": get_key, "size": shm.size}
+      131              return self._get_data_with_lock(lock_file, shm_handle)
+      132          except Exception:
+      133              return None
+      134          finally:
+      135              if shm:
+      136                  shm.close()
+      138      def cleanup(self, request_id: str) -> None:
+      139          # SHM segments are automatically unlinked during 'get' (shm_read_bytes).
+      140          # If 'get' is never called (e.g. error flow), the SHM segment might leak.
+      141          # A robust implementation might track created segments and unlink them here
+      142          # if they haven't been consumed.
+      143          # For now, we rely on the consumer to read and unlink.
+      144          pass
+      146      def close(self) -> None:
+      147          pass
+      149      def health(self) -> dict[str, Any]:
+      150          return {"status": "healthy", "threshold": self.threshold, **self._metrics}
+
+---------- IMPLEMENTER vllm_omni.distributed.omni_connectors.connectors.yuanrong_connector:YuanrongConnector  stubs=0/5 ----------
+       19  class YuanrongConnector(OmniConnectorBase):
+       62      def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
+       63          if not self.client:
+       64              logger.error("Datasystem client not initialized")
+       65              return False, 0, None
+       66  
+       67          try:
+       68              serialized_data = self.serialize_obj(data)
+       69              key = self._make_key(put_key, from_stage, to_stage)
+       70              self.client.set(key, serialized_data, self.set_param.write_mode)
+       71  
+       72              self._metrics["puts"] += 1
+       73              self._metrics["bytes_transferred"] += len(serialized_data)
+       74  
+       75              logger.debug(
+       76                  "YuanrongConnector: stored %s (%s -> %s) %d bytes",
+       77                  key,
+       78                  from_stage,
+       79                  to_stage,
+       80                  len(serialized_data),
+       81              )
+       82              return True, len(serialized_data), None
+       83  
+       84          except Exception as exc:
+       85              self._metrics["errors"] += 1
+       86              logger.error("YuanrongConnector put failed: %s", exc)
+       87              return False, 0, None
+       89      def get(
+       90          self, from_stage: str, to_stage: str, get_key: str, metadata: dict[str, Any] | None = None
+       91      ) -> tuple[Any, int] | None:
+       92          if not self.client:
+       93              logger.error("Datasystem client not initialized")
+       94              return None
+       95  
+       96          key = self._make_key(get_key, from_stage, to_stage)
+       97          try:
+       98              raw_list = self.client.get([key], False, self.get_sub_timeout_ms)
+       99              raw_data = raw_list[0] if raw_list else None
+      100              if raw_data is not None:
+      101                  data = self.deserialize_obj(raw_data)
+      102                  self._metrics["gets"] += 1
+      103                  payload_size = len(raw_data)
+      104                  logger.debug(
+      105                      "YuanrongConnector: retrieved %s (%s -> %s) %d bytes",
+      106                      key,
+      107                      from_stage,
+      108                      to_stage,
+      109                      payload_size,
+      110                  )
+      111                  return data, payload_size
+      112  
+      113          except Exception as exc:
+      114              self._metrics["timeouts"] += 1
+      115              logger.error("YuanrongConnector get failed: %s", exc)
+      116              return None
+      118      def cleanup(self, request_id: str) -> None:
+      119          if not self.client:
+      120              return
+      121  
+      122          # Note: Datasystem doesn't have explicit delete, data will be garbage collected
+      123          logger.debug("YuanrongConnector: cleanup requested for %s (no-op)", request_id)
+      125      def health(self) -> dict[str, Any]:
+      126          if not self.client:
+      127              return {"status": "unhealthy", "error": "Datasystem client not initialized"}
+      128  
+      129          return {"status": "healthy", "host": self.host, "port": self.port, **self._metrics}
+      131      def close(self) -> None:
+      132          if not self.client:
+      133              return
+      134  
+      135          self.client = None
+      136          logger.info("YuanrongConnector closed")

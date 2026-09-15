@@ -1,0 +1,316 @@
+row 141   Red-Hat-AI-Innovation-Team/its_hub#122
+============================================================================
+CLASS OpenAICompatibleLanguageModel in its_hub/lms.py   loc=311 methods=6 wmc=32 lcom=0.5
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      205  class OpenAICompatibleLanguageModel(AbstractLanguageModel):
+      206      def __init__(
+      207          self,
+      208          endpoint: str,
+      209          api_key: str,
+      210          model_name: str,
+      211          system_prompt: str | None = None,
+      212          is_async: bool = False,
+      213          # default runtime parameters
+      214          stop: str | None = None,
+      215          max_tokens: int | None = None,
+      216          temperature: float | None = None,
+      217          max_tries: int = 8,
+      218          max_concurrency: int = -1,
+      219          replace_error_with_message: str | None = None,
+      220      ):
+      221          assert max_concurrency == -1 or max_concurrency > 0, (
+      222              "max_concurrency must be -1 (unlimited concurrency) or a positive integer"
+      223          )
+      224  
+      225          self.endpoint = endpoint
+      226          self.api_key = api_key
+      227          self.model_name = model_name
+      228          self.system_prompt = system_prompt
+      229          self.is_async = is_async
+      230          self.max_tries = max_tries
+      231          self.max_concurrency = max_concurrency
+      232          self.replace_error_with_message = replace_error_with_message
+      233  
+      234          # runtime parameters
+      235          self.stop = stop
+      236          self.max_tokens = max_tokens
+      237          self.temperature = temperature
+      238  
+      239          # set up headers for API requests
+      240          self.headers = {
+      241              "Content-Type": "application/json",
+      242              "Authorization": f"Bearer {self.api_key}",
+      243          }
+      244  
+      245          # endpoint type
+      246          self.endpoint_type = "openai" if "openai" in self.endpoint else "vllm"
+      247  
+      248      @property
+      249      def _chat_completion_endpoint(self) -> str:
+      250          return self.endpoint.rstrip("/") + "/chat/completions"
+      251  
+      252      def _prepare_request_data(
+      253          self,
+      254          messages: list[ChatMessage],
+      255          stop: str | None = None,
+      256          max_tokens: int | None = None,
+      257          temperature: float | None = None,
+      258          include_stop_str_in_output: bool | None = None,
+      259          tools: list[dict] | None = None,
+      260          tool_choice: str | dict | None = None,
+      261      ) -> dict:
+      262          # helper method to prepare request data for both sync and async methods
+      263          # Convert dict messages to Message objects if needed
+      264          messages = [
+      265              msg if isinstance(msg, ChatMessage) else ChatMessage(**msg)
+      266              for msg in messages
+      267          ]
+      268  
+      269          if self.system_prompt:
+      270              messages = [
+      271                  ChatMessage(role="system", content=self.system_prompt),
+      272                  *messages,
+      273              ]
+      274  
+      275          request_data = {
+      276              "model": self.model_name,
+      277              "messages": [msg.to_dict() for msg in messages],
+      278          }
+      279  
+      280          if self.endpoint_type == "vllm":
+      281              request_data["extra_body"] = {}
+      282              if messages[-1].role == "assistant":
+      283                  request_data["extra_body"]["add_generation_prompt"] = False
+      284                  request_data["extra_body"]["continue_final_message"] = True
+      285                  request_data["add_generation_prompt"] = False
+      286                  request_data["continue_final_message"] = True
+      287              if include_stop_str_in_output is not None:
+      288                  request_data["extra_body"]["include_stop_str_in_output"] = (
+      289                      include_stop_str_in_output
+      290                  )
+      291                  request_data["include_stop_str_in_output"] = include_stop_str_in_output
+      292          else:
+      293              logging.info(
+      294                  "openai endpoint does not support add_generation_prompt, continue_final_message, or include_stop_str_in_output"
+      295              )
+      296              if include_stop_str_in_output is not None:
+      297                  logging.warning(
+      298                      "include_stop_str_in_output parameter is not supported with OpenAI endpoints and will be ignored"
+      299                  )
+      300  
+      301          # set default runtime parameters
+      302          if self.stop is not None:
+      303              request_data["stop"] = self.stop
+      304          if self.max_tokens is not None:
+      305              request_data["max_tokens"] = self.max_tokens
+      306          if self.temperature is not None:
+      307              request_data["temperature"] = self.temperature
+      308  
+      309          # override runtime parameters
+      310          if stop is not None:
+      311              request_data["stop"] = stop
+      312          if max_tokens is not None:
+      313              request_data["max_tokens"] = max_tokens
+      314          if temperature is not None:
+      315              request_data["temperature"] = temperature
+      316  
+      317          # add tools and tool_choice if provided
+      318          if tools is not None:
+      319              request_data["tools"] = tools
+      320          if tool_choice is not None:
+      321              request_data["tool_choice"] = tool_choice
+      322  
+      323          return request_data
+      324  
+      325      async def _generate(
+      326          self,
+      327          messages_lst: list[list[ChatMessage]],
+      328          stop: str | None = None,
+      329          max_tokens: int | None = None,
+      330          temperature: float | None = None,
+      331          include_stop_str_in_output: bool | None = None,
+      332          tools: list[dict] | None = None,
+      333          tool_choice: str | dict | None = None,
+      334      ) -> list[dict]:
+      335          # limit concurrency to max_concurrency using a semaphore
+      336          semaphore = asyncio.Semaphore(
+      337              len(messages_lst) if self.max_concurrency == -1 else self.max_concurrency
+      338          )
+      339  
+      340          # create a single session for all requests in this call
+      341          async with aiohttp.ClientSession() as session:
+      342  
+      343              @backoff.on_exception(
+      344                  backoff.expo,
+      345                  RETRYABLE_ERRORS,
+      346                  max_tries=self.max_tries,
+      347                  on_backoff=enhanced_on_backoff,
+      348                  giveup=lambda e: not should_retry(e),
+      349              )
+      350              async def fetch_response(
+      351                  messages: list[ChatMessage], _temperature: float | None
+      352              ) -> dict:
+      353                  async with semaphore:
+      354                      request_data = self._prepare_request_data(
+      355                          messages,
+      356                          stop,
+      357                          max_tokens,
+      358                          _temperature,
+      359                          include_stop_str_in_output,
+      360                          tools,
+      361                          tool_choice,
+      362                      )
+      363  
+      364                      async with session.post(
+      365                          self._chat_completion_endpoint,
+      366                          headers=self.headers,
+      367                          json=request_data,
+      368                      ) as response:
+      369                          if response.status != 200:
+      370                              error_text = await response.text()
+      371                              api_error = parse_api_error(response.status, error_text)
+      372                              if not should_retry(api_error):
+      373                                  logging.error(format_non_retryable_error(api_error))
+      374                              raise api_error
+      375                          response_json = await response.json()
+      376                          # Return the full message object to preserve tool calls
+      377                          return response_json["choices"][0]["message"]
+      378  
+      379              async def safe_fetch_response(
+      380                  messages: list[ChatMessage], _temperature: float | None
+      381              ) -> dict:
+      382                  if self.replace_error_with_message is not None:
+      383                      try:
+      384                          return await fetch_response(messages, _temperature)
+      385                      except (aiohttp.ClientError, TimeoutError) as e:
+      386                          logging.error(f"Network error during async generation: {e}")
+      387                          return {
+      388                              "role": "assistant",
+      389                              "content": self.replace_error_with_message,
+      390                          }
+      391                      except APIError as e:
+      392                          logging.error(f"API error during async generation: {e}")
+      393                          return {
+      394                              "role": "assistant",
+      395                              "content": self.replace_error_with_message,
+      396                          }
+      397                  else:
+      398                      return await fetch_response(messages, _temperature)
+      399  
+      400              # gather all responses asynchronously, with concurrency limited to max_concurrency
+      401              temperature_lst = (
+      402                  temperature
+      403                  if isinstance(temperature, list)
+      404                  else [temperature] * len(messages_lst)
+      405              )
+      406              return await asyncio.gather(
+      407                  *(
+      408                      safe_fetch_response(messages, _temperature)
+      409                      for messages, _temperature in zip(messages_lst, temperature_lst)
+      410                  )
+      411              )
+      412  
+      413      def generate(
+      414          self,
+      415          messages_or_messages_lst: list[ChatMessage] | list[list[ChatMessage]],
+      416          stop: str | None = None,
+      417          max_tokens: int | None = None,
+      418          temperature: float | list[float] | None = None,
+      419          include_stop_str_in_output: bool | None = None,
+      420          tools: list[dict] | None = None,
+      421          tool_choice: str | dict | None = None,
+      422      ) -> dict | list[dict]:
+      423          # Check if we have a single list of messages or a list of message lists
+      424          # Single list: [{"role": "user", "content": "..."}] or [Message(...)]
+      425          # Multiple lists: [[{"role": "user", "content": "..."}], [{"role": "user", "content": "..."}]]
+      426          is_single = not isinstance(messages_or_messages_lst[0], list)
+      427          messages_lst = (
+      428              [messages_or_messages_lst] if is_single else messages_or_messages_lst
+      429          )
+      430          if self.is_async:
+      431              loop = asyncio.get_event_loop()
+      432              response_or_responses = loop.run_until_complete(
+      433                  self._generate(
+      434                      messages_lst,
+      435                      stop,
+      436                      max_tokens,
+      437                      temperature,
+      438                      include_stop_str_in_output,
+      439                      tools,
+      440                      tool_choice,
+      441                  )
+      442              )
+      443          else:
+      444  
+      445              @backoff.on_exception(
+      446                  backoff.expo,
+      447                  RETRYABLE_ERRORS,
+      448                  max_tries=self.max_tries,
+      449                  on_backoff=enhanced_on_backoff,
+      450                  giveup=lambda e: not should_retry(e),
+      451              )
+      452              def fetch_single_response(
+      453                  messages: list[ChatMessage], _temperature: float | None
+      454              ) -> dict:
+      455                  request_data = self._prepare_request_data(
+      456                      messages,
+      457                      stop,
+      458                      max_tokens,
+      459                      _temperature,
+      460                      include_stop_str_in_output,
+      461                      tools,
+      462                      tool_choice,
+      463                  )
+      464  
+      465                  response = requests.post(
+      466                      self._chat_completion_endpoint,
+      467                      headers=self.headers,
+      468                      json=request_data,
+      469                  )
+      470  
+      471                  if response.status_code != 200:
+      472                      api_error = parse_api_error(response.status_code, response.text)
+      473                      if not should_retry(api_error):
+      474                          logging.error(format_non_retryable_error(api_error))
+      475                      raise api_error
+      476  
+      477                  response_json = response.json()
+      478                  # Return the full message object to preserve tool calls
+      479                  return response_json["choices"][0]["message"]
+      480  
+      481              def safe_fetch_single_response(
+      482                  messages: list[ChatMessage], _temperature: float | None
+      483              ) -> dict:
+      484                  if self.replace_error_with_message is not None:
+      485                      try:
+      486                          return fetch_single_response(messages, _temperature)
+      487                      except requests.RequestException as e:
+      488                          logging.error(f"Network error during sync generation: {e}")
+      489                          return {
+      490                              "role": "assistant",
+      491                              "content": self.replace_error_with_message,
+      492                          }
+      493                      except APIError as e:
+      494                          logging.error(f"API error during sync generation: {e}")
+      495                          return {
+      496                              "role": "assistant",
+      497                              "content": self.replace_error_with_message,
+      498                          }
+      499                  else:
+      500                      return fetch_single_response(messages, _temperature)
+      501  
+      502              temperature_lst = (
+      503                  temperature
+      504                  if isinstance(temperature, list)
+      505                  else [temperature] * len(messages_lst)
+      506              )
+      507              response_or_responses = [
+      508                  safe_fetch_single_response(messages, _temperature)
+      509                  for messages, _temperature in zip(messages_lst, temperature_lst)
+      510              ]
+      511          return response_or_responses[0] if is_single else response_or_responses
+      512  
+      513      # TODO implement evaluation
+      514      def evaluate(self, prompt: str, generation: str) -> list[float]:
+      515          raise NotImplementedError("evaluate method not implemented")

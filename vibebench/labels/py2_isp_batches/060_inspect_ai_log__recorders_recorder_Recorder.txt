@@ -1,0 +1,537 @@
+row 60   UKGovernmentBEIS/inspect_ai#3525
+============================================================================
+CONTRACT inspect_ai.log._recorders.recorder:Recorder   kind=abc abstract_methods=14.0 implementers=3.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file src/inspect_ai/log/_recorders/recorder.py
+       19  class Recorder(abc.ABC):
+       20      @classmethod
+       21      @abc.abstractmethod
+       22      def handles_location(cls, location: str) -> bool: ...
+       23  
+       24      @classmethod
+       25      @abc.abstractmethod
+       26      def handles_bytes(cls, first_bytes: bytes) -> bool: ...
+       27  
+       28      @abc.abstractmethod
+       29      def default_log_buffer(self, sample_count: int, high_throughput: bool) -> int: ...
+       30  
+       31      @abc.abstractmethod
+       32      def is_writeable(self) -> bool: ...
+       33  
+       34      @abc.abstractmethod
+       35      async def log_init(self, eval: EvalSpec, location: str | None = None) -> str: ...
+       36  
+       37      @abc.abstractmethod
+       38      async def log_start(self, eval: EvalSpec, plan: EvalPlan) -> None: ...
+       39  
+       40      @abc.abstractmethod
+       41      async def log_sample(self, eval: EvalSpec, sample: EvalSample) -> None: ...
+       42  
+       43      @abc.abstractmethod
+       44      async def flush(self, eval: EvalSpec) -> None: ...
+       45  
+       46      @abc.abstractmethod
+       47      async def log_finish(
+       48          self,
+       49          eval: EvalSpec,
+       50          status: EvalStatus,
+       51          stats: EvalStats,
+       52          results: EvalResults | None,
+       53          reductions: list[EvalSampleReductions] | None,
+       54          error: EvalError | None = None,
+       55          header_only: bool = False,
+       56          invalidated: bool = False,
+       57      ) -> EvalLog: ...
+       58  
+       59      @classmethod
+       60      @abc.abstractmethod
+       61      async def read_log(
+       62          cls,
+       63          location: str,
+       64          header_only: bool = False,
+       65          async_fs: AsyncFilesystem | None = None,
+       66      ) -> EvalLog: ...
+       67  
+       68      @classmethod
+       69      @abc.abstractmethod
+       70      async def read_log_bytes(
+       71          cls, log_bytes: IO[bytes], header_only: bool = False
+       72      ) -> EvalLog: ...
+       73  
+       74      @classmethod
+       75      @abc.abstractmethod
+       76      async def read_log_sample(
+       77          cls,
+       78          location: str,
+       79          id: str | int | None = None,
+       80          epoch: int = 1,
+       81          uuid: str | None = None,
+       82          exclude_fields: set[str] | None = None,
+       83      ) -> EvalSample: ...
+       84  
+       85      @classmethod
+       86      @abc.abstractmethod
+       87      async def read_log_sample_summaries(
+       88          cls, location: str, async_fs: AsyncFilesystem | None = None
+       89      ) -> list[EvalSampleSummary]: ...
+       90  
+       91      @classmethod
+       92      async def read_log_sample_ids(cls, location: str) -> list[tuple[str | int, int]]:
+       93          return sorted(
+       94              (
+       95                  (sample_summary.id, sample_summary.epoch)
+       96                  for sample_summary in await cls.read_log_sample_summaries(location)
+       97              ),
+       98              key=lambda x: (
+       99                  x[1],
+      100                  (x[0] if isinstance(x[0], str) else str(x[0]).zfill(20)),
+      101              ),
+      102          )
+      103  
+      104      @classmethod
+      105      @abc.abstractmethod
+      106      async def write_log(
+      107          cls, location: str, log: EvalLog, if_match_etag: str | None = None
+      108      ) -> None: ...
+
+---------- IMPLEMENTER inspect_ai.log._recorders.eval:EvalRecorder  stubs=0/14 ----------
+       65  class EvalRecorder(FileRecorder):
+       66      @override
+       67      @classmethod
+       68      def handles_location(cls, location: str) -> bool:
+       69          return location.endswith(".eval")
+       71      @override
+       72      @classmethod
+       73      def handles_bytes(cls, first_bytes: bytes) -> bool:
+       74          return first_bytes == b"PK\x03\x04"  # ZIP local file header
+       76      @override
+       77      def default_log_buffer(self, sample_count: int, high_throughput: bool) -> int:
+       78          if high_throughput:
+       79              # High-throughput: flush ~10 times over the run
+       80              return max(10, sample_count // 10)
+       81          else:
+       82              # .eval files are 5-8x smaller than .json files so we
+       83              # are much less worried about flushing frequently
+       84              # scale flushes in alignment with sample_count so small runs
+       85              # flush more often (sample by sample) and large runs less often
+       86              return max(1, min(math.floor(sample_count / 3), 10))
+       95      @override
+       96      async def log_init(
+       97          self, eval: EvalSpec, location: str | None = None, *, clean: bool = False
+       98      ) -> str:
+       99          # if the file exists then read summaries
+      100          if not clean and location is not None and self.fs.exists(location):
+      101              with file(location, "rb") as f:
+      102                  with ZipFile(f, "r") as zip:
+      103                      log_start = _read_start(zip)
+      104                      summary_counter = _read_summary_counter(zip.namelist())
+      105                      summaries = _read_all_summaries(zip, summary_counter)
+      106          else:
+      107              log_start = None
+      108              summary_counter = 0
+      109              summaries = []
+      110  
+      111          # create zip wrapper
+      112          zip_file = location or self._log_file_path(eval)
+      113          zip_log_file = ZipLogFile(file=zip_file)
+      114          await zip_log_file.init(log_start, summary_counter, summaries)
+      115  
+      116          # track zip
+      117          self.data[self._log_file_key(eval)] = zip_log_file
+      118  
+      119          # return file path
+      120          return zip_file
+      122      @override
+      123      async def log_start(self, eval: EvalSpec, plan: EvalPlan) -> None:
+      124          log = self.data[self._log_file_key(eval)]
+      125          start = LogStart(version=LOG_SCHEMA_VERSION, eval=eval, plan=plan)
+      126          await log.start(start)
+      128      @override
+      129      async def log_sample(self, eval: EvalSpec, sample: EvalSample) -> None:
+      130          log = self.data[self._log_file_key(eval)]
+      131          await log.buffer_sample(sample)
+      133      @override
+      134      async def flush(self, eval: EvalSpec) -> None:
+      135          # get the zip log
+      136          log = self.data[self._log_file_key(eval)]
+      137  
+      138          # write the buffered samples
+      139          await log.write_buffered_samples()
+      140  
+      141          # flush to underlying stream
+      142          await log.flush()
+      144      @override
+      145      async def log_finish(
+      146          self,
+      147          eval: EvalSpec,
+      148          status: EvalStatus,
+      149          stats: EvalStats,
+      150          results: EvalResults | None,
+      151          reductions: list[EvalSampleReductions] | None,
+      152          error: EvalError | None = None,
+      153          header_only: bool = False,
+      154          invalidated: bool = False,
+      155      ) -> EvalLog:
+      156          # get the key and log
+      157          key = self._log_file_key(eval)
+      158          log = self.data[key]
+      159  
+      160          # write the buffered samples
+      161          await log.write_buffered_samples()
+      162  
+      163          # write consolidated summaries
+      164          await log.write(SUMMARIES_JSON, log._summaries)
+      165  
+      166          # write reductions
+      167          if reductions is not None:
+      168              await log.write(REDUCTIONS_JSON, reductions)
+      169  
+      170          # Get the results
+      171          log_results = LogResults(
+      172              status=status, stats=stats, results=results, error=error
+      173          )
+      174  
+      175          # add the results to the original eval log from start.json
+      176          log_start = log.log_start
+      177          if log_start is None:
+      178              raise RuntimeError("Log not properly initialised")
+      179  
+      180          eval_header = EvalLog(
+      181              version=log_start.version,
+      182              invalidated=invalidated,
+      183              eval=log_start.eval,
+      184              plan=log_start.plan,
+      185              results=log_results.results,
+      186              stats=log_results.stats,
+      187              status=log_results.status,
+      188              error=log_results.error,
+      189          )
+      190          await log.write(HEADER_JSON, eval_header)
+      191  
+      192          # flush and write the results
+      193          await log.flush()
+      194          result = await log.close(header_only)
+      195  
+      196          # stop tracking this eval
+      197          del self.data[key]
+      198  
+      199          return result
+      201      @classmethod
+      202      @override
+      203      async def read_log(
+      204          cls,
+      205          location: str,
+      206          header_only: bool = False,
+      207          async_fs: AsyncFilesystem | None = None,
+      208      ) -> EvalLog:
+      209          if async_fs is not None:
+      210              return await cls._read_log_impl(location, header_only, async_fs)
+      211          else:
+      212              async with AsyncFilesystem() as owned_fs:
+      213                  return await cls._read_log_impl(location, header_only, owned_fs)
+      257      @override
+      258      @classmethod
+      259      async def read_log_bytes(
+      260          cls, log_bytes: IO[bytes], header_only: bool = False
+      261      ) -> EvalLog:
+      262          return _read_log_from_bytes(log_bytes, location="", header_only=header_only)
+      264      @override
+      265      @classmethod
+      266      async def read_log_sample(
+      267          cls,
+      268          location: str,
+      269          id: str | int | None = None,
+      270          epoch: int = 1,
+      271          uuid: str | None = None,
+      272          exclude_fields: set[str] | None = None,
+      273      ) -> EvalSample:
+      274          with file(location, "rb") as z:
+      275              with ZipFile(z, mode="r") as zip:
+      276                  try:
+      277                      # if a uuid was specified then read the summaries and find the matching sample
+      278                      if id is None:
+      279                          if uuid is None:
+      280                              raise ValueError(
+      281                                  "You must specify an 'id' or 'uuid' to read"
+      282                              )
+      283                          summaries = _read_sample_summaries(zip)
+      284                          sample = next(
+      285                              (summary for summary in summaries if summary.uuid == uuid),
+      286                              None,
+      287                          )
+      288                          if sample is None:
+      289                              raise ValueError(
+      290                                  f"Sample with uuid '{uuid}' not found in log."
+      291                              )
+      292                          id = sample.id
+      293                          epoch = sample.epoch
+      294  
+      295                      with zip.open(_sample_filename(id, epoch), "r") as f:
+      296                          if exclude_fields:
+      297                              # Use streaming JSON parser to skip large fields
+      298                              # This significantly reduces memory usage for large samples
+      299                              import ijson  # type: ignore
+      300                              from ijson import IncompleteJSONError
+      301                              from ijson.backends.python import (  # type: ignore[import-untyped]
+      302                                  UnexpectedSymbol,
+      303                              )
+      304  
+      305                              try:
+      306                                  data: dict[str, Any] = {}
+      307                                  for key, value in ijson.kvitems(f, "", use_float=True):
+      308                                      if key not in exclude_fields:
+      309                                          data[key] = value
+      310                              except (
+      311                                  ValueError,
+      312                                  IncompleteJSONError,
+      313                                  UnexpectedSymbol,
+      314                              ) as ex:
+      315                                  # ijson doesn't support NaN/Inf which are valid in
+      316                                  # Python's JSON. Fall back to standard json.load
+      317                                  # and manually remove excluded fields.
+      318                                  if is_ijson_nan_inf_error(ex):
+      319                                      f.seek(0)
+      320                                      data = json.load(f)
+      321                                      for field in exclude_fields:
+      322                                          data.pop(field, None)
+      323                                  else:
+       ... truncated at 60 lines ...
+      335      @classmethod
+      336      @override
+      337      async def read_log_sample_summaries(
+      338          cls, location: str, async_fs: AsyncFilesystem | None = None
+      339      ) -> list[EvalSampleSummary]:
+      340          if async_fs is not None:
+      341              return await cls._read_log_sample_summaries_impl(location, async_fs)
+      342          else:
+      343              async with AsyncFilesystem() as owned_fs:
+      344                  return await cls._read_log_sample_summaries_impl(location, owned_fs)
+      356      @classmethod
+      357      @override
+      358      async def write_log(
+      359          cls, location: str, log: EvalLog, if_match_etag: str | None = None
+      360      ) -> None:
+      361          fs = filesystem(location)
+      362          if fs.is_s3() and if_match_etag:
+      363              # Use S3 conditional write
+      364              await cls._write_log_s3_conditional(location, log, if_match_etag, fs)
+      365          else:
+      366              # Standard write using the recorder (so we get all of the extra streams)
+      367              await _write_eval_log_with_recorder(log, dirname(location), location)
+      (does not define: is_writeable; inherited or absent)
+
+---------- IMPLEMENTER inspect_ai.log._recorders.file:FileRecorder  stubs=0/14 ----------
+       19  class FileRecorder(Recorder):
+       35      @override
+       36      def is_writeable(self) -> bool:
+       37          return self.fs.is_writeable(self.log_dir)
+       39      @override
+       40      @classmethod
+       41      async def read_log_sample(
+       42          cls,
+       43          location: str,
+       44          id: str | int | None = None,
+       45          epoch: int = 1,
+       46          uuid: str | None = None,
+       47          exclude_fields: set[str] | None = None,
+       48      ) -> EvalSample:
+       49          # establish the log to read from (might be cached)
+       50          eval_log = await cls._log_file_maybe_cached(location)
+       51  
+       52          # throw if no samples
+       53          if not eval_log.samples:
+       54              raise IndexError(f"No samples found in log {location}")
+       55  
+       56          # find the sample
+       57          id = normalise_sample_id(id) if id is not None else id
+       58          eval_sample = next(
+       59              (
+       60                  sample
+       61                  for sample in (eval_log.samples)
+       62                  if (
+       63                      id
+       64                      and normalise_sample_id(sample.id) == id
+       65                      and sample.epoch == epoch
+       66                  )
+       67                  or (uuid and sample.uuid == uuid)
+       68              ),
+       69              None,
+       70          )
+       71          if eval_sample is None:
+       72              raise IndexError(
+       73                  f"Sample id {id} for epoch {epoch} not found in log {location}"
+       74              )
+       75          else:
+       76              return eval_sample
+       78      @classmethod
+       79      @override
+       80      async def read_log_sample_summaries(
+       81          cls, location: str, async_fs: AsyncFilesystem | None = None
+       82      ) -> list[EvalSampleSummary]:
+       83          # establish the log to read from (might be cached)
+       84          eval_log = await cls._log_file_maybe_cached(location)
+       85          if not eval_log.samples:
+       86              return []
+       87          return [sample.summary() for sample in eval_log.samples]
+      (does not define: default_log_buffer, flush, handles_bytes, handles_location, log_finish, log_init, log_sample, log_start, read_log, read_log_bytes, write_log; inherited or absent)
+
+---------- IMPLEMENTER inspect_ai.log._recorders.json:JSONRecorder  stubs=0/14 ----------
+       35  class JSONRecorder(FileRecorder):
+       36      @override
+       37      @classmethod
+       38      def handles_location(cls, location: str) -> bool:
+       39          return location.endswith(".json")
+       41      @override
+       42      @classmethod
+       43      def handles_bytes(cls, first_bytes: bytes) -> bool:
+       44          return first_bytes[:1] == b"{"
+       46      @override
+       47      def default_log_buffer(self, sample_count: int, high_throughput: bool) -> int:
+       48          if high_throughput:
+       49              # High-throughput: flush ~10 times over the run
+       50              return max(10, sample_count // 10)
+       51          else:
+       52              # we write the entire file in one shot and the files can
+       53              # get fairly large (> 100MB) so we are a bit more sparing
+       54              # for remote filesystem writes
+       55              if self.is_local():
+       56                  return 10
+       57              else:
+       58                  return 100
+       77      @override
+       78      async def log_init(self, eval: EvalSpec, location: str | None = None) -> str:
+       79          # initialize file log for this eval
+       80          # compute an absolute path if it's a relative ref
+       81          # (so that the writes go to the correct place even
+       82          # if the working directory is switched for a task)
+       83          file = location or absolute_file_path(self._log_file_path(eval))
+       84  
+       85          # compute an absolute path if it's a relative ref
+       86          # (so that the writes go to the correct place even
+       87          # if the working directory is switched for a task)
+       88          self.data[self._log_file_key(eval)] = JSONRecorder.JSONLogFile(
+       89              file=file, data=EvalLog(eval=eval)
+       90          )
+       91  
+       92          # attempt to
+       93          return file
+       95      @override
+       96      async def log_start(self, eval: EvalSpec, plan: EvalPlan) -> None:
+       97          log = self.data[self._log_file_key(eval)]
+       98          log.data.plan = plan
+      100      @override
+      101      async def log_sample(self, eval: EvalSpec, sample: EvalSample) -> None:
+      102          log = self.data[self._log_file_key(eval)]
+      103          if log.data.samples is None:
+      104              log.data.samples = []
+      105          log.data.samples.append(sample)
+      107      @override
+      108      async def log_finish(
+      109          self,
+      110          eval: EvalSpec,
+      111          status: EvalStatus,
+      112          stats: EvalStats,
+      113          results: EvalResults | None,
+      114          reductions: list[EvalSampleReductions] | None,
+      115          error: EvalError | None = None,
+      116          header_only: bool = False,
+      117          invalidated: bool = False,
+      118      ) -> EvalLog:
+      119          log = self.data[self._log_file_key(eval)]
+      120          log.data.status = status
+      121          log.data.stats = stats
+      122          log.data.results = results
+      123          log.data.invalidated = invalidated
+      124          if error:
+      125              log.data.error = error
+      126          if reductions:
+      127              log.data.reductions = reductions
+      128          await self.write_log(log.file, log.data)
+      129          log.data.location = log.file
+      130  
+      131          # stop tracking this data
+      132          del self.data[self._log_file_key(eval)]
+      133  
+      134          # return the log
+      135          return log.data
+      137      @override
+      138      async def flush(self, eval: EvalSpec) -> None:
+      139          log = self.data[self._log_file_key(eval)]
+      140          await self.write_log(log.file, log.data)
+      142      @override
+      143      @classmethod
+      144      async def read_log(
+      145          cls,
+      146          location: str,
+      147          header_only: bool = False,
+      148          async_fs: AsyncFilesystem | None = None,
+      149      ) -> EvalLog:
+      150          fs = filesystem(location)
+      151  
+      152          if header_only:
+      153              # Fast path: header only
+      154              try:
+      155                  log = _read_header_streaming(location)
+      156                  if fs.is_s3():
+      157                      file_info = fs.info(location)
+      158                      log.etag = file_info.etag
+      159                  return log
+      160              # The Python JSON serializer supports NaN and Inf, however
+      161              # this isn't technically part of the JSON spec. The json-stream
+      162              # library shares this limitation, so if we fail with an
+      163              # invalid character (or Unexpected symbol) then we move on and and parse w/ pydantic
+      164              # (which does support NaN and Inf by default)
+      165              except (ValueError, IncompleteJSONError, UnexpectedSymbol) as ex:
+      166                  if is_ijson_nan_inf_error(ex):
+      167                      pass
+      168                  else:
+      169                      raise ValueError(f"Unable to read log file: {location}") from ex
+      170  
+      171          # full reads (and fallback to streaming reads if they encounter invalid json characters)
+      172          if fs.is_s3():
+      173              # read content and get ETag such that they always match
+      174              content, etag = await _s3_read_with_etag(location, fs)
+      175              raw_data = from_json(content)
+      176          else:
+      177              with file(location, "r") as f:
+      178                  raw_data = from_json(f.read())
+      179              etag = None
+      180  
+      181          log = _parse_json_log(raw_data, header_only)
+      182          log.location = location
+      183          if etag:
+      184              log.etag = etag
+      185  
+      186          return log
+      188      @override
+      189      @classmethod
+      190      async def read_log_bytes(
+      191          cls, log_bytes: IO[bytes], header_only: bool = False
+      192      ) -> EvalLog:
+      193          return _parse_json_log(from_json(log_bytes.read()), header_only)
+      195      @override
+      196      @classmethod
+      197      async def write_log(
+      198          cls, location: str, log: EvalLog, if_match_etag: str | None = None
+      199      ) -> None:
+      200          from inspect_ai.log._file import eval_log_json
+      201  
+      202          # sort samples before writing as they can come in out of order
+      203          if log.samples:
+      204              sort_samples(log.samples)
+      205  
+      206          fs = filesystem(location)
+      207          if fs.is_s3() and if_match_etag:
+      208              # Use S3 conditional write
+      209              await cls._write_log_s3_conditional(location, log, if_match_etag, fs)
+      210          else:
+      211              # Standard write
+      212              # get log as bytes
+      213              log_bytes = eval_log_json(log)
+      214  
+      215              with trace_action(logger, "Log Write", location):
+      216                  with file(location, "wb") as f:
+      217                      f.write(log_bytes)
+      (does not define: is_writeable, read_log_sample, read_log_sample_summaries; inherited or absent)

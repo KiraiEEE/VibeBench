@@ -1,0 +1,1811 @@
+row 33   nexi-lab/nexus#622
+============================================================================
+CONTRACT nexus.backends.backend:Backend   kind=abc abstract_methods=10.0 implementers=17.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file src/nexus/backends/backend.py
+       15  class Backend(ABC):
+       16      """
+       17      Unified backend interface for storage operations.
+       18  
+       19      All storage backends (LocalFS, S3, GCS, etc.) implement this interface.
+       20      It combines:
+       21      - Content-addressable storage (CAS) for automatic deduplication
+       22      - Directory operations for filesystem compatibility
+       23  
+       24      Content Operations:
+       25      - Files stored by SHA-256 hash
+       26      - Automatic deduplication (same content = stored once)
+       27      - Reference counting for safe deletion
+       28  
+       29      Directory Operations:
+       30      - Virtual directory structure (metadata-based or backend-native)
+       31      - Compatible with path router and mounting
+       32      """
+       33  
+       34      @property
+       35      @abstractmethod
+       36      def name(self) -> str:
+       37          """
+       38          Backend identifier name.
+       39  
+       40          Returns:
+       41              Backend name (e.g., "local", "gcs", "s3")
+       42          """
+       43          pass
+       44  
+       45      @property
+       46      def user_scoped(self) -> bool:
+       47          """
+       48          Whether this backend requires per-user credentials (OAuth-based).
+       49  
+       50          User-scoped backends (e.g., Google Drive, OneDrive) use different
+       51          credentials for each user. The backend will receive OperationContext
+       52          to determine which user's credentials to use.
+       53  
+       54          Non-user-scoped backends (e.g., GCS, S3) use shared service account
+       55          credentials and ignore the context parameter.
+       56  
+       57          Returns:
+       58              True if backend requires per-user credentials, False otherwise
+       59              Default: False (shared credentials)
+       60  
+       61          Examples:
+       62              >>> # Shared credentials (GCS, S3)
+       63              >>> gcs_backend.user_scoped
+       64              False
+       65  
+       66              >>> # Per-user OAuth (Google Drive, OneDrive)
+       67              >>> gdrive_backend.user_scoped
+       68              True
+       69          """
+       70          return False
+       71  
+       72      # === Content Operations (CAS) ===
+       73  
+       74      @abstractmethod
+       75      def write_content(self, content: bytes, context: "OperationContext | None" = None) -> str:
+       76          """
+       77          Write content to storage and return its content hash.
+       78  
+       79          If content already exists (same hash), increments reference count
+       80          instead of writing duplicate data.
+       81  
+       82          Args:
+       83              content: File content as bytes
+       84              context: Operation context with user/tenant info (optional, for user-scoped backends)
+       85  
+       86          Returns:
+       87              Content hash (SHA-256 as hex string)
+       88  
+       89          Raises:
+       90              BackendError: If write operation fails
+       91  
+       92          Note:
+       93              For user_scoped backends, context.user_id determines which user's
+       94              credentials to use. Non-user-scoped backends ignore this parameter.
+       95          """
+       96          pass
+       97  
+       98      @abstractmethod
+       99      def read_content(self, content_hash: str, context: "OperationContext | None" = None) -> bytes:
+      100          """
+      101          Read content by its hash.
+      102  
+      103          Args:
+      104              content_hash: SHA-256 hash as hex string
+      105              context: Operation context with user/tenant info (optional, for user-scoped backends)
+      106  
+      107          Returns:
+      108              File content as bytes
+      109  
+      110          Raises:
+      111              NexusFileNotFoundError: If content doesn't exist
+      112              BackendError: If read operation fails
+      113  
+      114          Note:
+      115              For user_scoped backends, context.user_id determines which user's
+      116              credentials to use. Non-user-scoped backends ignore this parameter.
+      117          """
+      118          pass
+      119  
+      120      def batch_read_content(
+      121          self, content_hashes: list[str], context: "OperationContext | None" = None
+      122      ) -> dict[str, bytes | None]:
+      123          """
+      124          Read multiple content items by their hashes (batch operation).
+      125  
+      126          This is an optimization to reduce round-trips for backends that support
+      127          batch operations. Default implementation calls read_content() for each hash.
+      128          Backends should override this for better performance.
+      129  
+      130          Args:
+      131              content_hashes: List of SHA-256 hashes as hex strings
+      132              context: Operation context with user/tenant info (optional, for user-scoped backends)
+      133  
+      134          Returns:
+      135              Dictionary mapping content_hash -> content bytes
+      136              Returns None for hashes that don't exist (instead of raising)
+      137  
+      138          Note:
+      139              Unlike read_content(), this does NOT raise on missing content.
+      140              Missing content is indicated by None values in the result dict.
+      141          """
+      142          result: dict[str, bytes | None] = {}
+      143          for content_hash in content_hashes:
+      144              try:
+      145                  result[content_hash] = self.read_content(content_hash, context=context)
+      146              except Exception:
+      147                  # Return None for missing/errored content
+      148                  result[content_hash] = None
+      149          return result
+      150  
+      151      def stream_content(
+      152          self, content_hash: str, chunk_size: int = 8192, context: "OperationContext | None" = None
+      153      ) -> Any:
+      154          """
+      155          Stream content by its hash in chunks (generator).
+      156  
+      157          This is a memory-efficient alternative to read_content() for large files.
+      158          Instead of loading entire file into memory, yields chunks as an iterator.
+      159  
+      160          Args:
+      161              content_hash: SHA-256 hash as hex string
+      162              chunk_size: Size of each chunk in bytes (default: 8KB)
+      163              context: Operation context with user/tenant info (optional, for user-scoped backends)
+      164  
+      165          Yields:
+      166              bytes: Chunks of file content
+      167  
+      168          Raises:
+      169              NexusFileNotFoundError: If content doesn't exist
+      170              BackendError: If read operation fails
+      171  
+      172          Example:
+      173              >>> # Stream large file without loading into memory
+      174              >>> for chunk in backend.stream_content(content_hash):
+      175              ...     process_chunk(chunk)  # Process incrementally
+      176          """
+      177          # Default implementation: read entire file and yield in chunks
+      178          # Backends can override for true streaming from storage
+      179          content = self.read_content(content_hash, context=context)
+      180          for i in range(0, len(content), chunk_size):
+      181              yield content[i : i + chunk_size]
+      182  
+      183      @abstractmethod
+      184      def delete_content(self, content_hash: str, context: "OperationContext | None" = None) -> None:
+      185          """
+      186          Delete content by hash.
+      187  
+      188          Decrements reference count. Only deletes actual file when
+      189          reference count reaches zero.
+      190  
+      191          Args:
+      192              content_hash: SHA-256 hash as hex string
+      193              context: Operation context with user/tenant info (optional, for user-scoped backends)
+      194  
+      195          Raises:
+      196              NexusFileNotFoundError: If content doesn't exist
+      197              BackendError: If delete operation fails
+      198  
+      199          Note:
+      200              For user_scoped backends, context.user_id determines which user's
+      201              credentials to use. Non-user-scoped backends ignore this parameter.
+      202          """
+      203          pass
+      204  
+      205      @abstractmethod
+      206      def content_exists(self, content_hash: str, context: "OperationContext | None" = None) -> bool:
+      207          """
+      208          Check if content exists.
+      209  
+      210          Args:
+      211              content_hash: SHA-256 hash as hex string
+      212              context: Operation context with user/tenant info (optional, for user-scoped backends)
+      213  
+      214          Returns:
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER nexus.backends.gcs:GCSBackend  stubs=0/10 ----------
+       31  @register_connector(
+       32      "gcs",
+       33      description="Google Cloud Storage with CAS deduplication",
+       34      category="storage",
+       35      requires=["google-cloud-storage"],
+       36  )
+       37  class GCSBackend(Backend):
+      135      @property
+      136      def name(self) -> str:
+      137          """Backend identifier name."""
+      138          return "gcs"
+      206      def write_content(self, content: bytes, context: "OperationContext | None" = None) -> str:
+      207          """
+      208          Write content to CAS storage and return its hash.
+      209  
+      210          If content already exists, increments reference count.
+      211  
+      212          Args:
+      213              content: File content as bytes
+      214              _context: Operation context (ignored for GCS backend)
+      215          """
+      216          content_hash = self._compute_hash(content)
+      217          content_path = self._hash_to_path(content_hash)
+      218  
+      219          try:
+      220              blob = self.bucket.blob(content_path)
+      221  
+      222              # Check if content already exists
+      223              if blob.exists():
+      224                  metadata = self._read_metadata(content_hash)
+      225                  metadata["ref_count"] = metadata.get("ref_count", 0) + 1
+      226                  self._write_metadata(content_hash, metadata)
+      227                  return content_hash
+      228  
+      229              # Content doesn't exist - write it
+      230              blob.upload_from_string(content, timeout=60)
+      231  
+      232              # Create metadata
+      233              metadata = {"ref_count": 1, "size": len(content)}
+      234              self._write_metadata(content_hash, metadata)
+      235  
+      236              return content_hash
+      237  
+      238          except Exception as e:
+      239              raise BackendError(
+      240                  f"Failed to write content: {e}", backend="gcs", path=content_hash
+      241              ) from e
+      243      def read_content(self, content_hash: str, context: "OperationContext | None" = None) -> bytes:
+      244          """Read content by its hash.
+      245  
+      246          Args:
+      247              content_hash: SHA-256 hash as hex string
+      248              _context: Operation context (ignored for GCS backend)
+      249          """
+      250          content_path = self._hash_to_path(content_hash)
+      251  
+      252          try:
+      253              blob = self.bucket.blob(content_path)
+      254  
+      255              if not blob.exists():
+      256                  raise NexusFileNotFoundError(content_hash)
+      257  
+      258              content = blob.download_as_bytes(timeout=60)
+      259  
+      260              # Verify hash
+      261              actual_hash = self._compute_hash(content)
+      262              if actual_hash != content_hash:
+      263                  raise BackendError(
+      264                      f"Content hash mismatch: expected {content_hash}, got {actual_hash}",
+      265                      backend="gcs",
+      266                      path=content_hash,
+      267                  )
+      268  
+      269              return bytes(content)
+      270  
+      271          except NotFound as e:
+      272              raise NexusFileNotFoundError(content_hash) from e
+      273          except NexusFileNotFoundError:
+      274              raise
+      275          except Exception as e:
+      276              raise BackendError(
+      277                  f"Failed to read content: {e}", backend="gcs", path=content_hash
+      278              ) from e
+      280      def delete_content(self, content_hash: str, context: "OperationContext | None" = None) -> None:
+      281          """Delete content by hash with reference counting.
+      282  
+      283          Args:
+      284              content_hash: SHA-256 hash as hex string
+      285              _context: Operation context (ignored for GCS backend)
+      286          """
+      287          content_path = self._hash_to_path(content_hash)
+      288  
+      289          try:
+      290              blob = self.bucket.blob(content_path)
+      291  
+      292              if not blob.exists():
+      293                  raise NexusFileNotFoundError(content_hash)
+      294  
+      295              metadata = self._read_metadata(content_hash)
+      296              ref_count = metadata.get("ref_count", 1)
+      297  
+      298              if ref_count <= 1:
+      299                  # Last reference - delete file and metadata
+      300                  blob.delete(timeout=60)
+      301  
+      302                  meta_blob = self.bucket.blob(self._get_meta_path(content_hash))
+      303                  if meta_blob.exists():
+      304                      meta_blob.delete(timeout=60)
+      305              else:
+      306                  # Decrement reference count
+      307                  metadata["ref_count"] = ref_count - 1
+      308                  self._write_metadata(content_hash, metadata)
+      309  
+      310          except NotFound as e:
+      311              raise NexusFileNotFoundError(content_hash) from e
+      312          except NexusFileNotFoundError:
+      313              raise
+      314          except Exception as e:
+      315              raise BackendError(
+      316                  f"Failed to delete content: {e}", backend="gcs", path=content_hash
+      317              ) from e
+      319      def content_exists(self, content_hash: str, context: "OperationContext | None" = None) -> bool:
+      320          """Check if content exists.
+      321  
+      322          Args:
+      323              content_hash: SHA-256 hash as hex string
+      324              _context: Operation context (ignored for GCS backend)
+      325          """
+      326          try:
+      327              content_path = self._hash_to_path(content_hash)
+      328              blob = self.bucket.blob(content_path)
+      329              return bool(blob.exists())
+      330          except Exception:
+      331              return False
+      333      def get_content_size(self, content_hash: str, context: "OperationContext | None" = None) -> int:
+      334          """Get content size in bytes.
+      335  
+      336          Args:
+      337              content_hash: SHA-256 hash as hex string
+      338              _context: Operation context (ignored for GCS backend)
+      339          """
+      340          content_path = self._hash_to_path(content_hash)
+      341  
+      342          try:
+      343              blob = self.bucket.blob(content_path)
+      344  
+      345              if not blob.exists():
+      346                  raise NexusFileNotFoundError(content_hash)
+      347  
+      348              # Reload to get metadata including size
+      349              blob.reload()
+      350              size = blob.size
+      351              if size is None:
+      352                  raise BackendError(
+      353                      "Failed to get content size: size is None",
+      354                      backend="gcs",
+      355                      path=content_hash,
+      356                  )
+      357              return int(size)
+      358  
+      359          except NotFound as e:
+      360              raise NexusFileNotFoundError(content_hash) from e
+      361          except NexusFileNotFoundError:
+      362              raise
+      363          except Exception as e:
+      364              raise BackendError(
+      365                  f"Failed to get content size: {e}", backend="gcs", path=content_hash
+      366              ) from e
+      368      def get_ref_count(self, content_hash: str, context: "OperationContext | None" = None) -> int:
+      369          """Get reference count for content.
+      370  
+      371          Args:
+      372              content_hash: SHA-256 hash as hex string
+      373              context: Operation context (ignored for GCS backend)
+      374          """
+      375          if not self.content_exists(content_hash, context=context):
+      376              raise NexusFileNotFoundError(content_hash)
+      377  
+      378          metadata = self._read_metadata(content_hash)
+      379          return int(metadata.get("ref_count", 0))
+      383      def mkdir(
+      384          self,
+      385          path: str,
+      386          parents: bool = False,
+      387          exist_ok: bool = False,
+      388          context: "OperationContext | EnhancedOperationContext | None" = None,
+      389      ) -> None:
+      390          """
+      391          Create directory marker in GCS.
+      392  
+      393          GCS doesn't have native directories, so we create marker objects
+      394          with trailing slashes to represent directories.
+      395          """
+      396          # Normalize path
+      397          path = path.strip("/")
+      398          if not path:
+      399              return  # Root always exists
+      400  
+      401          # GCS directories are represented with trailing slash
+      402          dir_path = f"dirs/{path}/"
+      403  
+      404          try:
+      405              blob = self.bucket.blob(dir_path)
+      406  
+      407              if blob.exists():
+      408                  if not exist_ok:
+      409                      raise FileExistsError(f"Directory already exists: {path}")
+      410                  return
+      411  
+      412              if not parents:
+      413                  # Check if parent exists
+      414                  parent = "/".join(path.split("/")[:-1])
+      415                  if parent and not self.is_directory(parent):
+      416                      raise FileNotFoundError(f"Parent directory not found: {parent}")
+      417  
+      418              # Create directory marker
+      419              blob.upload_from_string("", content_type="application/x-directory", timeout=60)
+      420  
+      421          except (FileExistsError, FileNotFoundError):
+      422              raise
+      423          except Exception as e:
+      424              raise BackendError(f"Failed to create directory: {e}", backend="gcs", path=path) from e
+      426      def rmdir(
+      427          self,
+      428          path: str,
+      429          recursive: bool = False,
+      430          context: "OperationContext | EnhancedOperationContext | None" = None,
+      431      ) -> None:
+      432          """Remove directory from GCS."""
+      433          # Normalize path
+      434          path = path.strip("/")
+      435          if not path:
+      436              raise BackendError("Cannot remove root directory", backend="gcs", path=path)
+      437  
+      438          dir_path = f"dirs/{path}/"
+      439  
+      440          try:
+      441              blob = self.bucket.blob(dir_path)
+      442  
+      443              if not blob.exists():
+      444                  raise NexusFileNotFoundError(path)
+      445  
+      446              if not recursive:
+      447                  # Check if directory is empty
+      448                  # List objects with this prefix (excluding the marker itself)
+      449                  blobs = list(
+      450                      self.client.list_blobs(
+      451                          self.bucket_name, prefix=dir_path, max_results=2, timeout=60
+      452                      )
+      453                  )
+      454                  # If there's more than just the marker, directory is not empty
+      455                  if len(blobs) > 1:
+      456                      raise OSError(f"Directory not empty: {path}")
+      457  
+      458              # Delete directory marker
+      459              blob.delete(timeout=60)
+      460  
+      461              if recursive:
+      462                  # Delete all objects with this prefix
+      463                  blobs = self.client.list_blobs(self.bucket_name, prefix=dir_path, timeout=60)
+      464                  for blob in blobs:
+      465                      blob.delete(timeout=60)
+      466  
+      467          except NotFound as e:
+      468              raise NexusFileNotFoundError(path) from e
+      469          except (NexusFileNotFoundError, OSError):
+      470              raise
+      471          except Exception as e:
+      472              raise BackendError(f"Failed to remove directory: {e}", backend="gcs", path=path) from e
+      474      def is_directory(self, path: str, context: "OperationContext | None" = None) -> bool:
+      475          """Check if path is a directory."""
+      476          try:
+      477              # Normalize path
+      478              path = path.strip("/")
+      479              if not path:
+      480                  return True  # Root is always a directory
+      481  
+      482              dir_path = f"dirs/{path}/"
+      483              blob = self.bucket.blob(dir_path)
+      484              return bool(blob.exists())
+      485  
+      486          except Exception:
+      487              return False
+
+---------- IMPLEMENTER nexus.backends.gcs_connector:GCSConnectorBackend  stubs=0/10 ----------
+       58  @register_connector(
+       59      "gcs_connector",
+       60      description="Google Cloud Storage with direct path mapping",
+       61      category="storage",
+       62      requires=["google-cloud-storage"],
+       63  )
+       64  class GCSConnectorBackend(BaseBlobStorageConnector, CacheConnectorMixin):
+      205      @property
+      206      def name(self) -> str:
+      207          """Backend identifier name."""
+      208          return "gcs_connector"
+      687      def read_content(
+      688          self,
+      689          content_hash: str,
+      690          context: "OperationContext | None" = None,
+      691      ) -> bytes:
+      692          """
+      693          Read content from GCS with caching support.
+      694  
+      695          When caching is enabled (db_session provided):
+      696          1. Check cache for non-stale entry with matching version
+      697          2. If cache hit, return cached content
+      698          3. If cache miss, read from GCS and cache result
+      699  
+      700          Args:
+      701              content_hash: Version ID (if versioning) or hash (if not)
+      702              context: Operation context with backend_path
+      703  
+      704          Returns:
+      705              File content as bytes
+      706  
+      707          Raises:
+      708              ValueError: If backend_path not provided
+      709              NexusFileNotFoundError: If file doesn't exist
+      710              BackendError: If read operation fails
+      711          """
+      712          if not context or not context.backend_path:
+      713              raise ValueError(
+      714                  "GCS connector requires backend_path in OperationContext. "
+      715                  "This backend reads files from actual paths, not CAS hashes."
+      716              )
+      717  
+      718          # Get cache path (prefers virtual_path over backend_path)
+      719          cache_path = self._get_cache_path(context) or context.backend_path
+      720  
+      721          # Check cache first if enabled
+      722          cache_rejected_reason = None
+      723          if self._has_caching():
+      724              import contextlib
+      725  
+      726              with contextlib.suppress(Exception):
+      727                  cached = self._read_from_cache(cache_path, original=True)
+      728                  if cached and not cached.stale and cached.content_binary:
+      729                      # For GCS versioned storage, always check current backend version
+      730                      # Don't compare content_hash (which may be SHA256 from metadata)
+      731                      # to backend_version (which is GCS generation number) - they're different types
+      732                      if cached.backend_version:
+      733                          # Get current backend version to verify cache freshness
+      734                          current_version = self.get_version(context.backend_path, context)
+      735                          if current_version and cached.backend_version == current_version:
+      736                              logger.info(
+      737                                  f"[GCS] Cache hit (version match) for {cache_path} "
+      738                                  f"(version={current_version})"
+      739                              )
+      740                              return cached.content_binary
+      741                          elif current_version:
+      742                              # Version mismatch - cache entry exists but version is stale
+      743                              cache_rejected_reason = "version mismatch"
+      744                              logger.info(
+      745                                  f"[GCS] Cache version mismatch for {cache_path} "
+      746                                  f"(cached={cached.backend_version}, current={current_version})"
+       ... truncated at 60 lines ...
+      787      def write_content(
+      788          self,
+      789          content: bytes,
+      790          context: "OperationContext | None" = None,
+      791      ) -> str:
+      792          """
+      793          Write content to GCS and update cache.
+      794  
+      795          Per design doc (cache-layer.md), after successful write:
+      796          1. Write to GCS backend
+      797          2. Update cache with new content and version
+      798  
+      799          Args:
+      800              content: File content as bytes
+      801              context: Operation context with backend_path
+      802  
+      803          Returns:
+      804              If versioning enabled: GCS generation number
+      805              If no versioning: Content hash (for metadata compatibility)
+      806  
+      807          Raises:
+      808              ValueError: If backend_path is not provided in context
+      809              BackendError: If write operation fails
+      810          """
+      811          if not context or not context.backend_path:
+      812              raise ValueError(
+      813                  "GCS connector requires backend_path in OperationContext. "
+      814                  "This backend stores files at actual paths, not CAS hashes."
+      815              )
+      816  
+      817          # Get virtual path for cache operations
+      818          virtual_path = context.backend_path
+      819          if hasattr(context, "virtual_path") and context.virtual_path:
+      820              virtual_path = context.virtual_path
+      821  
+      822          # Get actual blob path from backend_path
+      823          blob_path = self._get_blob_path(context.backend_path)
+      824  
+      825          # Detect appropriate Content-Type with charset for proper encoding
+      826          content_type = self._detect_content_type(context.backend_path, content)
+      827  
+      828          # Upload blob
+      829          new_version = self._upload_blob(blob_path, content, content_type)
+      830  
+      831          # Update cache after write if caching is enabled
+      832          # Per design doc: both GCS and cache should be updated when write succeeds
+      833          if self._has_caching():
+      834              import contextlib
+      835  
+      836              with contextlib.suppress(Exception):
+      837                  tenant_id = getattr(context, "tenant_id", None)
+      838                  self._write_to_cache(
+      839                      path=virtual_path,
+      840                      content=content,
+      841                      backend_version=new_version,
+      842                      tenant_id=tenant_id,
+      843                  )
+      844  
+      845          return new_version
+      (does not define: content_exists, delete_content, get_content_size, get_ref_count, is_directory, mkdir, rmdir; inherited or absent)
+
+---------- IMPLEMENTER nexus.backends.gdrive_connector:GoogleDriveConnectorBackend  stubs=0/10 ----------
+       88  @register_connector(
+       89      "gdrive_connector",
+       90      description="Google Drive with OAuth 2.0 authentication",
+       91      category="oauth",
+       92      requires=["google-api-python-client", "google-auth-oauthlib"],
+       93  )
+       94  class GoogleDriveConnectorBackend(Backend):
+      240      @property
+      241      def name(self) -> str:
+      242          """Backend identifier name."""
+      243          return "gdrive"
+      513      def write_content(self, content: bytes, context: "OperationContext | None" = None) -> str:
+      514          """
+      515          Write content to Google Drive and return its content hash.
+      516  
+      517          For connector backends, this writes to a temporary location indexed by hash.
+      518          The actual file path is determined later via backend_path in context.
+      519  
+      520          Args:
+      521              content: File content as bytes
+      522              context: Operation context with user_id and backend_path
+      523  
+      524          Returns:
+      525              Content hash (SHA-256 as hex string)
+      526  
+      527          Raises:
+      528              BackendError: If write operation fails
+      529          """
+      530          if context is None or not hasattr(context, "backend_path") or context.backend_path is None:
+      531              raise BackendError(
+      532                  "Google Drive connector requires OperationContext with backend_path",
+      533                  backend="gdrive",
+      534              )
+      535  
+      536          # Calculate content hash (BLAKE3, Rust-accelerated)
+      537          content_hash = hash_content(content)
+      538  
+      539          service = self._get_drive_service(context)
+      540  
+      541          # Resolve path to parent folder and filename (backend_path is checked above)
+      542          parent_id, filename = self._resolve_path_to_folder_id(
+      543              service, context.backend_path, context
+      544          )
+      545  
+      546          try:
+      547              # Check if file already exists
+      548              query = f"name='{filename}' and '{parent_id}' in parents and trashed=false"
+      549  
+      550              if self.use_shared_drives:
+      551                  results = (
+      552                      service.files()
+      553                      .list(
+      554                          q=query,
+      555                          spaces="drive",
+      556                          fields="files(id, name)",
+      557                          includeItemsFromAllDrives=True,
+      558                          supportsAllDrives=True,
+      559                      )
+      560                      .execute()
+      561                  )
+      562              else:
+      563                  results = (
+      564                      service.files()
+      565                      .list(q=query, spaces="drive", fields="files(id, name)")
+      566                      .execute()
+      567                  )
+      568  
+      569              files = results.get("files", [])
+      570  
+      571              # Guess MIME type
+      572              mime_type, _ = mimetypes.guess_type(filename)
+       ... truncated at 60 lines ...
+      610      def read_content(self, content_hash: str, context: "OperationContext | None" = None) -> bytes:
+      611          """
+      612          Read content from Google Drive by path (not hash).
+      613  
+      614          For connector backends, content_hash is ignored - we use backend_path instead.
+      615  
+      616          Args:
+      617              content_hash: Ignored for connector backends
+      618              context: Operation context with backend_path
+      619  
+      620          Returns:
+      621              File content as bytes
+      622  
+      623          Raises:
+      624              NexusFileNotFoundError: If file doesn't exist
+      625              BackendError: If read operation fails
+      626          """
+      627          if context is None or not hasattr(context, "backend_path") or context.backend_path is None:
+      628              raise BackendError(
+      629                  "Google Drive connector requires OperationContext with backend_path",
+      630                  backend="gdrive",
+      631              )
+      632  
+      633          service = self._get_drive_service(context)
+      634  
+      635          # Resolve path to parent folder and filename (backend_path is checked above)
+      636          parent_id, filename = self._resolve_path_to_folder_id(
+      637              service, context.backend_path, context
+      638          )
+      639  
+      640          try:
+      641              # Find file by name in parent folder
+      642              query = f"name='{filename}' and '{parent_id}' in parents and trashed=false"
+      643  
+      644              if self.use_shared_drives:
+      645                  results = (
+      646                      service.files()
+      647                      .list(
+      648                          q=query,
+      649                          spaces="drive",
+      650                          fields="files(id, name, mimeType)",
+      651                          includeItemsFromAllDrives=True,
+      652                          supportsAllDrives=True,
+      653                      )
+      654                      .execute()
+      655                  )
+      656              else:
+      657                  results = (
+      658                      service.files()
+      659                      .list(q=query, spaces="drive", fields="files(id, name, mimeType)")
+      660                      .execute()
+      661                  )
+      662  
+      663              files = results.get("files", [])
+      664  
+      665              if not files:
+      666                  raise NexusFileNotFoundError(
+      667                      context.backend_path
+      668                  )  # backend_path is str (checked above)
+      669  
+       ... truncated at 60 lines ...
+      732      def delete_content(self, content_hash: str, context: "OperationContext | None" = None) -> bool:  # type: ignore[override]
+      733          """
+      734          Delete content from Google Drive by path.
+      735  
+      736          For connector backends, content_hash is ignored - we use backend_path instead.
+      737  
+      738          Args:
+      739              content_hash: Ignored for connector backends
+      740              context: Operation context with backend_path
+      741  
+      742          Returns:
+      743              True if deleted, False if not found
+      744  
+      745          Raises:
+      746              BackendError: If delete operation fails
+      747          """
+      748          if context is None or not hasattr(context, "backend_path") or context.backend_path is None:
+      749              raise BackendError(
+      750                  "Google Drive connector requires OperationContext with backend_path",
+      751                  backend="gdrive",
+      752              )
+      753  
+      754          service = self._get_drive_service(context)
+      755  
+      756          # Resolve path to parent folder and filename (backend_path is checked above)
+      757          parent_id, filename = self._resolve_path_to_folder_id(
+      758              service, context.backend_path, context
+      759          )
+      760  
+      761          try:
+      762              # Find file by name in parent folder
+      763              query = f"name='{filename}' and '{parent_id}' in parents and trashed=false"
+      764  
+      765              if self.use_shared_drives:
+      766                  results = (
+      767                      service.files()
+      768                      .list(
+      769                          q=query,
+      770                          spaces="drive",
+      771                          fields="files(id, name)",
+      772                          includeItemsFromAllDrives=True,
+      773                          supportsAllDrives=True,
+      774                      )
+      775                      .execute()
+      776                  )
+      777              else:
+      778                  results = (
+      779                      service.files()
+      780                      .list(q=query, spaces="drive", fields="files(id, name)")
+      781                      .execute()
+      782                  )
+      783  
+      784              files = results.get("files", [])
+      785  
+      786              if not files:
+      787                  return False
+      788  
+      789              file_id = files[0]["id"]
+      790  
+      791              # Move to trash
+       ... truncated at 60 lines ...
+      806      def content_exists(self, content_hash: str, context: "OperationContext | None" = None) -> bool:
+      807          """
+      808          Check if content exists in Google Drive by path.
+      809  
+      810          For connector backends, content_hash is ignored - we use backend_path instead.
+      811  
+      812          Args:
+      813              content_hash: Ignored for connector backends
+      814              context: Operation context with backend_path
+      815  
+      816          Returns:
+      817              True if file exists, False otherwise
+      818          """
+      819          if context is None or not hasattr(context, "backend_path"):
+      820              return False
+      821  
+      822          try:
+      823              service = self._get_drive_service(context)
+      824  
+      825              # Resolve path to parent folder and filename (backend_path is checked above)
+      826              parent_id, filename = self._resolve_path_to_folder_id(
+      827                  service,
+      828                  context.backend_path or "",
+      829                  context,
+      830              )
+      831  
+      832              # Find file by name in parent folder
+      833              query = f"name='{filename}' and '{parent_id}' in parents and trashed=false"
+      834  
+      835              if self.use_shared_drives:
+      836                  results = (
+      837                      service.files()
+      838                      .list(
+      839                          q=query,
+      840                          spaces="drive",
+      841                          fields="files(id)",
+      842                          includeItemsFromAllDrives=True,
+      843                          supportsAllDrives=True,
+      844                      )
+      845                      .execute()
+      846                  )
+      847              else:
+      848                  results = (
+      849                      service.files().list(q=query, spaces="drive", fields="files(id)").execute()
+      850                  )
+      851  
+      852              files = results.get("files", [])
+      853              return len(files) > 0
+      854  
+      855          except Exception:
+      856              return False
+      858      def get_content_size(self, content_hash: str, context: "OperationContext | None" = None) -> int:
+      859          """Get content size from Google Drive.
+      860  
+      861          Args:
+      862              content_hash: Content hash (file ID in Drive)
+      863              context: Operation context (optional)
+      864  
+      865          Returns:
+      866              Content size in bytes
+      867  
+      868          Raises:
+      869              NexusFileNotFoundError: If file doesn't exist
+      870              BackendError: If operation fails
+      871          """
+      872          try:
+      873              service = self._get_drive_service(context)
+      874              file_metadata = service.files().get(fileId=content_hash, fields="size").execute()
+      875  
+      876              size = file_metadata.get("size")
+      877              if size is None:
+      878                  # Google Workspace files don't have size
+      879                  return 0
+      880              return int(size)
+      881  
+      882          except Exception as e:
+      883              if "File not found" in str(e):
+      884                  raise NexusFileNotFoundError(content_hash) from e
+      885              raise BackendError(
+      886                  f"Failed to get content size: {e}",
+      887                  backend="gdrive",
+      888                  path=content_hash,
+      889              ) from e
+      891      def get_ref_count(self, content_hash: str, context: "OperationContext | None" = None) -> int:
+      892          """Get reference count (always 1 for connector backends).
+      893  
+      894          Connector backends don't do deduplication, so each file
+      895          has exactly one reference.
+      896  
+      897          Args:
+      898              content_hash: Content hash
+      899              context: Operation context
+      900  
+      901          Returns:
+      902              Always 1 (no reference counting)
+      903          """
+      904          # No deduplication - each file is unique
+      905          return 1
+      907      def mkdir(
+      908          self,
+      909          path: str,
+      910          parents: bool = False,
+      911          exist_ok: bool = False,
+      912          context: "OperationContext | None" = None,
+      913      ) -> None:
+      914          """Create directory in Google Drive.
+      915  
+      916          Args:
+      917              path: Directory path relative to backend root
+      918              parents: Create parent directories if needed
+      919              exist_ok: Don't raise error if directory exists
+      920              context: Operation context
+      921  
+      922          Raises:
+      923              FileExistsError: If directory exists and exist_ok=False
+      924              FileNotFoundError: If parent doesn't exist and parents=False
+      925              BackendError: If operation fails
+      926          """
+      927          path = path.strip("/")
+      928          if not path:
+      929              return  # Root always exists
+      930  
+      931          if context is None:
+      932              raise BackendError(
+      933                  "Google Drive connector mkdir requires OperationContext",
+      934                  backend="gdrive",
+      935              )
+      936  
+      937          try:
+      938              service = self._get_drive_service(context)
+      939              root_folder_id = self._get_or_create_root_folder(service, context)
+      940  
+      941              # Check if folder exists
+      942              if self.is_directory(path):
+      943                  if not exist_ok:
+      944                      raise FileExistsError(f"Directory already exists: {path}")
+      945                  return
+      946  
+      947              # Navigate through path components to create folder hierarchy
+      948              parts = path.split("/")
+      949              parent_id = root_folder_id
+      950  
+      951              for i, folder_name in enumerate(parts):
+      952                  if not folder_name:
+      953                      continue
+      954  
+      955                  # Check if this is the last component (the folder we want to create)
+      956                  is_last = i == len(parts) - 1
+      957  
+      958                  if not is_last:
+      959                      # Intermediate folder - create if parents=True, otherwise fail if missing
+      960                      if parents:
+      961                          parent_id = self._get_or_create_folder(
+      962                              service, folder_name, parent_id, context
+      963                          )
+      964                      else:
+      965                          # Try to get existing folder
+      966                          query = f"name='{folder_name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+       ... truncated at 60 lines ...
+     1005      def rmdir(
+     1006          self,
+     1007          path: str,
+     1008          recursive: bool = False,
+     1009          context: "OperationContext | None" = None,
+     1010      ) -> None:
+     1011          """Remove directory from Google Drive.
+     1012  
+     1013          Args:
+     1014              path: Directory path
+     1015              recursive: Remove non-empty directory (moves to trash)
+     1016              context: Operation context (not used, authentication handled internally)
+     1017  
+     1018          Raises:
+     1019              BackendError: If trying to remove root
+     1020              NexusFileNotFoundError: If directory doesn't exist
+     1021              OSError: If directory not empty and recursive=False
+     1022              BackendError: If operation fails
+     1023          """
+     1024          path = path.strip("/")
+     1025          if not path:
+     1026              raise BackendError("Cannot remove root directory", backend="gdrive", path=path)
+     1027  
+     1028          try:
+     1029              service = self._get_drive_service(None)
+     1030              root_folder_id = self._get_or_create_root_folder(service, None)
+     1031  
+     1032              # Resolve path to folder ID
+     1033              folder_id = self._resolve_path_to_folder_id(service, path, root_folder_id)
+     1034              if not folder_id:
+     1035                  raise NexusFileNotFoundError(path)
+     1036  
+     1037              if not recursive:
+     1038                  # Check if directory is empty
+     1039                  query = f"'{folder_id}' in parents and trashed=false"
+     1040                  results = service.files().list(q=query, fields="files(id)", pageSize=1).execute()
+     1041                  if results.get("files", []):
+     1042                      raise OSError(f"Directory not empty: {path}")
+     1043  
+     1044              # Move to trash (Google Drive doesn't permanently delete immediately)
+     1045              service.files().update(fileId=folder_id, body={"trashed": True}).execute()
+     1046  
+     1047          except (NexusFileNotFoundError, OSError):
+     1048              raise
+     1049          except Exception as e:
+     1050              raise BackendError(
+     1051                  f"Failed to remove directory {path}: {e}",
+     1052                  backend="gdrive",
+     1053                  path=path,
+     1054              ) from e
+     1056      def is_directory(self, path: str, context: "OperationContext | None" = None) -> bool:
+     1057          """Check if path is a directory in Google Drive.
+     1058  
+     1059          Args:
+     1060              path: Path to check
+     1061  
+     1062          Returns:
+     1063              True if path is a folder, False otherwise
+     1064          """
+     1065          try:
+     1066              path = path.strip("/")
+     1067              if not path:
+     1068                  return True  # Root is always a directory
+     1069  
+     1070              service = self._get_drive_service(None)
+     1071              root_folder_id = self._get_or_create_root_folder(service, None)
+     1072  
+     1073              # Split path into parent and target name
+     1074              parts = path.split("/")
+     1075              target_name = parts[-1]
+     1076              parent_parts = parts[:-1]
+     1077  
+     1078              # Navigate to parent folder (without creating missing folders)
+     1079              parent_id = root_folder_id
+     1080              for part in parent_parts:
+     1081                  if not part:
+     1082                      continue
+     1083  
+     1084                  # Try to find existing folder (don't create it)
+     1085                  query = f"name='{part}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+     1086                  if self.use_shared_drives:
+     1087                      results = (
+     1088                          service.files()
+     1089                          .list(
+     1090                              q=query,
+     1091                              spaces="drive",
+     1092                              fields="files(id)",
+     1093                              includeItemsFromAllDrives=True,
+     1094                              supportsAllDrives=True,
+     1095                          )
+     1096                          .execute()
+     1097                      )
+     1098                  else:
+     1099                      results = (
+     1100                          service.files().list(q=query, spaces="drive", fields="files(id)").execute()
+     1101                      )
+     1102  
+     1103                  files = results.get("files", [])
+     1104                  if not files:
+     1105                      # Parent doesn't exist, so path doesn't exist
+     1106                      return False
+     1107                  parent_id = files[0]["id"]
+     1108  
+     1109              # Check if target exists as a folder
+     1110              query = f"name='{target_name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+     1111  
+     1112              if self.use_shared_drives:
+     1113                  results = (
+     1114                      service.files()
+     1115                      .list(
+       ... truncated at 60 lines ...
+
+---------- IMPLEMENTER nexus.backends.gmail_connector:GmailConnectorBackend  stubs=0/10 ----------
+       64  class GmailConnectorBackend(Backend, CacheConnectorMixin):
+      195      @property
+      196      def name(self) -> str:
+      197          """Backend identifier name."""
+      198          return "gmail"
+      494      def write_content(self, content: bytes, context: "OperationContext | None" = None) -> str:
+      495          """
+      496          Write content is not supported for Gmail connector (read-only).
+      497  
+      498          Args:
+      499              content: File content as bytes
+      500              context: Operation context
+      501  
+      502          Raises:
+      503              BackendError: Always raised (read-only backend)
+      504          """
+      505          raise BackendError(
+      506              "Gmail connector is read-only. Cannot write emails back to Gmail.",
+      507              backend="gmail",
+      508          )
+      510      def read_content(self, content_hash: str, context: "OperationContext | None" = None) -> bytes:
+      511          """
+      512          Read email content from cache or Gmail API.
+      513  
+      514          For connector backends, content_hash is ignored - we use backend_path instead.
+      515  
+      516          Args:
+      517              content_hash: Ignored for connector backends
+      518              context: Operation context with backend_path
+      519  
+      520          Returns:
+      521              Email content as YAML bytes
+      522  
+      523          Raises:
+      524              NexusFileNotFoundError: If email doesn't exist
+      525              BackendError: If read operation fails or PyYAML not installed
+      526          """
+      527          if yaml is None:
+      528              raise BackendError(
+      529                  "PyYAML not installed. Install with: pip install pyyaml",
+      530                  backend="gmail",
+      531              )
+      532  
+      533          if not context or not context.backend_path:
+      534              raise BackendError(
+      535                  "Gmail connector requires backend_path in OperationContext. "
+      536                  "This backend reads files from actual paths, not CAS hashes.",
+      537                  backend="gmail",
+      538              )
+      539  
+      540          # Extract filename from flattened path (e.g., "SENT/thread_id-msg_id.yaml" -> "thread_id-msg_id.yaml")
+      541          path_parts = context.backend_path.split("/")
+      542          if len(path_parts) == 2 and path_parts[0] in self.LABEL_FOLDERS:
+      543              # Path is "LABEL/thread_id-msg_id.yaml" - use just the filename
+      544              filename = path_parts[1]
+      545          elif len(path_parts) == 1:
+      546              # Already just a filename
+      547              filename = path_parts[0]
+      548          else:
+      549              raise NexusFileNotFoundError(context.backend_path)
+      550  
+      551          # Extract message_id from filename (format: thread_id-msg_id.yaml)
+      552          if not filename.endswith(".yaml"):
+      553              raise NexusFileNotFoundError(context.backend_path)
+      554  
+      555          # Split "thread_id-msg_id.yaml" to get msg_id
+      556          filename_parts = filename.replace(".yaml", "").split("-", 1)
+      557          if len(filename_parts) != 2:
+      558              raise NexusFileNotFoundError(context.backend_path)
+      559  
+      560          message_id = filename_parts[1]  # Get msg_id from "thread_id-msg_id"
+      561  
+      562          # Get cache path
+      563          cache_path = self._get_cache_path(context) or context.backend_path
+      564  
+      565          # Check cache first (if caching enabled)
+      566          if self._has_caching():
+      567              cached = self._read_from_cache(cache_path, original=True)
+      568              if cached and not cached.stale and cached.content_binary:
+      569                  return cached.content_binary
+       ... truncated at 60 lines ...
+      681      def delete_content(self, content_hash: str, context: "OperationContext | None" = None) -> None:
+      682          """
+      683          Delete is not supported for Gmail connector (read-only).
+      684  
+      685          Args:
+      686              content_hash: Content hash
+      687              context: Operation context
+      688  
+      689          Raises:
+      690              BackendError: Always raised (read-only backend)
+      691          """
+      692          raise BackendError(
+      693              "Gmail connector is read-only. Cannot delete emails from Gmail.",
+      694              backend="gmail",
+      695          )
+      697      def content_exists(self, content_hash: str, context: "OperationContext | None" = None) -> bool:
+      698          """
+      699          Check if email exists.
+      700  
+      701          Args:
+      702              content_hash: Content hash (ignored)
+      703              context: Operation context with backend_path
+      704  
+      705          Returns:
+      706              True if email exists, False otherwise
+      707          """
+      708          if not context or not context.backend_path:
+      709              return False
+      710  
+      711          try:
+      712              # Extract filename from flattened path (e.g., "SENT/thread_id-msg_id.yaml" -> "thread_id-msg_id.yaml")
+      713              path_parts = context.backend_path.split("/")
+      714              if len(path_parts) == 2 and path_parts[0] in self.LABEL_FOLDERS:
+      715                  # Path is "LABEL/thread_id-msg_id.yaml" - use just the filename
+      716                  filename = path_parts[1]
+      717              elif len(path_parts) == 1:
+      718                  # Already just a filename
+      719                  filename = path_parts[0]
+      720              else:
+      721                  return False
+      722  
+      723              # Validate filename format (thread_id-msg_id.yaml)
+      724              if not filename.endswith(".yaml"):
+      725                  return False
+      726  
+      727              # Check if filename has correct format: thread_id-msg_id.yaml
+      728              filename_parts = filename.replace(".yaml", "").split("-", 1)
+      729              if len(filename_parts) != 2:
+      730                  return False
+      731  
+      732              message_id = filename_parts[1]  # Extract msg_id from "thread_id-msg_id"
+      733  
+      734              # Try to fetch from Gmail API
+      735              try:
+      736                  service = self._get_gmail_service(context)
+      737                  service.users().messages().get(userId="me", id=message_id, format="full").execute()
+      738                  return True
+      739              except Exception:
+      740                  return False
+      741  
+      742          except Exception:
+      743              return False
+      745      def get_content_size(self, content_hash: str, context: "OperationContext | None" = None) -> int:
+      746          """Get email content size (cache-first, efficient).
+      747  
+      748          Performance optimization: Checks cache first to avoid API calls during
+      749          ls -la operations. Only hits Gmail API if not cached.
+      750  
+      751          Args:
+      752              content_hash: Content hash (ignored)
+      753              context: Operation context with backend_path
+      754  
+      755          Returns:
+      756              Content size in bytes
+      757  
+      758          Raises:
+      759              NexusFileNotFoundError: If email doesn't exist
+      760              BackendError: If operation fails
+      761          """
+      762          if context is None or not hasattr(context, "backend_path"):
+      763              raise ValueError("Gmail connector requires backend_path in OperationContext")
+      764  
+      765          # OPTIMIZATION: Check cache first (efficient - no API call)
+      766          # This is crucial for ls -la performance with many files
+      767          if hasattr(context, "virtual_path") and context.virtual_path:
+      768              cached_size = self._get_size_from_cache(context.virtual_path)
+      769              if cached_size is not None:
+      770                  return cached_size
+      771  
+      772          # Fallback: Read content to get size (hits Gmail API)
+      773          # This only happens when file is not cached
+      774          content = self.read_content(content_hash, context)
+      775          return len(content)
+      777      def get_ref_count(self, content_hash: str, context: "OperationContext | None" = None) -> int:
+      778          """Get reference count (always 1 for connector backends).
+      779  
+      780          Args:
+      781              content_hash: Content hash
+      782              context: Operation context
+      783  
+      784          Returns:
+      785              Always 1 (no reference counting)
+      786          """
+      787          return 1
+      872      def mkdir(
+      873          self,
+      874          path: str,
+      875          parents: bool = False,
+      876          exist_ok: bool = False,
+      877          context: "OperationContext | None" = None,
+      878      ) -> None:
+      879          """Create directory (not supported for Gmail connector).
+      880  
+      881          Args:
+      882              path: Directory path
+      883              parents: Create parent directories if needed
+      884              exist_ok: Don't raise error if directory exists
+      885              context: Operation context
+      886  
+      887          Raises:
+      888              BackendError: Always raised (read-only backend)
+      889          """
+      890          raise BackendError(
+      891              "Gmail connector is read-only. Cannot create directories.",
+      892              backend="gmail",
+      893          )
+      895      def rmdir(
+      896          self,
+      897          path: str,
+      898          recursive: bool = False,
+      899          context: "OperationContext | None" = None,
+      900      ) -> None:
+      901          """Remove directory (not supported for Gmail connector).
+      902  
+      903          Args:
+      904              path: Directory path
+      905              recursive: Remove non-empty directory
+      906              context: Operation context
+      907  
+      908          Raises:
+      909              BackendError: Always raised (read-only backend)
+      910          """
+      911          raise BackendError(
+      912              "Gmail connector is read-only. Cannot remove directories.",
+      913              backend="gmail",
+      914          )
+      916      def is_directory(self, path: str, context: "OperationContext | None" = None) -> bool:
+      917          """Check if path is a directory.
+      918  
+      919          Args:
+      920              path: Path to check
+      921              context: Operation context
+      922  
+      923          Returns:
+      924              True if path is a directory, False if it's a file
+      925          """
+      926          path = path.strip("/")
+      927          if not path:
+      928              return True  # Root is always a directory
+      929  
+      930          # Check if it's a label folder (SENT/, STARRED/, etc.)
+      931          # Everything else (email files with format LABEL/thread_id-msg_id.yaml) is a file
+      932          return path in self.LABEL_FOLDERS
+
+---------- IMPLEMENTER nexus.backends.hn_connector:HNConnectorBackend  stubs=4/10 ----------
+       79  @register_connector(
+       80      "hn_connector",
+       81      description="HackerNews API (read-only)",
+       82      category="api",
+       83      requires=["httpx"],
+       84  )
+       85  class HNConnectorBackend(Backend, CacheConnectorMixin):
+      158      @property
+      159      def name(self) -> str:
+      160          """Backend identifier name."""
+      161          return "hn"
+      364      def read_content(
+      365          self,
+      366          content_hash: str,
+      367          context: "OperationContext | None" = None,
+      368      ) -> bytes:
+      369          """
+      370          Read content from HN API via virtual path.
+      371  
+      372          For HN connector, content_hash is ignored - we use backend_path from context.
+      373  
+      374          Args:
+      375              content_hash: Ignored for HN connector
+      376              context: Operation context with backend_path
+      377  
+      378          Returns:
+      379              JSON content as bytes
+      380  
+      381          Raises:
+      382              BackendError: If operation fails
+      383          """
+      384          if not context or not context.backend_path:
+      385              raise BackendError(
+      386                  "HN connector requires context with backend_path",
+      387                  backend="hn",
+      388              )
+      389  
+      390          path = context.backend_path
+      391          cache_path = self._get_cache_path(context) or path
+      392  
+      393          # Check cache first (if caching enabled)
+      394          if self._has_caching():
+      395              cached = self._read_from_cache(cache_path, original=True)
+      396              if cached and not cached.stale and cached.content_binary:
+      397                  logger.info(f"[HN] Cache hit: {path}")
+      398                  return cached.content_binary
+      399  
+      400          # Resolve path
+      401          feed, rank = self._resolve_path(path)
+      402  
+      403          if rank is None:
+      404              raise BackendError(
+      405                  f"Cannot read directory: {path}. Use list_dir() instead.",
+      406                  backend="hn",
+      407              )
+      408  
+      409          # Fetch from HN API
+      410          logger.info(f"[HN] Fetching from API: {feed}/{rank}")
+      411  
+      412          async def _fetch() -> bytes:
+      413              try:
+      414                  story = await self._fetch_feed_story(feed, rank)
+      415                  content = json.dumps(story, indent=2, ensure_ascii=False).encode("utf-8")
+      416                  return content
+      417              finally:
+      418                  await self._close_client()
+      419  
+      420          content = asyncio.run(_fetch())
+      421  
+      422          # Cache the result
+      423          if self._has_caching():
+       ... truncated at 60 lines ...
+      437      def write_content(
+      438          self,
+      439          content: bytes,
+      440          context: "OperationContext | None" = None,
+      441      ) -> str:
+      442          """Write content (not supported - HN is read-only)."""
+      443          raise NotImplementedError(
+      444              "HN connector is read-only. HackerNews API does not support posting."
+      445          )
+      447      def delete_content(
+      448          self,
+      449          content_hash: str,
+      450          context: "OperationContext | None" = None,
+      451      ) -> None:
+      452          """Delete content (not supported - HN is read-only)."""
+      453          raise NotImplementedError(
+      454              "HN connector is read-only. HackerNews API does not support deletion."
+      455          )
+      457      def content_exists(
+      458          self,
+      459          content_hash: str,
+      460          context: "OperationContext | None" = None,
+      461      ) -> bool:
+      462          """Check if content exists."""
+      463          if not context or not context.backend_path:
+      464              return False
+      465  
+      466          try:
+      467              feed, rank = self._resolve_path(context.backend_path)
+      468              return feed != "" and (rank is None or 1 <= rank <= self.stories_per_feed)
+      469          except BackendError:
+      470              return False
+      472      def get_content_size(
+      473          self,
+      474          content_hash: str,
+      475          context: "OperationContext | None" = None,
+      476      ) -> int:
+      477          """Get content size (cache-first, efficient).
+      478  
+      479          Performance optimization: Checks cache first for actual size.
+      480          Falls back to 10KB estimate if not cached.
+      481          """
+      482          # OPTIMIZATION: Check cache first for actual size
+      483          if context and hasattr(context, "virtual_path") and context.virtual_path:
+      484              cached_size = self._get_size_from_cache(context.virtual_path)
+      485              if cached_size is not None:
+      486                  return cached_size
+      487  
+      488          # Fallback: Return approximate size estimate
+      489          return 10 * 1024  # 10 KB estimate
+      491      def get_ref_count(
+      492          self,
+      493          content_hash: str,
+      494          context: "OperationContext | None" = None,
+      495      ) -> int:
+      496          """Get reference count (always 1 for HN connector)."""
+      497          return 1
+      501      def mkdir(
+      502          self,
+      503          path: str,
+      504          parents: bool = False,
+      505          exist_ok: bool = False,
+      506          context: "OperationContext | None" = None,
+      507      ) -> None:
+      508          """Create directory (not supported - fixed structure)."""
+      509          raise NotImplementedError(
+      510              "HN connector has a fixed virtual structure. mkdir() is not supported."
+      511          )
+      513      def rmdir(
+      514          self,
+      515          path: str,
+      516          recursive: bool = False,
+      517          context: "OperationContext | None" = None,
+      518      ) -> None:
+      519          """Remove directory (not supported - fixed structure)."""
+      520          raise NotImplementedError(
+      521              "HN connector has a fixed virtual structure. rmdir() is not supported."
+      522          )
+      524      def is_directory(
+      525          self,
+      526          path: str,
+      527          context: "OperationContext | None" = None,
+      528      ) -> bool:
+      529          """Check if path is a directory."""
+      530          path = path.strip("/")
+      531  
+      532          # Handle hn prefix
+      533          if path.startswith("hn/"):
+      534              path = path[3:]
+      535  
+      536          # Root or feed directories
+      537          if path == "" or path == "hn":
+      538              return True
+      539  
+      540          return path in {"top", "new", "best", "ask", "show", "jobs"}
+
+---------- IMPLEMENTER nexus.backends.local:LocalBackend  stubs=0/10 ----------
+       24  @register_connector(
+       25      "local",
+       26      description="Local filesystem with CAS deduplication",
+       27      category="storage",
+       28  )
+       29  class LocalBackend(Backend):
+       86      @property
+       87      def name(self) -> str:
+       88          """Backend identifier name."""
+       89          return "local"
+      263      def write_content(self, content: bytes, context: "OperationContext | None" = None) -> str:
+      264          """
+      265          Write content to CAS storage and return its hash.
+      266  
+      267          If content already exists, increments reference count.
+      268          Handles race conditions when multiple threads write the same content.
+      269  
+      270          Args:
+      271              content: File content as bytes
+      272              _context: Operation context (ignored for local backend)
+      273          """
+      274          content_hash = self._compute_hash(content)
+      275          content_path = self._hash_to_path(content_hash)
+      276  
+      277          # Fix #514: Acquire lock BEFORE checking if content exists
+      278          # This prevents TOCTOU race where multiple threads see "not exists"
+      279          # and all try to create initial metadata with ref_count=1
+      280          lock_path = self._get_lock_path(content_hash)
+      281          lock_path.parent.mkdir(parents=True, exist_ok=True)
+      282  
+      283          try:
+      284              with self._lock_file(lock_path):
+      285                  # Check if content already exists (inside lock)
+      286                  if content_path.exists():
+      287                      # Content exists - increment ref_count
+      288                      metadata = self._read_metadata(content_hash)
+      289                      metadata["ref_count"] = metadata.get("ref_count", 0) + 1
+      290                      self._write_metadata(content_hash, metadata)
+      291                      # Add to cache since we have the content in memory
+      292                      if self.content_cache is not None:
+      293                          self.content_cache.put(content_hash, content)
+      294                      return content_hash
+      295  
+      296                  # Content doesn't exist - write atomically
+      297                  content_path.parent.mkdir(parents=True, exist_ok=True)
+      298  
+      299                  tmp_path = None
+      300                  try:
+      301                      # Write to temp file first
+      302                      with tempfile.NamedTemporaryFile(
+      303                          mode="wb", dir=content_path.parent, delete=False
+      304                      ) as tmp_file:
+      305                          tmp_path = Path(tmp_file.name)
+      306                          tmp_file.write(content)
+      307                          tmp_file.flush()  # Flush Python buffers
+      308                          os.fsync(tmp_file.fileno())  # Force OS to write to disk
+      309  
+      310                      # Move to final location (atomic on Unix)
+      311                      os.replace(str(tmp_path), str(content_path))
+      312                      tmp_path = None  # Successfully moved
+      313  
+      314                      # Create metadata with ref_count=1
+      315                      metadata = {"ref_count": 1, "size": len(content)}
+      316                      self._write_metadata(content_hash, metadata)
+      317  
+      318                      # Add to cache since we have the content in memory
+      319                      if self.content_cache is not None:
+      320                          self.content_cache.put(content_hash, content)
+      321  
+      322                      return content_hash
+       ... truncated at 60 lines ...
+      335      def read_content(self, content_hash: str, context: "OperationContext | None" = None) -> bytes:
+      336          """Read content by its hash with retry for Windows file locking.
+      337  
+      338          Args:
+      339              content_hash: SHA-256 hash as hex string
+      340              _context: Operation context (ignored for local backend)
+      341          """
+      342          # Check cache first for fast path
+      343          if self.content_cache is not None:
+      344              cached_content = self.content_cache.get(content_hash)
+      345              if cached_content is not None:
+      346                  return cached_content
+      347  
+      348          # Cache miss - read from disk
+      349          content_path = self._hash_to_path(content_hash)
+      350  
+      351          # Retry logic for Windows file locking issues
+      352          max_retries = 3
+      353          retry_delay = 0.01  # 10ms
+      354  
+      355          for attempt in range(max_retries):
+      356              # Check if file exists (with retry for race conditions)
+      357              if not content_path.exists():
+      358                  if attempt < max_retries - 1:
+      359                      # File might be mid-write - retry
+      360                      import time
+      361  
+      362                      time.sleep(retry_delay)
+      363                      continue
+      364                  # File genuinely doesn't exist
+      365                  raise NexusFileNotFoundError(
+      366                      path=content_hash,
+      367                      message=f"CAS content not found: {content_hash}",
+      368                  )
+      369  
+      370              try:
+      371                  # Read directly without locking (content files are immutable after creation)
+      372                  content = content_path.read_bytes()
+      373  
+      374                  # Verify hash
+      375                  actual_hash = self._compute_hash(content)
+      376                  if actual_hash != content_hash:
+      377                      raise BackendError(
+      378                          f"Content hash mismatch: expected {content_hash}, got {actual_hash}",
+      379                          backend="local",
+      380                          path=content_hash,
+      381                      )
+      382  
+      383                  # Add to cache for future reads
+      384                  if self.content_cache is not None:
+      385                      self.content_cache.put(content_hash, content)
+      386  
+      387                  return content
+      388  
+      389              except OSError as e:
+      390                  # File might be locked on Windows - retry
+      391                  if attempt < max_retries - 1:
+      392                      import time
+      393  
+      394                      time.sleep(retry_delay)
+       ... truncated at 60 lines ...
+      509      def delete_content(self, content_hash: str, context: "OperationContext | None" = None) -> None:
+      510          """Delete content by hash with reference counting.
+      511  
+      512          Args:
+      513              content_hash: SHA-256 hash as hex string
+      514              _context: Operation context (ignored for local backend)
+      515          """
+      516          content_path = self._hash_to_path(content_hash)
+      517  
+      518          if not content_path.exists():
+      519              raise NexusFileNotFoundError(content_hash)
+      520  
+      521          # Fix #514: Use file locking to prevent race condition on ref_count
+      522          lock_path = self._get_lock_path(content_hash)
+      523          lock_path.parent.mkdir(parents=True, exist_ok=True)
+      524  
+      525          should_delete_lock = False
+      526          try:
+      527              with self._lock_file(lock_path):
+      528                  metadata = self._read_metadata(content_hash)
+      529                  ref_count = metadata.get("ref_count", 1)
+      530  
+      531                  if ref_count <= 1:
+      532                      # Last reference - delete file and metadata
+      533                      content_path.unlink()
+      534  
+      535                      meta_path = self._get_meta_path(content_hash)
+      536                      if meta_path.exists():
+      537                          meta_path.unlink()
+      538  
+      539                      # Mark lock file for deletion after context manager releases it
+      540                      should_delete_lock = True
+      541  
+      542                      # Clean up empty directories
+      543                      self._cleanup_empty_dirs(content_path.parent)
+      544                  else:
+      545                      # Decrement reference count
+      546                      metadata["ref_count"] = ref_count - 1
+      547                      self._write_metadata(content_hash, metadata)
+      548  
+      549              # Clean up lock file AFTER releasing the lock (fixes #562 - Windows PermissionError)
+      550              # Retry logic for Windows file locking semantics
+      551              if should_delete_lock and lock_path.exists():
+      552                  import time
+      553  
+      554                  for attempt in range(3):
+      555                      try:
+      556                          lock_path.unlink()
+      557                          break
+      558                      except PermissionError:
+      559                          if attempt < 2:
+      560                              # Exponential backoff: 10ms, 20ms
+      561                              time.sleep(0.01 * (2**attempt))
+      562                          else:
+      563                              # Last attempt failed - log warning but don't fail the operation
+      564                              # Lock file will be orphaned but this is better than failing deletion
+      565                              import logging
+      566  
+      567                              logging.warning(
+      568                                  f"Failed to delete lock file {lock_path} after 3 attempts. "
+       ... truncated at 60 lines ...
+      590      def content_exists(self, content_hash: str, context: "OperationContext | None" = None) -> bool:
+      591          """Check if content exists.
+      592  
+      593          Args:
+      594              content_hash: SHA-256 hash as hex string
+      595              _context: Operation context (ignored for local backend)
+      596          """
+      597          content_path = self._hash_to_path(content_hash)
+      598          return content_path.exists()
+      600      def get_content_size(self, content_hash: str, context: "OperationContext | None" = None) -> int:
+      601          """Get content size in bytes.
+      602  
+      603          Args:
+      604              content_hash: SHA-256 hash as hex string
+      605              _context: Operation context (ignored for local backend)
+      606          """
+      607          content_path = self._hash_to_path(content_hash)
+      608  
+      609          if not content_path.exists():
+      610              raise NexusFileNotFoundError(content_hash)
+      611  
+      612          try:
+      613              return content_path.stat().st_size
+      614          except OSError as e:
+      615              raise BackendError(
+      616                  f"Failed to get content size: {e}", backend="local", path=content_hash
+      617              ) from e
+      619      def get_ref_count(self, content_hash: str, context: "OperationContext | None" = None) -> int:
+      620          """Get reference count for content.
+      621  
+      622          Args:
+      623              content_hash: SHA-256 hash as hex string
+      624              context: Operation context (ignored for local backend)
+      625          """
+      626          if not self.content_exists(content_hash, context=context):
+      627              raise NexusFileNotFoundError(content_hash)
+      628  
+      629          metadata = self._read_metadata(content_hash)
+      630          return int(metadata.get("ref_count", 0))
+      634      def mkdir(
+      635          self,
+      636          path: str,
+      637          parents: bool = False,
+      638          exist_ok: bool = False,
+      639          context: "OperationContext | EnhancedOperationContext | None" = None,
+      640      ) -> None:
+      641          """Create directory in virtual directory structure.
+      642  
+      643          Args:
+      644              path: Directory path (relative to backend root)
+      645              parents: Create parent directories if needed (like mkdir -p)
+      646              exist_ok: Don't raise error if directory exists
+      647              _context: Operation context (ignored for local backend)
+      648          """
+      649          full_path = self.dir_root / path.lstrip("/")
+      650  
+      651          try:
+      652              if parents:
+      653                  full_path.mkdir(parents=True, exist_ok=exist_ok)
+      654              else:
+      655                  full_path.mkdir(exist_ok=exist_ok)
+      656          except FileExistsError as e:
+      657              if not exist_ok:
+      658                  raise e
+      659          except FileNotFoundError as e:
+      660              raise BackendError(
+      661                  f"Parent directory not found: {path}", backend="local", path=path
+      662              ) from e
+      663          except OSError as e:
+      664              raise BackendError(
+      665                  f"Failed to create directory: {e}", backend="local", path=path
+      666              ) from e
+      668      def rmdir(
+      669          self,
+      670          path: str,
+      671          recursive: bool = False,
+      672          context: "OperationContext | EnhancedOperationContext | None" = None,
+      673      ) -> None:
+      674          """Remove directory from virtual directory structure."""
+      675          full_path = self.dir_root / path.lstrip("/")
+      676  
+      677          if not full_path.exists():
+      678              raise NexusFileNotFoundError(path)
+      679  
+      680          if not full_path.is_dir():
+      681              raise BackendError(f"Path is not a directory: {path}", backend="local", path=path)
+      682  
+      683          try:
+      684              if recursive:
+      685                  shutil.rmtree(full_path)
+      686              else:
+      687                  full_path.rmdir()
+      688          except OSError as e:
+      689              # Re-raise OSError for "directory not empty"
+      690              if e.errno in (errno.ENOTEMPTY, 66):  # errno.ENOTEMPTY or macOS errno 66
+      691                  raise
+      692              raise BackendError(
+      693                  f"Failed to remove directory: {e}", backend="local", path=path
+      694              ) from e
+      696      def is_directory(self, path: str, context: "OperationContext | None" = None) -> bool:
+      697          """Check if path is a directory."""
+      698          try:
+      699              full_path = self.dir_root / path.lstrip("/")
+      700              return full_path.exists() and full_path.is_dir()
+      701          except Exception:
+      702              return False
+
+(11 further implementers not shown)

@@ -1,0 +1,2016 @@
+row 158   apache/iceberg-python#3057
+============================================================================
+CONTRACT pyiceberg.catalog:MetastoreCatalog   kind=abc abstract_methods=15.0 implementers=6.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file pyiceberg/catalog/__init__.py
+      835  class MetastoreCatalog(Catalog, ABC):
+      836      def __init__(self, name: str, **properties: str):
+      837          super().__init__(name, **properties)
+      838  
+      839      def create_table_transaction(
+      840          self,
+      841          identifier: str | Identifier,
+      842          schema: Schema | pa.Schema,
+      843          location: str | None = None,
+      844          partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+      845          sort_order: SortOrder = UNSORTED_SORT_ORDER,
+      846          properties: Properties = EMPTY_DICT,
+      847      ) -> CreateTableTransaction:
+      848          return CreateTableTransaction(
+      849              self._create_staged_table(identifier, schema, location, partition_spec, sort_order, properties)
+      850          )
+      851  
+      852      def table_exists(self, identifier: str | Identifier) -> bool:
+      853          try:
+      854              self.load_table(identifier)
+      855              return True
+      856          except NoSuchTableError:
+      857              return False
+      858  
+      859      def namespace_exists(self, namespace: str | Identifier) -> bool:
+      860          """Check if a namespace exists.
+      861  
+      862          Args:
+      863              namespace (str | Identifier): Namespace identifier.
+      864  
+      865          Returns:
+      866              bool: True if the namespace exists, False otherwise.
+      867          """
+      868          try:
+      869              self.load_namespace_properties(namespace)
+      870              return True
+      871          except NoSuchNamespaceError:
+      872              return False
+      873  
+      874      def purge_table(self, identifier: str | Identifier) -> None:
+      875          table = self.load_table(identifier)
+      876          self.drop_table(identifier)
+      877          io = load_file_io(self.properties, table.metadata_location)
+      878          metadata = table.metadata
+      879          manifest_lists_to_delete = set()
+      880          manifests_to_delete: list[ManifestFile] = []
+      881          for snapshot in metadata.snapshots:
+      882              manifests_to_delete += snapshot.manifests(io)
+      883              manifest_lists_to_delete.add(snapshot.manifest_list)
+      884  
+      885          manifest_paths_to_delete = {manifest.manifest_path for manifest in manifests_to_delete}
+      886          prev_metadata_files = {log.metadata_file for log in metadata.metadata_log}
+      887  
+      888          delete_data_files(io, manifests_to_delete)
+      889          delete_files(io, manifest_paths_to_delete, MANIFEST)
+      890          delete_files(io, manifest_lists_to_delete, MANIFEST_LIST)
+      891          delete_files(io, prev_metadata_files, PREVIOUS_METADATA)
+      892          delete_files(io, {table.metadata_location}, METADATA)
+      893  
+      894      def _create_staged_table(
+      895          self,
+      896          identifier: str | Identifier,
+      897          schema: Schema | pa.Schema,
+      898          location: str | None = None,
+      899          partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+      900          sort_order: SortOrder = UNSORTED_SORT_ORDER,
+      901          properties: Properties = EMPTY_DICT,
+      902      ) -> StagedTable:
+      903          """Create a table and return the table instance without committing the changes.
+      904  
+      905          Args:
+      906              identifier (str | Identifier): Table identifier.
+      907              schema (Schema): Table's schema.
+      908              location (str | None): Location for the table. Optional Argument.
+      909              partition_spec (PartitionSpec): PartitionSpec for the table.
+      910              sort_order (SortOrder): SortOrder for the table.
+      911              properties (Properties): Table properties that can be a string based dictionary.
+      912  
+      913          Returns:
+      914              StagedTable: the created staged table instance.
+      915          """
+      916          schema: Schema = self._convert_schema_if_needed(  # type: ignore
+      917              schema,
+      918              int(properties.get(TableProperties.FORMAT_VERSION, TableProperties.DEFAULT_FORMAT_VERSION)),  # type: ignore
+      919          )
+      920  
+      921          database_name, table_name = self.identifier_to_database_and_table(identifier)
+      922  
+      923          location = self._resolve_table_location(location, database_name, table_name)
+      924          provider = load_location_provider(location, properties)
+      925          metadata_location = provider.new_table_metadata_file_location()
+      926          metadata = new_table_metadata(
+      927              location=location, schema=schema, partition_spec=partition_spec, sort_order=sort_order, properties=properties
+      928          )
+      929          io = self._load_file_io(properties=properties, location=metadata_location)
+      930          return StagedTable(
+      931              identifier=(database_name, table_name),
+      932              metadata=metadata,
+      933              metadata_location=metadata_location,
+      934              io=io,
+      935              catalog=self,
+      936          )
+      937  
+      938      def _update_and_stage_table(
+      939          self,
+      940          current_table: Table | None,
+      941          table_identifier: Identifier,
+      942          requirements: tuple[TableRequirement, ...],
+      943          updates: tuple[TableUpdate, ...],
+      944      ) -> StagedTable:
+      945          for requirement in requirements:
+      946              requirement.validate(current_table.metadata if current_table else None)
+      947  
+      948          updated_metadata = update_table_metadata(
+      949              base_metadata=current_table.metadata if current_table else self._empty_table_metadata(),
+      950              updates=updates,
+      951              enforce_validation=current_table is None,
+      952              metadata_location=current_table.metadata_location if current_table else None,
+      953          )
+      954  
+      955          new_metadata_version = self._parse_metadata_version(current_table.metadata_location) + 1 if current_table else 0
+      956          provider = load_location_provider(updated_metadata.location, updated_metadata.properties)
+      957          new_metadata_location = provider.new_table_metadata_file_location(new_metadata_version)
+      958  
+      959          return StagedTable(
+      960              identifier=table_identifier,
+      961              metadata=updated_metadata,
+      962              metadata_location=new_metadata_location,
+      963              io=self._load_file_io(properties=updated_metadata.properties, location=new_metadata_location),
+      964              catalog=self,
+      965          )
+      966  
+      967      def _get_updated_props_and_update_summary(
+      968          self, current_properties: Properties, removals: set[str] | None, updates: Properties
+      969      ) -> tuple[PropertiesUpdateSummary, Properties]:
+      970          self._check_for_overlap(updates=updates, removals=removals)
+      971          updated_properties = dict(current_properties)
+      972  
+      973          removed: set[str] = set()
+      974          updated: set[str] = set()
+      975  
+      976          if removals:
+      977              for key in removals:
+      978                  if key in updated_properties:
+      979                      updated_properties.pop(key)
+      980                      removed.add(key)
+      981          if updates:
+      982              for key, value in updates.items():
+      983                  updated_properties[key] = value
+      984                  updated.add(key)
+      985  
+      986          expected_to_change = (removals or set()).difference(removed)
+      987          properties_update_summary = PropertiesUpdateSummary(
+      988              removed=list(removed or []), updated=list(updated or []), missing=list(expected_to_change)
+      989          )
+      990  
+      991          return properties_update_summary, updated_properties
+      992  
+      993      def _resolve_table_location(self, location: str | None, database_name: str, table_name: str) -> str:
+      994          if not location:
+      995              return self._get_default_warehouse_location(database_name, table_name)
+      996          return location.rstrip("/")
+      997  
+      998      def _get_default_warehouse_location(self, database_name: str, table_name: str) -> str:
+      999          """Return the default warehouse location using the convention of `warehousePath/databaseName/tableName`."""
+     1000          database_properties = self.load_namespace_properties(database_name)
+     1001          if database_location := database_properties.get(LOCATION):
+     1002              database_location = database_location.rstrip("/")
+     1003              return f"{database_location}/{table_name}"
+     1004  
+     1005          if warehouse_path := self.properties.get(WAREHOUSE_LOCATION):
+     1006              warehouse_path = warehouse_path.rstrip("/")
+     1007              return f"{warehouse_path}/{database_name}/{table_name}"
+     1008  
+     1009          raise ValueError("No default path is set, please specify a location when creating a table")
+     1010  
+     1011      def _get_hive_style_warehouse_location(self, database_name: str, table_name: str) -> str:
+     1012          """Return the default warehouse location following the Hive convention of `warehousePath/databaseName.db/tableName`."""
+     1013          database_properties = self.load_namespace_properties(database_name)
+     1014          if database_location := database_properties.get(LOCATION):
+     1015              database_location = database_location.rstrip("/")
+     1016              return f"{database_location}/{table_name}"
+     1017  
+     1018          if warehouse_path := self.properties.get(WAREHOUSE_LOCATION):
+     1019              warehouse_path = warehouse_path.rstrip("/")
+     1020              return f"{warehouse_path}/{database_name}.db/{table_name}"
+     1021  
+     1022          raise ValueError("No default path is set, please specify a location when creating a table")
+     1023  
+     1024      @staticmethod
+     1025      def _write_metadata(metadata: TableMetadata, io: FileIO, metadata_path: str) -> None:
+     1026          ToOutputFile.table_metadata(metadata, io.new_output(metadata_path))
+     1027  
+     1028      @staticmethod
+     1029      def _parse_metadata_version(metadata_location: str) -> int:
+     1030          """Parse the version from the metadata location.
+     1031  
+     1032          The version is the first part of the file name, before the first dash.
+     1033          For example, the version of the metadata file
+     1034          `s3://bucket/db/tb/metadata/00001-6c97e413-d51b-4538-ac70-12fe2a85cb83.metadata.json`
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER pyiceberg.catalog.bigquery_metastore:BigQueryMetastoreCatalog  stubs=6/15 ----------
+       61  class BigQueryMetastoreCatalog(MetastoreCatalog):
+      101      def create_table(
+      102          self,
+      103          identifier: str | Identifier,
+      104          schema: Union[Schema, "pa.Schema"],
+      105          location: str | None = None,
+      106          partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+      107          sort_order: SortOrder = UNSORTED_SORT_ORDER,
+      108          properties: Properties = EMPTY_DICT,
+      109      ) -> Table:
+      110          """
+      111          Create an Iceberg table.
+      112  
+      113          Args:
+      114              identifier: Table identifier.
+      115              schema: Table's schema.
+      116              location: Location for the table. Optional Argument.
+      117              partition_spec: PartitionSpec for the table.
+      118              sort_order: SortOrder for the table.
+      119              properties: Table properties that can be a string based dictionary.
+      120  
+      121          Returns:
+      122              Table: the created table instance.
+      123  
+      124          Raises:
+      125              AlreadyExistsError: If a table with the name already exists.
+      126              ValueError: If the identifier is invalid, or no path is given to store metadata.
+      127  
+      128          """
+      129          schema: Schema = self._convert_schema_if_needed(schema)  # type: ignore
+      130  
+      131          dataset_name, table_name = self.identifier_to_database_and_table(identifier)
+      132  
+      133          dataset_ref = DatasetReference(project=self.project_id, dataset_id=dataset_name)
+      134          location = self._resolve_table_location(location, dataset_name, table_name)
+      135          provider = load_location_provider(table_location=location, table_properties=properties)
+      136          metadata_location = provider.new_table_metadata_file_location()
+      137  
+      138          metadata = new_table_metadata(
+      139              location=location, schema=schema, partition_spec=partition_spec, sort_order=sort_order, properties=properties
+      140          )
+      141  
+      142          io = load_file_io(properties=self.properties, location=metadata_location)
+      143          self._write_metadata(metadata, io, metadata_location)
+      144  
+      145          dataset_ref = DatasetReference(project=self.project_id, dataset_id=dataset_name)
+      146  
+      147          try:
+      148              table = self._make_new_table(
+      149                  metadata, metadata_location, TableReference(dataset_ref=dataset_ref, table_id=table_name)
+      150              )
+      151              self.client.create_table(table)
+      152          except Conflict as e:
+      153              raise TableAlreadyExistsError(f"Table {table_name} already exists") from e
+      154  
+      155          return self.load_table(identifier=identifier)
+      157      def create_namespace(self, namespace: str | Identifier, properties: Properties = EMPTY_DICT) -> None:
+      158          """Create a namespace in the catalog.
+      159  
+      160          Args:
+      161              namespace: Namespace identifier.
+      162              properties: A string dictionary of properties for the given namespace.
+      163  
+      164          Raises:
+      165              ValueError: If the identifier is invalid.
+      166              AlreadyExistsError: If a namespace with the given name already exists.
+      167          """
+      168          database_name = self.identifier_to_database(namespace)
+      169  
+      170          try:
+      171              dataset_ref = DatasetReference(project=self.project_id, dataset_id=database_name)
+      172              dataset = Dataset(dataset_ref=dataset_ref)
+      173              dataset.external_catalog_dataset_options = self._create_external_catalog_dataset_options(
+      174                  self._get_default_warehouse_location_for_dataset(database_name), properties, dataset_ref
+      175              )
+      176              self.client.create_dataset(dataset)
+      177          except Conflict as e:
+      178              raise NamespaceAlreadyExistsError("Namespace {database_name} already exists") from e
+      180      def load_table(self, identifier: str | Identifier) -> Table:
+      181          """
+      182          Load the table's metadata and returns the table instance.
+      183  
+      184          You can also use this method to check for table existence using 'try catalog.table() except TableNotFoundError'.
+      185          Note: This method doesn't scan data stored in the table.
+      186  
+      187          Args:
+      188              identifier: Table identifier.
+      189  
+      190          Returns:
+      191              Table: the table instance with its metadata.
+      192  
+      193          Raises:
+      194              NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
+      195          """
+      196          database_name, table_name = self.identifier_to_database_and_table(identifier, NoSuchTableError)
+      197          dataset_name, table_name = self.identifier_to_database_and_table(identifier, NoSuchTableError)
+      198  
+      199          try:
+      200              table_ref = TableReference(
+      201                  dataset_ref=DatasetReference(project=self.project_id, dataset_id=dataset_name),
+      202                  table_id=table_name,
+      203              )
+      204              table = self.client.get_table(table_ref)
+      205              return self._convert_bigquery_table_to_iceberg_table(identifier, table)
+      206          except NotFound as e:
+      207              raise NoSuchTableError(f"Table does not exist: {dataset_name}.{table_name}") from e
+      209      def drop_table(self, identifier: str | Identifier) -> None:
+      210          """Drop a table.
+      211  
+      212          Args:
+      213              identifier: Table identifier.
+      214  
+      215          Raises:
+      216              NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
+      217          """
+      218          dataset_name, table_name = self.identifier_to_database_and_table(identifier, NoSuchTableError)
+      219  
+      220          try:
+      221              table_ref = TableReference(
+      222                  dataset_ref=DatasetReference(project=self.project_id, dataset_id=dataset_name),
+      223                  table_id=table_name,
+      224              )
+      225              self.client.delete_table(table_ref)
+      226          except NoSuchTableError as e:
+      227              raise NoSuchTableError(f"Table does not exist: {dataset_name}.{table_name}") from e
+      229      def commit_table(
+      230          self, table: Table, requirements: tuple[TableRequirement, ...], updates: tuple[TableUpdate, ...]
+      231      ) -> CommitTableResponse:
+      232          raise NotImplementedError
+      234      def rename_table(self, from_identifier: str | Identifier, to_identifier: str | Identifier) -> Table:
+      235          raise NotImplementedError
+      237      def drop_namespace(self, namespace: str | Identifier) -> None:
+      238          database_name = self.identifier_to_database(namespace)
+      239  
+      240          try:
+      241              dataset_ref = DatasetReference(project=self.project_id, dataset_id=database_name)
+      242              dataset = Dataset(dataset_ref=dataset_ref)
+      243              self.client.delete_dataset(dataset)
+      244          except NotFound as e:
+      245              raise NoSuchNamespaceError(f"Namespace {namespace} does not exist.") from e
+      247      def list_tables(self, namespace: str | Identifier) -> list[Identifier]:
+      248          database_name = self.identifier_to_database(namespace)
+      249          iceberg_tables: list[Identifier] = []
+      250          try:
+      251              dataset_ref = DatasetReference(project=self.project_id, dataset_id=database_name)
+      252              # The list_tables method returns an iterator of TableListItem
+      253              bq_tables_iterator = self.client.list_tables(dataset=dataset_ref)
+      254  
+      255              for bq_table_list_item in bq_tables_iterator:
+      256                  iceberg_tables.append((database_name, bq_table_list_item.table_id))
+      257          except NotFound:
+      258              raise NoSuchNamespaceError(f"Namespace (dataset) '{database_name}' not found.") from None
+      259          return iceberg_tables
+      261      def list_namespaces(self, namespace: str | Identifier = ()) -> list[Identifier]:
+      262          # Since this catalog only supports one-level namespaces, it always returns an empty list unless
+      263          # passed an empty namespace to list all namespaces within the catalog.
+      264          if namespace:
+      265              raise NoSuchNamespaceError(f"Namespace (dataset) '{namespace}' not found.") from None
+      266  
+      267          # List top-level datasets
+      268          datasets_iterator = self.client.list_datasets()
+      269          return [(dataset.dataset_id,) for dataset in datasets_iterator]
+      271      def register_table(self, identifier: str | Identifier, metadata_location: str) -> Table:
+      272          """Register a new table using existing metadata.
+      273  
+      274          Args:
+      275              identifier (Union[str, Identifier]): Table identifier for the table
+      276              metadata_location (str): The location to the metadata
+      277  
+      278          Returns:
+      279              Table: The newly registered table
+      280  
+      281          Raises:
+      282              TableAlreadyExistsError: If the table already exists
+      283          """
+      284          dataset_name, table_name = self.identifier_to_database_and_table(identifier)
+      285  
+      286          dataset_ref = DatasetReference(project=self.project_id, dataset_id=dataset_name)
+      287  
+      288          io = self._load_file_io(location=metadata_location)
+      289          file = io.new_input(metadata_location)
+      290          metadata = FromInputFile.table_metadata(file)
+      291  
+      292          try:
+      293              table = self._make_new_table(
+      294                  metadata, metadata_location, TableReference(dataset_ref=dataset_ref, table_id=table_name)
+      295              )
+      296              self.client.create_table(table)
+      297          except Conflict as e:
+      298              raise TableAlreadyExistsError(f"Table {table_name} already exists") from e
+      299  
+      300          return self.load_table(identifier=identifier)
+      302      def list_views(self, namespace: str | Identifier) -> list[Identifier]:
+      303          raise NotImplementedError
+      305      def drop_view(self, identifier: str | Identifier) -> None:
+      306          raise NotImplementedError
+      308      def view_exists(self, identifier: str | Identifier) -> bool:
+      309          raise NotImplementedError
+      311      def load_namespace_properties(self, namespace: str | Identifier) -> Properties:
+      312          dataset_name = self.identifier_to_database(namespace)
+      313  
+      314          try:
+      315              dataset = self.client.get_dataset(DatasetReference(project=self.project_id, dataset_id=dataset_name))
+      316  
+      317              if dataset and dataset.external_catalog_dataset_options:
+      318                  return dataset.external_catalog_dataset_options.to_api_repr()
+      319          except NotFound as e:
+      320              raise NoSuchNamespaceError(f"Namespace {namespace} not found") from e
+      321          return {}
+      323      def update_namespace_properties(
+      324          self, namespace: str | Identifier, removals: set[str] | None = None, updates: Properties = EMPTY_DICT
+      325      ) -> PropertiesUpdateSummary:
+      326          raise NotImplementedError
+
+---------- IMPLEMENTER pyiceberg.catalog.dynamodb:DynamoDbCatalog  stubs=5/15 ----------
+       94  class DynamoDbCatalog(MetastoreCatalog):
+      152      def create_table(
+      153          self,
+      154          identifier: str | Identifier,
+      155          schema: Union[Schema, "pa.Schema"],
+      156          location: str | None = None,
+      157          partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+      158          sort_order: SortOrder = UNSORTED_SORT_ORDER,
+      159          properties: Properties = EMPTY_DICT,
+      160      ) -> Table:
+      161          """
+      162          Create an Iceberg table.
+      163  
+      164          Args:
+      165              identifier: Table identifier.
+      166              schema: Table's schema.
+      167              location: Location for the table. Optional Argument.
+      168              partition_spec: PartitionSpec for the table.
+      169              sort_order: SortOrder for the table.
+      170              properties: Table properties that can be a string based dictionary.
+      171  
+      172          Returns:
+      173              Table: the created table instance.
+      174  
+      175          Raises:
+      176              AlreadyExistsError: If a table with the name already exists.
+      177              ValueError: If the identifier is invalid, or no path is given to store metadata.
+      178  
+      179          """
+      180          schema: Schema = self._convert_schema_if_needed(  # type: ignore
+      181              schema,
+      182              int(properties.get(TableProperties.FORMAT_VERSION, TableProperties.DEFAULT_FORMAT_VERSION)),  # type: ignore
+      183          )
+      184  
+      185          database_name, table_name = self.identifier_to_database_and_table(identifier)
+      186  
+      187          location = self._resolve_table_location(location, database_name, table_name)
+      188          provider = load_location_provider(table_location=location, table_properties=properties)
+      189          metadata_location = provider.new_table_metadata_file_location()
+      190  
+      191          metadata = new_table_metadata(
+      192              location=location, schema=schema, partition_spec=partition_spec, sort_order=sort_order, properties=properties
+      193          )
+      194          io = load_file_io(properties=self.properties, location=metadata_location)
+      195          self._write_metadata(metadata, io, metadata_location)
+      196  
+      197          self._ensure_namespace_exists(database_name=database_name)
+      198  
+      199          try:
+      200              self._put_dynamo_item(
+      201                  item=_get_create_table_item(
+      202                      database_name=database_name, table_name=table_name, properties=properties, metadata_location=metadata_location
+      203                  ),
+      204                  condition_expression=f"attribute_not_exists({DYNAMODB_COL_IDENTIFIER})",
+      205              )
+      206          except ConditionalCheckFailedException as e:
+      207              raise TableAlreadyExistsError(f"Table {database_name}.{table_name} already exists") from e
+      208  
+      209          return self.load_table(identifier=identifier)
+      211      def register_table(self, identifier: str | Identifier, metadata_location: str) -> Table:
+      212          """Register a new table using existing metadata.
+      213  
+      214          Args:
+      215              identifier (Union[str, Identifier]): Table identifier for the table
+      216              metadata_location (str): The location to the metadata
+      217  
+      218          Returns:
+      219              Table: The newly registered table
+      220  
+      221          Raises:
+      222              TableAlreadyExistsError: If the table already exists
+      223          """
+      224          raise NotImplementedError
+      226      def commit_table(
+      227          self, table: Table, requirements: tuple[TableRequirement, ...], updates: tuple[TableUpdate, ...]
+      228      ) -> CommitTableResponse:
+      229          """Commit updates to a table.
+      230  
+      231          Args:
+      232              table (Table): The table to be updated.
+      233              requirements: (Tuple[TableRequirement, ...]): Table requirements.
+      234              updates: (Tuple[TableUpdate, ...]): Table updates.
+      235  
+      236          Returns:
+      237              CommitTableResponse: The updated metadata.
+      238  
+      239          Raises:
+      240              NoSuchTableError: If a table with the given identifier does not exist.
+      241              CommitFailedException: Requirement not met, or a conflict with a concurrent commit.
+      242          """
+      243          raise NotImplementedError
+      245      def load_table(self, identifier: str | Identifier) -> Table:
+      246          """
+      247          Load the table's metadata and returns the table instance.
+      248  
+      249          You can also use this method to check for table existence using 'try catalog.table() except TableNotFoundError'.
+      250          Note: This method doesn't scan data stored in the table.
+      251  
+      252          Args:
+      253              identifier: Table identifier.
+      254  
+      255          Returns:
+      256              Table: the table instance with its metadata.
+      257  
+      258          Raises:
+      259              NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
+      260          """
+      261          database_name, table_name = self.identifier_to_database_and_table(identifier, NoSuchTableError)
+      262          dynamo_table_item = self._get_iceberg_table_item(database_name=database_name, table_name=table_name)
+      263          return self._convert_dynamo_table_item_to_iceberg_table(dynamo_table_item=dynamo_table_item)
+      265      def drop_table(self, identifier: str | Identifier) -> None:
+      266          """Drop a table.
+      267  
+      268          Args:
+      269              identifier: Table identifier.
+      270  
+      271          Raises:
+      272              NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
+      273          """
+      274          database_name, table_name = self.identifier_to_database_and_table(identifier, NoSuchTableError)
+      275  
+      276          try:
+      277              self._delete_dynamo_item(
+      278                  namespace=database_name,
+      279                  identifier=f"{database_name}.{table_name}",
+      280                  condition_expression=f"attribute_exists({DYNAMODB_COL_IDENTIFIER})",
+      281              )
+      282          except ConditionalCheckFailedException as e:
+      283              raise NoSuchTableError(f"Table does not exist: {database_name}.{table_name}") from e
+      285      def rename_table(self, from_identifier: str | Identifier, to_identifier: str | Identifier) -> Table:
+      286          """Rename a fully classified table name.
+      287  
+      288          This method can only rename Iceberg tables in AWS Glue.
+      289  
+      290          Args:
+      291              from_identifier: Existing table identifier.
+      292              to_identifier: New table identifier.
+      293  
+      294          Returns:
+      295              Table: the updated table instance with its metadata.
+      296  
+      297          Raises:
+      298              ValueError: When from table identifier is invalid.
+      299              NoSuchTableError: When a table with the name does not exist.
+      300              NoSuchIcebergTableError: When from table is not a valid iceberg table.
+      301              NoSuchPropertyException: When from table miss some required properties.
+      302              NoSuchNamespaceError: When the destination namespace doesn't exist.
+      303          """
+      304          from_database_name, from_table_name = self.identifier_to_database_and_table(from_identifier, NoSuchTableError)
+      305          to_database_name, to_table_name = self.identifier_to_database_and_table(to_identifier)
+      306  
+      307          from_table_item = self._get_iceberg_table_item(database_name=from_database_name, table_name=from_table_name)
+      308  
+      309          try:
+      310              # Verify that from_identifier is a valid iceberg table
+      311              self._convert_dynamo_table_item_to_iceberg_table(dynamo_table_item=from_table_item)
+      312          except NoSuchPropertyException as e:
+      313              raise NoSuchPropertyException(
+      314                  f"Failed to rename table {from_database_name}.{from_table_name} since it is missing required properties"
+      315              ) from e
+      316          except NoSuchIcebergTableError as e:
+      317              raise NoSuchIcebergTableError(
+      318                  f"Failed to rename table {from_database_name}.{from_table_name} since it is not a valid iceberg table"
+      319              ) from e
+      320  
+      321          self._ensure_namespace_exists(database_name=from_database_name)
+      322          self._ensure_namespace_exists(database_name=to_database_name)
+      323  
+      324          try:
+      325              self._put_dynamo_item(
+      326                  item=_get_rename_table_item(
+      327                      from_dynamo_table_item=from_table_item, to_database_name=to_database_name, to_table_name=to_table_name
+      328                  ),
+      329                  condition_expression=f"attribute_not_exists({DYNAMODB_COL_IDENTIFIER})",
+      330              )
+      331          except ConditionalCheckFailedException as e:
+      332              raise TableAlreadyExistsError(f"Table {to_database_name}.{to_table_name} already exists") from e
+      333  
+      334          try:
+      335              self.drop_table(from_identifier)
+      336          except (NoSuchTableError, GenericDynamoDbError) as e:
+      337              log_message = f"Failed to drop old table {from_database_name}.{from_table_name}. "
+      338  
+      339              try:
+      340                  self.drop_table(to_identifier)
+      341                  log_message += f"Rolled back table creation for {to_database_name}.{to_table_name}."
+      342              except (NoSuchTableError, GenericDynamoDbError):
+      343                  log_message += (
+      344                      f"Failed to roll back table creation for {to_database_name}.{to_table_name}. Please clean up manually"
+       ... truncated at 60 lines ...
+      351      def create_namespace(self, namespace: str | Identifier, properties: Properties = EMPTY_DICT) -> None:
+      352          """Create a namespace in the catalog.
+      353  
+      354          Args:
+      355              namespace: Namespace identifier.
+      356              properties: A string dictionary of properties for the given namespace.
+      357  
+      358          Raises:
+      359              ValueError: If the identifier is invalid.
+      360              AlreadyExistsError: If a namespace with the given name already exists.
+      361          """
+      362          database_name = self.identifier_to_database(namespace)
+      363  
+      364          try:
+      365              self._put_dynamo_item(
+      366                  item=_get_create_database_item(database_name=database_name, properties=properties),
+      367                  condition_expression=f"attribute_not_exists({DYNAMODB_COL_NAMESPACE})",
+      368              )
+      369          except ConditionalCheckFailedException as e:
+      370              raise NamespaceAlreadyExistsError(f"Database {database_name} already exists") from e
+      372      def drop_namespace(self, namespace: str | Identifier) -> None:
+      373          """Drop a namespace.
+      374  
+      375          A Glue namespace can only be dropped if it is empty.
+      376  
+      377          Args:
+      378              namespace: Namespace identifier.
+      379  
+      380          Raises:
+      381              NoSuchNamespaceError: If a namespace with the given name does not exist, or the identifier is invalid.
+      382              NamespaceNotEmptyError: If the namespace is not empty.
+      383          """
+      384          database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+      385          table_identifiers = self.list_tables(namespace=database_name)
+      386  
+      387          if len(table_identifiers) > 0:
+      388              raise NamespaceNotEmptyError(f"Database {database_name} is not empty")
+      389  
+      390          try:
+      391              self._delete_dynamo_item(
+      392                  namespace=database_name,
+      393                  identifier=DYNAMODB_NAMESPACE,
+      394                  condition_expression=f"attribute_exists({DYNAMODB_COL_IDENTIFIER})",
+      395              )
+      396          except ConditionalCheckFailedException as e:
+      397              raise NoSuchNamespaceError(f"Database does not exist: {database_name}") from e
+      399      def list_tables(self, namespace: str | Identifier) -> list[Identifier]:
+      400          """List Iceberg tables under the given namespace in the catalog.
+      401  
+      402          Args:
+      403              namespace (str | Identifier): Namespace identifier to search.
+      404  
+      405          Returns:
+      406              List[Identifier]: list of table identifiers.
+      407          """
+      408          database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+      409  
+      410          paginator = self.dynamodb.get_paginator("query")
+      411  
+      412          try:
+      413              page_iterator = paginator.paginate(
+      414                  TableName=self.dynamodb_table_name,
+      415                  IndexName=DYNAMODB_NAMESPACE_GSI,
+      416                  KeyConditionExpression=f"{DYNAMODB_COL_NAMESPACE} = :namespace ",
+      417                  ExpressionAttributeValues={
+      418                      ":namespace": {
+      419                          "S": database_name,
+      420                      }
+      421                  },
+      422              )
+      423          except (
+      424              self.dynamodb.exceptions.ProvisionedThroughputExceededException,
+      425              self.dynamodb.exceptions.RequestLimitExceeded,
+      426              self.dynamodb.exceptions.InternalServerError,
+      427              self.dynamodb.exceptions.ResourceNotFoundException,
+      428          ) as e:
+      429              raise GenericDynamoDbError(e.message) from e
+      430  
+      431          table_identifiers = []
+      432          for page in page_iterator:
+      433              for item in page["Items"]:
+      434                  _dict = _convert_dynamo_item_to_regular_dict(item)
+      435                  identifier_col = _dict[DYNAMODB_COL_IDENTIFIER]
+      436                  if identifier_col == DYNAMODB_NAMESPACE:
+      437                      continue
+      438  
+      439                  table_identifiers.append(self.identifier_to_tuple(identifier_col))
+      440  
+      441          return table_identifiers
+      443      def list_namespaces(self, namespace: str | Identifier = ()) -> list[Identifier]:
+      444          """List top-level namespaces from the catalog.
+      445  
+      446          We do not support hierarchical namespace.
+      447  
+      448          Returns:
+      449              List[Identifier]: a List of namespace identifiers.
+      450          """
+      451          # Hierarchical namespace is not supported. Return an empty list
+      452          if namespace:
+      453              return []
+      454  
+      455          paginator = self.dynamodb.get_paginator("query")
+      456  
+      457          try:
+      458              page_iterator = paginator.paginate(
+      459                  TableName=self.dynamodb_table_name,
+      460                  ConsistentRead=True,
+      461                  KeyConditionExpression=f"{DYNAMODB_COL_IDENTIFIER} = :identifier",
+      462                  ExpressionAttributeValues={
+      463                      ":identifier": {
+      464                          "S": DYNAMODB_NAMESPACE,
+      465                      }
+      466                  },
+      467              )
+      468          except (
+      469              self.dynamodb.exceptions.ProvisionedThroughputExceededException,
+      470              self.dynamodb.exceptions.RequestLimitExceeded,
+      471              self.dynamodb.exceptions.InternalServerError,
+      472              self.dynamodb.exceptions.ResourceNotFoundException,
+      473          ) as e:
+      474              raise GenericDynamoDbError(e.message) from e
+      475  
+      476          database_identifiers = []
+      477          for page in page_iterator:
+      478              for item in page["Items"]:
+      479                  _dict = _convert_dynamo_item_to_regular_dict(item)
+      480                  namespace_col = _dict[DYNAMODB_COL_NAMESPACE]
+      481                  database_identifiers.append(self.identifier_to_tuple(namespace_col))
+      482  
+      483          return database_identifiers
+      485      def load_namespace_properties(self, namespace: str | Identifier) -> Properties:
+      486          """
+      487          Get properties for a namespace.
+      488  
+      489          Args:
+      490              namespace: Namespace identifier.
+      491  
+      492          Returns:
+      493              Properties: Properties for the given namespace.
+      494  
+      495          Raises:
+      496              NoSuchNamespaceError: If a namespace with the given name does not exist, or identifier is invalid.
+      497          """
+      498          database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+      499          namespace_item = self._get_iceberg_namespace_item(database_name=database_name)
+      500          namespace_dict = _convert_dynamo_item_to_regular_dict(namespace_item)
+      501          return _get_namespace_properties(namespace_dict=namespace_dict)
+      503      def update_namespace_properties(
+      504          self, namespace: str | Identifier, removals: set[str] | None = None, updates: Properties = EMPTY_DICT
+      505      ) -> PropertiesUpdateSummary:
+      506          """
+      507          Remove or update provided property keys for a namespace.
+      508  
+      509          Args:
+      510              namespace: Namespace identifier
+      511              removals: Set of property keys that need to be removed. Optional Argument.
+      512              updates: Properties to be updated for the given namespace.
+      513  
+      514          Raises:
+      515              NoSuchNamespaceError: If a namespace with the given name does not exist， or identifier is invalid.
+      516              ValueError: If removals and updates have overlapping keys.
+      517          """
+      518          database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+      519          namespace_item = self._get_iceberg_namespace_item(database_name=database_name)
+      520          namespace_dict = _convert_dynamo_item_to_regular_dict(namespace_item)
+      521          current_properties = _get_namespace_properties(namespace_dict=namespace_dict)
+      522  
+      523          properties_update_summary, updated_properties = self._get_updated_props_and_update_summary(
+      524              current_properties=current_properties, removals=removals, updates=updates
+      525          )
+      526  
+      527          try:
+      528              self._put_dynamo_item(
+      529                  item=_get_update_database_item(
+      530                      namespace_item=namespace_item,
+      531                      updated_properties=updated_properties,
+      532                  ),
+      533                  condition_expression=f"attribute_exists({DYNAMODB_COL_NAMESPACE})",
+      534              )
+      535          except ConditionalCheckFailedException as e:
+      536              raise NoSuchNamespaceError(f"Database {database_name} does not exist") from e
+      537  
+      538          return properties_update_summary
+      540      def list_views(self, namespace: str | Identifier) -> list[Identifier]:
+      541          raise NotImplementedError
+      543      def drop_view(self, identifier: str | Identifier) -> None:
+      544          raise NotImplementedError
+      546      def view_exists(self, identifier: str | Identifier) -> bool:
+      547          raise NotImplementedError
+
+---------- IMPLEMENTER pyiceberg.catalog.glue:GlueCatalog  stubs=3/15 ----------
+      311  class GlueCatalog(MetastoreCatalog):
+      420      def create_table(
+      421          self,
+      422          identifier: str | Identifier,
+      423          schema: Union[Schema, "pa.Schema"],
+      424          location: str | None = None,
+      425          partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+      426          sort_order: SortOrder = UNSORTED_SORT_ORDER,
+      427          properties: Properties = EMPTY_DICT,
+      428      ) -> Table:
+      429          """
+      430          Create an Iceberg table.
+      431  
+      432          Args:
+      433              identifier: Table identifier.
+      434              schema: Table's schema.
+      435              location: Location for the table. Optional Argument.
+      436              partition_spec: PartitionSpec for the table.
+      437              sort_order: SortOrder for the table.
+      438              properties: Table properties that can be a string based dictionary.
+      439  
+      440          Returns:
+      441              Table: the created table instance.
+      442  
+      443          Raises:
+      444              AlreadyExistsError: If a table with the name already exists.
+      445              ValueError: If the identifier is invalid, or no path is given to store metadata.
+      446  
+      447          """
+      448          staged_table = self._create_staged_table(
+      449              identifier=identifier,
+      450              schema=schema,
+      451              location=location,
+      452              partition_spec=partition_spec,
+      453              sort_order=sort_order,
+      454              properties=properties,
+      455          )
+      456          database_name, table_name = self.identifier_to_database_and_table(identifier)
+      457  
+      458          self._write_metadata(staged_table.metadata, staged_table.io, staged_table.metadata_location)
+      459          table_input = _construct_table_input(table_name, staged_table.metadata_location, properties, staged_table.metadata)
+      460          self._create_glue_table(database_name=database_name, table_name=table_name, table_input=table_input)
+      461  
+      462          return self.load_table(identifier=identifier)
+      464      def register_table(self, identifier: str | Identifier, metadata_location: str) -> Table:
+      465          """Register a new table using existing metadata.
+      466  
+      467          Args:
+      468              identifier (Union[str, Identifier]): Table identifier for the table
+      469              metadata_location (str): The location to the metadata
+      470  
+      471          Returns:
+      472              Table: The newly registered table
+      473  
+      474          Raises:
+      475              TableAlreadyExistsError: If the table already exists
+      476          """
+      477          database_name, table_name = self.identifier_to_database_and_table(identifier)
+      478          properties = EMPTY_DICT
+      479          io = self._load_file_io(location=metadata_location)
+      480          file = io.new_input(metadata_location)
+      481          metadata = FromInputFile.table_metadata(file)
+      482          table_input = _construct_table_input(table_name, metadata_location, properties, metadata)
+      483          self._create_glue_table(database_name=database_name, table_name=table_name, table_input=table_input)
+      484          return self.load_table(identifier=identifier)
+      486      def commit_table(
+      487          self, table: Table, requirements: tuple[TableRequirement, ...], updates: tuple[TableUpdate, ...]
+      488      ) -> CommitTableResponse:
+      489          """Commit updates to a table.
+      490  
+      491          Args:
+      492              table (Table): The table to be updated.
+      493              requirements: (Tuple[TableRequirement, ...]): Table requirements.
+      494              updates: (Tuple[TableUpdate, ...]): Table updates.
+      495  
+      496          Returns:
+      497              CommitTableResponse: The updated metadata.
+      498  
+      499          Raises:
+      500              NoSuchTableError: If a table with the given identifier does not exist.
+      501              CommitFailedException: Requirement not met, or a conflict with a concurrent commit.
+      502          """
+      503          table_identifier = table.name()
+      504          database_name, table_name = self.identifier_to_database_and_table(table_identifier, NoSuchTableError)
+      505  
+      506          current_glue_table: TableTypeDef | None
+      507          glue_table_version_id: str | None
+      508          current_table: Table | None
+      509          try:
+      510              current_glue_table = self._get_glue_table(database_name=database_name, table_name=table_name)
+      511              glue_table_version_id = current_glue_table.get("VersionId")
+      512              current_table = self._convert_glue_to_iceberg(glue_table=current_glue_table)
+      513          except NoSuchTableError:
+      514              current_glue_table = None
+      515              glue_table_version_id = None
+      516              current_table = None
+      517  
+      518          updated_staged_table = self._update_and_stage_table(current_table, table_identifier, requirements, updates)
+      519          if current_table and updated_staged_table.metadata == current_table.metadata:
+      520              # no changes, do nothing
+      521              return CommitTableResponse(metadata=current_table.metadata, metadata_location=current_table.metadata_location)
+      522          self._write_metadata(
+      523              metadata=updated_staged_table.metadata,
+      524              io=updated_staged_table.io,
+      525              metadata_path=updated_staged_table.metadata_location,
+      526          )
+      527  
+      528          if current_table:
+      529              # table exists, update the table
+      530              if not glue_table_version_id:
+      531                  raise CommitFailedException(
+      532                      f"Cannot commit {database_name}.{table_name} because Glue table version id is missing"
+      533                  )
+      534  
+      535              # Pass `version_id` to implement optimistic locking: it ensures updates are rejected if concurrent
+      536              # modifications occur. See more details at https://iceberg.apache.org/docs/latest/aws/#optimistic-locking
+      537              update_table_input = _construct_table_input(
+      538                  table_name=table_name,
+      539                  metadata_location=updated_staged_table.metadata_location,
+      540                  properties=updated_staged_table.properties,
+      541                  metadata=updated_staged_table.metadata,
+      542                  glue_table=current_glue_table,
+      543                  prev_metadata_location=current_table.metadata_location,
+      544              )
+      545              self._update_glue_table(
+       ... truncated at 60 lines ...
+      565      def load_table(self, identifier: str | Identifier) -> Table:
+      566          """Load the table's metadata and returns the table instance.
+      567  
+      568          You can also use this method to check for table existence using 'try catalog.table() except TableNotFoundError'.
+      569          Note: This method doesn't scan data stored in the table.
+      570  
+      571          Args:
+      572              identifier: Table identifier.
+      573  
+      574          Returns:
+      575              Table: the table instance with its metadata.
+      576  
+      577          Raises:
+      578              NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
+      579          """
+      580          database_name, table_name = self.identifier_to_database_and_table(identifier, NoSuchTableError)
+      581  
+      582          return self._convert_glue_to_iceberg(self._get_glue_table(database_name=database_name, table_name=table_name))
+      584      def drop_table(self, identifier: str | Identifier) -> None:
+      585          """Drop a table.
+      586  
+      587          Args:
+      588              identifier: Table identifier.
+      589  
+      590          Raises:
+      591              NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
+      592          """
+      593          database_name, table_name = self.identifier_to_database_and_table(identifier, NoSuchTableError)
+      594          try:
+      595              self.glue.delete_table(DatabaseName=database_name, Name=table_name)
+      596          except self.glue.exceptions.EntityNotFoundException as e:
+      597              raise NoSuchTableError(f"Table does not exist: {database_name}.{table_name}") from e
+      599      def rename_table(self, from_identifier: str | Identifier, to_identifier: str | Identifier) -> Table:
+      600          """Rename a fully classified table name.
+      601  
+      602          This method can only rename Iceberg tables in AWS Glue.
+      603  
+      604          Args:
+      605              from_identifier: Existing table identifier.
+      606              to_identifier: New table identifier.
+      607  
+      608          Returns:
+      609              Table: the updated table instance with its metadata.
+      610  
+      611          Raises:
+      612              ValueError: When from table identifier is invalid.
+      613              NoSuchTableError: When a table with the name does not exist.
+      614              NoSuchIcebergTableError: When from table is not a valid iceberg table.
+      615              NoSuchPropertyException: When from table miss some required properties.
+      616              NoSuchNamespaceError: When the destination namespace doesn't exist.
+      617          """
+      618          from_database_name, from_table_name = self.identifier_to_database_and_table(from_identifier, NoSuchTableError)
+      619          to_database_name, to_table_name = self.identifier_to_database_and_table(to_identifier)
+      620          try:
+      621              get_table_response = self.glue.get_table(DatabaseName=from_database_name, Name=from_table_name)
+      622          except self.glue.exceptions.EntityNotFoundException as e:
+      623              raise NoSuchTableError(f"Table does not exist: {from_database_name}.{from_table_name}") from e
+      624  
+      625          glue_table = get_table_response["Table"]
+      626  
+      627          try:
+      628              # verify that from_identifier is a valid iceberg table
+      629              self._convert_glue_to_iceberg(glue_table=glue_table)
+      630          except NoSuchPropertyException as e:
+      631              raise NoSuchPropertyException(
+      632                  f"Failed to rename table {from_database_name}.{from_table_name} since it is missing required properties"
+      633              ) from e
+      634          except NoSuchIcebergTableError as e:
+      635              raise NoSuchIcebergTableError(
+      636                  f"Failed to rename table {from_database_name}.{from_table_name} since it is not a valid iceberg table"
+      637              ) from e
+      638  
+      639          rename_table_input = _construct_rename_table_input(to_table_name=to_table_name, glue_table=glue_table)
+      640          self._create_glue_table(database_name=to_database_name, table_name=to_table_name, table_input=rename_table_input)
+      641  
+      642          try:
+      643              self.drop_table(from_identifier)
+      644          except Exception as e:
+      645              log_message = f"Failed to drop old table {from_database_name}.{from_table_name}. "
+      646  
+      647              try:
+      648                  self.drop_table(to_identifier)
+      649                  log_message += f"Rolled back table creation for {to_database_name}.{to_table_name}."
+      650              except NoSuchTableError:
+      651                  log_message += (
+      652                      f"Failed to roll back table creation for {to_database_name}.{to_table_name}. Please clean up manually"
+      653                  )
+      654  
+      655              raise ValueError(log_message) from e
+      656  
+      657          return self.load_table(to_identifier)
+      659      def create_namespace(self, namespace: str | Identifier, properties: Properties = EMPTY_DICT) -> None:
+      660          """Create a namespace in the catalog.
+      661  
+      662          Args:
+      663              namespace: Namespace identifier.
+      664              properties: A string dictionary of properties for the given namespace.
+      665  
+      666          Raises:
+      667              ValueError: If the identifier is invalid.
+      668              AlreadyExistsError: If a namespace with the given name already exists.
+      669          """
+      670          database_name = self.identifier_to_database(namespace)
+      671          try:
+      672              self.glue.create_database(DatabaseInput=_construct_database_input(database_name, properties))
+      673          except self.glue.exceptions.AlreadyExistsException as e:
+      674              raise NamespaceAlreadyExistsError(f"Database {database_name} already exists") from e
+      676      def drop_namespace(self, namespace: str | Identifier) -> None:
+      677          """Drop a namespace.
+      678  
+      679          A Glue namespace can only be dropped if it is empty.
+      680  
+      681          Args:
+      682              namespace: Namespace identifier.
+      683  
+      684          Raises:
+      685              NoSuchNamespaceError: If a namespace with the given name does not exist, or the identifier is invalid.
+      686              NamespaceNotEmptyError: If the namespace is not empty.
+      687          """
+      688          database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+      689          try:
+      690              table_list_response = self.glue.get_tables(DatabaseName=database_name)
+      691              table_list = table_list_response["TableList"]
+      692          except self.glue.exceptions.EntityNotFoundException as e:
+      693              raise NoSuchNamespaceError(f"Database does not exist: {database_name}") from e
+      694  
+      695          if len(table_list) > 0:
+      696              first_table = table_list[0]
+      697              if self.__is_iceberg_table(first_table):
+      698                  raise NamespaceNotEmptyError(f"Cannot drop namespace {database_name} because it still contains Iceberg tables")
+      699              else:
+      700                  raise NamespaceNotEmptyError(
+      701                      f"Cannot drop namespace {database_name} because it still contains non-Iceberg tables"
+      702                  )
+      703          self.glue.delete_database(Name=database_name)
+      705      def list_tables(self, namespace: str | Identifier) -> list[Identifier]:
+      706          """List Iceberg tables under the given namespace in the catalog.
+      707  
+      708          Args:
+      709              namespace (str | Identifier): Namespace identifier to search.
+      710  
+      711          Returns:
+      712              List[Identifier]: list of table identifiers.
+      713  
+      714          Raises:
+      715              NoSuchNamespaceError: If a namespace with the given name does not exist, or the identifier is invalid.
+      716          """
+      717          database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+      718          table_list: list[TableTypeDef] = []
+      719          next_token: str | None = None
+      720          try:
+      721              while True:
+      722                  table_list_response = (
+      723                      self.glue.get_tables(DatabaseName=database_name)
+      724                      if not next_token
+      725                      else self.glue.get_tables(DatabaseName=database_name, NextToken=next_token)
+      726                  )
+      727                  table_list.extend(table_list_response["TableList"])
+      728                  next_token = table_list_response.get("NextToken")
+      729                  if not next_token:
+      730                      break
+      731  
+      732          except self.glue.exceptions.EntityNotFoundException as e:
+      733              raise NoSuchNamespaceError(f"Database does not exist: {database_name}") from e
+      734          return [(database_name, table["Name"]) for table in table_list if self.__is_iceberg_table(table)]
+      736      def list_namespaces(self, namespace: str | Identifier = ()) -> list[Identifier]:
+      737          """List namespaces from the given namespace. If not given, list top-level namespaces from the catalog.
+      738  
+      739          Returns:
+      740              List[Identifier]: a List of namespace identifiers.
+      741          """
+      742          # Hierarchical namespace is not supported. Return an empty list
+      743          if namespace:
+      744              return []
+      745  
+      746          database_list: list[DatabaseTypeDef] = []
+      747          next_token: str | None = None
+      748  
+      749          while True:
+      750              databases_response = self.glue.get_databases() if not next_token else self.glue.get_databases(NextToken=next_token)
+      751              database_list.extend(databases_response["DatabaseList"])
+      752              next_token = databases_response.get("NextToken")
+      753              if not next_token:
+      754                  break
+      755  
+      756          return [self.identifier_to_tuple(database["Name"]) for database in database_list]
+      758      def load_namespace_properties(self, namespace: str | Identifier) -> Properties:
+      759          """Get properties for a namespace.
+      760  
+      761          Args:
+      762              namespace: Namespace identifier.
+      763  
+      764          Returns:
+      765              Properties: Properties for the given namespace.
+      766  
+      767          Raises:
+      768              NoSuchNamespaceError: If a namespace with the given name does not exist, or identifier is invalid.
+      769          """
+      770          database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+      771          try:
+      772              database_response = self.glue.get_database(Name=database_name)
+      773          except self.glue.exceptions.EntityNotFoundException as e:
+      774              raise NoSuchNamespaceError(f"Database does not exist: {database_name}") from e
+      775          except self.glue.exceptions.InvalidInputException as e:
+      776              raise NoSuchNamespaceError(f"Invalid input for namespace {database_name}") from e
+      777  
+      778          database = database_response["Database"]
+      779  
+      780          properties = dict(database.get("Parameters", {}))
+      781          if "LocationUri" in database:
+      782              properties["location"] = database["LocationUri"]
+      783          if "Description" in database:
+      784              properties["Description"] = database["Description"]
+      785  
+      786          return properties
+      788      def update_namespace_properties(
+      789          self, namespace: str | Identifier, removals: set[str] | None = None, updates: Properties = EMPTY_DICT
+      790      ) -> PropertiesUpdateSummary:
+      791          """Remove provided property keys and updates properties for a namespace.
+      792  
+      793          Args:
+      794              namespace: Namespace identifier.
+      795              removals: Set of property keys that need to be removed. Optional Argument.
+      796              updates: Properties to be updated for the given namespace.
+      797  
+      798          Raises:
+      799              NoSuchNamespaceError: If a namespace with the given name does not exist， or identifier is invalid.
+      800              ValueError: If removals and updates have overlapping keys.
+      801          """
+      802          current_properties = self.load_namespace_properties(namespace=namespace)
+      803          properties_update_summary, updated_properties = self._get_updated_props_and_update_summary(
+      804              current_properties=current_properties, removals=removals, updates=updates
+      805          )
+      806  
+      807          database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+      808          self.glue.update_database(Name=database_name, DatabaseInput=_construct_database_input(database_name, updated_properties))
+      809  
+      810          return properties_update_summary
+      812      def list_views(self, namespace: str | Identifier) -> list[Identifier]:
+      813          raise NotImplementedError
+      815      def drop_view(self, identifier: str | Identifier) -> None:
+      816          raise NotImplementedError
+      818      def view_exists(self, identifier: str | Identifier) -> bool:
+      819          raise NotImplementedError
+
+---------- IMPLEMENTER pyiceberg.catalog.hive:HiveCatalog  stubs=3/15 ----------
+      297  class HiveCatalog(MetastoreCatalog):
+      391      def create_table(
+      392          self,
+      393          identifier: str | Identifier,
+      394          schema: Union[Schema, "pa.Schema"],
+      395          location: str | None = None,
+      396          partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+      397          sort_order: SortOrder = UNSORTED_SORT_ORDER,
+      398          properties: Properties = EMPTY_DICT,
+      399      ) -> Table:
+      400          """Create a table.
+      401  
+      402          Args:
+      403              identifier: Table identifier.
+      404              schema: Table's schema.
+      405              location: Location for the table. Optional Argument.
+      406              partition_spec: PartitionSpec for the table.
+      407              sort_order: SortOrder for the table.
+      408              properties: Table properties that can be a string based dictionary.
+      409  
+      410          Returns:
+      411              Table: the created table instance.
+      412  
+      413          Raises:
+      414              AlreadyExistsError: If a table with the name already exists.
+      415              ValueError: If the identifier is invalid.
+      416          """
+      417          properties = {**DEFAULT_PROPERTIES, **properties}
+      418          staged_table = self._create_staged_table(
+      419              identifier=identifier,
+      420              schema=schema,
+      421              location=location,
+      422              partition_spec=partition_spec,
+      423              sort_order=sort_order,
+      424              properties=properties,
+      425          )
+      426          database_name, table_name = self.identifier_to_database_and_table(identifier)
+      427  
+      428          self._write_metadata(staged_table.metadata, staged_table.io, staged_table.metadata_location)
+      429          tbl = self._convert_iceberg_into_hive(staged_table)
+      430  
+      431          with self._client as open_client:
+      432              self._create_hive_table(open_client, tbl)
+      433              hive_table = open_client.get_table(dbname=database_name, tbl_name=table_name)
+      434  
+      435          return self._convert_hive_into_iceberg(hive_table)
+      437      def register_table(self, identifier: str | Identifier, metadata_location: str) -> Table:
+      438          """Register a new table using existing metadata.
+      439  
+      440          Args:
+      441              identifier (Union[str, Identifier]): Table identifier for the table
+      442              metadata_location (str): The location to the metadata
+      443  
+      444          Returns:
+      445              Table: The newly registered table
+      446  
+      447          Raises:
+      448              TableAlreadyExistsError: If the table already exists
+      449          """
+      450          database_name, table_name = self.identifier_to_database_and_table(identifier)
+      451          io = self._load_file_io(location=metadata_location)
+      452          metadata_file = io.new_input(metadata_location)
+      453          staged_table = StagedTable(
+      454              identifier=(database_name, table_name),
+      455              metadata=FromInputFile.table_metadata(metadata_file),
+      456              metadata_location=metadata_location,
+      457              io=io,
+      458              catalog=self,
+      459          )
+      460          tbl = self._convert_iceberg_into_hive(staged_table)
+      461          with self._client as open_client:
+      462              self._create_hive_table(open_client, tbl)
+      463              hive_table = open_client.get_table(dbname=database_name, tbl_name=table_name)
+      464  
+      465          return self._convert_hive_into_iceberg(hive_table)
+      467      def list_views(self, namespace: str | Identifier) -> list[Identifier]:
+      468          raise NotImplementedError
+      470      def view_exists(self, identifier: str | Identifier) -> bool:
+      471          raise NotImplementedError
+      502      def commit_table(
+      503          self, table: Table, requirements: tuple[TableRequirement, ...], updates: tuple[TableUpdate, ...]
+      504      ) -> CommitTableResponse:
+      505          """Commit updates to a table.
+      506  
+      507          Args:
+      508              table (Table): The table to be updated.
+      509              requirements: (Tuple[TableRequirement, ...]): Table requirements.
+      510              updates: (Tuple[TableUpdate, ...]): Table updates.
+      511  
+      512          Returns:
+      513              CommitTableResponse: The updated metadata.
+      514  
+      515          Raises:
+      516              NoSuchTableError: If a table with the given identifier does not exist.
+      517              CommitFailedException: Requirement not met, or a conflict with a concurrent commit.
+      518          """
+      519          table_identifier = table.name()
+      520          database_name, table_name = self.identifier_to_database_and_table(table_identifier, NoSuchTableError)
+      521          # commit to hive
+      522          # https://github.com/apache/hive/blob/master/standalone-metastore/metastore-common/src/main/thrift/hive_metastore.thrift#L1232
+      523          with self._client as open_client:
+      524              lock: LockResponse = open_client.lock(self._create_lock_request(database_name, table_name))
+      525  
+      526              try:
+      527                  if lock.state != LockState.ACQUIRED:
+      528                      if lock.state == LockState.WAITING:
+      529                          self._wait_for_lock(database_name, table_name, lock.lockid, open_client)
+      530                      else:
+      531                          raise CommitFailedException(f"Failed to acquire lock for {table_identifier}, state: {lock.state}")
+      532  
+      533                  hive_table: HiveTable | None
+      534                  current_table: Table | None
+      535                  try:
+      536                      hive_table = self._get_hive_table(open_client, database_name, table_name)
+      537                      current_table = self._convert_hive_into_iceberg(hive_table)
+      538                  except NoSuchTableError:
+      539                      hive_table = None
+      540                      current_table = None
+      541  
+      542                  updated_staged_table = self._update_and_stage_table(current_table, table_identifier, requirements, updates)
+      543                  if current_table and updated_staged_table.metadata == current_table.metadata:
+      544                      # no changes, do nothing
+      545                      return CommitTableResponse(metadata=current_table.metadata, metadata_location=current_table.metadata_location)
+      546                  self._write_metadata(
+      547                      metadata=updated_staged_table.metadata,
+      548                      io=updated_staged_table.io,
+      549                      metadata_path=updated_staged_table.metadata_location,
+      550                  )
+      551  
+      552                  if hive_table and current_table:
+      553                      # Table exists, update it.
+      554  
+      555                      # Note on table properties:
+      556                      # - Iceberg table properties are stored in both HMS and Iceberg metadata JSON.
+      557                      # - Updates are reflected in both locations
+      558                      # - Existing HMS table properties (set by external systems like Hive/Spark) are preserved.
+      559                      #
+      560                      # While it is possible to modify HMS table properties through this API, it is not recommended:
+      561                      # - Mixing HMS-specific properties in Iceberg metadata can cause confusion
+       ... truncated at 60 lines ...
+      614      def load_table(self, identifier: str | Identifier) -> Table:
+      615          """Load the table's metadata and return the table instance.
+      616  
+      617          You can also use this method to check for table existence using 'try catalog.table() except TableNotFoundError'.
+      618          Note: This method doesn't scan data stored in the table.
+      619  
+      620          Args:
+      621              identifier: Table identifier.
+      622  
+      623          Returns:
+      624              Table: the table instance with its metadata.
+      625  
+      626          Raises:
+      627              NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
+      628          """
+      629          database_name, table_name = self.identifier_to_database_and_table(identifier, NoSuchTableError)
+      630  
+      631          with self._client as open_client:
+      632              hive_table = self._get_hive_table(open_client, database_name, table_name)
+      633  
+      634          return self._convert_hive_into_iceberg(hive_table)
+      636      def drop_table(self, identifier: str | Identifier) -> None:
+      637          """Drop a table.
+      638  
+      639          Args:
+      640              identifier: Table identifier.
+      641  
+      642          Raises:
+      643              NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
+      644          """
+      645          database_name, table_name = self.identifier_to_database_and_table(identifier, NoSuchTableError)
+      646          try:
+      647              with self._client as open_client:
+      648                  open_client.drop_table(dbname=database_name, name=table_name, deleteData=False)
+      649          except NoSuchObjectException as e:
+      650              # When the namespace doesn't exist, it throws the same error
+      651              raise NoSuchTableError(f"Table does not exists: {table_name}") from e
+      657      def rename_table(self, from_identifier: str | Identifier, to_identifier: str | Identifier) -> Table:
+      658          """Rename a fully classified table name.
+      659  
+      660          Args:
+      661              from_identifier: Existing table identifier.
+      662              to_identifier: New table identifier.
+      663  
+      664          Returns:
+      665              Table: the updated table instance with its metadata.
+      666  
+      667          Raises:
+      668              ValueError: When from table identifier is invalid.
+      669              NoSuchTableError: When a table with the name does not exist.
+      670              NoSuchNamespaceError: When the destination namespace doesn't exist.
+      671              TableAlreadyExistsError: When the destination table already exists.
+      672          """
+      673          from_database_name, from_table_name = self.identifier_to_database_and_table(from_identifier, NoSuchTableError)
+      674          to_database_name, to_table_name = self.identifier_to_database_and_table(to_identifier)
+      675  
+      676          if self.table_exists(to_identifier):
+      677              raise TableAlreadyExistsError(f"Table already exists: {to_table_name}")
+      678  
+      679          try:
+      680              with self._client as open_client:
+      681                  tbl = open_client.get_table(dbname=from_database_name, tbl_name=from_table_name)
+      682                  tbl.dbName = to_database_name
+      683                  tbl.tableName = to_table_name
+      684                  open_client.alter_table_with_environment_context(
+      685                      dbname=from_database_name,
+      686                      tbl_name=from_table_name,
+      687                      new_tbl=tbl,
+      688                      environment_context=EnvironmentContext(properties={DO_NOT_UPDATE_STATS: DO_NOT_UPDATE_STATS_DEFAULT}),
+      689                  )
+      690          except NoSuchObjectException as e:
+      691              raise NoSuchTableError(f"Table does not exist: {from_table_name}") from e
+      692          except InvalidOperationException as e:
+      693              raise NoSuchNamespaceError(f"Database does not exists: {to_database_name}") from e
+      694          return self.load_table(to_identifier)
+      696      def create_namespace(self, namespace: str | Identifier, properties: Properties = EMPTY_DICT) -> None:
+      697          """Create a namespace in the catalog.
+      698  
+      699          Args:
+      700              namespace: Namespace identifier.
+      701              properties: A string dictionary of properties for the given namespace.
+      702  
+      703          Raises:
+      704              ValueError: If the identifier is invalid.
+      705              AlreadyExistsError: If a namespace with the given name already exists.
+      706          """
+      707          database_name = self.identifier_to_database(namespace)
+      708          hive_database = HiveDatabase(name=database_name, parameters=properties)
+      709  
+      710          try:
+      711              with self._client as open_client:
+      712                  open_client.create_database(_annotate_namespace(hive_database, properties))
+      713          except AlreadyExistsException as e:
+      714              raise NamespaceAlreadyExistsError(f"Database {database_name} already exists") from e
+      716      def drop_namespace(self, namespace: str | Identifier) -> None:
+      717          """Drop a namespace.
+      718  
+      719          Args:
+      720              namespace: Namespace identifier.
+      721  
+      722          Raises:
+      723              NoSuchNamespaceError: If a namespace with the given name does not exist, or the identifier is invalid.
+      724              NamespaceNotEmptyError: If the namespace is not empty.
+      725          """
+      726          database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+      727          try:
+      728              with self._client as open_client:
+      729                  open_client.drop_database(database_name, deleteData=False, cascade=False)
+      730          except InvalidOperationException as e:
+      731              raise NamespaceNotEmptyError(f"Database {database_name} is not empty") from e
+      732          except MetaException as e:
+      733              raise NoSuchNamespaceError(f"Database does not exists: {database_name}") from e
+      735      def list_tables(self, namespace: str | Identifier) -> list[Identifier]:
+      736          """List Iceberg tables under the given namespace in the catalog.
+      737  
+      738          When the database doesn't exist, it will just return an empty list.
+      739  
+      740          Args:
+      741              namespace: Database to list.
+      742  
+      743          Returns:
+      744              List[Identifier]: list of table identifiers.
+      745  
+      746          Raises:
+      747              NoSuchNamespaceError: If a namespace with the given name does not exist, or the identifier is invalid.
+      748          """
+      749          database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+      750          with self._client as open_client:
+      751              return [
+      752                  (database_name, table.tableName)
+      753                  for table in open_client.get_table_objects_by_name(
+      754                      dbname=database_name, tbl_names=open_client.get_all_tables(db_name=database_name)
+      755                  )
+      756                  if table.parameters.get(TABLE_TYPE, "").lower() == ICEBERG
+      757              ]
+      759      def list_namespaces(self, namespace: str | Identifier = ()) -> list[Identifier]:
+      760          """List namespaces from the given namespace. If not given, list top-level namespaces from the catalog.
+      761  
+      762          Returns:
+      763              List[Identifier]: a List of namespace identifiers.
+      764          """
+      765          # Hierarchical namespace is not supported. Return an empty list
+      766          if namespace:
+      767              return []
+      768  
+      769          with self._client as open_client:
+      770              return list(map(self.identifier_to_tuple, open_client.get_all_databases()))
+      772      def load_namespace_properties(self, namespace: str | Identifier) -> Properties:
+      773          """Get properties for a namespace.
+      774  
+      775          Args:
+      776              namespace: Namespace identifier.
+      777  
+      778          Returns:
+      779              Properties: Properties for the given namespace.
+      780  
+      781          Raises:
+      782              NoSuchNamespaceError: If a namespace with the given name does not exist, or identifier is invalid.
+      783          """
+      784          database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+      785          try:
+      786              with self._client as open_client:
+      787                  database = open_client.get_database(name=database_name)
+      788                  properties = database.parameters
+      789                  properties[LOCATION] = database.locationUri
+      790                  if comment := database.description:
+      791                      properties[COMMENT] = comment
+      792                  return properties
+      793          except NoSuchObjectException as e:
+      794              raise NoSuchNamespaceError(f"Database does not exists: {database_name}") from e
+      796      def update_namespace_properties(
+      797          self, namespace: str | Identifier, removals: set[str] | None = None, updates: Properties = EMPTY_DICT
+      798      ) -> PropertiesUpdateSummary:
+      799          """Remove provided property keys and update properties for a namespace.
+      800  
+      801          Args:
+      802              namespace: Namespace identifier.
+      803              removals: Set of property keys that need to be removed. Optional Argument.
+      804              updates: Properties to be updated for the given namespace.
+      805  
+      806          Raises:
+      807              NoSuchNamespaceError: If a namespace with the given name does not exist
+      808              ValueError: If removals and updates have overlapping keys.
+      809          """
+      810          self._check_for_overlap(updates=updates, removals=removals)
+      811          database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+      812          with self._client as open_client:
+      813              try:
+      814                  database = open_client.get_database(database_name)
+      815                  parameters = database.parameters
+      816              except NoSuchObjectException as e:
+      817                  raise NoSuchNamespaceError(f"Database does not exists: {database_name}") from e
+      818  
+      819              removed: set[str] = set()
+      820              updated: set[str] = set()
+      821  
+      822              if removals:
+      823                  for key in removals:
+      824                      if key in parameters:
+      825                          parameters.pop(key)
+      826                          removed.add(key)
+      827              if updates:
+      828                  for key, value in updates.items():
+      829                      parameters[key] = value
+      830                      updated.add(key)
+      831  
+      832              open_client.alter_database(database_name, _annotate_namespace(database, parameters))
+      833  
+      834          expected_to_change = (removals or set()).difference(removed)
+      835  
+      836          return PropertiesUpdateSummary(removed=list(removed or []), updated=list(updated or []), missing=list(expected_to_change))
+      838      def drop_view(self, identifier: str | Identifier) -> None:
+      839          raise NotImplementedError
+
+---------- IMPLEMENTER pyiceberg.catalog.memory:InMemoryCatalog  stubs=3/15 ----------
+       22  class InMemoryCatalog(SqlCatalog):
+      (does not define: commit_table, create_namespace, create_table, drop_namespace, drop_table, drop_view, list_namespaces, list_tables, list_views, load_namespace_properties, load_table, register_table, rename_table, update_namespace_properties, view_exists; inherited or absent)
+
+---------- IMPLEMENTER pyiceberg.catalog.sql:SqlCatalog  stubs=3/15 ----------
+      105  class SqlCatalog(MetastoreCatalog):
+      172      def create_table(
+      173          self,
+      174          identifier: str | Identifier,
+      175          schema: Union[Schema, "pa.Schema"],
+      176          location: str | None = None,
+      177          partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+      178          sort_order: SortOrder = UNSORTED_SORT_ORDER,
+      179          properties: Properties = EMPTY_DICT,
+      180      ) -> Table:
+      181          """
+      182          Create an Iceberg table.
+      183  
+      184          Args:
+      185              identifier: Table identifier.
+      186              schema: Table's schema.
+      187              location: Location for the table. Optional Argument.
+      188              partition_spec: PartitionSpec for the table.
+      189              sort_order: SortOrder for the table.
+      190              properties: Table properties that can be a string based dictionary.
+      191  
+      192          Returns:
+      193              Table: the created table instance.
+      194  
+      195          Raises:
+      196              AlreadyExistsError: If a table with the name already exists.
+      197              ValueError: If the identifier is invalid, or no path is given to store metadata.
+      198  
+      199          """
+      200          schema: Schema = self._convert_schema_if_needed(  # type: ignore
+      201              schema,
+      202              int(properties.get(TableProperties.FORMAT_VERSION, TableProperties.DEFAULT_FORMAT_VERSION)),  # type: ignore
+      203          )
+      204  
+      205          namespace_identifier = Catalog.namespace_from(identifier)
+      206          table_name = Catalog.table_name_from(identifier)
+      207          if not self.namespace_exists(namespace_identifier):
+      208              raise NoSuchNamespaceError(f"Namespace does not exist: {namespace_identifier}")
+      209  
+      210          namespace = Catalog.namespace_to_string(namespace_identifier)
+      211          location = self._resolve_table_location(location, namespace, table_name)
+      212          location_provider = load_location_provider(table_location=location, table_properties=properties)
+      213          metadata_location = location_provider.new_table_metadata_file_location()
+      214          metadata = new_table_metadata(
+      215              location=location, schema=schema, partition_spec=partition_spec, sort_order=sort_order, properties=properties
+      216          )
+      217          io = load_file_io(properties=self.properties, location=metadata_location)
+      218          self._write_metadata(metadata, io, metadata_location)
+      219  
+      220          with Session(self.engine) as session:
+      221              try:
+      222                  session.add(
+      223                      IcebergTables(
+      224                          catalog_name=self.name,
+      225                          table_namespace=namespace,
+      226                          table_name=table_name,
+      227                          metadata_location=metadata_location,
+      228                          previous_metadata_location=None,
+      229                      )
+      230                  )
+      231                  session.commit()
+       ... truncated at 60 lines ...
+      237      def register_table(self, identifier: str | Identifier, metadata_location: str) -> Table:
+      238          """Register a new table using existing metadata.
+      239  
+      240          Args:
+      241              identifier (Union[str, Identifier]): Table identifier for the table
+      242              metadata_location (str): The location to the metadata
+      243  
+      244          Returns:
+      245              Table: The newly registered table
+      246  
+      247          Raises:
+      248              TableAlreadyExistsError: If the table already exists
+      249              NoSuchNamespaceError: If namespace does not exist
+      250          """
+      251          namespace_tuple = Catalog.namespace_from(identifier)
+      252          namespace = Catalog.namespace_to_string(namespace_tuple)
+      253          table_name = Catalog.table_name_from(identifier)
+      254          if not self.namespace_exists(namespace):
+      255              raise NoSuchNamespaceError(f"Namespace does not exist: {namespace}")
+      256  
+      257          with Session(self.engine) as session:
+      258              try:
+      259                  session.add(
+      260                      IcebergTables(
+      261                          catalog_name=self.name,
+      262                          table_namespace=namespace,
+      263                          table_name=table_name,
+      264                          metadata_location=metadata_location,
+      265                          previous_metadata_location=None,
+      266                      )
+      267                  )
+      268                  session.commit()
+      269              except IntegrityError as e:
+      270                  raise TableAlreadyExistsError(f"Table {namespace}.{table_name} already exists") from e
+      271  
+      272          return self.load_table(identifier=identifier)
+      274      def load_table(self, identifier: str | Identifier) -> Table:
+      275          """Load the table's metadata and return the table instance.
+      276  
+      277          You can also use this method to check for table existence using 'try catalog.table() except NoSuchTableError'.
+      278          Note: This method doesn't scan data stored in the table.
+      279  
+      280          Args:
+      281              identifier (str | Identifier): Table identifier.
+      282  
+      283          Returns:
+      284              Table: the table instance with its metadata.
+      285  
+      286          Raises:
+      287              NoSuchTableError: If a table with the name does not exist.
+      288          """
+      289          namespace_tuple = Catalog.namespace_from(identifier)
+      290          namespace = Catalog.namespace_to_string(namespace_tuple)
+      291          table_name = Catalog.table_name_from(identifier)
+      292          with Session(self.engine) as session:
+      293              stmt = select(IcebergTables).where(
+      294                  IcebergTables.catalog_name == self.name,
+      295                  IcebergTables.table_namespace == namespace,
+      296                  IcebergTables.table_name == table_name,
+      297              )
+      298              result = session.scalar(stmt)
+      299          if result:
+      300              return self._convert_orm_to_iceberg(result)
+      301          raise NoSuchTableError(f"Table does not exist: {namespace}.{table_name}")
+      303      def drop_table(self, identifier: str | Identifier) -> None:
+      304          """Drop a table.
+      305  
+      306          Args:
+      307              identifier (str | Identifier): Table identifier.
+      308  
+      309          Raises:
+      310              NoSuchTableError: If a table with the name does not exist.
+      311          """
+      312          namespace_tuple = Catalog.namespace_from(identifier)
+      313          namespace = Catalog.namespace_to_string(namespace_tuple)
+      314          table_name = Catalog.table_name_from(identifier)
+      315          with Session(self.engine) as session:
+      316              if self.engine.dialect.supports_sane_rowcount:
+      317                  res = session.execute(
+      318                      delete(IcebergTables).where(
+      319                          IcebergTables.catalog_name == self.name,
+      320                          IcebergTables.table_namespace == namespace,
+      321                          IcebergTables.table_name == table_name,
+      322                      )
+      323                  )
+      324                  if res.rowcount < 1:
+      325                      raise NoSuchTableError(f"Table does not exist: {namespace}.{table_name}")
+      326              else:
+      327                  try:
+      328                      tbl = (
+      329                          session.query(IcebergTables)
+      330                          .with_for_update(of=IcebergTables)
+      331                          .filter(
+      332                              IcebergTables.catalog_name == self.name,
+      333                              IcebergTables.table_namespace == namespace,
+      334                              IcebergTables.table_name == table_name,
+      335                          )
+      336                          .one()
+      337                      )
+      338                      session.delete(tbl)
+      339                  except NoResultFound as e:
+      340                      raise NoSuchTableError(f"Table does not exist: {namespace}.{table_name}") from e
+      341              session.commit()
+      343      def rename_table(self, from_identifier: str | Identifier, to_identifier: str | Identifier) -> Table:
+      344          """Rename a fully classified table name.
+      345  
+      346          Args:
+      347              from_identifier (str | Identifier): Existing table identifier.
+      348              to_identifier (str | Identifier): New table identifier.
+      349  
+      350          Returns:
+      351              Table: the updated table instance with its metadata.
+      352  
+      353          Raises:
+      354              NoSuchTableError: If a table with the name does not exist.
+      355              TableAlreadyExistsError: If a table with the new name already exist.
+      356              NoSuchNamespaceError: If the target namespace does not exist.
+      357          """
+      358          from_namespace_tuple = Catalog.namespace_from(from_identifier)
+      359          from_namespace = Catalog.namespace_to_string(from_namespace_tuple)
+      360          from_table_name = Catalog.table_name_from(from_identifier)
+      361          to_namespace_tuple = Catalog.namespace_from(to_identifier)
+      362          to_namespace = Catalog.namespace_to_string(to_namespace_tuple)
+      363          to_table_name = Catalog.table_name_from(to_identifier)
+      364          if not self.namespace_exists(to_namespace):
+      365              raise NoSuchNamespaceError(f"Namespace does not exist: {to_namespace}")
+      366          with Session(self.engine) as session:
+      367              try:
+      368                  if self.engine.dialect.supports_sane_rowcount:
+      369                      stmt = (
+      370                          update(IcebergTables)
+      371                          .where(
+      372                              IcebergTables.catalog_name == self.name,
+      373                              IcebergTables.table_namespace == from_namespace,
+      374                              IcebergTables.table_name == from_table_name,
+      375                          )
+      376                          .values(table_namespace=to_namespace, table_name=to_table_name)
+      377                      )
+      378                      result = session.execute(stmt)
+      379                      if result.rowcount < 1:
+      380                          raise NoSuchTableError(f"Table does not exist: {from_table_name}")
+      381                  else:
+      382                      try:
+      383                          tbl = (
+      384                              session.query(IcebergTables)
+      385                              .with_for_update(of=IcebergTables)
+      386                              .filter(
+      387                                  IcebergTables.catalog_name == self.name,
+      388                                  IcebergTables.table_namespace == from_namespace,
+      389                                  IcebergTables.table_name == from_table_name,
+      390                              )
+      391                              .one()
+      392                          )
+      393                          tbl.table_namespace = to_namespace
+      394                          tbl.table_name = to_table_name
+      395                      except NoResultFound as e:
+      396                          raise NoSuchTableError(f"Table does not exist: {from_table_name}") from e
+      397                  session.commit()
+      398              except IntegrityError as e:
+      399                  raise TableAlreadyExistsError(f"Table {to_namespace}.{to_table_name} already exists") from e
+      400          return self.load_table(to_identifier)
+      402      def commit_table(
+      403          self, table: Table, requirements: tuple[TableRequirement, ...], updates: tuple[TableUpdate, ...]
+      404      ) -> CommitTableResponse:
+      405          """Commit updates to a table.
+      406  
+      407          Args:
+      408              table (Table): The table to be updated.
+      409              requirements: (Tuple[TableRequirement, ...]): Table requirements.
+      410              updates: (Tuple[TableUpdate, ...]): Table updates.
+      411  
+      412          Returns:
+      413              CommitTableResponse: The updated metadata.
+      414  
+      415          Raises:
+      416              NoSuchTableError: If a table with the given identifier does not exist.
+      417              CommitFailedException: Requirement not met, or a conflict with a concurrent commit.
+      418          """
+      419          table_identifier = table.name()
+      420          namespace_tuple = Catalog.namespace_from(table_identifier)
+      421          namespace = Catalog.namespace_to_string(namespace_tuple)
+      422          table_name = Catalog.table_name_from(table_identifier)
+      423  
+      424          current_table: Table | None
+      425          try:
+      426              current_table = self.load_table(table_identifier)
+      427          except NoSuchTableError:
+      428              current_table = None
+      429  
+      430          updated_staged_table = self._update_and_stage_table(current_table, table.name(), requirements, updates)
+      431          if current_table and updated_staged_table.metadata == current_table.metadata:
+      432              # no changes, do nothing
+      433              return CommitTableResponse(metadata=current_table.metadata, metadata_location=current_table.metadata_location)
+      434          self._write_metadata(
+      435              metadata=updated_staged_table.metadata,
+      436              io=updated_staged_table.io,
+      437              metadata_path=updated_staged_table.metadata_location,
+      438          )
+      439  
+      440          with Session(self.engine) as session:
+      441              if current_table:
+      442                  # table exists, update it
+      443                  if self.engine.dialect.supports_sane_rowcount:
+      444                      stmt = (
+      445                          update(IcebergTables)
+      446                          .where(
+      447                              IcebergTables.catalog_name == self.name,
+      448                              IcebergTables.table_namespace == namespace,
+      449                              IcebergTables.table_name == table_name,
+      450                              IcebergTables.metadata_location == current_table.metadata_location,
+      451                          )
+      452                          .values(
+      453                              metadata_location=updated_staged_table.metadata_location,
+      454                              previous_metadata_location=current_table.metadata_location,
+      455                          )
+      456                      )
+      457                      result = session.execute(stmt)
+      458                      if result.rowcount < 1:
+      459                          raise CommitFailedException(f"Table has been updated by another process: {namespace}.{table_name}")
+      460                  else:
+      461                      try:
+       ... truncated at 60 lines ...
+      530      def create_namespace(self, namespace: str | Identifier, properties: Properties = EMPTY_DICT) -> None:
+      531          """Create a namespace in the catalog.
+      532  
+      533          Args:
+      534              namespace (str | Identifier): Namespace identifier.
+      535              properties (Properties): A string dictionary of properties for the given namespace.
+      536  
+      537          Raises:
+      538              NamespaceAlreadyExistsError: If a namespace with the given name already exists.
+      539          """
+      540          if self.namespace_exists(namespace):
+      541              raise NamespaceAlreadyExistsError(f"Namespace {namespace} already exists")
+      542  
+      543          if not properties:
+      544              properties = IcebergNamespaceProperties.NAMESPACE_MINIMAL_PROPERTIES
+      545          create_properties = properties if properties else IcebergNamespaceProperties.NAMESPACE_MINIMAL_PROPERTIES
+      546          with Session(self.engine) as session:
+      547              for key, value in create_properties.items():
+      548                  session.add(
+      549                      IcebergNamespaceProperties(
+      550                          catalog_name=self.name,
+      551                          namespace=Catalog.namespace_to_string(namespace, NoSuchNamespaceError),
+      552                          property_key=key,
+      553                          property_value=value,
+      554                      )
+      555                  )
+      556              session.commit()
+      558      def drop_namespace(self, namespace: str | Identifier) -> None:
+      559          """Drop a namespace.
+      560  
+      561          Args:
+      562              namespace (str | Identifier): Namespace identifier.
+      563  
+      564          Raises:
+      565              NoSuchNamespaceError: If a namespace with the given name does not exist.
+      566              NamespaceNotEmptyError: If the namespace is not empty.
+      567          """
+      568          if not self.namespace_exists(namespace):
+      569              raise NoSuchNamespaceError(f"Namespace does not exist: {namespace}")
+      570  
+      571          namespace_str = Catalog.namespace_to_string(namespace)
+      572          if tables := self.list_tables(namespace):
+      573              raise NamespaceNotEmptyError(f"Namespace {namespace_str} is not empty. {len(tables)} tables exist.")
+      574  
+      575          with Session(self.engine) as session:
+      576              session.execute(
+      577                  delete(IcebergNamespaceProperties).where(
+      578                      IcebergNamespaceProperties.catalog_name == self.name,
+      579                      IcebergNamespaceProperties.namespace == namespace_str,
+      580                  )
+      581              )
+      582              session.commit()
+      584      def list_tables(self, namespace: str | Identifier) -> list[Identifier]:
+      585          """List tables under the given namespace in the catalog.
+      586  
+      587          Args:
+      588              namespace (str | Identifier): Namespace identifier to search.
+      589  
+      590          Returns:
+      591              List[Identifier]: list of table identifiers.
+      592  
+      593          Raises:
+      594              NoSuchNamespaceError: If a namespace with the given name does not exist.
+      595          """
+      596          if namespace and not self.namespace_exists(namespace):
+      597              raise NoSuchNamespaceError(f"Namespace does not exist: {namespace}")
+      598  
+      599          namespace = Catalog.namespace_to_string(namespace)
+      600          stmt = select(IcebergTables).where(IcebergTables.catalog_name == self.name, IcebergTables.table_namespace == namespace)
+      601          with Session(self.engine) as session:
+      602              result = session.scalars(stmt)
+      603              return [(Catalog.identifier_to_tuple(table.table_namespace) + (table.table_name,)) for table in result]
+      605      def list_namespaces(self, namespace: str | Identifier = ()) -> list[Identifier]:
+      606          """List namespaces from the given namespace. If not given, list top-level namespaces from the catalog.
+      607  
+      608          Args:
+      609              namespace (str | Identifier): Namespace identifier to search.
+      610  
+      611          Returns:
+      612              List[Identifier]: a List of namespace identifiers.
+      613  
+      614          Raises:
+      615              NoSuchNamespaceError: If a namespace with the given name does not exist.
+      616          """
+      617          if namespace and not self.namespace_exists(namespace):
+      618              raise NoSuchNamespaceError(f"Namespace does not exist: {namespace}")
+      619  
+      620          table_stmt = select(IcebergTables.table_namespace).where(IcebergTables.catalog_name == self.name)
+      621          namespace_stmt = select(IcebergNamespaceProperties.namespace).where(IcebergNamespaceProperties.catalog_name == self.name)
+      622          if namespace:
+      623              namespace_like = Catalog.namespace_to_string(namespace, NoSuchNamespaceError) + "%"
+      624              table_stmt = table_stmt.where(IcebergTables.table_namespace.like(namespace_like))
+      625              namespace_stmt = namespace_stmt.where(IcebergNamespaceProperties.namespace.like(namespace_like))
+      626          stmt = union(
+      627              table_stmt,
+      628              namespace_stmt,
+      629          )
+      630          with Session(self.engine) as session:
+      631              namespace_tuple = Catalog.identifier_to_tuple(namespace)
+      632              sub_namespaces_level_length = len(namespace_tuple) + 1
+      633  
+      634              namespaces = list(
+      635                  {  # only get distinct namespaces
+      636                      ns[:sub_namespaces_level_length]  # truncate to the required level
+      637                      for ns in {Catalog.identifier_to_tuple(ns) for ns in session.execute(stmt).scalars()}
+      638                      if len(ns) >= sub_namespaces_level_length  # only get sub namespaces/children
+      639                      and ns[: sub_namespaces_level_length - 1] == namespace_tuple
+      640                      # exclude fuzzy matches when `namespace` contains `%` or `_`
+      641                  }
+      642              )
+      643  
+      644              return namespaces
+      646      def load_namespace_properties(self, namespace: str | Identifier) -> Properties:
+      647          """Get properties for a namespace.
+      648  
+      649          Args:
+      650              namespace (str | Identifier): Namespace identifier.
+      651  
+      652          Returns:
+      653              Properties: Properties for the given namespace.
+      654  
+      655          Raises:
+      656              NoSuchNamespaceError: If a namespace with the given name does not exist.
+      657          """
+      658          namespace_str = Catalog.namespace_to_string(namespace)
+      659          if not self.namespace_exists(namespace):
+      660              raise NoSuchNamespaceError(f"Namespace {namespace_str} does not exists")
+      661  
+      662          stmt = select(IcebergNamespaceProperties).where(
+      663              IcebergNamespaceProperties.catalog_name == self.name, IcebergNamespaceProperties.namespace == namespace_str
+      664          )
+      665          with Session(self.engine) as session:
+      666              result = session.scalars(stmt)
+      667              return {props.property_key: props.property_value for props in result}
+      669      def update_namespace_properties(
+      670          self, namespace: str | Identifier, removals: set[str] | None = None, updates: Properties = EMPTY_DICT
+      671      ) -> PropertiesUpdateSummary:
+      672          """Remove provided property keys and update properties for a namespace.
+      673  
+      674          Args:
+      675              namespace (str | Identifier): Namespace identifier.
+      676              removals (Set[str]): Set of property keys that need to be removed. Optional Argument.
+      677              updates (Properties): Properties to be updated for the given namespace.
+      678  
+      679          Raises:
+      680              NoSuchNamespaceError: If a namespace with the given name does not exist.
+      681              ValueError: If removals and updates have overlapping keys.
+      682          """
+      683          namespace_str = Catalog.namespace_to_string(namespace)
+      684          if not self.namespace_exists(namespace):
+      685              raise NoSuchNamespaceError(f"Namespace {namespace_str} does not exists")
+      686  
+      687          current_properties = self.load_namespace_properties(namespace=namespace)
+      688          properties_update_summary = self._get_updated_props_and_update_summary(
+      689              current_properties=current_properties, removals=removals, updates=updates
+      690          )[0]
+      691  
+      692          with Session(self.engine) as session:
+      693              if removals:
+      694                  delete_stmt = delete(IcebergNamespaceProperties).where(
+      695                      IcebergNamespaceProperties.catalog_name == self.name,
+      696                      IcebergNamespaceProperties.namespace == namespace_str,
+      697                      IcebergNamespaceProperties.property_key.in_(removals),
+      698                  )
+      699                  session.execute(delete_stmt)
+      700  
+      701              if updates:
+      702                  # SQLAlchemy does not (yet) support engine agnostic UPSERT
+      703                  # https://docs.sqlalchemy.org/en/20/orm/queryguide/dml.html#orm-upsert-statements
+      704                  # This is not a problem since it runs in a single transaction
+      705                  delete_stmt = delete(IcebergNamespaceProperties).where(
+      706                      IcebergNamespaceProperties.catalog_name == self.name,
+      707                      IcebergNamespaceProperties.namespace == namespace_str,
+      708                      IcebergNamespaceProperties.property_key.in_(set(updates.keys())),
+      709                  )
+      710                  session.execute(delete_stmt)
+      711                  insert_stmt_values = [
+      712                      {
+      713                          IcebergNamespaceProperties.catalog_name: self.name,
+      714                          IcebergNamespaceProperties.namespace: namespace_str,
+      715                          IcebergNamespaceProperties.property_key: property_key,
+      716                          IcebergNamespaceProperties.property_value: property_value,
+      717                      }
+      718                      for property_key, property_value in updates.items()
+      719                  ]
+      720                  insert_stmt = insert(IcebergNamespaceProperties).values(insert_stmt_values)
+      721                  session.execute(insert_stmt)
+      722              session.commit()
+      723          return properties_update_summary
+      725      def list_views(self, namespace: str | Identifier) -> list[Identifier]:
+      726          raise NotImplementedError
+      728      def view_exists(self, identifier: str | Identifier) -> bool:
+      729          raise NotImplementedError
+      731      def drop_view(self, identifier: str | Identifier) -> None:
+      732          raise NotImplementedError

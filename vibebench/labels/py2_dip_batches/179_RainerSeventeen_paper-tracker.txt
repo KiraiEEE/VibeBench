@@ -1,0 +1,272 @@
+row 179   RainerSeventeen/paper-tracker#45
+============================================================================
+PR RainerSeventeen/paper-tracker#45   cycles touched before=1.0 after=1.0
+QUESTION: does this PR make a module depend on a CONCRETE module in a
+          way that closes an import cycle, or otherwise invert the
+          dependency direction?
+
+NEWLY CYCLIC PAIRS involving a module this PR changed (7):
+    PaperTracker.config  <->  PaperTracker.sources.openalex.fetch
+    PaperTracker.config.app  <->  PaperTracker.sources.openalex.fetch
+    PaperTracker.config.search  <->  PaperTracker.sources.openalex.fetch
+    PaperTracker.sources.arxiv.fetch  <->  PaperTracker.sources.openalex.fetch
+    PaperTracker.sources.arxiv.source  <->  PaperTracker.sources.openalex.fetch
+    PaperTracker.sources.openalex.fetch  <->  PaperTracker.sources.openalex.source
+    PaperTracker.sources.openalex.fetch  <->  PaperTracker.sources.registry
+pre-existing cyclic pairs (NOT this PR): 21
+
+NEW IMPORT EDGES (absent from the before tree; target marked abstract or CONCRETE):
+  PaperTracker.sources.openalex.fetch -> PaperTracker.config   [CONCRETE]
+  PaperTracker.sources.openalex.fetch -> PaperTracker.core.models   [CONCRETE]
+  PaperTracker.sources.openalex.fetch -> PaperTracker.core.query   [CONCRETE]
+  PaperTracker.sources.openalex.fetch -> PaperTracker.sources.openalex.parser   [CONCRETE]
+  PaperTracker.sources.openalex.fetch -> PaperTracker.sources.openalex.query   [CONCRETE]
+  PaperTracker.sources.openalex.fetch -> PaperTracker.storage.deduplicate   [CONCRETE]
+  PaperTracker.sources.openalex.source -> PaperTracker.sources.openalex.fetch   [CONCRETE]
+  PaperTracker.sources.openalex.source -> PaperTracker.storage.deduplicate   [CONCRETE]
+
+---------- CHANGED MODULE PaperTracker.sources.openalex.fetch (src/PaperTracker/sources/openalex/fetch.py) ----------
+        1  """OpenAlex multi-round fetching strategy.
+        2  
+        3  Collects OpenAlex pages with local filtering, optional persistent deduplication,
+        4  rate limiting, and deterministic final ordering.
+        5  """
+        6  
+        7  from __future__ import annotations
+        8  
+        9  import logging
+       10  import time as time_module
+       11  from collections.abc import Callable
+       12  from datetime import datetime, timedelta, timezone
+       13  from time import time
+       14  from typing import TYPE_CHECKING, Any
+       15  
+       16  from PaperTracker.core.models import Paper
+       17  from PaperTracker.sources.openalex.parser import parse_openalex_works
+       18  from PaperTracker.sources.openalex.query import (
+       19      apply_not_filter,
+       20      apply_positive_filter,
+       21      compile_openalex_params,
+       22      extract_not_terms,
+       23  )
+       24  
+       25  if TYPE_CHECKING:
+       26      from PaperTracker.config import SearchConfig
+       27      from PaperTracker.core.query import SearchQuery
+       28      from PaperTracker.storage.deduplicate import SqliteDeduplicateStore
+       29  
+       30  logger = logging.getLogger(__name__)
+       31  
+       32  TIMEOUT_SECONDS = 120
+       33  REQUEST_INTERVAL = 3.0
+       34  
+       35  
+       36  def collect_papers_with_time_filter_openalex(
+       37      query: SearchQuery,
+       38      scope: SearchQuery | None,
+       39      policy: SearchConfig,
+       40      fetch_page_func: Callable[[dict[str, str], int, int], list[dict[str, Any]]],
+       41      dedup_store: SqliteDeduplicateStore | None,
+       42  ) -> list[Paper]:
+       43      """Collect OpenAlex papers with paged filtering and optional deduplication.
+       44  
+       45      Args:
+       46          query: Query object for this fetch task.
+       47          scope: Optional global scope merged into query compilation.
+       48          policy: Fetch policy limits and time window configuration.
+       49          fetch_page_func: Callback to fetch one page of OpenAlex works payloads.
+       50          dedup_store: Optional deduplication store.
+       51  
+       52      Returns:
+       53          Filtered and deduplicated papers sorted by unified timestamp descending,
+       54          capped at `policy.max_results`.
+       55      """
+       56      now = datetime.now(timezone.utc)
+       57      start_time = time()
+       58      params = compile_openalex_params(query=query, scope=scope)
+       59      params = _attach_publication_date_filter(params=params, search_config=policy, now=now)
+       60      not_terms = extract_not_terms(query=query, scope=scope)
+       61  
+       62      fetched_items = 0
+       63      page_index = 1
+       64      collected: list[Paper] = []
+       65  
+       66      while policy.max_fetch_items == -1 or fetched_items < policy.max_fetch_items:
+       67          elapsed = time() - start_time
+       68          if elapsed > TIMEOUT_SECONDS:
+       69              logger.warning(
+       70                  "OpenAlex fetch timeout (%.1fs > %ds) - fetched %d items; stop",
+       71                  elapsed,
+       72                  TIMEOUT_SECONDS,
+       73                  fetched_items,
+       74              )
+       75              break
+       76  
+       77          page_size = _resolve_page_size(policy=policy, fetched_items=fetched_items)
+       78          if page_size <= 0:
+       79              break
+       80  
+       81          payload_items = fetch_page_func(params, page_index, page_size)
+       82          if not payload_items:
+       83              logger.info("OpenAlex upstream exhausted at page=%d; stop", page_index)
+       84              break
+       85  
+       86          fetched_items += len(payload_items)
+       87          page_papers = parse_openalex_works(payload_items)
+       88          page_papers = apply_positive_filter(page_papers, query=query, scope=scope)
+       89          page_papers = apply_not_filter(page_papers, not_terms)
+       90          page_papers = _apply_time_window(papers=page_papers, search_config=policy, now=now)
+       91  
+       92          if dedup_store is not None:
+       93              page_papers = dedup_store.filter_new(page_papers)
+       94  
+       95          collected.extend(page_papers)
+       96  
+       97          if len(collected) >= policy.max_results:
+       98              logger.info("OpenAlex reached target max_results=%d; stop", policy.max_results)
+       99              break
+      100  
+      101          if policy.max_fetch_items != -1 and fetched_items >= policy.max_fetch_items:
+      102              logger.info("OpenAlex reached max_fetch_items=%d; stop", policy.max_fetch_items)
+      103              break
+      104  
+      105          if len(payload_items) < page_size:
+      106              logger.info("OpenAlex received short page at page=%d; stop", page_index)
+      107              break
+      108  
+      109          logger.debug("OpenAlex sleep %.1fs before next page", REQUEST_INTERVAL)
+      110          time_module.sleep(REQUEST_INTERVAL)
+      111          page_index += 1
+      112  
+      113      collected.sort(key=_resolve_sort_timestamp, reverse=True)
+      114      return collected[: policy.max_results]
+      115  
+      116  
+      117  def _resolve_page_size(*, policy: SearchConfig, fetched_items: int) -> int:
+      118      """Resolve next page size under `fetch_batch_size` and `max_fetch_items`."""
+      119      page_size = policy.fetch_batch_size
+      120      if policy.max_fetch_items == -1:
+       ... truncated at 120 lines ...
+
+---------- CHANGED MODULE PaperTracker.sources.openalex.fetch (src/PaperTracker/sources/openalex/fetch.py) ----------
+        1  """OpenAlex multi-round fetching strategy.
+        2  
+        3  Collects OpenAlex pages with local filtering, optional persistent deduplication,
+        4  rate limiting, and deterministic final ordering.
+        5  """
+        6  
+        7  from __future__ import annotations
+        8  
+        9  import logging
+       10  import time as time_module
+       11  from collections.abc import Callable
+       12  from datetime import datetime, timedelta, timezone
+       13  from time import time
+       14  from typing import TYPE_CHECKING, Any
+       15  
+       16  from PaperTracker.core.models import Paper
+       17  from PaperTracker.sources.openalex.parser import parse_openalex_works
+       18  from PaperTracker.sources.openalex.query import (
+       19      apply_not_filter,
+       20      apply_positive_filter,
+       21      compile_openalex_params,
+       22      extract_not_terms,
+       23  )
+       24  
+       25  if TYPE_CHECKING:
+       26      from PaperTracker.config import SearchConfig
+       27      from PaperTracker.core.query import SearchQuery
+       28      from PaperTracker.storage.deduplicate import SqliteDeduplicateStore
+       29  
+       30  logger = logging.getLogger(__name__)
+       31  
+       32  TIMEOUT_SECONDS = 120
+       33  REQUEST_INTERVAL = 3.0
+       34  
+       35  
+       36  def collect_papers_with_time_filter_openalex(
+       37      query: SearchQuery,
+       38      scope: SearchQuery | None,
+       39      policy: SearchConfig,
+       40      fetch_page_func: Callable[[dict[str, str], int, int], list[dict[str, Any]]],
+       41      dedup_store: SqliteDeduplicateStore | None,
+       42  ) -> list[Paper]:
+       43      """Collect OpenAlex papers with paged filtering and optional deduplication.
+       44  
+       45      Args:
+       46          query: Query object for this fetch task.
+       47          scope: Optional global scope merged into query compilation.
+       48          policy: Fetch policy limits and time window configuration.
+       49          fetch_page_func: Callback to fetch one page of OpenAlex works payloads.
+       50          dedup_store: Optional deduplication store.
+       51  
+       52      Returns:
+       53          Filtered and deduplicated papers sorted by unified timestamp descending,
+       54          capped at `policy.max_results`.
+       55      """
+       56      now = datetime.now(timezone.utc)
+       57      start_time = time()
+       58      params = compile_openalex_params(query=query, scope=scope)
+       59      params = _attach_publication_date_filter(params=params, search_config=policy, now=now)
+       60      not_terms = extract_not_terms(query=query, scope=scope)
+       61  
+       62      fetched_items = 0
+       63      page_index = 1
+       64      collected: list[Paper] = []
+       65  
+       66      while policy.max_fetch_items == -1 or fetched_items < policy.max_fetch_items:
+       67          elapsed = time() - start_time
+       68          if elapsed > TIMEOUT_SECONDS:
+       69              logger.warning(
+       70                  "OpenAlex fetch timeout (%.1fs > %ds) - fetched %d items; stop",
+       71                  elapsed,
+       72                  TIMEOUT_SECONDS,
+       73                  fetched_items,
+       74              )
+       75              break
+       76  
+       77          page_size = _resolve_page_size(policy=policy, fetched_items=fetched_items)
+       78          if page_size <= 0:
+       79              break
+       80  
+       81          payload_items = fetch_page_func(params, page_index, page_size)
+       82          if not payload_items:
+       83              logger.info("OpenAlex upstream exhausted at page=%d; stop", page_index)
+       84              break
+       85  
+       86          fetched_items += len(payload_items)
+       87          page_papers = parse_openalex_works(payload_items)
+       88          page_papers = apply_positive_filter(page_papers, query=query, scope=scope)
+       89          page_papers = apply_not_filter(page_papers, not_terms)
+       90          page_papers = _apply_time_window(papers=page_papers, search_config=policy, now=now)
+       91  
+       92          if dedup_store is not None:
+       93              page_papers = dedup_store.filter_new(page_papers)
+       94  
+       95          collected.extend(page_papers)
+       96  
+       97          if len(collected) >= policy.max_results:
+       98              logger.info("OpenAlex reached target max_results=%d; stop", policy.max_results)
+       99              break
+      100  
+      101          if policy.max_fetch_items != -1 and fetched_items >= policy.max_fetch_items:
+      102              logger.info("OpenAlex reached max_fetch_items=%d; stop", policy.max_fetch_items)
+      103              break
+      104  
+      105          if len(payload_items) < page_size:
+      106              logger.info("OpenAlex received short page at page=%d; stop", page_index)
+      107              break
+      108  
+      109          logger.debug("OpenAlex sleep %.1fs before next page", REQUEST_INTERVAL)
+      110          time_module.sleep(REQUEST_INTERVAL)
+      111          page_index += 1
+      112  
+      113      collected.sort(key=_resolve_sort_timestamp, reverse=True)
+      114      return collected[: policy.max_results]
+      115  
+      116  
+      117  def _resolve_page_size(*, policy: SearchConfig, fetched_items: int) -> int:
+      118      """Resolve next page size under `fetch_batch_size` and `max_fetch_items`."""
+      119      page_size = policy.fetch_batch_size
+      120      if policy.max_fetch_items == -1:
+       ... truncated at 120 lines ...

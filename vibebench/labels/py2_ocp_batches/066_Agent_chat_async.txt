@@ -1,0 +1,287 @@
+row 66   microsoft/OpenAIWorkshop#396
+============================================================================
+CHAIN in agentic_ai.agents.agent_framework.multi_agent.handoff_multi_domain_agent.Agent.chat_async   kind=value_switch subject='content.type' branches=2
+QUESTION: is the set of variants OPEN (a new one is expected, and
+          would force editing this chain) or CLOSED by nature?
+SHOWING THE WHOLE ENCLOSING FUNCTION -- a branch count alone cannot answer this.
+>>> marks the first line of the dispatch chain itself.
+
+file agentic_ai/agents/agent_framework/multi_agent/handoff_multi_domain_agent.py
+      503      async def chat_async(self, prompt: str) -> str:
+      504          """
+      505          Main chat entry point with intelligent routing and lazy classification.
+      506          
+      507          Flow:
+      508          1. If first message OR lazy classification is disabled: classify intent upfront
+      509          2. If lazy classification enabled: route to current agent first
+      510          3. Check agent response for handoff markers
+      511          4. If handoff detected: run intent classification and re-route
+      512          5. Stream response back to user
+      513          """
+      514          await self._setup_agents()
+      515  
+      516          # Clear tool calls from previous request (from mixin)
+      517          self.clear_tool_calls()
+      518  
+      519          # Increment turn counter
+      520          self._current_turn += 1
+      521          self.state_store[self._turn_key] = self._current_turn
+      522  
+      523          # Determine if we need upfront classification
+      524          is_first_message = self._current_domain is None
+      525          needs_upfront_classification = is_first_message or not self._lazy_classification
+      526          
+      527          target_domain = None
+      528          is_domain_change = False
+      529          
+      530          if needs_upfront_classification:
+      531              # Run intent classification before routing
+      532              logger.info(f"[HANDOFF] Running upfront classification (first_message={is_first_message}, lazy={self._lazy_classification})")
+      533              intent = await self._classify_intent(prompt, self._current_domain)
+      534              target_domain = intent["domain"]
+      535              is_domain_change = intent["is_domain_change"]
+      536              
+      537              # Announce handoff if domain changed
+      538              if is_domain_change and self._current_domain:
+      539                  handoff_message = (
+      540                      f"I'll connect you with our {DOMAINS[target_domain]['name']} "
+      541                      f"who can better assist with that."
+      542                  )
+      543                  
+      544                  if self._ws_manager:
+      545                      await self._ws_manager.broadcast(
+      546                          self.session_id,
+      547                          {
+      548                              "type": "handoff_announcement",
+      549                              "from_domain": self._current_domain,
+      550                              "to_domain": target_domain,
+      551                              "message": handoff_message,
+      552                          },
+      553                      )
+      554                  
+      555                  logger.info(f"[HANDOFF] Domain change: {self._current_domain} -> {target_domain}")
+      556          else:
+      557              # Lazy mode: use current domain (will check response for handoff markers)
+      558              target_domain = self._current_domain
+      559              logger.info(f"[HANDOFF] Using lazy classification, routing to current domain: {target_domain}")
+      560  
+      561          # Update current domain
+      562          previous_domain = self._current_domain
+      563          self._current_domain = target_domain
+      564          self.state_store[f"{self.session_id}_current_domain"] = target_domain
+      565  
+      566          # Get the specialist agent and thread
+      567          agent = self._domain_agents[target_domain]
+      568          thread = self._domain_threads[target_domain]
+      569          
+      570          # Prepare the prompt with context if this is a handoff
+      571          actual_prompt = prompt
+      572          if is_domain_change and previous_domain and previous_domain != target_domain:
+      573              context_prefix = await self._build_context_prefix(previous_domain, target_domain)
+      574              if context_prefix:
+      575                  actual_prompt = f"{context_prefix}\n\n{prompt}"
+      576                  logger.info(f"[HANDOFF] Added context prefix to prompt for {target_domain}")
+      577  
+      578          # Notify UI that agent started
+      579          if self._ws_manager:
+      580              await self._ws_manager.broadcast(
+      581                  self.session_id,
+      582                  {
+      583                      "type": "agent_start",
+      584                      "agent_id": target_domain,
+      585                      "agent_name": DOMAINS[target_domain]["name"],
+      586                      "show_message_in_internal_process": is_domain_change,  # Show handoff in left panel
+      587                  },
+      588              )
+      589  
+      590          # Stream response from specialist agent
+      591          full_response = []
+      592          
+      593          try:
+      594              async for chunk in agent.run_stream(actual_prompt, thread=thread):
+      595                  # Process contents in the chunk
+      596                  if hasattr(chunk, 'contents') and chunk.contents:
+      597                      for content in chunk.contents:
+      598                          # Check for tool/function calls - track with arguments
+>>>   599                          if content.type == "function_call":
+      600                              if content.name:
+      601                                  # New function call - finalize previous and start new
+      602                                  self.track_function_call_start(content.name)
+      603                                  
+      604                                  if self._ws_manager:
+      605                                      await self._ws_manager.broadcast(
+      606                                          self.session_id,
+      607                                          {
+      608                                              "type": "tool_called",
+      609                                              "agent_id": target_domain,
+      610                                              "tool_name": content.name,
+      611                                              "turn": self._current_turn,
+      612                                          },
+      613                                      )
+      614                              
+      615                              # Accumulate arguments
+      616                              args_chunk = getattr(content, 'arguments', '')
+      617                              if args_chunk:
+      618                                  self.track_function_call_arguments(args_chunk)
+      619                          
+      620                          elif content.type == "function_result":
+      621                              # Function completed - finalize
+      622                              self.finalize_tool_tracking()
+      623                  
+      624                  # Extract text from chunk
+      625                  if hasattr(chunk, 'text') and chunk.text:
+      626                      full_response.append(chunk.text)
+      627                      
+      628                      # Broadcast token to WebSocket
+      629                      if self._ws_manager:
+      630                          await self._ws_manager.broadcast(
+      631                              self.session_id,
+      632                              {
+      633                                  "type": "agent_token",
+      634                                  "agent_id": target_domain,
+      635                                  "content": chunk.text,
+      636                              },
+      637                          )
+      638                          
+      639          except Exception as exc:
+      640              logger.error(f"[HANDOFF] Error during agent streaming: {exc}", exc_info=True)
+      641              raise
+      642          
+      643          # Finalize any remaining function call
+      644          self.finalize_tool_tracking()
+      645  
+      646          assistant_response = ''.join(full_response)
+      647  
+      648          # Check if lazy classification is enabled and handoff was requested
+      649          if self._lazy_classification and self._detect_handoff_request(assistant_response):
+      650              logger.info(f"[HANDOFF] Handoff marker detected in response, running intent classification")
+      651              
+      652              # Run intent classification to determine new domain
+      653              intent = await self._classify_intent(prompt, target_domain)
+      654              new_target_domain = intent["domain"]
+      655              
+      656              if new_target_domain != target_domain:
+      657                  logger.info(f"[HANDOFF] Re-routing from {target_domain} to {new_target_domain}")
+      658                  
+      659                  # Update domain
+      660                  self._current_domain = new_target_domain
+      661                  self.state_store[f"{self.session_id}_current_domain"] = new_target_domain
+      662                  
+      663                  # Announce handoff
+      664                  handoff_message = (
+      665                      f"I'll connect you with our {DOMAINS[new_target_domain]['name']} "
+      666                      f"who can better assist with that."
+      667                  )
+      668                  
+      669                  if self._ws_manager:
+      670                      await self._ws_manager.broadcast(
+      671                          self.session_id,
+      672                          {
+      673                              "type": "handoff_announcement",
+      674                              "from_domain": target_domain,
+      675                              "to_domain": new_target_domain,
+      676                              "message": handoff_message,
+      677                          },
+      678                      )
+      679                  
+      680                  # Get new agent and thread
+      681                  new_agent = self._domain_agents[new_target_domain]
+      682                  new_thread = self._domain_threads[new_target_domain]
+      683                  
+      684                  # Build context prefix
+      685                  context_prefix = await self._build_context_prefix(target_domain, new_target_domain)
+      686                  actual_prompt_handoff = f"{context_prefix}\n\n{prompt}" if context_prefix else prompt
+      687                  
+      688                  # Notify UI
+      689                  if self._ws_manager:
+      690                      await self._ws_manager.broadcast(
+      691                          self.session_id,
+      692                          {
+      693                              "type": "agent_start",
+      694                              "agent_id": new_target_domain,
+      695                              "agent_name": DOMAINS[new_target_domain]["name"],
+      696                              "show_message_in_internal_process": True,
+      697                          },
+      698                      )
+      699                  
+      700                  # Get response from new agent
+      701                  full_response_handoff = []
+      702                  try:
+      703                      async for chunk in new_agent.run_stream(actual_prompt_handoff, thread=new_thread):
+      704                          if hasattr(chunk, 'contents') and chunk.contents:
+      705                              for content in chunk.contents:
+      706                                  if content.type == "function_call":
+      707                                      if content.name:
+      708                                          self.track_function_call_start(content.name)
+      709                                          
+      710                                          if self._ws_manager:
+      711                                              await self._ws_manager.broadcast(
+      712                                                  self.session_id,
+      713                                                  {
+      714                                                      "type": "tool_called",
+      715                                                      "agent_id": new_target_domain,
+      716                                                      "tool_name": content.name,
+      717                                                      "turn": self._current_turn,
+      718                                                  },
+      719                                              )
+      720                                      
+      721                                      args_chunk = getattr(content, 'arguments', '')
+      722                                      if args_chunk:
+      723                                          self.track_function_call_arguments(args_chunk)
+      724                                  
+      725                                  elif content.type == "function_result":
+      726                                      self.finalize_tool_tracking()
+      727                          
+      728                          if hasattr(chunk, 'text') and chunk.text:
+      729                              full_response_handoff.append(chunk.text)
+      730                              
+      731                              if self._ws_manager:
+      732                                  await self._ws_manager.broadcast(
+      733                                      self.session_id,
+      734                                      {
+      735                                          "type": "agent_token",
+      736                                          "agent_id": new_target_domain,
+      737                                          "content": chunk.text,
+      738                                      },
+      739                                  )
+      740                  except Exception as exc:
+      741                      logger.error(f"[HANDOFF] Error during handoff agent streaming: {exc}", exc_info=True)
+      742                      raise
+      743                  
+      744                  # Finalize any remaining function call
+      745                  self.finalize_tool_tracking()
+      746                  
+      747                  # Use handoff response
+      748                  assistant_response = ''.join(full_response_handoff)
+      749                  target_domain = new_target_domain
+      750                  thread = new_thread
+      751  
+      752          # Send final result
+      753          if self._ws_manager:
+      754              await self._ws_manager.broadcast(
+      755                  self.session_id,
+      756                  {
+      757                      "type": "final_result",
+      758                      "content": assistant_response,
+      759                  },
+      760              )
+      761  
+      762          # Update chat history
+      763          messages = [
+      764              {"role": "user", "content": prompt},
+      765              {"role": "assistant", "content": assistant_response},
+      766          ]
+      767          self.append_to_chat_history(messages)
+      768  
+      769          # Save thread state for this domain
+      770          thread_state_key = f"{self.session_id}_thread_{target_domain}"
+      771          new_state = await thread.serialize()
+      772          self.state_store[thread_state_key] = new_state
+      773  
+      774          # Save overall state
+      775          self._setstate({
+      776              "mode": "handoff_multi_domain",
+      777              "current_domain": target_domain,
+      778          })
+      779  
+      780          return assistant_response

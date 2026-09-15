@@ -1,0 +1,406 @@
+row 92   kivo360/OmoiOS#70
+============================================================================
+CLASS SpecSyncService in backend/omoi_os/services/spec_sync.py   loc=640 methods=8 wmc=52 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       82  class SpecSyncService:
+       83      """Service for syncing phase data to database with deduplication.
+       84  
+       85      This service is the bridge between the state machine (which generates
+       86      structured data from LLM responses) and the database (which stores
+       87      the actual requirements, tasks, and criteria records).
+       88  
+       89      Key features:
+       90      1. Bulk deduplication before insertion
+       91      2. Hierarchical sync (requirements -> criteria)
+       92      3. Idempotent operations (safe to retry)
+       93      4. Detailed statistics for monitoring
+       94      """
+       95  
+       96      def __init__(
+       97          self,
+       98          db: DatabaseService,
+       99          embedding_service: Optional[EmbeddingService] = None,
+      100      ):
+      101          """Initialize the sync service.
+      102  
+      103          Args:
+      104              db: Database service for queries.
+      105              embedding_service: Optional embedding service for semantic deduplication.
+      106          """
+      107          self.db = db
+      108          self.embedding_service = embedding_service
+      109          self.dedup_service = get_spec_dedup_service(db, embedding_service)
+      110  
+      111      async def sync_spec(
+      112          self,
+      113          spec_id: str,
+      114          session: Optional[AsyncSession] = None,
+      115      ) -> SyncResult:
+      116          """Sync all phase data for a spec to the database.
+      117  
+      118          This is the main entry point for the SYNC phase. It reads the
+      119          phase_data from the spec and persists requirements, tasks, and
+      120          criteria with deduplication.
+      121  
+      122          Args:
+      123              spec_id: ID of the spec to sync.
+      124              session: Optional async session.
+      125  
+      126          Returns:
+      127              SyncResult with success status and statistics.
+      128          """
+      129          stats = SyncStats()
+      130  
+      131          async def _sync(sess: AsyncSession) -> SyncResult:
+      132              # Load spec with phase data
+      133              result = await sess.execute(
+      134                  select(Spec)
+      135                  .filter(Spec.id == spec_id)
+      136                  .options(
+      137                      selectinload(Spec.requirements).selectinload(
+      138                          SpecRequirement.criteria
+      139                      ),
+      140                      selectinload(Spec.tasks),
+      141                  )
+      142              )
+      143              spec = result.scalar_one_or_none()
+      144  
+      145              if not spec:
+      146                  return SyncResult(
+      147                      success=False,
+      148                      spec_id=spec_id,
+      149                      message="Spec not found",
+      150                  )
+      151  
+      152              if not spec.phase_data:
+      153                  return SyncResult(
+      154                      success=True,
+      155                      spec_id=spec_id,
+      156                      stats=stats,
+      157                      message="No phase data to sync",
+      158                  )
+      159  
+      160              # Sync requirements from requirements phase
+      161              requirements_data = spec.phase_data.get("requirements", {})
+      162              if requirements_data:
+      163                  await self._sync_requirements(
+      164                      sess, spec, requirements_data, stats
+      165                  )
+      166  
+      167              # Sync tasks from tasks phase
+      168              tasks_data = spec.phase_data.get("tasks", {})
+      169              if tasks_data:
+      170                  await self._sync_tasks(sess, spec, tasks_data, stats)
+      171  
+      172              # Update linked_tickets count on spec
+      173              if stats.tickets_created > 0:
+      174                  spec.linked_tickets = (spec.linked_tickets or 0) + stats.tickets_created
+      175  
+      176              # Update spec embedding and hash for deduplication
+      177              await self._update_spec_dedup_fields(sess, spec)
+      178  
+      179              # Commit all changes
+      180              await sess.commit()
+      181  
+      182              logger.info(
+      183                  "Spec sync complete",
+      184                  extra={
+      185                      "spec_id": spec_id,
+      186                      "stats": stats.to_dict(),
+      187                  },
+      188              )
+      189  
+      190              return SyncResult(
+      191                  success=True,
+      192                  spec_id=spec_id,
+      193                  stats=stats,
+      194                  message=f"Synced {stats.requirements_created} requirements, "
+      195                  f"{stats.tasks_created} tasks "
+      196                  f"(skipped {stats.requirements_skipped + stats.tasks_skipped} duplicates)",
+      197              )
+      198  
+      199          if session:
+      200              return await _sync(session)
+      201          else:
+      202              async with self.db.get_async_session() as sess:
+      203                  return await _sync(sess)
+      204  
+      205      async def _sync_requirements(
+      206          self,
+      207          session: AsyncSession,
+      208          spec: Spec,
+      209          requirements_data: dict,
+      210          stats: SyncStats,
+      211      ) -> None:
+      212          """Sync requirements from phase data to database.
+      213  
+      214          Args:
+      215              session: Async database session.
+      216              spec: The spec being synced.
+      217              requirements_data: Requirements phase output data.
+      218              stats: Statistics tracker.
+      219          """
+      220          requirements = requirements_data.get("requirements", [])
+      221          if not requirements:
+      222              return
+      223  
+      224          logger.info(
+      225              f"Syncing {len(requirements)} requirements for spec {spec.id}"
+      226          )
+      227  
+      228          # Bulk deduplication
+      229          dedup_result = await self.dedup_service.deduplicate_requirements_bulk(
+      230              spec_id=spec.id,
+      231              requirements=requirements,
+      232              session=session,
+      233          )
+      234  
+      235          # Create non-duplicate requirements
+      236          for req_data in dedup_result.to_create:
+      237              try:
+      238                  new_req = SpecRequirement(
+      239                      spec_id=spec.id,
+      240                      title=req_data.get("title", ""),
+      241                      condition=req_data.get("condition", ""),
+      242                      action=req_data.get("action", ""),
+      243                      status="pending",
+      244                      content_hash=req_data.get("content_hash"),
+      245                      embedding_vector=req_data.get("embedding_vector"),
+      246                  )
+      247                  session.add(new_req)
+      248                  await session.flush()  # Get the ID
+      249  
+      250                  stats.requirements_created += 1
+      251  
+      252                  # Sync acceptance criteria for this requirement
+      253                  criteria = req_data.get("acceptance_criteria", [])
+      254                  if criteria:
+      255                      await self._sync_criteria(
+      256                          session, new_req.id, criteria, stats
+      257                      )
+      258  
+      259              except Exception as e:
+      260                  logger.error(f"Failed to create requirement: {e}")
+      261                  stats.errors.append(f"Requirement creation failed: {e}")
+      262  
+      263          stats.requirements_skipped = len(dedup_result.to_skip)
+      264  
+      265      async def _sync_criteria(
+      266          self,
+      267          session: AsyncSession,
+      268          requirement_id: str,
+      269          criteria: List[dict],
+      270          stats: SyncStats,
+      271      ) -> None:
+      272          """Sync acceptance criteria for a requirement.
+      273  
+      274          Args:
+      275              session: Async database session.
+      276              requirement_id: ID of the parent requirement.
+      277              criteria: List of criterion data dictionaries.
+      278              stats: Statistics tracker.
+      279          """
+      280          # Bulk deduplication for criteria
+      281          dedup_result = await self.dedup_service.deduplicate_criteria_bulk(
+      282              requirement_id=requirement_id,
+      283              criteria=[{"text": c} if isinstance(c, str) else c for c in criteria],
+      284              session=session,
+      285          )
+      286  
+      287          for crit_data in dedup_result.to_create:
+      288              try:
+      289                  text = crit_data.get("text", "")
+      290                  if isinstance(crit_data, str):
+      291                      text = crit_data
+      292  
+      293                  new_criterion = SpecAcceptanceCriterion(
+      294                      requirement_id=requirement_id,
+      295                      text=text,
+      296                      completed=False,
+      297                      content_hash=crit_data.get("content_hash") if isinstance(crit_data, dict) else compute_content_hash(text),
+      298                  )
+      299                  session.add(new_criterion)
+      300                  stats.criteria_created += 1
+      301  
+      302              except Exception as e:
+      303                  logger.error(f"Failed to create criterion: {e}")
+      304                  stats.errors.append(f"Criterion creation failed: {e}")
+      305  
+      306          stats.criteria_skipped += len(dedup_result.to_skip)
+      307  
+      308      async def _sync_tasks(
+      309          self,
+      310          session: AsyncSession,
+      311          spec: Spec,
+      312          tasks_data: dict,
+      313          stats: SyncStats,
+      314      ) -> None:
+      315          """Sync tasks from phase data to database.
+      316  
+      317          The TASKS phase output has two arrays:
+      318          - tickets: Logical groupings of work (what appears on the kanban board)
+      319          - tasks: Discrete work units with parent_ticket references
+      320  
+      321          This method creates:
+      322          1. Ticket records from the 'tickets' array (kanban board items)
+      323          2. Task records from the 'tasks' array (work units linked to tickets)
+      324          3. SpecTask records for spec tracking (linked to tasks)
+      325  
+      326          Falls back to 1:1 mapping if only 'tasks' array is present (legacy format).
+      327  
+      328          Args:
+      329              session: Async database session.
+      330              spec: The spec being synced.
+      331              tasks_data: Tasks phase output data with 'tickets' and 'tasks' arrays.
+      332              stats: Statistics tracker.
+      333          """
+      334          tickets = tasks_data.get("tickets", [])
+      335          tasks = tasks_data.get("tasks", [])
+      336  
+      337          # Map priority values
+      338          priority_map = {
+      339              "critical": "CRITICAL",
+      340              "high": "HIGH",
+      341              "medium": "MEDIUM",
+      342              "low": "LOW",
+      343          }
+      344  
+      345          # Track local ticket IDs to database IDs for linking tasks
+      346          ticket_id_map: Dict[str, str] = {}  # local_id -> db_id
+      347  
+      348          # Phase 1: Create Tickets (logical work groupings for kanban board)
+      349          if tickets:
+      350              logger.info(f"Syncing {len(tickets)} tickets for spec {spec.id}")
+      351  
+      352              for ticket_data in tickets:
+      353                  try:
+      354                      local_id = ticket_data.get("id", "")
+      355                      title = ticket_data.get("title", "")
+      356                      description = ticket_data.get("description", "")
+      357                      priority = ticket_data.get("priority", "MEDIUM").upper()
+      358                      requirements_refs = ticket_data.get("requirements", [])
+      359                      task_refs = ticket_data.get("tasks", [])
+      360                      dependencies = ticket_data.get("dependencies", [])
+      361  
+      362                      # Check for duplicate ticket
+      363                      existing_ticket = await session.execute(
+      364                          select(Ticket).where(
+      365                              Ticket.title == title,
+      366                              Ticket.project_id == spec.project_id,
+      367                              Ticket.context["spec_id"].astext == spec.id,
+      368                          )
+      369                      )
+      370                      if existing_ticket.scalar_one_or_none():
+      371                          stats.tickets_skipped += 1
+      372                          continue
+      373  
+      374                      new_ticket = Ticket(
+      375                          title=title,
+      376                          description=description,
+      377                          phase_id="PHASE_BACKLOG",
+      378                          status="backlog",
+      379                          priority=priority if priority in priority_map.values() else "MEDIUM",
+      380                          project_id=spec.project_id,
+      381                          user_id=spec.user_id,  # Inherit user from spec
+      382                          dependencies={
+      383                              "blocked_by": dependencies,
+      384                              "requirements": requirements_refs,
+      385                              "task_refs": task_refs,
+      386                          } if dependencies or requirements_refs else None,
+      387                          context={
+      388                              "spec_id": spec.id,
+      389                              "local_ticket_id": local_id,
+      390                              "source": "spec_sync",
+      391                              "workflow_mode": "spec_driven",
+      392                          },
+      393                      )
+      394                      session.add(new_ticket)
+      395                      await session.flush()
+      396                      stats.tickets_created += 1
+      397                      ticket_id_map[local_id] = new_ticket.id
+      398  
+      399                      logger.debug(
+      400                          f"Created ticket: {title}",
+      401                          extra={"spec_id": spec.id, "ticket_id": new_ticket.id},
+      402                      )
+      403  
+      404                  except Exception as e:
+      405                      logger.error(f"Failed to create ticket: {e}")
+      406                      stats.errors.append(f"Ticket creation failed: {e}")
+      407  
+      408          # Phase 2: Create Tasks (discrete work units linked to tickets)
+      409          # Track local task IDs to database IDs for dependency resolution
+      410          task_id_map: Dict[str, str] = {}  # local_id (TSK-001) -> db_uuid
+      411          tasks_with_deps: List[tuple[Task, dict]] = []  # (Task, original_dependencies)
+      412  
+      413          if tasks:
+      414              logger.info(f"Syncing {len(tasks)} tasks for spec {spec.id}")
+      415  
+      416              # Bulk deduplication for SpecTasks
+      417              dedup_result = await self.dedup_service.deduplicate_tasks_bulk(
+      418                  spec_id=spec.id,
+      419                  tasks=tasks,
+      420                  session=session,
+      421              )
+      422  
+      423              for task_data in dedup_result.to_create:
+      424                  try:
+      425                      local_task_id = task_data.get("id", "")  # e.g., "TSK-001"
+      426                      title = task_data.get("title", "")
+      427                      description = task_data.get("description", "")
+      428                      parent_ticket_local_id = task_data.get("parent_ticket", "")
+      429                      task_type = task_data.get("type", "implementation")
+      430                      priority = task_data.get("priority", "medium").lower()
+      431                      dependencies = task_data.get("dependencies", {})
+      432                      estimated_hours = task_data.get("estimated_hours")
+      433  
+      434                      # Create SpecTask for spec tracking
+      435                      new_spec_task = SpecTask(
+      436                          spec_id=spec.id,
+      437                          title=title,
+      438                          description=description,
+      439                          phase=task_data.get("phase", "Implementation"),
+      440                          priority=priority,
+      441                          status="pending",
+      442                          dependencies=dependencies.get("depends_on", []) if isinstance(dependencies, dict) else [],
+      443                          estimated_hours=estimated_hours,
+      444                          content_hash=task_data.get("content_hash"),
+      445                          embedding_vector=task_data.get("embedding_vector"),
+      446                      )
+      447                      session.add(new_spec_task)
+      448                      await session.flush()
+      449                      stats.tasks_created += 1
+      450  
+      451                      # Find or create parent ticket for this task
+      452                      parent_ticket_id = ticket_id_map.get(parent_ticket_local_id)
+      453  
+      454                      if not parent_ticket_id and not tickets:
+      455                          # Legacy format: No tickets array, create ticket per task
+      456                          ticket_priority = priority_map.get(priority, "MEDIUM")
+      457                          new_ticket = Ticket(
+      458                              title=title,
+      459                              description=description,
+      460                              phase_id="PHASE_BACKLOG",
+      461                              status="backlog",
+      462                              priority=ticket_priority,
+      463                              project_id=spec.project_id,
+      464                              user_id=spec.user_id,  # Inherit user from spec
+      465                              context={
+      466                                  "spec_id": spec.id,
+      467                                  "spec_task_id": new_spec_task.id,
+      468                                  "source": "spec_sync",
+      469                                  "workflow_mode": "spec_driven",
+      470                              },
+      471                          )
+      472                          session.add(new_ticket)
+      473                          await session.flush()
+      474                          stats.tickets_created += 1
+      475                          parent_ticket_id = new_ticket.id
+      476  
+      477                      if parent_ticket_id:
+      478                          # Create Task (work unit) linked to the Ticket
+      479                          # Initially create with empty dependencies - we'll resolve them after all tasks are created
+      480                          new_task = Task(
+      481                              ticket_id=parent_ticket_id,
+       ... truncated at 400 lines ...

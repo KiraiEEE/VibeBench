@@ -1,0 +1,406 @@
+row 187   chopratejas/headroom#51
+============================================================================
+CLASS SQLiteMemoryStore in headroom/memory/adapters/sqlite.py   loc=726 methods=21 wmc=88 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       46  class SQLiteMemoryStore:
+       47      """SQLite-based memory store implementing the MemoryStore protocol.
+       48  
+       49      Features:
+       50      - Full CRUD operations with batch support
+       51      - Hierarchical scope filtering (user -> session -> agent -> turn)
+       52      - Temporal versioning with supersession chains
+       53      - Point-in-time queries via valid_at filter
+       54      - Thread-safe: connection-per-request pattern
+       55  
+       56      Usage:
+       57          store = SQLiteMemoryStore("./memories.db")
+       58          await store.save(memory)
+       59          memories = await store.query(MemoryFilter(user_id="alice"))
+       60  
+       61      Schema:
+       62          The memories table stores all Memory fields with appropriate indexes
+       63          for efficient querying by scope, category, importance, and time.
+       64      """
+       65  
+       66      def __init__(self, db_path: str | Path = "headroom_memory.db") -> None:
+       67          """Initialize the SQLite memory store.
+       68  
+       69          Args:
+       70              db_path: Path to SQLite database file. Created if it doesn't exist.
+       71          """
+       72          self.db_path = Path(db_path)
+       73          self._init_db()
+       74  
+       75      def _get_conn(self) -> sqlite3.Connection:
+       76          """Get a new database connection (thread-safe pattern).
+       77  
+       78          Returns:
+       79              A new SQLite connection with row factory configured.
+       80          """
+       81          conn = sqlite3.connect(str(self.db_path))
+       82          conn.row_factory = sqlite3.Row
+       83          return conn
+       84  
+       85      def _init_db(self) -> None:
+       86          """Initialize the database schema with indexes."""
+       87          with self._get_conn() as conn:
+       88              # Create memories table
+       89              conn.execute("""
+       90                  CREATE TABLE IF NOT EXISTS memories (
+       91                      id TEXT PRIMARY KEY,
+       92                      content TEXT NOT NULL,
+       93  
+       94                      -- Hierarchical scoping
+       95                      user_id TEXT NOT NULL,
+       96                      session_id TEXT,
+       97                      agent_id TEXT,
+       98                      turn_id TEXT,
+       99  
+      100                      -- Temporal
+      101                      created_at TEXT NOT NULL,
+      102                      valid_from TEXT NOT NULL,
+      103                      valid_until TEXT,
+      104  
+      105                      -- Classification
+      106                      category TEXT NOT NULL,
+      107                      importance REAL NOT NULL DEFAULT 0.5,
+      108  
+      109                      -- Lineage
+      110                      supersedes TEXT,
+      111                      superseded_by TEXT,
+      112                      promoted_from TEXT,
+      113                      promotion_chain TEXT NOT NULL DEFAULT '[]',
+      114  
+      115                      -- Access tracking
+      116                      access_count INTEGER NOT NULL DEFAULT 0,
+      117                      last_accessed TEXT,
+      118  
+      119                      -- Entity references (JSON array)
+      120                      entity_refs TEXT NOT NULL DEFAULT '[]',
+      121  
+      122                      -- Embedding (BLOB for numpy array)
+      123                      embedding BLOB,
+      124  
+      125                      -- Metadata (JSON object)
+      126                      metadata TEXT NOT NULL DEFAULT '{}'
+      127                  )
+      128              """)
+      129  
+      130              # Create indexes for efficient querying
+      131              conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories(user_id)")
+      132              conn.execute(
+      133                  "CREATE INDEX IF NOT EXISTS idx_memories_session_id ON memories(session_id)"
+      134              )
+      135              conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories(agent_id)")
+      136              conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_turn_id ON memories(turn_id)")
+      137              conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category)")
+      138              conn.execute(
+      139                  "CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance)"
+      140              )
+      141              conn.execute(
+      142                  "CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at)"
+      143              )
+      144              conn.execute(
+      145                  "CREATE INDEX IF NOT EXISTS idx_memories_valid_until ON memories(valid_until)"
+      146              )
+      147  
+      148              # Composite index for common scope queries
+      149              conn.execute("""
+      150                  CREATE INDEX IF NOT EXISTS idx_memories_scope
+      151                  ON memories(user_id, session_id, agent_id, turn_id)
+      152              """)
+      153  
+      154              # Index for supersession chain traversal
+      155              conn.execute(
+      156                  "CREATE INDEX IF NOT EXISTS idx_memories_supersedes ON memories(supersedes)"
+      157              )
+      158              conn.execute(
+      159                  "CREATE INDEX IF NOT EXISTS idx_memories_superseded_by ON memories(superseded_by)"
+      160              )
+      161  
+      162              conn.commit()
+      163  
+      164      def _serialize_embedding(self, embedding: np.ndarray | None) -> bytes | None:
+      165          """Serialize numpy array to bytes for BLOB storage."""
+      166          if embedding is None:
+      167              return None
+      168          return bytes(embedding.astype(np.float32).tobytes())
+      169  
+      170      def _deserialize_embedding(
+      171          self, data: bytes | None, dim: int | None = None
+      172      ) -> np.ndarray | None:
+      173          """Deserialize bytes back to numpy array."""
+      174          if data is None:
+      175              return None
+      176          arr = np.frombuffer(data, dtype=np.float32)
+      177          return arr
+      178  
+      179      def _memory_to_row(self, memory: Memory) -> dict[str, Any]:
+      180          """Convert Memory object to row dict for insertion."""
+      181          return {
+      182              "id": memory.id,
+      183              "content": memory.content,
+      184              "user_id": memory.user_id,
+      185              "session_id": memory.session_id,
+      186              "agent_id": memory.agent_id,
+      187              "turn_id": memory.turn_id,
+      188              "created_at": memory.created_at.isoformat(),
+      189              "valid_from": memory.valid_from.isoformat(),
+      190              "valid_until": memory.valid_until.isoformat() if memory.valid_until else None,
+      191              "category": "",  # Deprecated - kept for backwards compatibility
+      192              "importance": memory.importance,
+      193              "supersedes": memory.supersedes,
+      194              "superseded_by": memory.superseded_by,
+      195              "promoted_from": memory.promoted_from,
+      196              "promotion_chain": json.dumps(memory.promotion_chain),
+      197              "access_count": memory.access_count,
+      198              "last_accessed": memory.last_accessed.isoformat() if memory.last_accessed else None,
+      199              "entity_refs": json.dumps(memory.entity_refs),
+      200              "embedding": self._serialize_embedding(memory.embedding),
+      201              "metadata": json.dumps(memory.metadata),
+      202          }
+      203  
+      204      def _row_to_memory(self, row: sqlite3.Row) -> Memory:
+      205          """Convert database row to Memory object."""
+      206          return Memory(
+      207              id=row["id"],
+      208              content=row["content"],
+      209              user_id=row["user_id"],
+      210              session_id=row["session_id"],
+      211              agent_id=row["agent_id"],
+      212              turn_id=row["turn_id"],
+      213              created_at=datetime.fromisoformat(row["created_at"]),
+      214              valid_from=datetime.fromisoformat(row["valid_from"]),
+      215              valid_until=datetime.fromisoformat(row["valid_until"]) if row["valid_until"] else None,
+      216              importance=row["importance"],
+      217              supersedes=row["supersedes"],
+      218              superseded_by=row["superseded_by"],
+      219              promoted_from=row["promoted_from"],
+      220              promotion_chain=json.loads(row["promotion_chain"]) if row["promotion_chain"] else [],
+      221              access_count=row["access_count"],
+      222              last_accessed=datetime.fromisoformat(row["last_accessed"])
+      223              if row["last_accessed"]
+      224              else None,
+      225              entity_refs=json.loads(row["entity_refs"]) if row["entity_refs"] else [],
+      226              embedding=self._deserialize_embedding(row["embedding"]),
+      227              metadata=json.loads(row["metadata"]) if row["metadata"] else {},
+      228          )
+      229  
+      230      async def save(self, memory: Memory) -> None:
+      231          """Save or update a memory.
+      232  
+      233          If a memory with the same ID exists, it will be updated.
+      234  
+      235          Args:
+      236              memory: The memory to save.
+      237          """
+      238          row = self._memory_to_row(memory)
+      239  
+      240          with self._get_conn() as conn:
+      241              conn.execute(
+      242                  """
+      243                  INSERT OR REPLACE INTO memories (
+      244                      id, content, user_id, session_id, agent_id, turn_id,
+      245                      created_at, valid_from, valid_until,
+      246                      category, importance,
+      247                      supersedes, superseded_by, promoted_from, promotion_chain,
+      248                      access_count, last_accessed,
+      249                      entity_refs, embedding, metadata
+      250                  ) VALUES (
+      251                      :id, :content, :user_id, :session_id, :agent_id, :turn_id,
+      252                      :created_at, :valid_from, :valid_until,
+      253                      :category, :importance,
+      254                      :supersedes, :superseded_by, :promoted_from, :promotion_chain,
+      255                      :access_count, :last_accessed,
+      256                      :entity_refs, :embedding, :metadata
+      257                  )
+      258                  """,
+      259                  row,
+      260              )
+      261              conn.commit()
+      262  
+      263      async def save_batch(self, memories: list[Memory]) -> None:
+      264          """Save multiple memories in a single transaction.
+      265  
+      266          Args:
+      267              memories: List of memories to save.
+      268          """
+      269          if not memories:
+      270              return
+      271  
+      272          rows = [self._memory_to_row(m) for m in memories]
+      273  
+      274          with self._get_conn() as conn:
+      275              conn.executemany(
+      276                  """
+      277                  INSERT OR REPLACE INTO memories (
+      278                      id, content, user_id, session_id, agent_id, turn_id,
+      279                      created_at, valid_from, valid_until,
+      280                      category, importance,
+      281                      supersedes, superseded_by, promoted_from, promotion_chain,
+      282                      access_count, last_accessed,
+      283                      entity_refs, embedding, metadata
+      284                  ) VALUES (
+      285                      :id, :content, :user_id, :session_id, :agent_id, :turn_id,
+      286                      :created_at, :valid_from, :valid_until,
+      287                      :category, :importance,
+      288                      :supersedes, :superseded_by, :promoted_from, :promotion_chain,
+      289                      :access_count, :last_accessed,
+      290                      :entity_refs, :embedding, :metadata
+      291                  )
+      292                  """,
+      293                  rows,
+      294              )
+      295              conn.commit()
+      296  
+      297      async def get(self, memory_id: str) -> Memory | None:
+      298          """Retrieve a memory by ID.
+      299  
+      300          Args:
+      301              memory_id: The unique identifier of the memory.
+      302  
+      303          Returns:
+      304              The memory if found, None otherwise.
+      305          """
+      306          with self._get_conn() as conn:
+      307              cursor = conn.execute(
+      308                  "SELECT * FROM memories WHERE id = ?",
+      309                  (memory_id,),
+      310              )
+      311              row = cursor.fetchone()
+      312  
+      313              if row is None:
+      314                  return None
+      315  
+      316              return self._row_to_memory(row)
+      317  
+      318      async def get_batch(self, memory_ids: list[str]) -> list[Memory]:
+      319          """Retrieve multiple memories by ID.
+      320  
+      321          Args:
+      322              memory_ids: List of memory IDs to retrieve.
+      323  
+      324          Returns:
+      325              List of found memories (may be shorter than input if some not found).
+      326          """
+      327          if not memory_ids:
+      328              return []
+      329  
+      330          placeholders = ", ".join("?" * len(memory_ids))
+      331  
+      332          with self._get_conn() as conn:
+      333              cursor = conn.execute(
+      334                  f"SELECT * FROM memories WHERE id IN ({placeholders})",
+      335                  memory_ids,
+      336              )
+      337  
+      338              return [self._row_to_memory(row) for row in cursor]
+      339  
+      340      async def delete(self, memory_id: str) -> bool:
+      341          """Delete a memory by ID.
+      342  
+      343          Args:
+      344              memory_id: The unique identifier of the memory.
+      345  
+      346          Returns:
+      347              True if the memory was deleted, False if not found.
+      348          """
+      349          with self._get_conn() as conn:
+      350              cursor = conn.execute(
+      351                  "DELETE FROM memories WHERE id = ?",
+      352                  (memory_id,),
+      353              )
+      354              conn.commit()
+      355              return cursor.rowcount > 0
+      356  
+      357      async def delete_batch(self, memory_ids: list[str]) -> int:
+      358          """Delete multiple memories by ID.
+      359  
+      360          Args:
+      361              memory_ids: List of memory IDs to delete.
+      362  
+      363          Returns:
+      364              Number of memories actually deleted.
+      365          """
+      366          if not memory_ids:
+      367              return 0
+      368  
+      369          placeholders = ", ".join("?" * len(memory_ids))
+      370  
+      371          with self._get_conn() as conn:
+      372              cursor = conn.execute(
+      373                  f"DELETE FROM memories WHERE id IN ({placeholders})",
+      374                  memory_ids,
+      375              )
+      376              conn.commit()
+      377              return cursor.rowcount
+      378  
+      379      def _build_query_conditions(self, filter: MemoryFilter) -> tuple[list[str], list[Any]]:
+      380          """Build WHERE clause conditions from a MemoryFilter.
+      381  
+      382          Returns:
+      383              Tuple of (conditions list, params list).
+      384          """
+      385          conditions: list[str] = []
+      386          params: list[Any] = []
+      387  
+      388          # Hierarchical scope filtering
+      389          if filter.user_id is not None:
+      390              conditions.append("user_id = ?")
+      391              params.append(filter.user_id)
+      392  
+      393              # Hierarchical filtering: when filtering by user_id only,
+      394              # return USER-level and below (all that user's memories)
+      395              # This is implicit - we just filter by user_id
+      396  
+      397              if filter.session_id is not None:
+      398                  conditions.append("session_id = ?")
+      399                  params.append(filter.session_id)
+      400  
+      401                  if filter.agent_id is not None:
+      402                      conditions.append("agent_id = ?")
+      403                      params.append(filter.agent_id)
+      404  
+      405                      if filter.turn_id is not None:
+      406                          conditions.append("turn_id = ?")
+      407                          params.append(filter.turn_id)
+      408              elif filter.agent_id is not None:
+      409                  # Agent without session - unusual but supported
+      410                  conditions.append("agent_id = ?")
+      411                  params.append(filter.agent_id)
+      412              elif filter.turn_id is not None:
+      413                  # Turn without session/agent - unusual but supported
+      414                  conditions.append("turn_id = ?")
+      415                  params.append(filter.turn_id)
+      416          elif filter.session_id is not None:
+      417              # Session without user - filter by session only
+      418              conditions.append("session_id = ?")
+      419              params.append(filter.session_id)
+      420          elif filter.agent_id is not None:
+      421              # Agent without user/session
+      422              conditions.append("agent_id = ?")
+      423              params.append(filter.agent_id)
+      424          elif filter.turn_id is not None:
+      425              # Turn only
+      426              conditions.append("turn_id = ?")
+      427              params.append(filter.turn_id)
+      428  
+      429          # Explicit scope level filtering
+      430          if filter.scope_levels is not None and len(filter.scope_levels) > 0:
+      431              scope_conditions = []
+      432              for level in filter.scope_levels:
+      433                  if level == ScopeLevel.USER:
+      434                      # USER level: no session/agent/turn
+      435                      scope_conditions.append(
+      436                          "(session_id IS NULL AND agent_id IS NULL AND turn_id IS NULL)"
+      437                      )
+      438                  elif level == ScopeLevel.SESSION:
+      439                      # SESSION level: has session, no agent/turn
+      440                      scope_conditions.append(
+      441                          "(session_id IS NOT NULL AND agent_id IS NULL AND turn_id IS NULL)"
+      442                      )
+      443                  elif level == ScopeLevel.AGENT:
+      444                      # AGENT level: has agent, no turn
+      445                      scope_conditions.append("(agent_id IS NOT NULL AND turn_id IS NULL)")
+       ... truncated at 400 lines ...

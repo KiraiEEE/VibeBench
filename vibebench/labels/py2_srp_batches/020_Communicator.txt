@@ -1,0 +1,406 @@
+row 20   NVIDIA/NVFlare#4359
+============================================================================
+CLASS Communicator in nvflare/private/fed/client/communicator.py   loc=577 methods=12 wmc=63 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       51  class Communicator:
+       52      def __init__(
+       53          self,
+       54          client_config=None,
+       55          secure_train=False,
+       56          client_state_processors: Optional[List[Filter]] = None,
+       57          compression=None,
+       58          cell: Cell = None,
+       59          client_register_interval=2,
+       60          timeout=5.0,
+       61          maint_msg_timeout=5.0,
+       62      ):
+       63          """To init the Communicator.
+       64  
+       65          Args:
+       66              client_config: client configuration data
+       67              secure_train: True/False to indicate if secure train
+       68              client_state_processors: Client state processor filters
+       69              compression: communicate compression algorithm
+       70          """
+       71          self.cell = cell
+       72          self.client_config = client_config
+       73          self.secure_train = secure_train
+       74  
+       75          self.verbose = False
+       76          self.heartbeat_done = False
+       77          self.client_state_processors = client_state_processors
+       78          self.compression = compression
+       79          self.client_register_interval = client_register_interval
+       80          self.timeout = timeout
+       81          self.maint_msg_timeout = maint_msg_timeout
+       82  
+       83          # token and token_signature are issued by the Server after the client is authenticated
+       84          # they are added to every message going to the server as proof of authentication
+       85          self.token = None
+       86          self.token_signature = None
+       87          self.ssid = None
+       88          self.client_name = None
+       89          self.token_verifier = None
+       90          self.abort_signal = Signal()
+       91          self.engine = None
+       92          self.last_task_id = None  # ID of the last task received
+       93          self.pending_task = None  # the task currently being processed
+       94          self.logger = get_obj_logger(self)
+       95          self._state_lock = threading.Lock()
+       96          tmp_ctx = FLContext()
+       97          tmp_ctx.set_prop(
+       98              key=ReservedKey.IDENTITY_NAME,
+       99              value=client_config["client_name"],
+      100              private=False,
+      101              sticky=True,
+      102          )
+      103          self._peer_ctx = tmp_ctx
+      104  
+      105      """
+      106      To call set_add_auth_headers_filters, both cell and token must be available.
+      107      The set_cell is called when cell becomes available, set_auth is called when token becomes available.
+      108      In CP, set_cell happens before set_auth, hence we call set_add_auth_headers_filters in set_auth for CP.
+      109      In CJ, set_auth happens before set_cell, hence we call set_add_auth_headers_filters in set_cell for CJ.
+      110      """
+      111  
+      112      def set_auth(self, client_name, token, token_signature, ssid):
+      113          self.ssid = ssid
+      114          self.token_signature = token_signature
+      115          self.token = token
+      116          self.client_name = client_name
+      117  
+      118          if self.cell:
+      119              # for CP
+      120              set_add_auth_headers_filters(self.cell, client_name, token, token_signature, ssid)
+      121  
+      122          # put auth properties in data bus so that they can be used elsewhere
+      123          set_scope_property(scope_name=client_name, key=FLMetaKey.AUTH_TOKEN, value=token)
+      124          set_scope_property(scope_name=client_name, key=FLMetaKey.AUTH_TOKEN_SIGNATURE, value=token_signature)
+      125  
+      126      def set_cell(self, cell):
+      127          self.cell = cell
+      128          if self.token:
+      129              # for CJ
+      130              set_add_auth_headers_filters(self.cell, self.client_name, self.token, self.token_signature, self.ssid)
+      131  
+      132          # set CB to receive task messages from children
+      133          cell.register_request_cb(
+      134              channel=CellChannel.SERVER_COMMAND,
+      135              topic=ServerCommandNames.GET_TASK,
+      136              cb=self._process_get_task,
+      137          )
+      138  
+      139          cell.register_request_cb(
+      140              channel=CellChannel.SERVER_COMMAND,
+      141              topic=ServerCommandNames.SUBMIT_UPDATE,
+      142              cb=self._process_submit_result,
+      143          )
+      144  
+      145      @staticmethod
+      146      def _make_try_again():
+      147          shareable = Shareable()
+      148          shareable.set_header(key=FLContextKey.TASK_ID, value="")
+      149          shareable.set_header(key=ServerCommandKey.TASK_NAME, value=SpecialTaskName.TRY_AGAIN)
+      150          return shareable
+      151  
+      152      def _process_get_task(self, request: CellMessage):
+      153          req = request.payload
+      154          origin = request.get_header(MessageHeaderKey.ORIGIN)
+      155          if not isinstance(req, Shareable):
+      156              self.logger.error(f"Bad get_task request from {origin}")
+      157  
+      158          # note: the self.pending_task is unset by "submit_update", which could happen at any time.
+      159          # we first assign self.pending_task to a different var (pending_task) and use this var in our processing.
+      160          pending_task = self.pending_task
+      161          pending_task_id = None
+      162          if not self.engine or not pending_task:
+      163              task = self._make_try_again()
+      164          else:
+      165              assert isinstance(pending_task, Shareable)
+      166              last_task_id = req.get_header(ServerCommandKey.LAST_TASK_ID)
+      167              task_id = pending_task.get_header(FLContextKey.TASK_ID)
+      168              if last_task_id == task_id:
+      169                  self.logger.debug(f"same task request from {origin=}: {last_task_id=} - ask it to try again")
+      170                  task = self._make_try_again()
+      171              elif not pending_task.get_header(ReservedKey.TASK_IS_READY):
+      172                  self.logger.debug(f"task {task_id} not ready - ask it to try again")
+      173                  task = self._make_try_again()
+      174              else:
+      175                  # we'll send the pending task to the child.
+      176                  # make a copy of the task - only headers are copied!
+      177                  task = make_copy(pending_task, exclude_headers=[ReservedKey.TASK_IS_READY])
+      178                  pending_task_id = task_id
+      179  
+      180          if self.engine:
+      181              if pending_task_id:
+      182                  # fire event to notify others that the pending task is sent to a child client
+      183                  with self.engine.new_context() as fl_ctx:
+      184                      requesting_client_ctx = req.get_peer_context()
+      185                      fl_ctx.set_peer_context(requesting_client_ctx)
+      186                      fl_ctx.set_prop(FLContextKey.TASK_ID, pending_task_id, private=True, sticky=False)
+      187                      fl_ctx.set_prop(FLContextKey.TASK_DATA, task, private=True, sticky=False)
+      188                      self.engine.fire_event(EventType.TASK_ASSIGNMENT_SENT, fl_ctx)
+      189                      is_processed = fl_ctx.get_prop(FLContextKey.EVENT_PROCESSED)
+      190                      if not is_processed:
+      191                          # no one listened or processed this event
+      192                          self.logger.warning(
+      193                              f"event {EventType.TASK_ASSIGNMENT_SENT} for task {pending_task_id} is not processed"
+      194                          )
+      195  
+      196          task.set_peer_context(self._peer_ctx)
+      197          return new_cell_message({MessageHeaderKey.RETURN_CODE: ReturnCode.OK}, task)
+      198  
+      199      def _process_submit_result(self, request: CellMessage):
+      200          if not self.engine:
+      201              # this could happen only when we crashed after task was pulled and restarted
+      202              # since we don't have CJ restart capability this is impossible currently.
+      203              self.logger.error("received submit_result while no engine")
+      204              return new_cell_message({}, Shareable())
+      205  
+      206          with self.engine.new_context() as fl_ctx:
+      207              assert isinstance(fl_ctx, FLContext)
+      208              result = request.payload
+      209              assert isinstance(result, Shareable)
+      210              peer_ctx = result.get_peer_context()
+      211              if peer_ctx:
+      212                  fl_ctx.set_peer_context(peer_ctx)
+      213  
+      214                  # we also need to set peer_props since some app code expects it.
+      215                  result.set_peer_props(peer_ctx.get_all_public_props())
+      216  
+      217              fl_ctx.set_prop(
+      218                  key=FLContextKey.TASK_RESULT,
+      219                  value=result,
+      220                  private=True,
+      221                  sticky=False,
+      222              )
+      223              self.engine.fire_event(EventType.TASK_RESULT_RECEIVED, fl_ctx)
+      224              is_processed = fl_ctx.get_prop(FLContextKey.EVENT_PROCESSED)
+      225              if not is_processed:
+      226                  # no one listened or processed this event
+      227                  task_id = result.get_header(ReservedKey.TASK_ID)
+      228                  self.logger.warning(f"event {EventType.TASK_RESULT_RECEIVED} for task {task_id} is not processed")
+      229  
+      230          return new_cell_message({MessageHeaderKey.RETURN_CODE: ReturnCode.OK}, Shareable())
+      231  
+      232      def client_registration(self, client_name, project_name, fl_ctx: FLContext):
+      233          """Register the client with the FLARE Server.
+      234  
+      235          Note that the client no longer needs to be directly connected with the Server!
+      236  
+      237          Since the client may be connected with the Server indirectly (e.g. via bridge nodes or proxy), in the secure
+      238          mode, the client authentication cannot be based on the connection's TLS cert. Instead, the server and the
+      239          client will explicitly authenticate each other using their provisioned PKI credentials, as follows:
+      240  
+      241          1. Make sure that the Server is authentic. The client sends a Challenge request with a random nonce.
+      242          The server is expected to return the following in its reply:
+      243              - its cert and common name (Server_CN)
+      244              - signature on the received client nonce + Server_CN
+      245              - a random Server Nonce. This will be used for the server to validate the client's identity in the
+      246              Registration request.
+      247  
+      248          The client then validates to make sure:
+      249              - the Server_CN is the same as presented in the server cert
+      250              - the Server_CN is the same as configured in the client's config (fed_client.json)
+      251              - the signature is valid
+      252  
+      253          2. Client sends Registration request that contains:
+      254              - client cert and common name (Client_CN)
+      255              - signature on the received Server Nonce + Client_CN
+      256  
+      257          The Server then validates to make sure:
+      258              - the Client_CN is the same as presented in the client cert
+      259              - the signature is valid
+      260  
+      261          NOTE: we do not explicitly validate certs' expiration time. This is because currently the same certs are
+      262          also used for SSL connections, which already validate expiration.
+      263  
+      264          Args:
+      265              client_name: client name
+      266              project_name: FL study project name
+      267              fl_ctx: FLContext
+      268  
+      269          Returns:
+      270              The client's token
+      271  
+      272          """
+      273          start = time.time()
+      274          while not self.cell:
+      275              self.logger.info("Waiting for the client cell to be created.")
+      276              if time.time() - start > 15.0:
+      277                  raise RuntimeError("Client cell could not be created. Failed to login the client.")
+      278              time.sleep(0.5)
+      279  
+      280          shared_fl_ctx = gen_new_peer_ctx(fl_ctx)
+      281          private_key_file = None
+      282          root_cert_file = None
+      283          cert_file = None
+      284  
+      285          secure_mode = fl_ctx.get_prop(FLContextKey.SECURE_MODE, False)
+      286          expected_host = None
+      287  
+      288          if secure_mode:
+      289              # explicitly authenticate with the Server
+      290              expected_host = None
+      291              server_config = fl_ctx.get_prop(FLContextKey.SERVER_CONFIG)
+      292              if server_config:
+      293                  server0 = server_config[0]
+      294                  expected_host = server0.get("identity")
+      295  
+      296              if not expected_host:
+      297                  # the provision was done with an old version
+      298                  # to be backward compatible, we expect the host to be the server host we connected to
+      299                  # we get the host name from DataBus!
+      300                  expected_host = get_scope_property(scope_name=client_name, key=FLContextKey.SERVER_HOST_NAME)
+      301  
+      302              if not expected_host:
+      303                  raise RuntimeError("cannot determine expected_host")
+      304  
+      305              client_config = fl_ctx.get_prop(FLContextKey.CLIENT_CONFIG)
+      306              if not client_config:
+      307                  raise RuntimeError(f"missing {FLContextKey.CLIENT_CONFIG} in FL Context")
+      308              private_key_file = client_config.get(SecureTrainConst.PRIVATE_KEY)
+      309              cert_file = client_config.get(SecureTrainConst.SSL_CERT)
+      310              root_cert_file = client_config.get(SecureTrainConst.SSL_ROOT_CERT)
+      311  
+      312          authenticator = Authenticator(
+      313              cell=self.cell,
+      314              project_name=project_name,
+      315              client_name=client_name,
+      316              client_type=ClientType.REGULAR,
+      317              expected_sp_identity=expected_host,
+      318              secure_mode=secure_mode,
+      319              root_cert_file=root_cert_file,
+      320              private_key_file=private_key_file,
+      321              cert_file=cert_file,
+      322              msg_timeout=self.maint_msg_timeout,
+      323              retry_interval=self.client_register_interval,
+      324          )
+      325  
+      326          token, signature, ssid, token_verifier = authenticator.authenticate(shared_fl_ctx, self.abort_signal)
+      327          self.token_verifier = token_verifier
+      328          self.set_auth(client_name, token, signature, ssid)
+      329  
+      330          # Extract server CC info from shared_fl_ctx and store in main fl_ctx
+      331          server_cc_info = shared_fl_ctx.get_prop("_cc_info")
+      332          if server_cc_info:
+      333              fl_ctx.set_prop(key="_cc_info", value=server_cc_info, sticky=False, private=False)
+      334              self.logger.debug("Stored server CC info in FL context")
+      335  
+      336          return token, signature, ssid
+      337  
+      338      def pull_task(self, project_name, token, ssid, fl_ctx: FLContext, timeout=None):
+      339          """Get a task from server.
+      340  
+      341          Args:
+      342              project_name: FL study project name
+      343              token: client token
+      344              ssid: service session ID
+      345              fl_ctx: FLContext
+      346              timeout: how long to wait for response from server
+      347  
+      348          Returns:
+      349              A CurrentTask message from server
+      350  
+      351          """
+      352          if not self.engine:
+      353              self.engine = fl_ctx.get_engine()
+      354              self._peer_ctx = gen_new_peer_ctx(fl_ctx)
+      355  
+      356          start_time = time.time()
+      357          shareable = Shareable()
+      358          shared_fl_ctx = gen_new_peer_ctx(fl_ctx)
+      359          shareable.set_peer_context(shared_fl_ctx)
+      360          if self.last_task_id:
+      361              shareable.set_header(ServerCommandKey.LAST_TASK_ID, self.last_task_id)
+      362  
+      363          task_message = new_cell_message(
+      364              {
+      365                  CellMessageHeaderKeys.PROJECT_NAME: project_name,
+      366              },
+      367              shareable,
+      368          )
+      369          job_id = fl_ctx.get_job_id()
+      370  
+      371          if not timeout:
+      372              timeout = self.timeout
+      373  
+      374          parent_fqcn = determine_parent_fqcn(self.client_config, fl_ctx)
+      375          self.logger.debug(f"pulling task from parent FQCN: {parent_fqcn}")
+      376  
+      377          fqcn = FQCN.join([parent_fqcn, job_id])
+      378          task = None
+      379          try:
+      380              task = self.cell.send_request(
+      381                  target=fqcn,
+      382                  channel=CellChannel.SERVER_COMMAND,
+      383                  topic=ServerCommandNames.GET_TASK,
+      384                  request=task_message,
+      385                  timeout=timeout,
+      386                  optional=True,
+      387                  abort_signal=fl_ctx.get_run_abort_signal(),
+      388              )
+      389              return_code = task.get_header(MessageHeaderKey.RETURN_CODE)
+      390          except Exception as ex:
+      391              self.logger.error(f"Error getting task: {ex}")
+      392              return_code = ReturnCode.INVALID_REQUEST
+      393  
+      394          end_time = time.time()
+      395  
+      396          if return_code == ReturnCode.OK:
+      397              size = task.get_header(MessageHeaderKey.PAYLOAD_LEN)
+      398              task_data = task.payload
+      399              if not isinstance(task_data, Shareable):
+      400                  self.logger.error(f"bad task from {parent_fqcn}: expect Shareable but got {type(task_data)}")
+      401  
+      402              task_name = task_data.get_header(ServerCommandKey.TASK_NAME)
+      403              self.logger.debug(f"received task from parent {parent_fqcn}: {task_name=}")
+      404  
+      405              # Check if server requires a minimum get_task_timeout (e.g., for tensor streaming)
+      406              min_timeout_raw = task_data.get_header(ServerCommandKey.MIN_GET_TASK_TIMEOUT)
+      407              if min_timeout_raw is not None:
+      408                  # Defensively coerce to float since headers may be serialized/deserialized as strings
+      409                  try:
+      410                      min_timeout = float(min_timeout_raw)
+      411                  except (TypeError, ValueError):
+      412                      self.logger.warning(
+      413                          f"Invalid MIN_GET_TASK_TIMEOUT header value: {min_timeout_raw!r} "
+      414                          f"(expected numeric). Ignoring."
+      415                      )
+      416                      min_timeout = None
+      417  
+      418                  if min_timeout is not None:
+      419                      with self._state_lock:
+      420                          if min_timeout > self.timeout:
+      421                              old_timeout = self.timeout
+      422                              self.timeout = min_timeout
+      423                              # Only log when actually adjusting timeout
+      424                              self.logger.info(
+      425                                  f"Server requires get_task_timeout >= {min_timeout}s (likely for tensor streaming). "
+      426                                  f"Automatically adjusting from {old_timeout}s to {min_timeout}s."
+      427                              )
+      428  
+      429              fl_ctx.set_prop(FLContextKey.SSID, ssid, sticky=False)
+      430              if task_name not in [SpecialTaskName.END_RUN, SpecialTaskName.TRY_AGAIN]:
+      431                  self.logger.info(
+      432                      f"Received from {parent_fqcn}. getTask: {task_name} size: {format_size(size)} "
+      433                      f"({size} Bytes) time: {end_time - start_time:.6f} seconds"
+      434                  )
+      435                  self.last_task_id = task_data.get_header(FLContextKey.TASK_ID)
+      436                  self.pending_task = task_data
+      437          elif return_code == ReturnCode.AUTHENTICATION_ERROR:
+      438              self.logger.warning("get_task request authentication failed.")
+      439              task = None
+      440          else:
+      441              self.logger.warning(f"Failed to get_task from {parent_fqcn}. Will try it again.")
+      442              task = None
+      443  
+      444          return task
+      445  
+      446      def submit_update(
+      447          self, project_name, token, ssid, fl_ctx: FLContext, client_name, shareable, execute_task_name, timeout=None
+      448      ):
+      449          """Submit the task execution result back to the server.
+      450  
+       ... truncated at 400 lines ...

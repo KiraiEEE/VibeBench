@@ -1,0 +1,406 @@
+row 178   amazon-far/holosoma#71
+============================================================================
+CLASS InteractionMeshRetargeter in src/holosoma_retargeting/holosoma_retargeting/src/interaction_mesh_retargeter.py   loc=1094 methods=20 wmc=127 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       38  class InteractionMeshRetargeter:
+       39      """
+       40      A class to perform kinematic retargeting from human motion to a robot,
+       41      preserving spatial relationships using an interaction mesh.
+       42      """
+       43  
+       44      def __init__(
+       45          self,
+       46          task_constants: ModuleType,
+       47          object_urdf_path: str,
+       48          q_a_init_idx: int = -7,
+       49          activate_foot_sticking: bool = True,
+       50          activate_obj_non_penetration: bool = True,
+       51          activate_joint_limits: bool = True,
+       52          step_size: float = 0.2,
+       53          collision_detection_threshold: float = 0.1,
+       54          penetration_tolerance: float = 1e-3,
+       55          foot_sticking_tolerance: float = 1e-3,
+       56          visualize: bool = False,
+       57          debug: bool = False,
+       58          w_nominal_tracking_init: float = 5.0,
+       59          nominal_tracking_tau: float = 10.0,
+       60      ):
+       61          """This kinematic retargeter solves the diffIK problem with hard constraints in SQP style.
+       62          During each SQP iteration, the problem is solved with the following constraints and costs:
+       63              1. [Cost] Minimize the Laplacian deformation in the object frame.
+       64              2. [Constraint] Enforce the non-penetration constraints w/ the ground and (if activated) the object.
+       65              3. [Constraint] Enforce the foot sticking constraints if activated.
+       66              4. [Constraint] Enforce the joint limits if activated.
+       67              5. [Constraint] Enforce trust region of dq.
+       68          The constraints are linearized and the costs are quadratic with a trust region.
+       69  
+       70          Args:
+       71              q_a_init_idx: the index in robot's configuration where the optimization variables start. -7: starts from the
+       72              floating base, -3: starts from the translation of the floating base, 0: starts from the actuated DOF,
+       73              12: starts from waist, 15: starts from left shoulder
+       74              step_size: trust region for each SQP iteration.
+       75              collision_detection_threshold: only start to detect collision
+       76              when the distance is smaller than this threshold.
+       77              penetration_tolerance: tolerance for penetration when enforcing non-penetration constraints.
+       78              foot_sticking_tolerance: tolerance for foot sticking constraints in x, y.
+       79              nominal_tracking_tau: the time constant for the nominal tracking cost.
+       80          """
+       81  
+       82          self.robot_model_path = task_constants.ROBOT_URDF_FILE
+       83          self.object_model_path = object_urdf_path
+       84          self.object_name = task_constants.OBJECT_NAME
+       85          self.collision_detection_threshold = collision_detection_threshold
+       86          self.activate_foot_sticking = activate_foot_sticking
+       87          self.activate_obj_non_penetration = activate_obj_non_penetration
+       88          self.activate_joint_limits = activate_joint_limits
+       89          self.foot_links = dict(zip(task_constants.FOOT_STICKING_LINKS, task_constants.FOOT_STICKING_LINKS))
+       90          self.penetration_tolerance = penetration_tolerance
+       91          self.step_size = step_size
+       92          self.visualize = visualize
+       93          self.debug = debug
+       94          self.demo_joints = task_constants.DEMO_JOINTS
+       95          self.laplacian_match_links = task_constants.JOINTS_MAPPING
+       96          self.task_constants = task_constants
+       97  
+       98          self.smplh_mapped_joint_indices = [self.demo_joints.index(name) for name in self.laplacian_match_links]
+       99  
+      100          # Setup weights and parameters
+      101          self.laplacian_weights = 10
+      102          self.smooth_weight = 0.2
+      103          # Tolerance for foot sticking constraints in x, y.
+      104          self.foot_sticking_tolerance = foot_sticking_tolerance
+      105  
+      106          # Setup visualization if requested
+      107          if self.visualize:
+      108              self._setup_visualization()
+      109  
+      110          # Load Mujoco model
+      111          if self.object_name == "ground":
+      112              robot_xml_path = self.robot_model_path.replace(".urdf", ".xml")
+      113          elif self.object_name == "multi_boxes":
+      114              robot_xml_path = self.task_constants.SCENE_XML_FILE
+      115          else:
+      116              robot_xml_path = self.robot_model_path.replace(".urdf", "_w_" + self.object_name + ".xml")
+      117  
+      118          self.robot_model = mujoco.MjModel.from_xml_path(robot_xml_path)
+      119          print("Loading robot model from: ", robot_xml_path)
+      120  
+      121          self.robot_data = mujoco.MjData(self.robot_model)
+      122  
+      123          if self.robot_data.qpos.shape[0] > 7 + self.task_constants.ROBOT_DOF:
+      124              self.has_dynamic_object = True
+      125          else:
+      126              self.has_dynamic_object = False
+      127  
+      128          self.nq = self.robot_model.nq
+      129  
+      130          self.q_a_init_idx = q_a_init_idx
+      131          self.q_a_indices = np.arange(7 + self.q_a_init_idx, 7 + self.task_constants.ROBOT_DOF)
+      132  
+      133          self.nq_a = len(self.q_a_indices)
+      134  
+      135          # Create complete limits with floating base (-inf, inf) and actuated joint limits
+      136          n_floating_base = 7
+      137          joint_names = [self.robot_model.joint(i).name for i in range(self.robot_model.njnt)]
+      138          actuated_joints = [(i, name) for i, name in enumerate(joint_names) if name]  # Filter out None names
+      139  
+      140          large_number = 1e6
+      141          complete_lower_limits = np.concatenate(
+      142              [-large_number * np.ones(n_floating_base), self.robot_model.jnt_range[[i for i, _ in actuated_joints], 0]]
+      143          )
+      144          complete_upper_limits = np.concatenate(
+      145              [large_number * np.ones(n_floating_base), self.robot_model.jnt_range[[i for i, _ in actuated_joints], 1]]
+      146          )
+      147  
+      148          self.q_a_lb = complete_lower_limits[self.q_a_indices]
+      149          self.q_a_ub = complete_upper_limits[self.q_a_indices]
+      150  
+      151          self.q_a_lb[np.array(list(self.task_constants.MANUAL_LB.keys())).astype(int)] = list(
+      152              self.task_constants.MANUAL_LB.values()
+      153          )
+      154          self.q_a_ub[np.array(list(self.task_constants.MANUAL_UB.keys())).astype(int)] = list(
+      155              self.task_constants.MANUAL_UB.values()
+      156          )
+      157  
+      158          # Prevent too much waist twist
+      159          self.Q_diag = np.zeros(self.nq_a) * 1e-3
+      160          self.Q_diag[np.array(list(self.task_constants.MANUAL_COST.keys())).astype(int)] = list(
+      161              self.task_constants.MANUAL_COST.values()
+      162          )
+      163  
+      164          self.w_nominal_tracking_init = w_nominal_tracking_init
+      165          self.nominal_tracking_tau = nominal_tracking_tau
+      166          self.track_nominal_indices = task_constants.NOMINAL_TRACKING_INDICES
+      167  
+      168      def _setup_visualization(self):
+      169          """Setup Viser visualization components."""
+      170          self.server = viser.ViserServer()
+      171  
+      172          # 1) Ensure a world frame exists (absolute path!)
+      173          try:
+      174              self.server.scene.add_frame("/world", show_axes=False)
+      175          except Exception:
+      176              print("Starting viser")
+      177  
+      178          # Create parent frames for robot and object
+      179          self.robot_base = self.server.scene.add_frame("/world/robot", show_axes=False)
+      180  
+      181          print("robot_model_path: ", self.robot_model_path)
+      182  
+      183          # Load robot URDF
+      184          self.robot_urdf = yourdfpy.URDF.load(
+      185              self.robot_model_path,
+      186              load_meshes=True,
+      187              build_scene_graph=True,
+      188          )
+      189  
+      190          print("Viser using robot URDF: ", self.robot_model_path)
+      191  
+      192          # Create ViserUrdf instance for robot, attaching it to the robot_base frame
+      193          self.viser_robot = ViserUrdf(
+      194              self.server,
+      195              urdf_or_path=self.robot_urdf,
+      196              root_node_name="/world/robot",  # This links to the robot_base frame we created
+      197          )
+      198  
+      199          # Similarly for object
+      200          if self.object_model_path:
+      201              self.object_base = self.server.scene.add_frame("/world/object", show_axes=False)
+      202  
+      203              self.object_urdf = yourdfpy.URDF.load(
+      204                  self.object_model_path,
+      205                  load_meshes=True,
+      206                  build_scene_graph=True,
+      207              )
+      208  
+      209              # Create ViserUrdf instance for object, attaching it to the object_base frame
+      210              self.viser_object = ViserUrdf(
+      211                  self.server,
+      212                  urdf_or_path=self.object_urdf,
+      213                  root_node_name="/world/object",  # This links to the object_base frame we created
+      214              )
+      215              print("Viser using object URDF: ", self.object_model_path)
+      216  
+      217          else:
+      218              self.viser_object = None
+      219  
+      220          # Check the number of actuated joints and their names
+      221          robot_joint_limits = self.viser_robot.get_actuated_joint_limits()
+      222          print("\nRobot joints:")
+      223          print("Number of actuated joints:", len(robot_joint_limits))
+      224          print("Joint names:", list(robot_joint_limits.keys()))
+      225  
+      226          # Initialize robot with this configuration
+      227          robot_initial_config = np.zeros(len(robot_joint_limits))
+      228          self.viser_robot.update_cfg(robot_initial_config)
+      229  
+      230          # Add grid
+      231          self.server.scene.add_grid(
+      232              "/world/grid",
+      233              width=8,
+      234              height=8,
+      235              position=(0.0, 0.0, 0.0),
+      236          )
+      237  
+      238      def draw_mesh_from_geom(self, model, data, geom_id, geom_name, name="/mesh", color=(50, 150, 255), opacity=0.5):
+      239          """
+      240          Draw a single MuJoCo mesh geom (already baked to world coords) in viser.
+      241          color is [0, 255] RGB ints; opacity is [0,1].
+      242          """
+      243          if not hasattr(self, "server"):
+      244              return
+      245          V, F = _world_mesh_from_geom(model, data, geom_id, geom_name)
+      246          self.server.scene.add_mesh_simple(
+      247              name,
+      248              vertices=V.astype(np.float32),
+      249              faces=F.astype(np.int32),
+      250              position=(0.0, 0.0, 0.0),  # already world-frame
+      251              color=tuple(int(c) for c in color),
+      252              opacity=float(opacity),
+      253          )
+      254  
+      255      def draw_mesh_pair_with_contact(
+      256          self,
+      257          model,
+      258          data,
+      259          geom_id1,
+      260          geom_id2,
+      261          geom1_name,
+      262          geom2_name,
+      263          fromto=None,
+      264          group_name="pair",
+      265          color1=(50, 150, 255),
+      266          color2=(255, 120, 60),
+      267          opacity=0.45,
+      268          show_segment=True,
+      269      ):
+      270          """
+      271          Draw two meshes and (optionally) a contact/query segment.
+      272          Uses the existing self.draw_keypoints(...) to visualize points.
+      273          """
+      274          # Note: sometime geom does not have mesh, mesh_id will be -1
+      275          if int(model.geom_dataid[geom_id1]) == -1 or int(model.geom_dataid[geom_id2]) == -1:
+      276              return
+      277  
+      278          base = f"/{group_name}"
+      279          # meshes
+      280          self.draw_mesh_from_geom(model, data, geom_id1, geom1_name, name=f"{base}/mesh1", color=color1, opacity=opacity)
+      281          self.draw_mesh_from_geom(model, data, geom_id2, geom2_name, name=f"{base}/mesh2", color=color2, opacity=opacity)
+      282  
+      283          # contact points (q: green, c: red) via your draw_keypoints
+      284          if fromto is not None:
+      285              q = np.asarray(fromto[:3], dtype=float)
+      286              c = np.asarray(fromto[3:], dtype=float)
+      287  
+      288              # your existing helper (rgba expects floats 0..1)
+      289              self.draw_keypoints(q, name=f"{group_name}_q", rgba=(0.0, 1.0, 0.0, 1.0))
+      290              self.draw_keypoints(c, name=f"{group_name}_c", rgba=(1.0, 0.0, 0.0, 1.0))
+      291  
+      292      def retarget_motion(
+      293          self,
+      294          human_joint_motions,
+      295          object_poses,
+      296          object_poses_augmented,
+      297          object_points_local_demo,
+      298          object_points_local,
+      299          foot_sticking_sequences,
+      300          q_a_init=None,
+      301          q_nominal_list=None,
+      302          original=True,
+      303          dest_res_path=None,
+      304      ):
+      305          """
+      306          The main function to retarget an entire motion sequence frame by frame.
+      307  
+      308          Args:
+      309              human_joint_motions (np.ndarray): (num_frames, num_joints, 3) array.
+      310              object_poses (np.ndarray): (num_frames, 7) array of demo object poses (quat, trans).
+      311              object_poses_augmented (np.ndarray): (num_frames, 7) array of augmented object poses (quat, trans).
+      312              object_points_local_demo (np.ndarray): Demo object points in local frame (rest pose).
+      313              object_points_local (np.ndarray): Current object points in local frame (rest pose).
+      314              foot_sticking_sequences (list): List of foot sticking sequences for each frame.
+      315              q_a_init (np.ndarray, optional): Initial robot configuration.
+      316              q_a_nominal (np.ndarray, optional): Nominal robot configuration.
+      317  
+      318          Returns:
+      319              tuple: (retargeted_motions, obj_pts_demo_list, obj_pts_list, tetrahedra)
+      320          """
+      321          num_frames = human_joint_motions.shape[0]
+      322          if q_nominal_list is not None:
+      323              q_locked_list = q_nominal_list
+      324          else:
+      325              q_locked_list = np.zeros((num_frames, self.nq))
+      326              q_locked_list[0, self.q_a_indices] = q_a_init
+      327  
+      328          q_locked_list[:, -7:] = object_poses_augmented
+      329          q = np.copy(q_locked_list[0])
+      330          retargeted_motions = [q]
+      331  
+      332          tetrahedra = []
+      333          obj_pts_demo_list = []  # scaled object pts
+      334          obj_pts_list = []  # original size object pts
+      335  
+      336          print(f"\nStarting motion retargeting for {num_frames} frames...")
+      337  
+      338          with tqdm(range(num_frames)) as pbar:
+      339              for i in pbar:
+      340                  # Get object poses and transform points
+      341                  object_quat_demo = object_poses[i, 3:]
+      342                  object_trans_demo = object_poses[i, :3]
+      343  
+      344                  # Get human joint positions and create interaction mesh in object frame
+      345                  human_mapped_joints = human_joint_motions[i, self.smplh_mapped_joint_indices]
+      346  
+      347                  if self.object_name == "ground":
+      348                      human_mapped_joints_in_object = human_mapped_joints
+      349                  else:
+      350                      human_mapped_joints_in_object = transform_points_world_to_local(
+      351                          object_quat_demo, object_trans_demo, human_mapped_joints
+      352                      )
+      353  
+      354                  source_vertices, source_tetrahedra = create_interaction_mesh(
+      355                      np.vstack([human_mapped_joints_in_object, object_points_local_demo])
+      356                  )
+      357                  tetrahedra.append(source_tetrahedra)
+      358  
+      359                  if self.debug:
+      360                      # Only for visualization
+      361                      object_quat = object_poses_augmented[i, 3:]
+      362                      object_trans = object_poses_augmented[i, :3]
+      363                      obj_pts_demo = transform_points_local_to_world(
+      364                          object_quat_demo, object_trans_demo, object_points_local_demo
+      365                      )
+      366                      obj_pts = transform_points_local_to_world(object_quat, object_trans, object_points_local)
+      367  
+      368                      obj_pts_demo_list.append(obj_pts_demo)
+      369                      obj_pts_list.append(obj_pts)
+      370                      human_kpts_handle_list = self.draw_keypoints(human_mapped_joints, name="human_kpts")  # 15 X 3
+      371                      obj_kpts_demo_handle_list = self.draw_keypoints(
+      372                          obj_pts_demo, name="object_demo_kpts", rgba=(1, 0, 0, 1)
+      373                      )  # 100 X 3
+      374                      obj_kpts_handle_list = self.draw_keypoints(
+      375                          obj_pts, name="object_kpts", rgba=(0, 1, 1, 1)
+      376                      )  # 100 X 3
+      377  
+      378                  # Create adjacency list and calculate target Laplacian coordinates
+      379                  adj_list = get_adjacency_list(source_tetrahedra, len(source_vertices))
+      380                  target_laplacian = calculate_laplacian_coordinates(source_vertices, adj_list)
+      381  
+      382                  # Run optimization
+      383                  if original:
+      384                      w_nominal_tracking = self.w_nominal_tracking_init
+      385                  else:
+      386                      w_nominal_tracking = self.w_nominal_tracking_init * np.exp(-i / self.nominal_tracking_tau)
+      387  
+      388                  q, cost = self.iterate(
+      389                      q_locked=q_locked_list[i],
+      390                      q_n=q,
+      391                      q_t_last=retargeted_motions[-1],
+      392                      target_laplacian=target_laplacian,
+      393                      adj_list=adj_list,
+      394                      obj_pts_local=object_points_local,
+      395                      foot_sticking=foot_sticking_sequences[i],
+      396                      w_nominal_tracking=w_nominal_tracking,
+      397                      q_a_nominal=(q_nominal_list[i, self.q_a_indices] if q_nominal_list is not None else None),
+      398                      init_t=i == 0,
+      399                      n_iter=50 if i == 0 else 10,
+      400                  )
+      401                  if self.debug:
+      402                      robot_link_positions = self._get_robot_link_positions(
+      403                          q, self.laplacian_match_links.values()
+      404                      )  # 15 X 3
+      405                      robot_kpts_handle_list = self.draw_keypoints(
+      406                          robot_link_positions, name="robot_kpts", rgba=(0, 1, 0, 1)
+      407                      )
+      408  
+      409                  retargeted_motions.append(q)
+      410                  if self.visualize and self.debug:
+      411                      self.draw_q(q)
+      412  
+      413                  pbar.set_postfix(cost=cost)
+      414  
+      415          # Remove previous debug visualization
+      416          if self.debug:
+      417              for handle in human_kpts_handle_list:
+      418                  handle.remove()
+      419              human_kpts_handle_list.clear()
+      420  
+      421              for handle in obj_kpts_demo_handle_list:
+      422                  handle.remove()
+      423              obj_kpts_demo_handle_list.clear()
+      424  
+      425              for handle in obj_kpts_handle_list:
+      426                  handle.remove()
+      427              obj_kpts_handle_list.clear()
+      428  
+      429              for handle in robot_kpts_handle_list:
+      430                  handle.remove()
+      431              robot_kpts_handle_list.clear()
+      432  
+      433          # Save results
+      434          np.savez(
+      435              dest_res_path,
+      436              qpos=np.array(retargeted_motions)[1:],
+      437              human_joints=human_joint_motions,
+       ... truncated at 400 lines ...

@@ -1,0 +1,375 @@
+row 93   urchade/GLiNER#342
+============================================================================
+CONTRACT gliner.model:BaseGLiNER   kind=abc abstract_methods=5.0 implementers=10.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file gliner/model.py
+      105  class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
+      106      config_class: type = None
+      107      model_class: type = None
+      108      ort_model_class: type = None
+      109      data_processor_class: type = None
+      110      data_collator_class: type = None
+      111      decoder_class: type = None
+      112  
+      113      def __init__(
+      114          self,
+      115          config: BaseGLiNERConfig,
+      116          model: Optional[BaseModel] = None,
+      117          tokenizer: Optional[BaseModel] = None,
+      118          data_processor: Optional[BaseProcessor] = None,
+      119          backbone_from_pretrained: Optional[bool] = False,
+      120          cache_dir: Optional[Union[str, Path]] = None,
+      121          **kwargs,
+      122      ):
+      123          """Initialize a BaseGLiNER model.
+      124  
+      125          Args:
+      126              config: Model configuration object.
+      127              model: Pre-initialized model instance. If None, creates a new model.
+      128              tokenizer: Pre-initialized tokenizer. If None, creates a new tokenizer.
+      129              data_processor: Pre-initialized data processor. If None, creates a new processor.
+      130              backbone_from_pretrained: Whether to load the backbone from pretrained weights.
+      131              cache_dir: Directory for caching downloaded models.
+      132              **kwargs: Additional keyword arguments passed to model creation.
+      133          """
+      134          super().__init__()
+      135          self.config = config
+      136  
+      137          if model is not None:
+      138              self.model = model
+      139          else:
+      140              self.model = self._create_model(config, backbone_from_pretrained, cache_dir, **kwargs)
+      141  
+      142          if data_processor is not None:
+      143              self.data_processor = data_processor
+      144          else:
+      145              self.data_processor = self._create_data_processor(config, cache_dir, tokenizer, **kwargs)
+      146  
+      147          if isinstance(self.model, BaseORTModel):
+      148              self.onnx_model = True
+      149          else:
+      150              self.onnx_model = False
+      151  
+      152          self.decoder = self.decoder_class(config)
+      153  
+      154          self._keys_to_ignore_on_save = None
+      155          self._inference_packing_config: Optional[InferencePackingConfig] = None
+      156  
+      157      @abstractmethod
+      158      def _create_model(self, config, backbone_from_pretrained, cache_dir, **kwargs):
+      159          """
+      160          Create model instance. Must be implemented by child classes.
+      161  
+      162          Returns:
+      163              Model instance
+      164          """
+      165          pass
+      166  
+      167      @abstractmethod
+      168      def _create_data_processor(self, config, cache_dir, tokenizer=None, **kwargs):
+      169          """
+      170          Create data processor instance. Must be implemented by child classes.
+      171  
+      172          Returns:
+      173              Data processor instance
+      174          """
+      175          pass
+      176  
+      177      @abstractmethod
+      178      def resize_embeddings(self):
+      179          pass
+      180  
+      181      @abstractmethod
+      182      def inference(self):
+      183          pass
+      184  
+      185      @abstractmethod
+      186      def evaluate(self):
+      187          pass
+      188      
+      189      def forward(self, *args, **kwargs):
+      190          """Forward pass through the model.
+      191  
+      192          Args:
+      193              *args: Positional arguments passed to the model.
+      194              **kwargs: Keyword arguments passed to the model.
+      195  
+      196          Returns:
+      197              Model output from the forward pass.
+      198          """
+      199          output = self.model(*args, **kwargs)
+      200          return output
+      201  
+      202      @property
+      203      def device(self):
+      204          """Get the device where the model is located.
+      205  
+      206          Returns:
+      207              Torch device object (CPU or CUDA).
+      208          """
+      209          if self.onnx_model:
+      210              providers = self.model.session.get_providers()
+      211              if "CUDAExecutionProvider" in providers:
+      212                  return torch.device("cuda")
+      213              return torch.device("cpu")
+      214          device = next(self.model.parameters()).device
+      215          return device
+      216  
+      217      def configure_inference_packing(self, config: Optional[InferencePackingConfig]) -> None:
+      218          """Configure default packing behavior for inference calls.
+      219  
+      220          Passing ``None`` disables packing by default. Individual inference
+      221          methods accept a ``packing_config`` argument to override this setting
+      222          on a per-call basis.
+      223  
+      224          Args:
+      225              config: Inference packing configuration or None to disable packing.
+      226          """
+      227          self._inference_packing_config = config
+      228  
+      229      def compile(self):
+      230          """Compile the model using torch.compile for optimization.
+      231  
+      232          Uses ``dynamic=True`` to generate shape-generic kernels, which avoids
+      233          recompilation on variable-length NER inputs. Also enables
+      234          ``capture_scalar_outputs`` to trace through data-dependent shape
+      235          operations (e.g., computing max number of entity types per batch).
+      236  
+      237          Best combined with ``quantize()`` for maximum throughput (~1.9x over fp32).
+      238  
+      239          When FlashDeBERTa is active, its custom Triton kernels are incompatible
+      240          with torch.compile tracing.  The encoder forward is automatically
+      241          wrapped with ``torch.compiler.disable`` so the rest of the model
+      242          (span representation, scoring, etc.) still benefits from compilation.
+      243          """
+      244          torch._dynamo.config.capture_scalar_outputs = True
+      245  
+      246          # FlashDeBERTa uses hand-written Triton kernels that torch.compile cannot trace. 
+      247          try:
+      248              bert_layer = self.model.token_rep_layer.bert_layer
+      249              model_cls = bert_layer.model.__class__.__name__
+      250              if model_cls == "FlashDebertaV2Model":
+      251                  bert_layer.forward = torch.compiler.disable(bert_layer.forward)
+      252          except AttributeError:
+      253              pass  # non-standard architecture, skip
+      254  
+      255          self.model = torch.compile(self.model, dynamic=True)
+      256  
+      257      _QUANTIZE_DTYPES = {
+      258          "fp16": torch.float16,
+      259          "float16": torch.float16,
+      260          "half": torch.float16,
+      261          "bf16": torch.bfloat16,
+      262          "bfloat16": torch.bfloat16,
+      263          "int8": "int8",
+      264      }
+      265  
+      266      def quantize(self, dtype: str = "fp16") -> None:
+      267          """Apply quantization to the model.
+      268  
+      269          Args:
+      270              dtype: Quantization type. Options:
+      271                  - ``"fp16"`` (default): float16 half-precision. On GPU, uses Tensor Core
+      272                    acceleration for ~1.4x speedup. On CPU, applies dynamic quantization
+      273                    (reduces memory, no speed benefit).
+      274                  - ``"bf16"``: bfloat16 half-precision. Better numerical stability than
+      275                    fp16 with slightly less speedup (~1.2x).
+      276                  - ``"int8"``: int8 quantization (GPU and CPU). On CPU, uses PyTorch's
+      277                    built-in dynamic quantization with FBGEMM int8 kernels (~1.6x
+      278                    speedup). On GPU, uses ``torchao`` int8 weight-only quantization
+      279                    (~50% memory reduction, no speed gain; requires the ``torchao``
+      280                    package). Stock DeBERTa-based models lose accuracy with int8;
+      281                    use this with models that have been fine-tuned with
+      282                    quantization-aware training (QAT).
+      283  
+      284          Raises:
+      285              RuntimeError: If the model is an ONNX model (use ONNX quantization instead).
+      286              ValueError: If *dtype* is not a recognized quantization type.
+      287              ImportError: If ``torchao`` is not installed and int8 on GPU is requested.
+      288  
+      289          Examples:
+      290              >>> model = GLiNER.from_pretrained("urchade/gliner_small-v2.1", map_location="cuda")
+      291              >>> model.quantize()           # fp16 half-precision on GPU — ~1.4x faster
+      292              >>> model.quantize("bf16")     # bfloat16 on GPU — ~1.2x faster
+      293              >>> model.quantize("int8")     # int8 quantization (torchao on GPU, FBGEMM on CPU)
+      294          """
+      295          if self.onnx_model:
+      296              raise RuntimeError(
+      297                  "Cannot apply PyTorch quantization to an ONNX model. "
+      298                  "Use export_to_onnx(quantize=True) for ONNX quantization."
+      299              )
+      300  
+      301          dtype_lower = dtype.lower()
+      302          if dtype_lower not in self._QUANTIZE_DTYPES:
+      303              raise ValueError(
+      304                  f"Unknown quantize dtype {dtype!r}. "
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER gliner.model:BaseEncoderGLiNER  stubs=0/5 ----------
+     1299  class BaseEncoderGLiNER(BaseGLiNER):
+     1300      def _create_model(self, config, backbone_from_pretrained, cache_dir, **kwargs):
+     1301          self.model = self.model_class(config, backbone_from_pretrained, cache_dir=cache_dir, **kwargs)
+     1302          return self.model
+     1304      def _create_data_processor(self, config, cache_dir, tokenizer=None, words_splitter=None, **kwargs):
+     1305          if tokenizer is None:
+     1306              tokenizer = AutoTokenizer.from_pretrained(config.model_name, cache_dir=cache_dir)
+     1307              self._set_tokenizer_spec_tokens(tokenizer)
+     1308          self.data_processor = self.data_processor_class(config, tokenizer, words_splitter)
+     1309          return self.data_processor
+     1315      def resize_embeddings(self, set_class_token_index=True):
+     1316          """Resize token embeddings to match tokenizer vocabulary size.
+     1317  
+     1318          Args:
+     1319              set_class_token_index: Whether to update the class token index.
+     1320          """
+     1321          if set_class_token_index:
+     1322              self.set_class_indices()
+     1323  
+     1324          if len(self.data_processor.transformer_tokenizer) != self.config.vocab_size:
+     1325              new_num_tokens = len(self.data_processor.transformer_tokenizer)
+     1326              model_embeds = self.model.token_rep_layer.resize_token_embeddings(new_num_tokens, None)
+     1327              self.config.vocab_size = model_embeds.num_embeddings
+     1328              if hasattr(self.config, "encoder_config"):
+     1329                  self.config.encoder_config.vocab_size = model_embeds.num_embeddings
+     1533      @torch.no_grad()
+     1534      def inference(
+     1535          self,
+     1536          texts: Union[str, List[str]],
+     1537          labels: List[str],
+     1538          flat_ner: bool = True,
+     1539          threshold: float = 0.5,
+     1540          multi_label: bool = False,
+     1541          batch_size: int = 8,
+     1542          packing_config: Optional[InferencePackingConfig] = None,
+     1543          input_spans: List[List[Dict]] = None,
+     1544          return_class_probs: bool = False,
+     1545          **external_inputs,
+     1546      ) -> List[List[Dict[str, Any]]]:
+     1547          """Predict entities for a batch of texts.
+     1548  
+     1549          Args:
+     1550              texts: A list of input texts to predict entities for or a single text string.
+     1551              labels: A list of labels to predict.
+     1552              flat_ner: Whether to use flat NER. Defaults to True.
+     1553              threshold: Confidence threshold for predictions. Defaults to 0.5.
+     1554              multi_label: Whether to allow multiple labels per token. Defaults to False.
+     1555              batch_size: Batch size for processing. Defaults to 8.
+     1556              packing_config: Configuration describing how to pack encoder inputs. When None
+     1557                  the instance-level configuration set via configure_inference_packing is used.
+     1558              input_spans: Input entity spans that should be classified by the model.
+     1559              return_class_probs: Whether to include class probabilities in output. Defaults to False.
+     1560              **external_inputs: Additional inputs to pass to the model.
+     1561  
+     1562          Returns:
+     1563              List of lists with predicted entities, where each entity is a dictionary containing:
+     1564                  - start: Start character position
+     1565                  - end: End character position
+     1566                  - text: Entity text
+     1567                  - label: Entity type
+     1568                  - score: Confidence score
+     1569                  - class_probs: (optional) Dictionary mapping class names to probabilities (top 5)
+     1570          """
+     1571          self.eval()
+     1572  
+     1573          # Normalize input
+     1574          if isinstance(texts, str):
+     1575              texts = [texts]
+     1576  
+     1577          # Filter out empty/whitespace-only strings
+     1578          valid_texts, valid_to_orig_idx = self._filter_valid_texts(texts)
+     1579  
+     1580          # Early exit: nothing valid to process
+     1581          if not valid_texts:
+     1582              return [[] for _ in texts]
+     1583  
+     1584          entity_types = list(dict.fromkeys(labels))
+     1585  
+     1586          tokens, all_start_token_idx_to_text_idx, all_end_token_idx_to_text_idx = \
+     1587              self.prepare_inputs(valid_texts)
+     1588  
+     1589          # Convert input_spans from character positions to word indices
+     1590          word_input_spans = None
+     1591          if input_spans is not None:
+     1592              valid_input_spans = [input_spans[i] for i in valid_to_orig_idx]
+       ... truncated at 60 lines ...
+     1714      def evaluate(
+     1715          self,
+     1716          test_data: List[Dict[str, Any]],
+     1717          flat_ner: bool = False,
+     1718          multi_label: bool = False,
+     1719          threshold: float = 0.5,
+     1720          batch_size: int = 12,
+     1721      ) -> Tuple[Any, float]:
+     1722          """Evaluate the model on a given test dataset.
+     1723  
+     1724          Args:
+     1725              test_data: The test data containing text and entity annotations.
+     1726              flat_ner: Whether to use flat NER. Defaults to False.
+     1727              multi_label: Whether to use multi-label classification. Defaults to False.
+     1728              threshold: The threshold for predictions. Defaults to 0.5.
+     1729              batch_size: The batch size for evaluation. Defaults to 12.
+     1730  
+     1731          Returns:
+     1732              Tuple containing the evaluation output and the F1 score.
+     1733          """
+     1734          self.eval()
+     1735          # Create the dataset and data loader
+     1736          dataset = test_data
+     1737          collator = self.data_collator_class(
+     1738              self.config,
+     1739              data_processor=self.data_processor,
+     1740              return_tokens=True,
+     1741              return_entities=True,
+     1742              return_id_to_classes=True,
+     1743              prepare_labels=False,
+     1744          )
+     1745          data_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collator)
+     1746  
+     1747          all_preds = self._process_batches(data_loader, threshold, flat_ner, multi_label)
+     1748          all_trues = []
+     1749  
+     1750          # Iterate over data batches
+     1751          for batch in data_loader:
+     1752              all_trues.extend(batch["entities"])
+     1753  
+     1754          # Evaluate the predictions
+     1755          evaluator = BaseNEREvaluator(all_trues, all_preds)
+     1756          out, f1 = evaluator.evaluate()
+     1757  
+     1758          return out, f1
+
+---------- IMPLEMENTER gliner.model:BaseBiEncoderGLiNER  stubs=0/5 ----------
+     1761  class BaseBiEncoderGLiNER(BaseEncoderGLiNER):
+     1762      def _create_data_processor(self, config, cache_dir, tokenizer=None, words_splitter=None, **kwargs):
+     1763          labels_tokenizer = AutoTokenizer.from_pretrained(config.labels_encoder, cache_dir=cache_dir)
+     1764          if tokenizer is None:
+     1765              tokenizer = AutoTokenizer.from_pretrained(config.model_name, cache_dir=cache_dir)
+     1766              self._set_tokenizer_spec_tokens(tokenizer)
+     1767  
+     1768          self.data_processor = self.data_processor_class(
+     1769              config, tokenizer, words_splitter, labels_tokenizer=labels_tokenizer
+     1770          )
+     1771          return self.data_processor
+     1773      def resize_embeddings(self, **kwargs):
+     1774          warnings.warn("Resizing embeddings is not supported for bi-encoder models.", stacklevel=2)
+      (does not define: _create_model, evaluate, inference; inherited or absent)
+
+---------- IMPLEMENTER gliner.model:UniEncoderSpanGLiNER  stubs=0/5 ----------
+     2017  class UniEncoderSpanGLiNER(BaseEncoderGLiNER):
+      (does not define: _create_data_processor, _create_model, evaluate, inference, resize_embeddings; inherited or absent)
+
+---------- IMPLEMENTER gliner.model:UniEncoderTokenGLiNER  stubs=0/5 ----------
+     2083  class UniEncoderTokenGLiNER(BaseEncoderGLiNER):
+      (does not define: _create_data_processor, _create_model, evaluate, inference, resize_embeddings; inherited or absent)
+
+---------- IMPLEMENTER gliner.model:BiEncoderSpanGLiNER  stubs=0/5 ----------
+     2141  class BiEncoderSpanGLiNER(BaseBiEncoderGLiNER):
+      (does not define: _create_data_processor, _create_model, evaluate, inference, resize_embeddings; inherited or absent)
+
+---------- IMPLEMENTER gliner.model:BiEncoderTokenGLiNER  stubs=0/5 ----------
+     2183  class BiEncoderTokenGLiNER(BaseBiEncoderGLiNER):
+      (does not define: _create_data_processor, _create_model, evaluate, inference, resize_embeddings; inherited or absent)
+
+(4 further implementers not shown)

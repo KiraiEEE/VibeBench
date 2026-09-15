@@ -1,0 +1,410 @@
+row 194   lee101/stock-prediction#14
+============================================================================
+CHAIN in trade_stock_e2e.analyze_symbols   kind=value_switch subject='candidate_name' branches=2
+QUESTION: is the set of variants OPEN (a new one is expected, and
+          would force editing this chain) or CLOSED by nature?
+SHOWING THE WHOLE ENCLOSING FUNCTION -- a branch count alone cannot answer this.
+>>> marks the first line of the dispatch chain itself.
+
+file trade_stock_e2e.py
+     1237  def analyze_symbols(symbols: List[str]) -> Dict:
+     1238      """Run backtest analysis on symbols and return results sorted by average return."""
+     1239      results = {}
+     1240      equities_tradable_now = is_nyse_trading_day_now()
+     1241      skip_closed_equity = _should_skip_closed_equity()
+     1242      skipped_equity_symbols: List[str] = []
+     1243  
+     1244      env_simulations_raw = os.getenv("MARKETSIM_BACKTEST_SIMULATIONS")
+     1245      env_simulations: Optional[int]
+     1246      if env_simulations_raw:
+     1247          try:
+     1248              env_simulations = max(1, int(env_simulations_raw))
+     1249          except ValueError:
+     1250              logger.warning(
+     1251                  "Ignoring invalid MARKETSIM_BACKTEST_SIMULATIONS=%r; using default of 70 simulations.",
+     1252                  env_simulations_raw,
+     1253              )
+     1254              env_simulations = None
+     1255          else:
+     1256              logger.info(f"Using MARKETSIM_BACKTEST_SIMULATIONS override of {env_simulations} for backtest iterations.")
+     1257      else:
+     1258          env_simulations = None
+     1259  
+     1260      kronos_only_mode = _is_kronos_only_mode()
+     1261  
+     1262      latest_snapshot = _load_latest_forecast_snapshot()
+     1263  
+     1264      for symbol in symbols:
+     1265          if symbol not in crypto_symbols and not equities_tradable_now:
+     1266              if skip_closed_equity:
+     1267                  skipped_equity_symbols.append(symbol)
+     1268                  continue
+     1269              logger.debug(
+     1270                  "%s: market closed but analyzing due to MARKETSIM_SKIP_CLOSED_EQUITY override.",
+     1271                  symbol,
+     1272              )
+     1273          try:
+     1274              kelly_fraction = None
+     1275              # not many because we need to adapt strats? eg the wierd spikes in uniusd are a big opportunity to trade w high/low
+     1276              # but then i bumped up because its not going to say buy crypto when its down, if its most recent based?
+     1277              num_simulations = env_simulations or 70
+     1278              used_fallback_engine = False
+     1279  
+     1280              try:
+     1281                  backtest_df = backtest_forecasts(symbol, num_simulations)
+     1282              except Exception as exc:
+     1283                  logger.warning(
+     1284                      f"Primary backtest_forecasts failed for {symbol}: {exc}. Attempting simulator fallback analytics."
+     1285                  )
+     1286                  try:
+     1287                      from marketsimulator import backtest_test3_inline as sim_backtest  # type: ignore
+     1288  
+     1289                      backtest_df = sim_backtest.backtest_forecasts(symbol, num_simulations)
+     1290                  except Exception as fallback_exc:
+     1291                      logger.error(f"Fallback backtest also failed for {symbol}: {fallback_exc}. Skipping symbol.")
+     1292                      continue
+     1293                  used_fallback_engine = True
+     1294  
+     1295              if backtest_df.empty:
+     1296                  logger.warning(f"Skipping {symbol} - backtest returned no simulations.")
+     1297                  continue
+     1298  
+     1299              required_columns = {
+     1300                  "simple_strategy_return",
+     1301                  "all_signals_strategy_return",
+     1302                  "entry_takeprofit_return",
+     1303                  "highlow_return",
+     1304              }
+     1305              missing_cols = required_columns.difference(backtest_df.columns)
+     1306              if missing_cols:
+     1307                  logger.warning(f"Skipping {symbol} - missing backtest metrics: {sorted(missing_cols)}")
+     1308                  continue
+     1309  
+     1310              sample_size = len(backtest_df)
+     1311              trading_days_per_year = 365 if symbol in crypto_symbols else 252
+     1312  
+     1313              _normalized_cache: Dict[str, Optional[pd.Series]] = {}
+     1314  
+     1315              def _normalized_series(column: str) -> Optional[pd.Series]:
+     1316                  if column not in _normalized_cache:
+     1317                      if column in backtest_df.columns:
+     1318                          _normalized_cache[column] = _normalize_series(backtest_df[column])
+     1319                      else:
+     1320                          _normalized_cache[column] = None
+     1321                  return _normalized_cache[column]
+     1322  
+     1323              def _metric(value: object, default: float = 0.0) -> float:
+     1324                  return coerce_numeric(value, default=default, prefer="mean")
+     1325  
+     1326              def _mean_column(column: str, default: float = 0.0) -> float:
+     1327                  series = _normalized_series(column)
+     1328                  if series is None or series.empty:
+     1329                      return default
+     1330                  return _metric(series, default=default)
+     1331  
+     1332              def _mean_return(primary: str, fallback: Optional[str] = None, default: float = 0.0) -> float:
+     1333                  series = _normalized_series(primary)
+     1334                  if series is None and fallback:
+     1335                      series = _normalized_series(fallback)
+     1336                  if series is None or series.empty:
+     1337                      return default
+     1338                  return _metric(series, default=default)
+     1339  
+     1340              strategy_returns_daily = {
+     1341                  "simple": _mean_return("simple_strategy_avg_daily_return", "simple_strategy_return"),
+     1342                  "all_signals": _mean_return("all_signals_strategy_avg_daily_return", "all_signals_strategy_return"),
+     1343                  "takeprofit": _mean_return("entry_takeprofit_avg_daily_return", "entry_takeprofit_return"),
+     1344                  "highlow": _mean_return("highlow_avg_daily_return", "highlow_return"),
+     1345                  "maxdiff": _mean_return("maxdiff_avg_daily_return", "maxdiff_return"),
+     1346                  "maxdiffalwayson": _mean_return("maxdiffalwayson_avg_daily_return", "maxdiffalwayson_return"),
+     1347              }
+     1348              strategy_returns_annual = {
+     1349                  "simple": _mean_return("simple_strategy_annual_return", "simple_strategy_return"),
+     1350                  "all_signals": _mean_return("all_signals_strategy_annual_return", "all_signals_strategy_return"),
+     1351                  "takeprofit": _mean_return("entry_takeprofit_annual_return", "entry_takeprofit_return"),
+     1352                  "highlow": _mean_return("highlow_annual_return", "highlow_return"),
+     1353                  "maxdiff": _mean_return("maxdiff_annual_return", "maxdiff_return"),
+     1354                  "maxdiffalwayson": _mean_return("maxdiffalwayson_annual_return", "maxdiffalwayson_return"),
+     1355              }
+     1356              if "ci_guard_return" in backtest_df.columns:
+     1357                  strategy_returns_daily["ci_guard"] = _mean_return(
+     1358                      "ci_guard_avg_daily_return",
+     1359                      "ci_guard_return",
+     1360                  )
+     1361                  strategy_returns_annual["ci_guard"] = _mean_return(
+     1362                      "ci_guard_annual_return",
+     1363                      "ci_guard_return",
+     1364                  )
+     1365              strategy_returns = strategy_returns_daily
+     1366              strategy_recent_sums: Dict[str, Optional[float]] = {}
+     1367  
+     1368              def _recent_return_sum(primary: str, fallback: Optional[str] = None, window: int = 2) -> Optional[float]:
+     1369                  series = _normalized_series(primary)
+     1370                  if (series is None or series.empty) and fallback:
+     1371                      series = _normalized_series(fallback)
+     1372                  if series is None or series.empty:
+     1373                      return None
+     1374                  recent = series.dropna()
+     1375                  if recent.empty or len(recent) < window:
+     1376                      return None
+     1377                  return float(recent.iloc[:window].sum())
+     1378  
+     1379              _strategy_series_map: Dict[str, Tuple[str, Optional[str]]] = {
+     1380                  "simple": ("simple_strategy_avg_daily_return", "simple_strategy_return"),
+     1381                  "all_signals": ("all_signals_strategy_avg_daily_return", "all_signals_strategy_return"),
+     1382                  "takeprofit": ("entry_takeprofit_avg_daily_return", "entry_takeprofit_return"),
+     1383                  "highlow": ("highlow_avg_daily_return", "highlow_return"),
+     1384                  "maxdiff": ("maxdiff_avg_daily_return", "maxdiff_return"),
+     1385                  "maxdiffalwayson": ("maxdiffalwayson_avg_daily_return", "maxdiffalwayson_return"),
+     1386              }
+     1387              if "ci_guard" in strategy_returns:
+     1388                  _strategy_series_map["ci_guard"] = ("ci_guard_avg_daily_return", "ci_guard_return")
+     1389  
+     1390              unprofit_return = 0.0
+     1391              unprofit_sharpe = 0.0
+     1392              if (
+     1393                  "unprofit_shutdown_avg_daily_return" in backtest_df.columns
+     1394                  or "unprofit_shutdown_return" in backtest_df.columns
+     1395              ):
+     1396                  unprofit_return = _mean_return("unprofit_shutdown_avg_daily_return", "unprofit_shutdown_return")
+     1397                  strategy_returns["unprofit_shutdown"] = unprofit_return
+     1398                  strategy_returns_annual["unprofit_shutdown"] = _mean_return(
+     1399                      "unprofit_shutdown_annual_return",
+     1400                      "unprofit_shutdown_return",
+     1401                  )
+     1402              if "unprofit_shutdown_sharpe" in backtest_df.columns:
+     1403                  unprofit_sharpe = _metric(backtest_df["unprofit_shutdown_sharpe"], default=0.0)
+     1404  
+     1405              raw_last_prediction = backtest_df.iloc[0]
+     1406              last_prediction = raw_last_prediction.apply(
+     1407                  lambda value: coerce_numeric(value, default=0.0, prefer="mean")
+     1408              )
+     1409              walk_forward_oos_sharpe_raw = last_prediction.get("walk_forward_oos_sharpe")
+     1410              walk_forward_turnover_raw = last_prediction.get("walk_forward_turnover")
+     1411              walk_forward_highlow_raw = last_prediction.get("walk_forward_highlow_sharpe")
+     1412              walk_forward_takeprofit_raw = last_prediction.get("walk_forward_takeprofit_sharpe")
+     1413              walk_forward_maxdiff_raw = last_prediction.get("walk_forward_maxdiff_sharpe")
+     1414  
+     1415              walk_forward_oos_sharpe = (
+     1416                  coerce_numeric(walk_forward_oos_sharpe_raw) if walk_forward_oos_sharpe_raw is not None else None
+     1417              )
+     1418              walk_forward_turnover = (
+     1419                  coerce_numeric(walk_forward_turnover_raw) if walk_forward_turnover_raw is not None else None
+     1420              )
+     1421              walk_forward_highlow_sharpe = (
+     1422                  coerce_numeric(walk_forward_highlow_raw) if walk_forward_highlow_raw is not None else None
+     1423              )
+     1424              walk_forward_takeprofit_sharpe = (
+     1425                  coerce_numeric(walk_forward_takeprofit_raw) if walk_forward_takeprofit_raw is not None else None
+     1426              )
+     1427              walk_forward_maxdiff_sharpe = (
+     1428                  coerce_numeric(walk_forward_maxdiff_raw) if walk_forward_maxdiff_raw is not None else None
+     1429              )
+     1430  
+     1431              close_price = coerce_numeric(last_prediction.get("close"), default=0.0)
+     1432              predicted_close_price = coerce_numeric(
+     1433                  last_prediction.get("predicted_close"),
+     1434                  default=close_price,
+     1435              )
+     1436              predicted_high_price = coerce_numeric(
+     1437                  last_prediction.get("predicted_high"),
+     1438                  default=predicted_close_price,
+     1439              )
+     1440              predicted_low_price = coerce_numeric(
+     1441                  last_prediction.get("predicted_low"),
+     1442                  default=predicted_close_price,
+     1443              )
+     1444  
+     1445              def _optional_numeric(value: object) -> Optional[float]:
+     1446                  raw = coerce_numeric(value, default=float("nan")) if value is not None else float("nan")
+     1447                  return raw if math.isfinite(raw) else None
+     1448  
+     1449              maxdiff_high_price = _optional_numeric(last_prediction.get("maxdiffprofit_high_price"))
+     1450              maxdiff_low_price = _optional_numeric(last_prediction.get("maxdiffprofit_low_price"))
+     1451              maxdiff_trade_bias = _optional_numeric(last_prediction.get("maxdiff_trade_bias"))
+     1452              maxdiffalwayson_high_price = _optional_numeric(last_prediction.get("maxdiffalwayson_high_price"))
+     1453              maxdiffalwayson_low_price = _optional_numeric(last_prediction.get("maxdiffalwayson_low_price"))
+     1454              maxdiff_primary_side_raw = raw_last_prediction.get("maxdiff_primary_side")
+     1455              maxdiff_primary_side = (
+     1456                  str(maxdiff_primary_side_raw).strip().lower()
+     1457                  if maxdiff_primary_side_raw is not None
+     1458                  else None
+     1459              )
+     1460              if maxdiff_primary_side == "":
+     1461                  maxdiff_primary_side = None
+     1462  
+     1463              snapshot_parts = [
+     1464                  f"{symbol} prediction snapshot",
+     1465                  f"close={close_price:.4f}",
+     1466                  f"pred_close={predicted_close_price:.4f}",
+     1467                  f"pred_high={predicted_high_price:.4f}",
+     1468                  f"pred_low={predicted_low_price:.4f}",
+     1469              ]
+     1470              if maxdiff_high_price is not None:
+     1471                  snapshot_parts.append(f"maxdiff_high={maxdiff_high_price:.4f}")
+     1472              if maxdiff_low_price is not None:
+     1473                  snapshot_parts.append(f"maxdiff_low={maxdiff_low_price:.4f}")
+     1474              if maxdiffalwayson_high_price is not None:
+     1475                  snapshot_parts.append(f"maxdiffalwayson_high={maxdiffalwayson_high_price:.4f}")
+     1476              if maxdiffalwayson_low_price is not None:
+     1477                  snapshot_parts.append(f"maxdiffalwayson_low={maxdiffalwayson_low_price:.4f}")
+     1478              if maxdiff_primary_side:
+     1479                  bias_fragment = maxdiff_primary_side
+     1480                  if maxdiff_trade_bias is not None and math.isfinite(maxdiff_trade_bias):
+     1481                      bias_fragment = f"{bias_fragment}({maxdiff_trade_bias:+.3f})"
+     1482                  snapshot_parts.append(f"maxdiff_side={bias_fragment}")
+     1483              _log_detail(" ".join(snapshot_parts))
+     1484  
+     1485              strategy_stats: Dict[str, Dict[str, float]] = {
+     1486                  "simple": {
+     1487                      "avg_return": strategy_returns.get("simple", 0.0),
+     1488                      "annual_return": strategy_returns_annual.get("simple", 0.0),
+     1489                      "sharpe": _mean_column("simple_strategy_sharpe"),
+     1490                      "turnover": _mean_column("simple_strategy_turnover"),
+     1491                      "max_drawdown": _mean_column("simple_strategy_max_drawdown"),
+     1492                  },
+     1493                  "all_signals": {
+     1494                      "avg_return": strategy_returns.get("all_signals", 0.0),
+     1495                      "annual_return": strategy_returns_annual.get("all_signals", 0.0),
+     1496                      "sharpe": _mean_column("all_signals_strategy_sharpe"),
+     1497                      "turnover": _mean_column("all_signals_strategy_turnover"),
+     1498                      "max_drawdown": _mean_column("all_signals_strategy_max_drawdown"),
+     1499                  },
+     1500                  "takeprofit": {
+     1501                      "avg_return": strategy_returns.get("takeprofit", 0.0),
+     1502                      "annual_return": strategy_returns_annual.get("takeprofit", 0.0),
+     1503                      "sharpe": _mean_column("entry_takeprofit_sharpe"),
+     1504                      "turnover": _mean_column("entry_takeprofit_turnover"),
+     1505                      "max_drawdown": _mean_column("entry_takeprofit_max_drawdown"),
+     1506                  },
+     1507                  "highlow": {
+     1508                      "avg_return": strategy_returns.get("highlow", 0.0),
+     1509                      "annual_return": strategy_returns_annual.get("highlow", 0.0),
+     1510                      "sharpe": _mean_column("highlow_sharpe"),
+     1511                      "turnover": _mean_column("highlow_turnover"),
+     1512                      "max_drawdown": _mean_column("highlow_max_drawdown"),
+     1513                  },
+     1514                  "maxdiff": {
+     1515                      "avg_return": strategy_returns.get("maxdiff", 0.0),
+     1516                      "annual_return": strategy_returns_annual.get("maxdiff", 0.0),
+     1517                      "sharpe": _mean_column("maxdiff_sharpe"),
+     1518                      "turnover": _mean_column("maxdiff_turnover"),
+     1519                      "max_drawdown": _mean_column("maxdiff_max_drawdown"),
+     1520                  },
+     1521                  "maxdiffalwayson": {
+     1522                      "avg_return": strategy_returns.get("maxdiffalwayson", 0.0),
+     1523                      "annual_return": strategy_returns_annual.get("maxdiffalwayson", 0.0),
+     1524                      "sharpe": _mean_column("maxdiffalwayson_sharpe"),
+     1525                      "turnover": _mean_column("maxdiffalwayson_turnover"),
+     1526                      "max_drawdown": _mean_column("maxdiffalwayson_max_drawdown"),
+     1527                  },
+     1528              }
+     1529              if "ci_guard" in strategy_returns:
+     1530                  strategy_stats["ci_guard"] = {
+     1531                      "avg_return": strategy_returns.get("ci_guard", 0.0),
+     1532                      "annual_return": strategy_returns_annual.get("ci_guard", 0.0),
+     1533                      "sharpe": _mean_column("ci_guard_sharpe"),
+     1534                      "turnover": _mean_column("ci_guard_turnover"),
+     1535                      "max_drawdown": _mean_column("ci_guard_max_drawdown"),
+     1536                  }
+     1537  
+     1538              for strat_name, (primary_col, fallback_col) in _strategy_series_map.items():
+     1539                  strategy_recent_sums[strat_name] = _recent_return_sum(primary_col, fallback_col)
+     1540  
+     1541              strategy_ineligible: Dict[str, str] = {}
+     1542              candidate_avg_returns: Dict[str, float] = {}
+     1543              allowed_side = _allowed_side_for(symbol)
+     1544              symbol_is_crypto = symbol in crypto_symbols
+     1545  
+     1546              for name, stats in strategy_stats.items():
+     1547                  if name not in strategy_returns:
+     1548                      continue
+     1549                  allow_config = True
+     1550                  if name == "takeprofit":
+     1551                      allow_config = ALLOW_TAKEPROFIT_ENTRY
+     1552                  elif name == "highlow":
+     1553                      allow_config = ALLOW_HIGHLOW_ENTRY
+     1554                  elif name == "maxdiff":
+     1555                      allow_config = ALLOW_MAXDIFF_ENTRY
+     1556                  elif name == "maxdiffalwayson":
+     1557                      allow_config = ALLOW_MAXDIFF_ALWAYS_ENTRY
+     1558  
+     1559                  if name in {"takeprofit", "highlow", "maxdiff", "maxdiffalwayson"}:
+     1560                      if not allow_config:
+     1561                          strategy_ineligible[name] = "disabled_by_config"
+     1562                          continue
+     1563                      eligible, reason = _evaluate_strategy_entry_gate(
+     1564                          symbol,
+     1565                          stats,
+     1566                          fallback_used=used_fallback_engine,
+     1567                          sample_size=sample_size,
+     1568                      )
+     1569                      if not eligible:
+     1570                          strategy_ineligible[name] = reason
+     1571                          continue
+     1572  
+     1573                  avg_metric = _metric(stats.get("avg_return"), default=0.0)
+     1574                  candidate_avg_returns[name] = avg_metric
+     1575  
+     1576              # Sort strategies by avg_return (simplified)
+     1577              ordered_strategies: List[str] = []
+     1578              if candidate_avg_returns:
+     1579                  ordered_strategies = [
+     1580                      name for name, _ in sorted(
+     1581                          candidate_avg_returns.items(),
+     1582                          key=lambda item: item[1],
+     1583                          reverse=True,
+     1584                      )
+     1585                  ]
+     1586              else:
+     1587                  ordered_strategies = ["simple"]
+     1588  
+     1589              if strategy_ineligible:
+     1590                  logger.debug("%s strategy entry gates rejected: %s", symbol, strategy_ineligible)
+     1591  
+     1592              close_movement_raw = predicted_close_price - close_price
+     1593              high_movement = predicted_high_price - close_price
+     1594              low_movement = predicted_low_price - close_price
+     1595  
+     1596              selection_notes: List[str] = []
+     1597              selected_strategy: Optional[str] = None
+     1598              avg_return = 0.0
+     1599              annual_return = 0.0
+     1600              predicted_movement = close_movement_raw
+     1601              position_side = "buy" if predicted_movement > 0 else "sell"
+     1602  
+     1603              for candidate_name in ordered_strategies:
+     1604                  if candidate_name in strategy_ineligible:
+     1605                      selection_notes.append(f"{candidate_name}=ineligible({strategy_ineligible[candidate_name]})")
+     1606                      continue
+     1607  
+     1608                  candidate_avg_return = candidate_avg_returns.get(candidate_name, 0.0)
+     1609  
+     1610                  candidate_position_side: Optional[str] = None
+     1611                  candidate_predicted_movement = close_movement_raw
+     1612  
+>>>  1613                  if candidate_name == "maxdiff":
+     1614                      if maxdiff_primary_side in {"buy", "sell"}:
+     1615                          candidate_position_side = maxdiff_primary_side
+     1616                          target_price = maxdiff_high_price if candidate_position_side == "buy" else maxdiff_low_price
+     1617                          if target_price is not None and math.isfinite(target_price):
+     1618                              candidate_predicted_movement = target_price - close_price
+     1619                      elif maxdiff_primary_side == "neutral" and maxdiff_trade_bias is not None:
+     1620                          if maxdiff_trade_bias > 0:
+     1621                              candidate_position_side = "buy"
+     1622                          elif maxdiff_trade_bias < 0:
+     1623                              candidate_position_side = "sell"
+     1624                  elif candidate_name == "maxdiffalwayson":
+     1625                      dominant_move = max(abs(high_movement), abs(low_movement))
+     1626                      if allowed_side == "sell":
+     1627                          candidate_position_side = "sell"
+     1628                          candidate_predicted_movement = -dominant_move
+     1629                      else:
+     1630                          candidate_position_side = "buy"
+     1631                          candidate_predicted_movement = dominant_move
+     1632  
+     1633                  if candidate_position_side is None and candidate_name == "all_signals":
+     1634                      if all(x > 0 for x in [close_movement_raw, high_movement, low_movement]):
+     1635                          candidate_position_side = "buy"
+     1636                      elif all(x < 0 for x in [close_movement_raw, high_movement, low_movement]):
+       ... truncated at 400 lines ...

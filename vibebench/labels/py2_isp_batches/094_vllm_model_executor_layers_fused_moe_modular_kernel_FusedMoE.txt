@@ -1,0 +1,704 @@
+row 94   vllm-project/vllm#38569
+============================================================================
+CONTRACT vllm.model_executor.layers.fused_moe.modular_kernel:FusedMoEExpertsModular   kind=abc abstract_methods=11.0 implementers=26.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file vllm/model_executor/layers/fused_moe/modular_kernel.py
+      751  class FusedMoEExpertsModular(FusedMoEExperts):
+      752      """
+      753      An abstract base class for the [Permute-Experts-Unpermute] step described
+      754          above.
+      755      """
+      756  
+      757      @staticmethod
+      758      def is_monolithic() -> bool:
+      759          return False
+      760  
+      761      def moe_problem_size(
+      762          self,
+      763          a1: torch.Tensor,
+      764          w1: torch.Tensor,
+      765          w2: torch.Tensor,
+      766          topk_ids: torch.Tensor,
+      767      ) -> tuple[int, int, int, int, int]:
+      768          """
+      769          Extract the MoE problem size from the given tensor arguments:
+      770          - a: The hidden states, input to the MoE layer.
+      771          - w1: The first set of expert weights.
+      772          - w2: The second set of expert weights.
+      773          - topk_ids: The topk ids.
+      774  
+      775          Note: extracting the problem shape from the weight and activation
+      776          tensors is not obvious.  It needs to be done this way specifically
+      777          due to subtle issues with particular kernels, e.g. the int4 kernels
+      778          divide the trailing dimension by two, so it's not "correct" to
+      779          extract N or K from the trailing dimension of w1 or w2.  Similarly,
+      780          some kernels transpose the weights, so this needs to be kept in mind.
+      781  
+      782          Note: This implementation covers most cases. However, if experts
+      783          require a specialized implementation, like MarlinExperts, they are free
+      784          to override this function.
+      785          """
+      786          assert w1.dim() == 3 and w2.dim() == 3
+      787          E, N, _ = w1.size()
+      788          K = a1.size(-1)
+      789  
+      790          if a1.dim() == 2:
+      791              # Make sure we are using the correct a1 (pre-permute).
+      792              assert topk_ids.size(0) == a1.size(0), f"{topk_ids.size(0)} != {a1.size(0)}"
+      793              M = a1.size(0)
+      794          else:
+      795              assert a1.dim() == 3
+      796              assert a1.size(0) == E, f"{a1.size(0)} == {E}"
+      797              M = a1.size(1)  # This is max_num_tokens
+      798  
+      799          assert topk_ids.dim() == 2
+      800          topk = topk_ids.size(1)
+      801  
+      802          return E, M, N, K, topk
+      803  
+      804      def workspace_dtype(self, act_dtype: torch.dtype) -> torch.dtype:
+      805          """
+      806          Workspace type: The dtype to use for the workspace tensors.
+      807          """
+      808          return act_dtype
+      809  
+      810      @abstractmethod
+      811      def workspace_shapes(
+      812          self,
+      813          M: int,
+      814          N: int,
+      815          K: int,
+      816          topk: int,
+      817          global_num_experts: int,
+      818          local_num_experts: int,
+      819          expert_tokens_meta: ExpertTokensMetadata | None,
+      820          activation: MoEActivation,
+      821      ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+      822          """
+      823          Compute the shapes for the temporary and final outputs of the two gemms
+      824          and activation in the fused expert function.  Since the gemms are
+      825          independent, the workspace for the first gemm can be shared with the
+      826          workspace for the last gemm.
+      827  
+      828          Inputs:
+      829          - M: number of tokens.
+      830          - N: Row (or column) dimension of expert weights.
+      831          - K: hidden dimension
+      832          - topk: The number of top-k experts to select.
+      833          - global_num_experts: global number of experts.
+      834          - local_num_experts: local number of experts due to DP/EP.
+      835          - expert_tokens_meta: number of tokens per expert metadata for batched
+      836                                format.
+      837  
+      838          Returns a tuple of:
+      839          - workspace13 shape tuple: must be large enough to hold the
+      840            result of either expert gemm.
+      841          - workspace2 shape tuple: must be large enough to hold the
+      842            result of the activation function.
+      843          - output shape tuple: must be exact size of the final gemm output.
+      844          - Note: workspace shapes can be 0 if the workspace is not needed.
+      845            But in order for activation chunking to work, the first dimension
+      846            of each tuple must be the number of tokens when the shape is
+      847            not 0.
+      848          """
+      849          raise NotImplementedError
+      850  
+      851      @staticmethod
+      852      def adjust_N_for_activation(N: int, activation: MoEActivation) -> int:
+      853          """
+      854          Calculate the output dimension for the activation function.
+      855  
+      856          For *_no_mul activations (e.g. relu2_no_mul),
+      857          there's no gate/up split, so output size equals input size (N).
+      858  
+      859          For regular gated activations (e.g., silu, gelu, swigluoai),
+      860          output size is N // 2 due to gate × activation(up) multiplication.
+      861  
+      862          Args:
+      863              N: The intermediate size (width of w1/w3 weights).
+      864              activation: The activation function enum.
+      865  
+      866          Returns:
+      867              The output dimension after activation.
+      868          """
+      869          return N if not activation.is_gated else N // 2
+      870  
+      871      def activation(
+      872          self, activation: MoEActivation, output: torch.Tensor, input: torch.Tensor
+      873      ) -> None:
+      874          apply_moe_activation(activation, output, input)
+      875  
+      876      @abstractmethod
+      877      def finalize_weight_and_reduce_impl(self) -> TopKWeightAndReduce:
+      878          raise NotImplementedError
+      879  
+      880      @abstractmethod
+      881      def apply(
+      882          self,
+      883          output: torch.Tensor,
+      884          hidden_states: torch.Tensor,
+      885          w1: torch.Tensor,
+      886          w2: torch.Tensor,
+      887          topk_weights: torch.Tensor,
+      888          topk_ids: torch.Tensor,
+      889          activation: MoEActivation,
+      890          global_num_experts: int,
+      891          expert_map: torch.Tensor | None,
+      892          a1q_scale: torch.Tensor | None,
+      893          a2_scale: torch.Tensor | None,
+      894          workspace13: torch.Tensor,
+      895          workspace2: torch.Tensor,
+      896          expert_tokens_meta: ExpertTokensMetadata | None,
+      897          apply_router_weight_on_input: bool,
+      898      ) -> None:
+      899          """
+      900          This function computes the intermediate result of a Mixture of Experts
+      901          (MoE) layer using two sets of weights, w1 and w2.
+      902  
+      903          Parameters:
+      904          - output: (torch.Tensor): The unweighted, unreduced output tensor.
+      905          - hidden_states: (torch.Tensor): The (quantized) input tensor to the MoE
+      906            layer.
+      907          - w1 (torch.Tensor): The first set of expert weights.
+      908          - w2 (torch.Tensor): The second set of expert weights.
+      909          - topk_weights: A map of row to expert weights. Some implementations
+      910            choose to do weight application.
+      911          - topk_ids (torch.Tensor): A map of row to expert id.
+      912          - activation (str): The activation function to apply after the first
+      913            MoE layer.
+      914          - global_num_experts (int): The total number of experts in the global
+      915            expert space.
+      916          - expert_map (Optional[torch.Tensor]):  A tensor mapping expert indices
+      917            from the global expert space to the local expert space of the expert
+      918            parallel shard.
+      919          - a1q_scale (Optional[torch.Tensor]): Optional quantized scale to be
+      920            used for a1.  Result of quantization from prepare/finalize and not
+      921            from the FusedMoEQuantConfig.
+      922          - workspace13 (torch.Tensor): A scratch tensor used for gemm outputs
+      923            must be large enough to hold output of either MoE gemm.
+      924          - workspace2 (torch.Tensor): A scratch tensor used for the activation
+      925            function.
+      926          - expert_tokens_meta (Optional[ExpertTokensMetadata]) - An optional
+      927            ExpertTokensMetadata object containing gpu/cpu tensors
+      928            as big as the number of local experts with the information about the
+      929            number of tokens assigned to each local expert.
+      930          - apply_router_weight_on_input: True if router weights are already
+      931            applied on the input. This is relevant if the implementation
+      932            chooses to do weight application.
+      933          """
+      934          raise NotImplementedError
+
+---------- IMPLEMENTER vllm.model_executor.layers.fused_moe.batched_deep_gemm_moe:BatchedDeepGemmExperts  stubs=0/11 ----------
+      264  class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
+      286      @staticmethod
+      287      def activation_format() -> mk.FusedMoEActivationFormat:
+      288          return mk.FusedMoEActivationFormat.BatchedExperts
+      290      @staticmethod
+      291      def _supports_current_device() -> bool:
+      292          return is_deep_gemm_supported()
+      294      @staticmethod
+      295      def _supports_no_act_and_mul() -> bool:
+      296          return False
+      298      @staticmethod
+      299      def _supports_quant_scheme(
+      300          weight_key: QuantKey | None,
+      301          activation_key: QuantKey | None,
+      302      ) -> bool:
+      303          SUPPORTED_W_A = [(kFp8Static128BlockSym, kFp8Dynamic128Sym)]
+      304          return (weight_key, activation_key) in SUPPORTED_W_A
+      306      @staticmethod
+      307      def _supports_activation(activation: MoEActivation) -> bool:
+      308          return activation == MoEActivation.SILU
+      310      @staticmethod
+      311      def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+      312          return True
+      314      def supports_chunking(self) -> bool:
+      315          return False
+      317      def supports_expert_map(self) -> bool:
+      318          return False
+      329      def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+      330          # Let PrepareAndFinalize::finalize() decide the impl.
+      331          return TopKWeightAndReduceDelegate()
+      333      def workspace_shapes(
+      334          self,
+      335          M: int,
+      336          N: int,
+      337          K: int,
+      338          topk: int,
+      339          global_num_experts: int,
+      340          local_num_experts: int,
+      341          expert_tokens_meta: mk.ExpertTokensMetadata | None,
+      342          activation: MoEActivation,
+      343      ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+      344          # FIXME (varun): We should be able to dispatch only from the leader
+      345          # DP ranks in the case of TP > 1. At the moment, all the Ranks
+      346          # end up sending their tokens. This needs to be fixed.
+      347          assert self.num_dispatchers is not None
+      348          assert self.max_num_tokens is not None
+      349          num_dispatchers = self.num_dispatchers
+      350          num_experts = local_num_experts
+      351          max_num_tokens = M if self.max_num_tokens is None else self.max_num_tokens
+      352          activation_out_dim = self.adjust_N_for_activation(N, activation)
+      353          workspace13 = (num_experts, max_num_tokens * num_dispatchers, max(K, N))
+      354          workspace2 = (num_experts, max_num_tokens * num_dispatchers, activation_out_dim)
+      355          output = (num_experts, max_num_tokens * num_dispatchers, K)
+      356          return (workspace13, workspace2, output)
+      385      def apply(
+      386          self,
+      387          output: torch.Tensor,
+      388          hidden_states: torch.Tensor,
+      389          w1: torch.Tensor,
+      390          w2: torch.Tensor,
+      391          topk_weights: torch.Tensor,
+      392          topk_ids: torch.Tensor,
+      393          activation: MoEActivation,
+      394          global_num_experts: int,
+      395          expert_map: torch.Tensor | None,
+      396          a1q_scale: torch.Tensor | None,
+      397          a2_scale: torch.Tensor | None,
+      398          workspace13: torch.Tensor,
+      399          workspace2: torch.Tensor,
+      400          expert_tokens_meta: mk.ExpertTokensMetadata | None,
+      401          apply_router_weight_on_input: bool,
+      402      ):
+      403          assert expert_tokens_meta is not None
+      404          expert_num_tokens = expert_tokens_meta.expert_num_tokens
+      405  
+      406          assert hidden_states.ndim == 3
+      407          assert self.block_shape is not None
+      408  
+      409          a1q = hidden_states
+      410          _, N, K = w1.size()
+      411  
+      412          assert w2.size(1) == K
+      413  
+      414          E, max_num_tokens, N, K, _ = self.moe_problem_size(
+      415              hidden_states, w1, w2, topk_ids
+      416          )
+      417  
+      418          workspace1 = _resize_cache(workspace13, (E, max_num_tokens, N))
+      419  
+      420          expected_m = self.estimate_expected_m(
+      421              global_num_experts=global_num_experts,
+      422              max_tokens_per_expert=max_num_tokens,
+      423              topk=topk_ids.size(-1),
+      424          )
+      425  
+      426          fp8_m_grouped_gemm_nt_masked(
+      427              (a1q, a1q_scale),
+      428              (w1, self.w1_scale),
+      429              workspace1,
+      430              expert_num_tokens,
+      431              expected_m,
+      432          )
+      433  
+      434          quant_scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
+      435          a2q, a2q_scale = persistent_masked_m_silu_mul_quant(
+      436              workspace1,
+      437              expert_num_tokens,
+      438              quant_scale_fmt=quant_scale_fmt,
+      439          )
+      440  
+      441          fp8_m_grouped_gemm_nt_masked(
+      442              (a2q, a2q_scale),
+      443              (w2, self.w2_scale),
+      444              output,
+       ... truncated at 60 lines ...
+
+---------- IMPLEMENTER vllm.model_executor.layers.fused_moe.cutlass_moe:CutlassExpertsFp8Base  stubs=0/11 ----------
+      265  class CutlassExpertsFp8Base(mk.FusedMoEExpertsModular):
+      295      @staticmethod
+      296      def _supports_current_device() -> bool:
+      297          return cutlass_group_gemm_supported()
+      299      @staticmethod
+      300      def _supports_no_act_and_mul() -> bool:
+      301          return False
+      303      @staticmethod
+      304      def _supports_quant_scheme(
+      305          weight_key: QuantKey | None,
+      306          activation_key: QuantKey | None,
+      307      ) -> bool:
+      308          SUPPORTED_W_A = [
+      309              (kFp8StaticChannelSym, kFp8DynamicTokenSym),
+      310              (kFp8StaticTensorSym, kFp8DynamicTensorSym),
+      311              (kFp8StaticTensorSym, kFp8StaticTensorSym),
+      312          ]
+      313          return (weight_key, activation_key) in SUPPORTED_W_A
+      315      @staticmethod
+      316      def _supports_activation(activation: MoEActivation) -> bool:
+      317          return activation in [
+      318              MoEActivation.SILU,
+      319              MoEActivation.GELU,
+      320              MoEActivation.SWIGLUOAI,
+      321          ]
+      323      def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+      324          # Let PrepareAndFinalize::finalize() decide the impl.
+      325          return TopKWeightAndReduceDelegate()
+      327      def apply(
+      328          self,
+      329          output: torch.Tensor,
+      330          hidden_states: torch.Tensor,
+      331          w1: torch.Tensor,
+      332          w2: torch.Tensor,
+      333          topk_weights: torch.Tensor,
+      334          topk_ids: torch.Tensor,
+      335          activation: MoEActivation,
+      336          global_num_experts: int,
+      337          expert_map: torch.Tensor | None,
+      338          a1q_scale: torch.Tensor | None,
+      339          a2_scale: torch.Tensor | None,
+      340          workspace13: torch.Tensor,
+      341          workspace2: torch.Tensor,
+      342          expert_tokens_meta: mk.ExpertTokensMetadata | None,
+      343          apply_router_weight_on_input: bool,
+      344      ):
+      345          assert self.w1_zp is None, "w1_zp is not supported in CUTLASS MoE"
+      346          assert self.w2_zp is None, "w2_zp is not supported in CUTLASS MoE"
+      347  
+      348          expert_num_tokens = None
+      349          if expert_tokens_meta is not None:
+      350              expert_num_tokens = expert_tokens_meta.expert_num_tokens
+      351  
+      352          use_batched_format = (
+      353              self.activation_format() == mk.FusedMoEActivationFormat.BatchedExperts
+      354          )
+      355  
+      356          in_dtype = hidden_states.dtype
+      357          run_cutlass_moe_fp8(
+      358              output,
+      359              hidden_states,
+      360              w1,
+      361              w2,
+      362              topk_ids,
+      363              activation,
+      364              global_num_experts,
+      365              expert_map,
+      366              self.w1_scale,
+      367              self.w2_scale,
+      368              a1q_scale,
+      369              a2_scale,
+      370              self.ab_strides1,
+      371              self.ab_strides2,
+      372              self.c_strides1,
+      373              self.c_strides2,
+      374              workspace13,
+      375              workspace2,
+      376              expert_num_tokens,
+      377              self.out_dtype if self.out_dtype is not None else in_dtype,
+      378              self.per_act_token_quant,
+      379              self.per_out_ch_quant,
+      380              use_batched_format,
+      381              topk_weights,
+      382          )
+      (does not define: _supports_parallel_config, activation_format, supports_chunking, supports_expert_map, workspace_shapes; inherited or absent)
+
+---------- IMPLEMENTER vllm.model_executor.layers.fused_moe.cutlass_moe:CutlassExpertsFp8  stubs=0/11 ----------
+      385  class CutlassExpertsFp8(CutlassExpertsFp8Base):
+      388      @staticmethod
+      389      def activation_format() -> mk.FusedMoEActivationFormat:
+      390          return mk.FusedMoEActivationFormat.Standard
+      392      @staticmethod
+      393      def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+      394          # CutlassExpertsFp8 does not support expert map, which is
+      395          # needed for STANDARD activation format kernels in DP/EP mode.
+      396          # Note that the BATCHED activation format does not use
+      397          # the expert map for identifying experts.
+      398          return not (
+      399              moe_parallel_config.use_fi_all2allv_kernels
+      400              or moe_parallel_config.use_deepep_ht_kernels
+      401          )
+      403      def supports_chunking(self) -> bool:
+      404          return True
+      406      def supports_expert_map(self) -> bool:
+      407          return False
+      409      def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+      410          # topk weights and reduction are fused in moe_unpermute cuda kernel
+      411          return TopKWeightAndReduceNoOP()
+      416      def workspace_shapes(
+      417          self,
+      418          M: int,
+      419          N: int,
+      420          K: int,
+      421          topk: int,
+      422          global_num_experts: int,
+      423          local_num_experts: int,
+      424          expert_tokens_meta: mk.ExpertTokensMetadata | None,
+      425          activation: MoEActivation,
+      426      ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+      427          activation_out_dim = self.adjust_N_for_activation(N, activation)
+      428          workspace1 = (M * topk, max(N, K))
+      429          workspace2 = (M * topk, max(activation_out_dim, K))
+      430          output = (M, K)
+      431          return (workspace1, workspace2, output)
+      (does not define: _supports_activation, _supports_current_device, _supports_no_act_and_mul, _supports_quant_scheme, apply; inherited or absent)
+
+---------- IMPLEMENTER vllm.model_executor.layers.fused_moe.cutlass_moe:CutlassBatchedExpertsFp8  stubs=0/11 ----------
+      434  class CutlassBatchedExpertsFp8(CutlassExpertsFp8Base):
+      437      @staticmethod
+      438      def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+      439          # BATCHED activation format works with EP because
+      440          # expert_map is not used to identify experts (the
+      441          # info is encoded/managed by the P/F logic).
+      442          return True
+      444      @staticmethod
+      445      def activation_format() -> mk.FusedMoEActivationFormat:
+      446          return mk.FusedMoEActivationFormat.BatchedExperts
+      448      def supports_chunking(self) -> bool:
+      449          return False
+      451      def supports_expert_map(self) -> bool:
+      452          return False
+      457      def workspace_shapes(
+      458          self,
+      459          M: int,
+      460          N: int,
+      461          K: int,
+      462          topk: int,
+      463          global_num_experts: int,
+      464          local_num_experts: int,
+      465          expert_tokens_meta: mk.ExpertTokensMetadata | None,
+      466          activation: MoEActivation,
+      467      ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+      468          num_dp = self.num_dispatchers
+      469          assert num_dp is not None
+      470          experts_per_worker = self.moe_config.num_local_experts
+      471          activation_out_dim = self.adjust_N_for_activation(N, activation)
+      472          workspace1 = (experts_per_worker, M * num_dp, max(N, K))
+      473          workspace2 = (
+      474              experts_per_worker,
+      475              M * num_dp,
+      476              max(activation_out_dim, K),
+      477          )
+      478          output = (experts_per_worker, M, K)
+      479          return (workspace1, workspace2, output)
+      (does not define: _supports_activation, _supports_current_device, _supports_no_act_and_mul, _supports_quant_scheme, apply, finalize_weight_and_reduce_impl; inherited or absent)
+
+---------- IMPLEMENTER vllm.model_executor.layers.fused_moe.cutlass_moe:CutlassExpertsFp4  stubs=0/11 ----------
+      664  class CutlassExpertsFp4(mk.FusedMoEExpertsModular):
+      671      @staticmethod
+      672      def _supports_current_device() -> bool:
+      673          p = current_platform
+      674          return p.is_cuda() and (
+      675              p.is_device_capability_family(100)
+      676              or p.is_device_capability_family(110)
+      677              or p.is_device_capability_family(120)
+      678          )
+      680      @staticmethod
+      681      def _supports_no_act_and_mul() -> bool:
+      682          return False
+      684      @staticmethod
+      685      def _supports_quant_scheme(
+      686          weight_key: QuantKey | None,
+      687          activation_key: QuantKey | None,
+      688      ) -> bool:
+      689          return (weight_key, activation_key) == (kNvfp4Static, kNvfp4Dynamic)
+      691      @staticmethod
+      692      def _supports_activation(activation: MoEActivation) -> bool:
+      693          # SILU uses a fused silu+mul+fp4_quant kernel path.
+      694          # Other gated activations use the generic apply_moe_activation()
+      695          # fallback + separate fp4 quantization in run_cutlass_moe_fp4().
+      696          return activation in [
+      697              MoEActivation.SILU,
+      698              MoEActivation.GELU,
+      699              MoEActivation.SWIGLUOAI,
+      700              MoEActivation.SWIGLUSTEP,
+      701          ]
+      703      @staticmethod
+      704      def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+      705          # CutlassExpertsFp4 does not support expert map, which is
+      706          # needed for STANDARD activation format kernels in EP mode.
+      707          return moe_parallel_config.ep_size == 1
+      709      @staticmethod
+      710      def activation_format() -> mk.FusedMoEActivationFormat:
+      711          return mk.FusedMoEActivationFormat.Standard
+      713      def supports_expert_map(self) -> bool:
+      714          return False
+      716      def supports_chunking(self) -> bool:
+      717          return True
+      719      def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+      720          return TopKWeightAndReduceNoOP()
+      725      def workspace_shapes(
+      726          self,
+      727          M: int,
+      728          N: int,
+      729          K: int,
+      730          topk: int,
+      731          global_num_experts: int,
+      732          local_num_experts: int,
+      733          expert_tokens_meta: mk.ExpertTokensMetadata | None,
+      734          activation: MoEActivation,
+      735      ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+      736          workspace1 = (M * topk, max(2 * N, K))
+      737          workspace2 = (M * topk, N)
+      738          output = (M, K)
+      739          return (workspace1, workspace2, output)
+      741      def apply(
+      742          self,
+      743          output: torch.Tensor,
+      744          hidden_states: torch.Tensor,
+      745          w1: torch.Tensor,
+      746          w2: torch.Tensor,
+      747          topk_weights: torch.Tensor,
+      748          topk_ids: torch.Tensor,
+      749          activation: MoEActivation,
+      750          global_num_experts: int,
+      751          expert_map: torch.Tensor | None,
+      752          a1q_scale: torch.Tensor | None,  # unused
+      753          a2_scale: torch.Tensor | None,  # unused
+      754          workspace13: torch.Tensor | None,
+      755          workspace2: torch.Tensor | None,
+      756          expert_tokens_meta: mk.ExpertTokensMetadata | None,
+      757          apply_router_weight_on_input: bool,
+      758      ):
+      759          e, m, n, k, _ = self.moe_problem_size(hidden_states, w1, w2, topk_ids)
+      760          n = w2.shape[2] * 2
+      761  
+      762          run_cutlass_moe_fp4(
+      763              output=output,
+      764              a=hidden_states,
+      765              a1_gscale=self.a1_gscale,
+      766              w1_fp4=w1,
+      767              w1_blockscale=self.w1_scale,
+      768              w1_alphas=self.g1_alphas,
+      769              a2_gscale=self.a2_gscale,
+      770              w2_fp4=w2,
+      771              w2_blockscale=self.w2_scale,
+      772              w2_alphas=self.g2_alphas,
+      773              topk_weights=topk_weights,
+      774              topk_ids=topk_ids,
+      775              activation=activation,
+      776              workspace13=workspace13,
+      777              workspace2=workspace2,
+      778              m=m,
+      779              n=n,
+      780              k=k,
+      781              e=e,
+      782              device=hidden_states.device,
+      783              apply_router_weight_on_input=apply_router_weight_on_input,
+      784          )
+
+---------- IMPLEMENTER vllm.model_executor.layers.fused_moe.cutlass_moe:CutlassExpertsW4A8Fp8  stubs=5/11 ----------
+      931  class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
+      959      @staticmethod
+      960      def activation_format() -> mk.FusedMoEActivationFormat:
+      961          return mk.FusedMoEActivationFormat.Standard
+      963      @staticmethod
+      964      def _supports_current_device() -> bool:
+      965          raise NotImplementedError(
+      966              "CutlassExpertsW4A8Fp8 is not yet used by an Oracle. "
+      967              "This method should not be called."
+      968          )
+      970      @staticmethod
+      971      def _supports_no_act_and_mul() -> bool:
+      972          raise NotImplementedError(
+      973              "CutlassExpertsW4A8Fp8 is not yet used by an Oracle. "
+      974              "This method should not be called."
+      975          )
+      977      @staticmethod
+      978      def _supports_quant_scheme(
+      979          weight_key: QuantKey | None,
+      980          activation_key: QuantKey | None,
+      981      ) -> bool:
+      982          raise NotImplementedError(
+      983              "CutlassExpertsW4A8Fp8 is not yet used by an Oracle. "
+      984              "This method should not be called."
+      985          )
+      987      @staticmethod
+      988      def _supports_activation(activation: MoEActivation) -> bool:
+      989          raise NotImplementedError(
+      990              "CutlassExpertsW4A8Fp8 is not yet used by an Oracle. "
+      991              "This method should not be called."
+      992          )
+      994      @staticmethod
+      995      def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+      996          raise NotImplementedError(
+      997              "CutlassExpertsW4A8Fp8 is not yet used by an Oracle. "
+      998              "This method should not be called."
+      999          )
+     1001      def supports_chunking(self) -> bool:
+     1002          return True
+     1004      def supports_expert_map(self) -> bool:
+     1005          return True
+     1007      def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+     1008          # topk weights and reduction are fused in moe_unpermute cuda kernel
+     1009          return TopKWeightAndReduceNoOP()
+     1014      def workspace_shapes(
+     1015          self,
+     1016          M: int,
+     1017          N: int,
+     1018          K: int,
+     1019          topk: int,
+     1020          global_num_experts: int,
+     1021          local_num_experts: int,
+     1022          expert_tokens_meta: mk.ExpertTokensMetadata | None,
+     1023          activation: MoEActivation,
+     1024      ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+     1025          activation_out_dim = self.adjust_N_for_activation(N, activation)
+     1026          workspace1 = (M * topk, max(N, K))
+     1027          workspace2 = (M * topk, max(activation_out_dim, K))
+     1028          output = (M, K)
+     1029          return (workspace1, workspace2, output)
+     1031      def apply(
+     1032          self,
+     1033          output: torch.Tensor,
+     1034          hidden_states: torch.Tensor,
+     1035          w1: torch.Tensor,
+     1036          w2: torch.Tensor,
+     1037          topk_weights: torch.Tensor,
+     1038          topk_ids: torch.Tensor,
+     1039          activation: MoEActivation,
+     1040          global_num_experts: int,
+     1041          expert_map: torch.Tensor | None,
+     1042          a1q_scale: torch.Tensor | None,
+     1043          a2_scale: torch.Tensor | None,
+     1044          workspace13: torch.Tensor | None,
+     1045          workspace2: torch.Tensor | None,
+     1046          expert_tokens_meta: mk.ExpertTokensMetadata | None,
+     1047          apply_router_weight_on_input: bool,
+     1048      ):
+     1049          assert self.w1_zp is None, "w1_zp is not supported in CUTLASS MoE"
+     1050          assert self.w2_zp is None, "w2_zp is not supported in CUTLASS MoE"
+     1051  
+     1052          expert_num_tokens = None
+     1053  
+     1054          use_batched_format = (
+     1055              self.activation_format() == mk.FusedMoEActivationFormat.BatchedExperts
+     1056          )
+     1057          assert not use_batched_format, "batched format not supported"
+     1058  
+     1059          in_dtype = hidden_states.dtype
+     1060  
+     1061          run_cutlass_moe_w4a8_fp8(
+     1062              output,
+     1063              hidden_states,
+     1064              w1,
+     1065              w2,
+     1066              topk_ids,
+     1067              activation,
+     1068              global_num_experts,
+     1069              expert_map,
+     1070              self.w1_scale,
+     1071              self.w2_scale,
+     1072              a1q_scale,
+     1073              a2_scale,
+     1074              self.g1_alphas,  # per-channel scales
+     1075              self.g2_alphas,  # per-channel scales
+     1076              self.a_strides1,
+     1077              self.a_strides2,
+     1078              self.b_strides1,
+     1079              self.b_strides2,
+     1080              self.c_strides1,
+     1081              self.c_strides2,
+     1082              self.s_strides1,
+     1083              self.s_strides2,
+     1084              workspace13,
+     1085              workspace2,
+     1086              expert_num_tokens,
+     1087              self.out_dtype if self.out_dtype is not None else in_dtype,
+     1088              self.per_act_token_quant,
+     1089              self.per_out_ch_quant,
+     1090              use_batched_format,
+       ... truncated at 60 lines ...
+
+(20 further implementers not shown)

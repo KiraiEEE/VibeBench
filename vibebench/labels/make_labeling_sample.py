@@ -35,6 +35,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import config as C  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sample_paths as SP  # noqa: E402
 
 
 def main() -> None:
@@ -44,6 +46,7 @@ def main() -> None:
     ap.add_argument("--holdout", action="store_true",
                      help="fresh seed + exclude rows already in "
                           "srp_labeling_sample.csv; write srp_holdout_sample.csv")
+    SP.add_args(ap)
     args = ap.parse_args()
 
     seed = C.RANDOM_SEED + 1000 if args.holdout else C.RANDOM_SEED
@@ -57,7 +60,7 @@ def main() -> None:
     class_rows = class_rows.merge(manifest, on=["pr_id", "file_path"], how="left")
 
     if args.holdout:
-        prev = pd.read_csv(C.LABELS_DIR / "srp_labeling_sample.csv")
+        prev = pd.read_csv(SP.sample_path("srp", args.lang))
         seen = set(zip(prev.pr_id, prev.file_path, prev.class_name))
         keys = list(zip(class_rows.pr_id, class_rows.file_path, class_rows.class_name))
         class_rows = class_rows[[k not in seen for k in keys]]
@@ -79,8 +82,7 @@ def main() -> None:
         "srp_risk", "local_path", "head_sha", "llm_srp_risk", "notes",
     ]
     C.LABELS_DIR.mkdir(parents=True, exist_ok=True)
-    name = "srp_holdout_sample.csv" if args.holdout else "srp_labeling_sample.csv"
-    out_path = C.LABELS_DIR / name
+    out_path = SP.resolve("srp", args.lang, holdout=args.holdout, force=args.force)
     sample[cols].to_csv(out_path, index=False)
 
     print(f"[labels] wrote {len(sample)} rows to {out_path}")

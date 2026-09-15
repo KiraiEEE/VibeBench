@@ -1084,36 +1084,34 @@ SRP_TS_THRESHOLDS = {
 # NOTE: tuned in-sample on those 120 labels; confirm on a fresh holdout sample
 # before publishing headline numbers.
 SRP_THRESHOLDS = {
-    # RECALIBRATED 2026-08-17 on the AIDev-7.6M corpus's own distribution,
-    # BEFORE any label existed (the non-circular method used for OCP, TS and
-    # Java). Anchored at the ~p90 of PRODUCTION classes, n=19,658 of 29,345.
+    # RECALIBRATED 2026-09-14 on the Python V2 corpus (7,050 PRs), anchored
+    # at ~p90 of PRODUCTION, ENTITY-DEDUPLICATED classes (n=71,706).
+    # The previous values were percentiles of the 546-PR V1 corpus.
+    # Derived mechanically by py_lang/propose_py_thresholds.py, BEFORE any
+    # label existed, so the bar is not fitted to the answer it is
+    # validated against. The V1 values (260 / 36 / 11 / 871 / 11 / 6) and
+    # their rationale remain in git history.
     #
-    # WHY PRODUCTION-ONLY, a deliberate change from earlier calibrations.
-    # Test classes are 33% of the Python corpus and are systematically smaller,
-    # so calibrating on ALL classes drags every threshold DOWN and makes
-    # production code cross them more readily -- while the production-only rate
-    # is what the report leads with. Calibrating on the population that is
-    # actually reported removes that mismatch. (Java is affected far more: 72.2%
-    # of its types are tests, so the same change is applied there.)
-    #
-    # MEASURED, production classes (n=19,658):
-    #   class_loc   p90=260  p95=490
-    #   wmc         p90=36   p95=69
-    #   methods     p90=11   p95=17
-    #   method ccn  p90=11   p95=17
-    #   params      p90=6    p95=9
-    #   file_loc    p90=871  p95=1325   (n=7,472 production files)
-    "class_loc": 260,       # was 200
-    "class_wmc": 36,        # was 47
-    "class_methods": 11,    # was 20 -- the old bar sat above this corpus's p95
-    "class_lcom": 0.8,      # UNCHANGED and NOT percentile-derived: on the
-                            # population it applies to (>=4 methods, 31.7% of
-                            # classes) LCOM reads p75=p90=p95=1.000. A metric
-                            # pinned at its own maximum cannot be calibrated by
-                            # percentile, so the validated 0.8 is kept.
-    "file_loc": 871,        # was 400
-    "func_ccn": 11,         # was 15
-    "func_params": 6,       # was 6 -- unchanged, p90 landed on the same value
+    # MEASURED, production entity-deduplicated classes (n=71,706):
+    #   class_loc   p90=248  p95=448
+    #   wmc         p90=36  p95=68
+    #   methods     p90=10  p95=16
+    #   method ccn  p90=12  p95=19
+    #   params      p90=7  p95=9
+    #   file_loc    p90=1133  (n=20,657 distinct production files)
+    "class_loc": 250,
+    "class_wmc": 36,
+    "class_methods": 10,
+    "class_lcom": 0.8,   # NOT percentile-derived:
+                            # LCOM reads p75=p90=p95=1.000 on the
+                            # population it applies to, so the
+                            # validated value is kept.
+    "file_loc": 1130,   # p90 of DISTINCT production files.
+                            # INERT in V2: run_python.py scores classes
+                            # only (as Java does), and srp_hits reads
+                            # file_loc for file-level rows alone.
+    "func_ccn": 12,
+    "func_params": 7,
 }
 # A file/class is flagged as an SRP risk when it exceeds this many rubric metrics.
 #
@@ -1207,7 +1205,7 @@ DIP_MEAN_D_COUNTS_AS_RISK = False
 # same discipline as SRP: tune on the tuning sample only, confirm on a fresh
 # holdout, never re-tune on a burned holdout.
 ISP_THRESHOLDS = {
-    "iface_abstract_methods": 10,   # fat interface: > this many abstract methods
+    "iface_abstract_methods": 7,   # fat interface: > this many abstract methods
     "impl_stub_ratio": 0.25,        # implementer stubs > 25% of iface methods...
     "impl_stub_min": 2,             # ...and at least this many stubbed (guard)
     "iface_mean_coverage": 0.75,    # mean implementer coverage below this = low
@@ -1269,8 +1267,11 @@ ISP_IMPLICIT_MIN_STUBS = 2
 # a non-LLM branch-cohesion signal, not more branch-count tuning. Do NOT re-tune
 # on the burned holdout; a rubric change needs a third fresh sample.
 OCP_THRESHOLDS = {
-    "dispatch_min_branches": 3,       # type switch is a smell at >= 3 branches (p90)
-    "value_switch_min_branches": 6,   # value/tag switch needs >= 6 (value p90)
+    # RECALIBRATED 2026-09-14 on the Python V2 corpus.
+    # dispatch_min_branches stays 3: Martin's own minimum for a switch,
+    # held constant across languages so type-based bars stay comparable.
+    "dispatch_min_branches": 3,
+    "value_switch_min_branches": 5,   # ~p90 of value/tag chains
 }
 OCP_RISK_MIN_HITS = 1  # PR flagged if it has >= this many delta reasons
 

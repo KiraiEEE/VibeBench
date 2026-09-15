@@ -1,0 +1,210 @@
+row 179   jkingsman/Remote-Terminal-for-MeshCore#19
+============================================================================
+CLASS ContactRepository in app/repository.py   loc=205 methods=15 wmc=32 lcom=1.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       32  class ContactRepository:
+       33      @staticmethod
+       34      async def upsert(contact: dict[str, Any]) -> None:
+       35          await db.conn.execute(
+       36              """
+       37              INSERT INTO contacts (public_key, name, type, flags, last_path, last_path_len,
+       38                                    last_advert, lat, lon, last_seen, on_radio, last_contacted)
+       39              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       40              ON CONFLICT(public_key) DO UPDATE SET
+       41                  name = COALESCE(excluded.name, contacts.name),
+       42                  type = CASE WHEN excluded.type = 0 THEN contacts.type ELSE excluded.type END,
+       43                  flags = excluded.flags,
+       44                  last_path = COALESCE(excluded.last_path, contacts.last_path),
+       45                  last_path_len = excluded.last_path_len,
+       46                  last_advert = COALESCE(excluded.last_advert, contacts.last_advert),
+       47                  lat = COALESCE(excluded.lat, contacts.lat),
+       48                  lon = COALESCE(excluded.lon, contacts.lon),
+       49                  last_seen = excluded.last_seen,
+       50                  on_radio = excluded.on_radio,
+       51                  last_contacted = COALESCE(excluded.last_contacted, contacts.last_contacted)
+       52              """,
+       53              (
+       54                  contact.get("public_key", "").lower(),
+       55                  contact.get("name") or contact.get("adv_name"),
+       56                  contact.get("type", 0),
+       57                  contact.get("flags", 0),
+       58                  contact.get("last_path") or contact.get("out_path"),
+       59                  contact.get("last_path_len")
+       60                  if "last_path_len" in contact
+       61                  else contact.get("out_path_len", -1),
+       62                  contact.get("last_advert"),
+       63                  contact.get("lat") if contact.get("lat") is not None else contact.get("adv_lat"),
+       64                  contact.get("lon") if contact.get("lon") is not None else contact.get("adv_lon"),
+       65                  contact.get("last_seen", int(time.time())),
+       66                  contact.get("on_radio", False),
+       67                  contact.get("last_contacted"),
+       68              ),
+       69          )
+       70          await db.conn.commit()
+       71  
+       72      @staticmethod
+       73      def _row_to_contact(row) -> Contact:
+       74          """Convert a database row to a Contact model."""
+       75          return Contact(
+       76              public_key=row["public_key"],
+       77              name=row["name"],
+       78              type=row["type"],
+       79              flags=row["flags"],
+       80              last_path=row["last_path"],
+       81              last_path_len=row["last_path_len"],
+       82              last_advert=row["last_advert"],
+       83              lat=row["lat"],
+       84              lon=row["lon"],
+       85              last_seen=row["last_seen"],
+       86              on_radio=bool(row["on_radio"]),
+       87              last_contacted=row["last_contacted"],
+       88              last_read_at=row["last_read_at"],
+       89          )
+       90  
+       91      @staticmethod
+       92      async def get_by_key(public_key: str) -> Contact | None:
+       93          cursor = await db.conn.execute(
+       94              "SELECT * FROM contacts WHERE public_key = ?", (public_key.lower(),)
+       95          )
+       96          row = await cursor.fetchone()
+       97          return ContactRepository._row_to_contact(row) if row else None
+       98  
+       99      @staticmethod
+      100      async def get_by_key_prefix(prefix: str) -> Contact | None:
+      101          """Get a contact by key prefix only if it resolves uniquely.
+      102  
+      103          Returns None when no contacts match OR when multiple contacts match
+      104          the prefix (to avoid silently selecting the wrong contact).
+      105          """
+      106          normalized_prefix = prefix.lower()
+      107          cursor = await db.conn.execute(
+      108              "SELECT * FROM contacts WHERE public_key LIKE ? ORDER BY public_key LIMIT 2",
+      109              (f"{normalized_prefix}%",),
+      110          )
+      111          rows = list(await cursor.fetchall())
+      112          if len(rows) != 1:
+      113              return None
+      114          return ContactRepository._row_to_contact(rows[0])
+      115  
+      116      @staticmethod
+      117      async def _get_prefix_matches(prefix: str, limit: int = 2) -> list[Contact]:
+      118          """Get contacts matching a key prefix, up to limit."""
+      119          cursor = await db.conn.execute(
+      120              "SELECT * FROM contacts WHERE public_key LIKE ? ORDER BY public_key LIMIT ?",
+      121              (f"{prefix.lower()}%", limit),
+      122          )
+      123          rows = list(await cursor.fetchall())
+      124          return [ContactRepository._row_to_contact(row) for row in rows]
+      125  
+      126      @staticmethod
+      127      async def get_by_key_or_prefix(key_or_prefix: str) -> Contact | None:
+      128          """Get a contact by exact key match, falling back to prefix match.
+      129  
+      130          Useful when the input might be a full 64-char public key or a shorter prefix.
+      131          """
+      132          contact = await ContactRepository.get_by_key(key_or_prefix)
+      133          if contact:
+      134              return contact
+      135  
+      136          matches = await ContactRepository._get_prefix_matches(key_or_prefix, limit=2)
+      137          if len(matches) == 1:
+      138              return matches[0]
+      139          if len(matches) > 1:
+      140              raise AmbiguousPublicKeyPrefixError(
+      141                  key_or_prefix,
+      142                  [m.public_key for m in matches],
+      143              )
+      144          return None
+      145  
+      146      @staticmethod
+      147      async def get_all(limit: int = 100, offset: int = 0) -> list[Contact]:
+      148          cursor = await db.conn.execute(
+      149              "SELECT * FROM contacts ORDER BY COALESCE(name, public_key) LIMIT ? OFFSET ?",
+      150              (limit, offset),
+      151          )
+      152          rows = await cursor.fetchall()
+      153          return [ContactRepository._row_to_contact(row) for row in rows]
+      154  
+      155      @staticmethod
+      156      async def get_recent_non_repeaters(limit: int = 200) -> list[Contact]:
+      157          """Get the most recently active non-repeater contacts.
+      158  
+      159          Orders by most recent activity (last_contacted or last_advert),
+      160          excluding repeaters (type=2).
+      161          """
+      162          cursor = await db.conn.execute(
+      163              """
+      164              SELECT * FROM contacts
+      165              WHERE type != 2
+      166              ORDER BY COALESCE(last_contacted, 0) DESC, COALESCE(last_advert, 0) DESC
+      167              LIMIT ?
+      168              """,
+      169              (limit,),
+      170          )
+      171          rows = await cursor.fetchall()
+      172          return [ContactRepository._row_to_contact(row) for row in rows]
+      173  
+      174      @staticmethod
+      175      async def update_path(public_key: str, path: str, path_len: int) -> None:
+      176          await db.conn.execute(
+      177              "UPDATE contacts SET last_path = ?, last_path_len = ?, last_seen = ? WHERE public_key = ?",
+      178              (path, path_len, int(time.time()), public_key.lower()),
+      179          )
+      180          await db.conn.commit()
+      181  
+      182      @staticmethod
+      183      async def set_on_radio(public_key: str, on_radio: bool) -> None:
+      184          await db.conn.execute(
+      185              "UPDATE contacts SET on_radio = ? WHERE public_key = ?",
+      186              (on_radio, public_key.lower()),
+      187          )
+      188          await db.conn.commit()
+      189  
+      190      @staticmethod
+      191      async def delete(public_key: str) -> None:
+      192          await db.conn.execute(
+      193              "DELETE FROM contacts WHERE public_key = ?",
+      194              (public_key.lower(),),
+      195          )
+      196          await db.conn.commit()
+      197  
+      198      @staticmethod
+      199      async def update_last_contacted(public_key: str, timestamp: int | None = None) -> None:
+      200          """Update the last_contacted timestamp for a contact."""
+      201          ts = timestamp if timestamp is not None else int(time.time())
+      202          await db.conn.execute(
+      203              "UPDATE contacts SET last_contacted = ?, last_seen = ? WHERE public_key = ?",
+      204              (ts, ts, public_key.lower()),
+      205          )
+      206          await db.conn.commit()
+      207  
+      208      @staticmethod
+      209      async def update_last_read_at(public_key: str, timestamp: int | None = None) -> bool:
+      210          """Update the last_read_at timestamp for a contact.
+      211  
+      212          Returns True if a row was updated, False if contact not found.
+      213          """
+      214          ts = timestamp if timestamp is not None else int(time.time())
+      215          cursor = await db.conn.execute(
+      216              "UPDATE contacts SET last_read_at = ? WHERE public_key = ?",
+      217              (ts, public_key.lower()),
+      218          )
+      219          await db.conn.commit()
+      220          return cursor.rowcount > 0
+      221  
+      222      @staticmethod
+      223      async def mark_all_read(timestamp: int) -> None:
+      224          """Mark all contacts as read at the given timestamp."""
+      225          await db.conn.execute("UPDATE contacts SET last_read_at = ?", (timestamp,))
+      226          await db.conn.commit()
+      227  
+      228      @staticmethod
+      229      async def get_by_pubkey_first_byte(hex_byte: str) -> list[Contact]:
+      230          """Get contacts whose public key starts with the given hex byte (2 chars)."""
+      231          cursor = await db.conn.execute(
+      232              "SELECT * FROM contacts WHERE substr(public_key, 1, 2) = ?",
+      233              (hex_byte.lower(),),
+      234          )
+      235          rows = await cursor.fetchall()
+      236          return [ContactRepository._row_to_contact(row) for row in rows]

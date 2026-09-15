@@ -1,0 +1,277 @@
+row 150   ouro-ai-labs/ouro#124
+============================================================================
+PR ouro-ai-labs/ouro#124   cycles touched before=1.0 after=2.0
+QUESTION: does this PR make a module depend on a CONCRETE module in a
+          way that closes an import cycle, or otherwise invert the
+          dependency direction?
+
+NEWLY CYCLIC PAIRS involving a module this PR changed (1):
+    agent.agent  <->  agent.task_policy
+pre-existing cyclic pairs (NOT this PR): 1
+
+NEW IMPORT EDGES (absent from the before tree; target marked abstract or CONCRETE):
+  agent.agent -> agent.task_policy   [CONCRETE]
+  agent.task_policy -> agent.agent   [CONCRETE]
+  agent.task_policy -> llm   [CONCRETE]
+  agent.task_policy -> tools.task_tools   [CONCRETE]
+  main -> agent.tasks   [CONCRETE]
+  main -> tools.sub_agent_batch   [CONCRETE]
+  main -> tools.task_tools   [CONCRETE]
+  test.test_ralph_loop -> agent.tasks   [CONCRETE]
+  test.test_sub_agent_batch -> agent.tasks   [CONCRETE]
+  test.test_sub_agent_batch -> agent.tool_executor   [CONCRETE]
+  test.test_sub_agent_batch -> llm   [CONCRETE]
+  test.test_sub_agent_batch -> tools.sub_agent_batch   [CONCRETE]
+  test.test_sub_agent_batch -> tools.task_tools   [CONCRETE]
+  test.test_task_dump_md_request_parse -> agent.task_policy   [CONCRETE]
+  test.test_task_tools -> agent.tasks   [CONCRETE]
+  test.test_task_tools -> tools.task_tools   [CONCRETE]
+  tools -> tools.sub_agent_batch   [CONCRETE]
+  tools.task_tools -> agent.tasks   [CONCRETE]
+  tools.task_tools -> tools.base   [abstract]
+
+---------- CHANGED MODULE agent.agent (agent/agent.py) ----------
+        1  """Loop agent implementation."""
+        2  
+        3  import logging
+        4  from typing import Optional
+        5  
+        6  from config import Config
+        7  from llm import LLMMessage
+        8  from utils import terminal_ui
+        9  from utils.tui.progress import AsyncSpinner
+       10  
+       11  from .base import BaseAgent
+       12  from .context import format_context_prompt
+       13  from .task_policy import TaskPolicy
+       14  
+       15  logger = logging.getLogger(__name__)
+       16  
+       17  
+       18  class LoopAgent(BaseAgent):
+       19      """Primary agent implementation — one unified loop for all tasks."""
+       20  
+       21      # Optional sections injected into system prompt (set by caller)
+       22      _skills_section: Optional[str] = None
+       23      _soul_section: Optional[str] = None
+       24  
+       25      def set_skills_section(self, skills_section: Optional[str]) -> None:
+       26          """Set the skills section to inject into system prompt.
+       27  
+       28          Args:
+       29              skills_section: Rendered skills section from render_skills_section(),
+       30                             or None to disable skills injection.
+       31          """
+       32          self._skills_section = skills_section
+       33  
+       34      def set_soul_section(self, soul_section: Optional[str]) -> None:
+       35          """Set the soul/personality section to prepend to the system prompt.
+       36  
+       37          Args:
+       38              soul_section: Content from ~/.ouro/bot/soul.md, or None to skip.
+       39          """
+       40          self._soul_section = soul_section
+       41  
+       42      SYSTEM_PROMPT = """<role>
+       43  You are a helpful AI assistant that uses tools to accomplish tasks efficiently and reliably.
+       44  </role>
+       45  
+       46  <workflow>
+       47  For each user request, follow this ReAct pattern:
+       48  1. THINK: Analyze what's needed, choose best tools
+       49  2. ACT: Execute with appropriate tools
+       50  3. OBSERVE: Check results and learn from them
+       51  4. REPEAT or COMPLETE: Continue the loop or provide final answer
+       52  
+       53  When you have enough information, provide your final answer directly without using more tools.
+       54  </workflow>
+       55  
+       56  <tool_usage_guidelines>
+       57  - Use bash for file operations like ls, find, etc.
+       58  - Use glob_files to find files by pattern (fast, efficient)
+       59  - Use grep_content for text/code search in files
+       60  - Use read_file only when you need full contents (avoid reading multiple large files at once)
+       61  - Use smart_edit for precise changes (fuzzy match, auto backup, diff preview)
+       62  - Use write_file only for creating new files or complete rewrites
+       63  - Tasks + sub_agent_batch are experimental graph-orchestration tools. Use them when dependency-aware planning is beneficial or explicitly requested.
+       64  - multi_task remains available for legacy/simple parallel subtasks.
+       65  - Use TaskCreate/TaskUpdate/TaskList/TaskGet/TaskFanout/TaskDumpMd for task graphs (see each tool's description for the full contract).
+       66  - Use manage_todo_list only for a simple linear checklist or if Tasks tools are unavailable.
+       67  </tool_usage_guidelines>
+       68  
+       69  <agents_md>
+       70  Project instructions may be defined in AGENTS.md files in the project directory structure.
+       71  Before modifying code, check for AGENTS.md: glob_files(pattern="AGENTS.md")
+       72  If found, read it with read_file and follow the project-specific instructions.
+       73  AGENTS.md is optional. If not found, proceed normally.
+       74  </agents_md>
+       75  
+       76  """
+       77  
+       78      def _task_policy(self) -> TaskPolicy:
+       79          policy = getattr(self, "_task_policy_impl", None)
+       80          if policy is None:
+       81              policy = TaskPolicy(self)
+       82              self._task_policy_impl = policy
+       83          return policy
+       84  
+       85      async def run(self, task: str, verify: bool = False) -> str:
+       86          """Execute ReAct loop until task is complete.
+       87  
+       88          Args:
+       89              task: The task to complete
+       90              verify: If True, use ralph loop (outer verification). If False, use
+       91                      plain react loop (suitable for interactive multi-turn sessions).
+       92  
+       93          Returns:
+       94              Final answer as a string
+       95          """
+       96          # Build system message with context (only if not already in memory)
+       97          # This allows multi-turn conversations to reuse the same system message
+       98          if not self.memory.system_messages:
+       99              system_content = self.SYSTEM_PROMPT
+      100              try:
+      101                  context = await format_context_prompt()
+      102                  system_content = system_content + "\n" + context
+      103              except Exception:
+      104                  # If context gathering fails, continue without it
+      105                  pass
+      106  
+      107              # Inject long-term memory instructions + current memories
+      108              if self.memory.long_term:
+      109                  try:
+      110                      async with AsyncSpinner(
+      111                          terminal_ui.console, "Loading memory...", title="Working"
+      112                      ):
+      113                          ltm_section = await self.memory.long_term.load_and_format()
+      114                      if ltm_section:
+      115                          system_content = system_content + "\n" + ltm_section
+      116                  except Exception:
+      117                      logger.warning("Failed to load long-term memory", exc_info=True)
+      118  
+      119              # Inject skills section if available
+      120              if self._skills_section:
+       ... truncated at 120 lines ...
+
+---------- CHANGED MODULE agent.task_policy (agent/task_policy.py) ----------
+        1  """Task-graph runtime policies used by LoopAgent.
+        2  
+        3  This module keeps task-specific orchestration policies separate from the core
+        4  agent loop to reduce coupling and keep the main runtime easier to reason about.
+        5  """
+        6  
+        7  from __future__ import annotations
+        8  
+        9  import logging
+       10  import re
+       11  from typing import TYPE_CHECKING
+       12  
+       13  from llm import LLMMessage
+       14  
+       15  if TYPE_CHECKING:
+       16      from .agent import LoopAgent
+       17  
+       18  logger = logging.getLogger(__name__)
+       19  
+       20  
+       21  class TaskPolicy:
+       22      """Runtime policies for task-graph workflows."""
+       23  
+       24      def __init__(self, agent: LoopAgent):
+       25          self.agent = agent
+       26  
+       27      def _task_store(self):
+       28          return getattr(self.agent, "task_store", None)
+       29  
+       30      async def _list_tasks_or_none(self):
+       31          store = self._task_store()
+       32          if store is None:
+       33              return None
+       34          try:
+       35              return await store.list_tasks()
+       36          except Exception:
+       37              return None
+       38  
+       39      def extract_task_dump_md_request(self, task: str) -> tuple[str, bool] | None:
+       40          """Parse explicit TaskDumpMd(path=..., includeDebug=...) user request."""
+       41          if "TaskDumpMd" not in task:
+       42              return None
+       43  
+       44          path_match = re.search(r"TaskDumpMd\([^)]*\bpath\s*=\s*(['\"])(.+?)\1", task)
+       45          if not path_match:
+       46              return None
+       47          path_value = str(path_match.group(2)).strip()
+       48          if not path_value:
+       49              return None
+       50  
+       51          include_debug = False
+       52          debug_match = re.search(
+       53              r"TaskDumpMd\([^)]*\bincludeDebug\s*=\s*(true|false|1|0)\b",
+       54              task,
+       55              flags=re.IGNORECASE,
+       56          )
+       57          if debug_match:
+       58              include_debug = debug_match.group(1).lower() in {"true", "1"}
+       59  
+       60          return (path_value, include_debug)
+       61  
+       62      async def auto_dump_tasks_md_if_requested(self, task: str) -> None:
+       63          store = self._task_store()
+       64          if store is None:
+       65              return
+       66  
+       67          request = self.extract_task_dump_md_request(task)
+       68          if not request:
+       69              return
+       70          path_value, include_debug = request
+       71  
+       72          tasks = await self._list_tasks_or_none()
+       73          if not tasks:
+       74              return
+       75  
+       76          try:
+       77              from tools.task_tools import TaskDumpMdTool
+       78  
+       79              dump = TaskDumpMdTool(store)
+       80              await dump.execute(path=path_value, includeDebug=include_debug)
+       81          except Exception:
+       82              logger.warning("Auto TaskDumpMd failed", exc_info=True)
+       83  
+       84      async def task_incomplete_summary(self) -> str | None:
+       85          tasks = await self._list_tasks_or_none()
+       86          if not tasks:
+       87              return None
+       88  
+       89          incomplete = [t for t in tasks if getattr(t, "status", None) != "completed"]
+       90          if not incomplete:
+       91              return None
+       92  
+       93          tasks_by_id = {t.id: t for t in tasks}
+       94          lines: list[str] = []
+       95          for task_item in incomplete:
+       96              blocked_by = list(getattr(task_item, "blocked_by", []) or [])
+       97              missing = []
+       98              for dep_id in blocked_by:
+       99                  dep = tasks_by_id.get(dep_id)
+      100                  if not dep or getattr(dep, "status", None) != "completed":
+      101                      missing.append(dep_id)
+      102              missing_txt = f" missingDeps={','.join(missing)}" if missing else ""
+      103              lines.append(
+      104                  f"- {task_item.id}: {task_item.status} :: {task_item.content}{missing_txt}"
+      105              )
+      106          return "\n".join(lines).rstrip()
+      107  
+      108      async def enforce_tasks_completed(self, *, tools: list, task: str, result: str) -> str:
+      109          """If task graph is incomplete, force another react pass to finish it."""
+      110          passes = 0
+      111          while passes < 3:
+      112              summary = await self.task_incomplete_summary()
+      113              if not summary:
+      114                  return result
+      115              passes += 1
+      116              gate_msg = (
+      117                  "You created Tasks but some are still incomplete. Continue by using the Task* tools "
+      118                  "to complete ALL tasks, then provide the final answer. Incomplete tasks:\n"
+      119                  f"{summary}"
+      120              )
+       ... truncated at 120 lines ...

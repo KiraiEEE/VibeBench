@@ -36,6 +36,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import config as C  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sample_paths as SP  # noqa: E402
 
 COLS = [
     "pr_id", "agent", "full_name", "pr_number", "merge_sha", "row_type",
@@ -66,6 +68,7 @@ def main() -> None:
     ap.add_argument("--holdout", action="store_true",
                     help="fresh seed + exclude tuning rows; write "
                          "ocp_holdout_sample.csv")
+    SP.add_args(ap)
     args = ap.parse_args()
 
     seed = C.RANDOM_SEED + 1000 if args.holdout else C.RANDOM_SEED
@@ -78,7 +81,7 @@ def main() -> None:
     ents["smell"] = ents["smell"].astype(bool)
 
     if args.holdout:
-        prev = pd.read_csv(C.LABELS_DIR / "ocp_labeling_sample.csv")
+        prev = pd.read_csv(SP.sample_path("ocp", args.lang))
         seen = {row_key(r) for r in prev.itertuples(index=False)}
         keys = [row_key(r) for r in ents.itertuples(index=False)]
         ents = ents[[k not in seen for k in keys]]
@@ -99,8 +102,7 @@ def main() -> None:
             sample[c] = ""
 
     C.LABELS_DIR.mkdir(parents=True, exist_ok=True)
-    name = "ocp_holdout_sample.csv" if args.holdout else "ocp_labeling_sample.csv"
-    out_path = C.LABELS_DIR / name
+    out_path = SP.resolve("ocp", args.lang, holdout=args.holdout, force=args.force)
     sample[COLS].to_csv(out_path, index=False)
 
     print(f"[ocp-labels] wrote {len(sample)} rows to {out_path}")

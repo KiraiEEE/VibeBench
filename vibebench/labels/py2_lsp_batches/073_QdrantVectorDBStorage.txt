@@ -1,0 +1,94 @@
+row 73   HKUDS/LightRAG#2853
+============================================================================
+OVERRIDE  lightrag.kg.qdrant_impl.QdrantVectorDBStorage.upsert
+BASE      lightrag.base.BaseVectorStorage.upsert
+QUESTION: can an instance of the SUBCLASS be used anywhere the BASE
+          is expected, without breaking the caller?
+
+---------------- BASE CLASS HEADER (lightrag/base.py) ----------------
+      217  @dataclass
+      218  class BaseVectorStorage(StorageNameSpace, ABC):
+---------------- BASE METHOD ----------------
+      274      @abstractmethod
+      275      async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+      276          """Insert or update vectors in the storage.
+      277  
+      278          Importance notes for in-memory storage:
+      279          1. Changes will be persisted to disk during the next index_done_callback
+      280          2. Only one process should updating the storage at a time before index_done_callback,
+      281             KG-storage-log should be used to avoid data corruption
+      282          """
+
+---------------- SUBCLASS HEADER (lightrag/kg/qdrant_impl.py) ----------------
+      117  @final
+      118  @dataclass
+      119  class QdrantVectorDBStorage(BaseVectorStorage):
+---------------- OVERRIDE ----------------
+      626      async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+      627          logger.debug(f"[{self.workspace}] Inserting {len(data)} to {self.namespace}")
+      628          if not data:
+      629              return
+      630  
+      631          import time
+      632  
+      633          current_time = int(time.time())
+      634  
+      635          list_data = [
+      636              {
+      637                  ID_FIELD: k,
+      638                  WORKSPACE_ID_FIELD: self.effective_workspace,
+      639                  CREATED_AT_FIELD: current_time,
+      640                  **{k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields},
+      641              }
+      642              for k, v in data.items()
+      643          ]
+      644          contents = [v["content"] for v in data.values()]
+      645          batches = [
+      646              contents[i : i + self._max_batch_size]
+      647              for i in range(0, len(contents), self._max_batch_size)
+      648          ]
+      649  
+      650          embedding_tasks = [self.embedding_func(batch) for batch in batches]
+      651          embeddings_list = await asyncio.gather(*embedding_tasks)
+      652  
+      653          embeddings = np.concatenate(embeddings_list)
+      654  
+      655          list_points = []
+      656          for i, d in enumerate(list_data):
+      657              list_points.append(
+      658                  models.PointStruct(
+      659                      id=compute_mdhash_id_for_qdrant(
+      660                          d[ID_FIELD], prefix=self.effective_workspace
+      661                      ),
+      662                      vector=embeddings[i],
+      663                      payload=d,
+      664                  )
+      665              )
+      666  
+      667          point_batches = self._build_upsert_batches(
+      668              list_points,
+      669              max_payload_bytes=self._max_upsert_payload_bytes,
+      670              max_points_per_batch=self._max_upsert_points_per_batch,
+      671          )
+      672  
+      673          if len(point_batches) > 1:
+      674              logger.info(
+      675                  f"[{self.workspace}] Qdrant upsert split into {len(point_batches)} batches "
+      676                  f"for {len(list_points)} points (max_payload_bytes={self._max_upsert_payload_bytes}, "
+      677                  f"max_points_per_batch={self._max_upsert_points_per_batch})"
+      678              )
+      679  
+      680          results = None
+      681          for batch_index, (points_batch, estimated_bytes) in enumerate(point_batches, 1):
+      682              logger.debug(
+      683                  f"[{self.workspace}] Qdrant upsert batch {batch_index}/{len(point_batches)}: "
+      684                  f"points={len(points_batch)}, estimated_payload_bytes={estimated_bytes}"
+      685              )
+      686              # Fail-fast: any batch failure raises immediately and stops subsequent batches.
+      687              results = self._client.upsert(
+      688                  collection_name=self.final_namespace,
+      689                  points=points_batch,
+      690                  wait=True,
+      691              )
+      692  
+      693          return results

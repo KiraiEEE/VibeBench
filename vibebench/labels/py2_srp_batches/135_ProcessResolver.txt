@@ -1,0 +1,406 @@
+row 135   mitmproxy/mitmproxy#8107
+============================================================================
+CLASS ProcessResolver in OximyWindows/src/OximyWindows/Resources/oximy-addon/process.py   loc=555 methods=16 wmc=134 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      112  class ProcessResolver:
+      113      """Resolves network connections to originating processes.
+      114  
+      115      Uses platform-specific tools to map network ports to process information:
+      116      - macOS/Linux: lsof for port lookup, ps for process info
+      117      - Windows: netstat for port lookup, wmic for process info
+      118  
+      119      The resolver queries the proxy port (always active) rather than ephemeral
+      120      client ports to avoid timing issues where connections close before lookup.
+      121      """
+      122  
+      123      def __init__(self, proxy_port: int = 0):
+      124          """Initialize the ProcessResolver.
+      125  
+      126          Args:
+      127              proxy_port: The proxy's listening port. Used to query active
+      128                          connections and filter for specific client ports.
+      129                          Call update_proxy_port() once the actual port is known.
+      130          """
+      131          self._proxy_port = proxy_port
+      132          self._cache: dict[int, dict] = {}  # PID -> process info
+      133          self._bundle_id_cache: dict[str, str | None] = {}  # app_path -> bundle_id
+      134          self._port_cache: dict[int, tuple[ClientProcess, float]] = {}  # port -> (ClientProcess, timestamp)
+      135          self._port_cache_ttl = 60.0  # Cache port->process mapping for 60 seconds (fail-open: longer TTL reduces blocking lookups)
+      136          self._resolution_timeout = 0.5  # Fail-open: max time to wait for process resolution before returning None
+      137  
+      138          self._is_macos = platform.system() == "Darwin"
+      139          self._is_linux = platform.system() == "Linux"
+      140          self._is_windows = platform.system() == "Windows"
+      141          self._bundle_cache_prepopulated = False
+      142          self._bundle_cache_task: asyncio.Task | None = None
+      143  
+      144      def update_proxy_port(self, port: int) -> None:
+      145          """Update the proxy port after the actual listening port is known."""
+      146          self._proxy_port = port
+      147  
+      148      async def get_process_for_port(self, port: int) -> ClientProcess:
+      149          """Get process information for a connection on the given local port.
+      150  
+      151          FAIL-OPEN: This method is designed to never block requests for long.
+      152          If resolution takes longer than _resolution_timeout (500ms), it returns
+      153          a placeholder result immediately. The proxy continues working even if
+      154          process attribution fails.
+      155          """
+      156          import time
+      157  
+      158          # Lazily trigger bundle cache prepopulation (non-blocking background task)
+      159          if self._is_macos and not self._bundle_cache_prepopulated:
+      160              self._bundle_cache_prepopulated = True
+      161              from mitmproxy.utils import asyncio_utils
+      162              self._bundle_cache_task = asyncio_utils.create_task(
+      163                  self._prepopulate_bundle_cache(),
+      164                  name="oximy_bundle_cache_prepopulate",
+      165                  keep_ref=True,
+      166              )
+      167  
+      168          # Check port cache first (avoids expensive lsof/netstat calls)
+      169          if port in self._port_cache:
+      170              cached_process, timestamp = self._port_cache[port]
+      171              if time.time() - timestamp < self._port_cache_ttl:
+      172                  return cached_process
+      173              # Cache expired, remove it
+      174              del self._port_cache[port]
+      175  
+      176          # FAIL-OPEN: Wrap the actual resolution in a timeout
+      177          # If it takes too long, return immediately with unknown process
+      178          try:
+      179              return await asyncio.wait_for(
+      180                  self._get_process_for_port_impl(port),
+      181                  timeout=self._resolution_timeout
+      182              )
+      183          except asyncio.TimeoutError:
+      184              logger.debug(f"[PROCESS] Resolution timeout for port {port} - proceeding without attribution (fail-open)")
+      185              if sentry_service:
+      186                  sentry_service.add_breadcrumb(category="process", message=f"Process resolution timeout for port {port}", level="warning", data={"port": port, "timeout_s": self._resolution_timeout})
+      187              return ClientProcess(
+      188                  pid=None,
+      189                  name="Unknown (timeout)",
+      190                  path=None,
+      191                  ppid=None,
+      192                  parent_name=None,
+      193                  user=None,
+      194                  port=port,
+      195                  bundle_id=None,
+      196              )
+      197  
+      198      async def _get_process_for_port_impl(self, port: int) -> ClientProcess:
+      199          """Internal implementation of process resolution."""
+      200          import time
+      201  
+      202          if not (self._is_macos or self._is_linux or self._is_windows):
+      203              return ClientProcess(
+      204                  pid=None,
+      205                  name="Unknown (unsupported platform)",
+      206                  path=None,
+      207                  ppid=None,
+      208                  parent_name=None,
+      209                  user=None,
+      210                  port=port,
+      211                  bundle_id=None,
+      212              )
+      213  
+      214          # Step 1: Find PID that owns this port
+      215          pid = await self._find_pid_for_port(port)
+      216          if pid is None:
+      217              logger.debug(f"[PROCESS] Could not find PID for port {port} - process may have exited")
+      218              return ClientProcess(
+      219                  pid=None,
+      220                  name="Unknown (exited)",
+      221                  path=None,
+      222                  ppid=None,
+      223                  parent_name=None,
+      224                  user=None,
+      225                  port=port,
+      226                  bundle_id=None,
+      227              )
+      228  
+      229          # Step 2: Get process info (with caching)
+      230          proc_info = await self._get_process_info(pid)
+      231          if proc_info is None:
+      232              return ClientProcess(
+      233                  pid=pid,
+      234                  name="Unknown (exited)",
+      235                  path=None,
+      236                  ppid=None,
+      237                  parent_name=None,
+      238                  user=None,
+      239                  port=port,
+      240                  bundle_id=None,
+      241              )
+      242  
+      243          # Step 3: Get parent info if parent is meaningful (not launchd/init)
+      244          parent_name = None
+      245          if proc_info.get("ppid") and proc_info["ppid"] > 1:
+      246              parent_info = await self._get_process_info(proc_info["ppid"])
+      247              if parent_info:
+      248                  parent_name = self._extract_name(parent_info.get("path"))
+      249  
+      250          name = self._extract_name(proc_info.get("path"))
+      251          bundle_id = await self._extract_bundle_id(proc_info.get("path"))
+      252  
+      253          # Step 4 (macOS only): Resolve responsible process
+      254          # Always try responsible PID on macOS — any process might delegate networking
+      255          # via XPC services, helper processes, or system daemons.
+      256          # The ctypes call is <0.1ms so there's no performance concern.
+      257          resp_proc_info = None  # Track responsible process info for ClientProcess fields
+      258          if self._is_macos:
+      259              # Classify for logging only
+      260              if bundle_id and bundle_id.lower() in _MACOS_SYSTEM_SERVICES:
+      261                  resolved_via = "system_service"
+      262              elif not bundle_id:
+      263                  resolved_via = "no_bundle_id"
+      264              else:
+      265                  resolved_via = "app_delegation_check"
+      266  
+      267              responsible_pid = _get_responsible_pid(pid)
+      268              if responsible_pid:
+      269                  resp_path = _proc_pidpath(responsible_pid)
+      270                  if resp_path:
+      271                      resp_bundle_id = await self._extract_bundle_id(resp_path)
+      272                      if resp_bundle_id and resp_bundle_id != bundle_id:
+      273                          logger.info(
+      274                              f"[PROCESS] Responsible PID: {bundle_id or name} (PID {pid}) "
+      275                              f"-> {resp_bundle_id} (PID {responsible_pid}) [{resolved_via}]"
+      276                          )
+      277                          bundle_id = resp_bundle_id
+      278                          name = self._extract_name(resp_path)
+      279                          pid = responsible_pid
+      280                          # Get full process info for the responsible process
+      281                          resp_proc_info = await self._get_process_info(responsible_pid)
+      282                  else:
+      283                      # libproc failed, fall back to ps for both path and info
+      284                      resp_proc_info = await self._get_process_info(responsible_pid)
+      285                      if resp_proc_info:
+      286                          resp_bundle_id = await self._extract_bundle_id(resp_proc_info.get("path"))
+      287                          if resp_bundle_id and resp_bundle_id != bundle_id:
+      288                              logger.info(
+      289                                  f"[PROCESS] Responsible PID (ps): {bundle_id or name} (PID {pid}) "
+      290                                  f"-> {resp_bundle_id} (PID {responsible_pid}) [{resolved_via}]"
+      291                              )
+      292                              bundle_id = resp_bundle_id
+      293                              name = self._extract_name(resp_proc_info.get("path"))
+      294                              pid = responsible_pid
+      295  
+      296          # Step 5 (macOS): Walk parent process tree if still no bundle_id.
+      297          # This resolves CLI processes (node, python, curl) spawned inside a
+      298          # terminal app by tracing: node → zsh → Terminal.app / Cursor.app.
+      299          if not bundle_id and self._is_macos:
+      300              ancestor_pid = proc_info.get("ppid")
+      301              depth = 0
+      302              while ancestor_pid and ancestor_pid > 1 and depth < 10:
+      303                  ancestor_info = await self._get_process_info(ancestor_pid)
+      304                  if not ancestor_info:
+      305                      break
+      306                  ancestor_bundle = await self._extract_bundle_id(ancestor_info.get("path"))
+      307                  if ancestor_bundle:
+      308                      logger.info(
+      309                          f"[PROCESS] Parent walk: {name} (PID {pid}) "
+      310                          f"-> {ancestor_bundle} (PID {ancestor_pid}, depth={depth + 1})"
+      311                      )
+      312                      bundle_id = ancestor_bundle
+      313                      break
+      314                  ancestor_pid = ancestor_info.get("ppid")
+      315                  depth += 1
+      316  
+      317          # Step 5b (Windows): Walk parent tree to find a recognizable application.
+      318          # This resolves CLI processes (node, python, curl) spawned from browsers/editors
+      319          # by tracing: node → cmd.exe → Code.exe / chrome.exe.
+      320          if not bundle_id and self._is_windows and _HAS_PSUTIL:
+      321              ancestor_pid = proc_info.get("ppid")
+      322              depth = 0
+      323              while ancestor_pid and ancestor_pid > 1 and depth < 10:
+      324                  ancestor_info = await self._get_process_info(ancestor_pid)
+      325                  if not ancestor_info:
+      326                      break
+      327                  ancestor_exe = self._extract_exe_name(ancestor_info.get("path"))
+      328                  if ancestor_exe:
+      329                      # Found a recognizable exe in the parent tree
+      330                      logger.info(
+      331                          f"[PROCESS] Windows parent walk: {name} (PID {pid}) "
+      332                          f"-> {ancestor_exe} (PID {ancestor_pid}, depth={depth + 1})"
+      333                      )
+      334                      bundle_id = ancestor_exe
+      335                      break
+      336                  ancestor_pid = ancestor_info.get("ppid")
+      337                  depth += 1
+      338  
+      339          # On Windows, use exe name as bundle_id fallback
+      340          if not bundle_id and self._is_windows:
+      341              bundle_id = self._extract_exe_name(proc_info.get("path"))
+      342  
+      343          # Use responsible process info if we resolved through it, otherwise original
+      344          final_info = resp_proc_info if resp_proc_info else proc_info
+      345  
+      346          result = ClientProcess(
+      347              pid=pid,
+      348              name=name,
+      349              path=final_info.get("path"),
+      350              ppid=final_info.get("ppid"),
+      351              parent_name=parent_name,
+      352              user=final_info.get("user"),
+      353              port=port,
+      354              bundle_id=bundle_id,
+      355          )
+      356  
+      357          # Cache the result to avoid expensive subprocess calls for same port
+      358          self._port_cache[port] = (result, time.time())
+      359  
+      360          # Limit cache size to prevent memory growth
+      361          if len(self._port_cache) > 1000:
+      362              # Remove oldest entries
+      363              sorted_entries = sorted(self._port_cache.items(), key=lambda x: x[1][1])
+      364              for old_port, _ in sorted_entries[:500]:
+      365                  del self._port_cache[old_port]
+      366  
+      367          return result
+      368  
+      369      async def _find_pid_for_port(self, port: int) -> int | None:
+      370          """Find PID that owns a local port. Cross-platform using psutil.
+      371  
+      372          On macOS, psutil.net_connections() requires root, so we iterate
+      373          user-owned processes and check their connections individually (~18ms).
+      374          """
+      375          if not _HAS_PSUTIL:
+      376              return None
+      377  
+      378          try:
+      379              loop = asyncio.get_event_loop()
+      380              pid = await loop.run_in_executor(
+      381                  None, lambda: self._find_pid_for_port_sync(port)
+      382              )
+      383              return pid
+      384          except Exception as e:
+      385              logger.debug(f"[PSUTIL] Lookup failed for port {port}: {e}")
+      386  
+      387          return None
+      388  
+      389      def _find_pid_for_port_sync(self, port: int) -> int | None:
+      390          """Synchronous PID lookup using psutil.
+      391  
+      392          On Windows, uses system-wide net_connections() (doesn't require admin).
+      393          On macOS/Linux, iterates user-owned processes since net_connections()
+      394          requires root on those platforms.
+      395          """
+      396          import os
+      397  
+      398          # Fast path for Windows: system-wide net_connections() works without admin
+      399          if self._is_windows:
+      400              try:
+      401                  for conn in psutil.net_connections(kind="tcp"):
+      402                      if not conn.laddr or conn.laddr.port != port:
+      403                          continue
+      404                      if conn.raddr and conn.raddr.port == self._proxy_port and conn.pid:
+      405                          return conn.pid
+      406                      if conn.pid:
+      407                          # Fallback: match just by local port
+      408                          return conn.pid
+      409              except (psutil.AccessDenied, OSError) as e:
+      410                  logger.debug(f"[PSUTIL] System-wide net_connections failed: {e}")
+      411                  # Fall through to per-process iteration
+      412  
+      413          uid = os.getuid() if hasattr(os, "getuid") else None
+      414          fallback_pid: int | None = None
+      415  
+      416          for proc in psutil.process_iter(["pid", "uids"]):
+      417              try:
+      418                  # On Unix, skip processes owned by other users
+      419                  if uid is not None:
+      420                      proc_uids = proc.info.get("uids")
+      421                      if proc_uids and proc_uids.real != uid:
+      422                          continue
+      423  
+      424                  for conn in proc.net_connections(kind="tcp"):
+      425                      if not conn.laddr or conn.laddr.port != port:
+      426                          continue
+      427                      # Primary: match client port connecting TO our proxy
+      428                      if conn.raddr and conn.raddr.port == self._proxy_port:
+      429                          logger.debug(f"[PSUTIL] Found PID {proc.pid} for port {port}")
+      430                          return proc.pid
+      431                      # Fallback: match just by local port (no raddr or different dest)
+      432                      if fallback_pid is None:
+      433                          fallback_pid = proc.pid
+      434  
+      435              except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+      436                  continue
+      437  
+      438          if fallback_pid is not None:
+      439              logger.debug(f"[PSUTIL] Found PID {fallback_pid} for port {port} (fallback)")
+      440          return fallback_pid
+      441  
+      442      async def _get_process_info(self, pid: int) -> dict | None:
+      443          """Get process information for a PID, using cache if available."""
+      444          if pid in self._cache:
+      445              return self._cache[pid]
+      446  
+      447          info = await self._fetch_process_info(pid)
+      448          if info:
+      449              self._cache[pid] = info
+      450  
+      451          return info
+      452  
+      453      async def _fetch_process_info(self, pid: int) -> dict | None:
+      454          """Fetch process info using psutil. Cross-platform."""
+      455          if _HAS_PSUTIL:
+      456              try:
+      457                  proc = psutil.Process(pid)
+      458                  return {
+      459                      "pid": pid,
+      460                      "ppid": proc.ppid(),
+      461                      "user": proc.username(),
+      462                      "path": proc.exe(),
+      463                  }
+      464              except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
+      465                  logger.debug(f"[PSUTIL] Failed for PID {pid}: {e}")
+      466  
+      467          # macOS fallback: use libproc for path
+      468          if self._is_macos:
+      469              path = _proc_pidpath(pid)
+      470              if path:
+      471                  return {"pid": pid, "ppid": None, "user": None, "path": path}
+      472  
+      473          return None
+      474  
+      475      def _extract_name(self, path: str | None) -> str | None:
+      476          """Extract process name from path."""
+      477          if not path:
+      478              return None
+      479          if "\\" in path:
+      480              name = path.rsplit("\\", 1)[-1]
+      481          else:
+      482              name = path.rsplit("/", 1)[-1]
+      483          if name.lower().endswith(".exe"):
+      484              name = name[:-4]
+      485          return name if name else None
+      486  
+      487      def _extract_exe_name(self, path: str | None) -> str | None:
+      488          """Extract exe filename from Windows path (e.g. 'chrome.exe')."""
+      489          if not path:
+      490              return None
+      491          if "\\" in path:
+      492              exe = path.rsplit("\\", 1)[-1]
+      493          else:
+      494              exe = path.rsplit("/", 1)[-1]
+      495          return exe if exe and exe.lower().endswith(".exe") else None
+      496  
+      497      async def _extract_bundle_id(self, path: str | None) -> str | None:
+      498          """Extract macOS bundle identifier from an app path or process name.
+      499  
+      500          Handles:
+      501          - .app bundles (e.g., /Applications/Safari.app/Contents/MacOS/Safari)
+      502          - .xpc services (e.g., com.apple.WebKit.Networking.xpc)
+      503          - Process names that are already bundle IDs (e.g., com.apple.WebKit.Networking)
+      504          """
+      505          if not path or not self._is_macos:
+      506              return None
+      507  
+      508          # Check cache first
+      509          if path in self._bundle_id_cache:
+      510              return self._bundle_id_cache[path]
+      511  
+       ... truncated at 400 lines ...

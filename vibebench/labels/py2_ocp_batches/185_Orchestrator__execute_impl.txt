@@ -1,0 +1,209 @@
+row 185   mixseek/mixseek-core#100
+============================================================================
+CHAIN in mixseek.orchestrator.orchestrator.Orchestrator._execute_impl   kind=isinstance subject='result' branches=3
+QUESTION: is the set of variants OPEN (a new one is expected, and
+          would force editing this chain) or CLOSED by nature?
+SHOWING THE WHOLE ENCLOSING FUNCTION -- a branch count alone cannot answer this.
+>>> marks the first line of the dispatch chain itself.
+
+file src/mixseek/orchestrator/orchestrator.py
+      160      async def _execute_impl(
+      161          self,
+      162          task: OrchestratorTask,
+      163          timeout: int,
+      164          span: Any | None = None,
+      165      ) -> ExecutionSummary:
+      166          """execute()の実装本体（Logfireトレースから分離）
+      167  
+      168          Args:
+      169              task: オーケストレータタスク
+      170              timeout: タイムアウト秒数
+      171              span: Logfire span（利用可能な場合）
+      172  
+      173          Returns:
+      174              ExecutionSummary
+      175          """
+      176          # 循環インポート回避のため遅延インポート
+      177          from mixseek.round_controller import RoundController
+      178  
+      179          user_prompt = task.user_prompt
+      180  
+      181          logger.info(f"Starting orchestration with {len(task.team_configs)} teams (timeout: {timeout}s)")
+      182          logger.debug(f"Workspace: {self.workspace}")
+      183  
+      184          # デバッグ: API 認証情報の確認（credentials_status のみ）
+      185          from mixseek.core.auth import get_auth_info
+      186  
+      187          try:
+      188              for team_config_path in task.team_configs:
+      189                  temp_config = load_team_config(team_config_path, self.workspace)
+      190                  if temp_config.leader and temp_config.leader.model:
+      191                      auth_info = get_auth_info(temp_config.leader.model)
+      192                      logger.debug(
+      193                          f"Team {temp_config.team_id}: Model={temp_config.leader.model}, "
+      194                          f"Auth={auth_info.get('provider', 'unknown')}, "
+      195                          f"Credentials={auth_info.get('credentials_status', 'unknown')}"
+      196                      )
+      197          except Exception as e:
+      198              logger.debug(f"Could not retrieve auth info: {e}")
+      199  
+      200          # team_id重複チェック（data integrity保証）
+      201          team_ids: list[str] = []
+      202          for team_config_path in task.team_configs:
+      203              temp_config = load_team_config(team_config_path, self.workspace)
+      204              if temp_config.team_id in team_ids:
+      205                  raise ValueError(
+      206                      f"Duplicate team_id detected: '{temp_config.team_id}'. "
+      207                      f"Each team configuration must have a unique team_id."
+      208                  )
+      209              team_ids.append(temp_config.team_id)
+      210  
+      211          # TeamStatus初期化
+      212          for team_config_path in task.team_configs:
+      213              # 一時的にチームIDを取得（設定読み込み）
+      214              temp_config = load_team_config(team_config_path, self.workspace)
+      215              self.team_statuses[temp_config.team_id] = TeamStatus(
+      216                  team_id=temp_config.team_id,
+      217                  team_name=temp_config.team_name,
+      218              )
+      219              logger.debug(f"Registered team: {temp_config.team_id} ({temp_config.team_name})")
+      220  
+      221          # Evaluator設定を取得（FR-050準拠）
+      222          config_manager = ConfigurationManager(workspace=self.workspace)
+      223          evaluator_settings = config_manager.get_evaluator_settings(self.settings.evaluator_config)
+      224  
+      225          # Judgment設定を取得
+      226          judgment_settings = config_manager.get_judgment_settings(self.settings.judgment_config)
+      227  
+      228          # PromptBuilder設定を取得
+      229          prompt_builder_settings = config_manager.get_prompt_builder_settings(self.settings.prompt_builder_config)
+      230  
+      231          # RoundController作成 (Feature 037, FR-046: pass all settings)
+      232          controllers = [
+      233              RoundController(
+      234                  team_config_path=team_config_path,
+      235                  workspace=self.workspace,
+      236                  task=task,
+      237                  evaluator_settings=evaluator_settings,
+      238                  judgment_settings=judgment_settings,
+      239                  prompt_builder_settings=prompt_builder_settings,
+      240                  save_db=self.save_db,
+      241                  on_round_complete=self._on_round_complete,
+      242              )
+      243              for team_config_path in task.team_configs
+      244          ]
+      245  
+      246          # 並列実行
+      247          start_time = time.time()
+      248          logger.info(f"Executing {len(controllers)} teams in parallel (execution_id: {task.execution_id})...")
+      249  
+      250          results = await asyncio.gather(
+      251              *[self._run_team(controller, user_prompt, timeout) for controller in controllers],
+      252              return_exceptions=True,
+      253          )
+      254  
+      255          execution_time = time.time() - start_time
+      256  
+      257          # 結果収集 (Feature 037: receive LeaderBoardEntry instead of RoundResult)
+      258          team_results: list[LeaderBoardEntry] = []
+      259          failed_teams_info: list[FailedTeamInfo] = []
+      260  
+      261          for result in results:
+>>>   262              if isinstance(result, LeaderBoardEntry):
+      263                  team_results.append(result)
+      264                  # TeamStatus更新
+      265                  self.team_statuses[result.team_id].status = "completed"
+      266                  self.team_statuses[result.team_id].completed_at = result.created_at
+      267              elif isinstance(result, PartialTeamFailureError):
+      268                  # 部分成功: team_results に追加（ステータスは "failed"/"timeout" のまま）
+      269                  team_results.append(result.entry)
+      270                  logger.info(
+      271                      f"Team {result.entry.team_id} partially succeeded "
+      272                      f"(best round: {result.entry.round_number}, score: {result.entry.score:.2f}), "
+      273                      f"original error: {result.original_error}"
+      274                  )
+      275              elif isinstance(result, Exception):
+      276                  # Exception発生時はログのみ記録（failed_teams_infoは後で一度だけ収集）
+      277                  logger.debug(f"Exception occurred during parallel execution: {result}")
+      278  
+      279          # 失敗したチーム情報を一度だけ収集（重複回避）
+      280          for team_id, status in self.team_statuses.items():
+      281              if status.status in ["failed", "timeout"]:
+      282                  logger.warning(f"Team {team_id} ({status.team_name}) failed: {status.error_message}")
+      283                  failed_teams_info.append(
+      284                      FailedTeamInfo(
+      285                          team_id=team_id,
+      286                          team_name=status.team_name,
+      287                          error_message=status.error_message or "Unknown error",
+      288                      )
+      289                  )
+      290  
+      291          # 最高スコアチーム特定 (Feature 037: 0-100 scale)
+      292          best_team_id = None
+      293          best_score = None
+      294  
+      295          if team_results:
+      296              best_result = max(team_results, key=lambda r: r.score)
+      297              best_team_id = best_result.team_id
+      298              best_score = best_result.score
+      299  
+      300          # 実行結果のログ
+      301          logger.info(f"Orchestration completed: {len(team_results)} succeeded, {len(failed_teams_info)} failed")
+      302          if team_results:
+      303              logger.info(f"Best result: {best_team_id} with score {best_score:.2f}")
+      304          if failed_teams_info:
+      305              for failed in failed_teams_info:
+      306                  logger.warning(f"Failed team {failed.team_id}: {failed.error_message}")
+      307  
+      308          # ExecutionSummary生成
+      309          summary = ExecutionSummary(
+      310              execution_id=task.execution_id,
+      311              user_prompt=user_prompt,
+      312              team_results=team_results,
+      313              best_team_id=best_team_id,
+      314              best_score=best_score,
+      315              total_execution_time_seconds=execution_time,
+      316              failed_teams_info=failed_teams_info,
+      317          )
+      318  
+      319          # ステータス決定（全成功=completed、一部失敗=partial_failure、全失敗=failed）
+      320          execution_status: str
+      321          if len(failed_teams_info) == 0:
+      322              execution_status = "completed"
+      323          elif len(team_results) == 0:
+      324              execution_status = "failed"
+      325          else:
+      326              execution_status = "partial_failure"
+      327  
+      328          # DuckDBに保存（Orchestrator統合、025-mixseek-core-orchestration）
+      329          if self.save_db:
+      330              from mixseek.storage.aggregation_store import AggregationStore
+      331  
+      332              store = AggregationStore(db_path=self.workspace / "mixseek.db")
+      333  
+      334              await store.save_execution_summary(
+      335                  execution_id=summary.execution_id,
+      336                  user_prompt=summary.user_prompt,
+      337                  status=execution_status,
+      338                  team_results=[result.model_dump(mode="json") for result in summary.team_results],
+      339                  total_teams=len(task.team_configs),
+      340                  best_team_id=summary.best_team_id,
+      341                  best_score=summary.best_score,
+      342                  total_execution_time_seconds=summary.total_execution_time_seconds,
+      343              )
+      344  
+      345              logger.info(
+      346                  f"Execution summary saved to DuckDB (execution_id: {summary.execution_id}, status: {execution_status})"
+      347              )
+      348  
+      349          # Logfire spanに結果を記録
+      350          if span is not None and LOGFIRE_AVAILABLE:
+      351              span.set_attribute("best_team_id", best_team_id or "none")
+      352              span.set_attribute("best_score", best_score or 0.0)
+      353              span.set_attribute("total_teams", len(task.team_configs))
+      354              span.set_attribute("completed_teams", len(team_results))
+      355              span.set_attribute("failed_teams", len(failed_teams_info))
+      356              span.set_attribute("execution_status", execution_status)
+      357              span.set_attribute("execution_time_seconds", execution_time)
+      358  
+      359          return summary

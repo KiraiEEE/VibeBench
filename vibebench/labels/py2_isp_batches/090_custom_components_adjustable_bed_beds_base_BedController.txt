@@ -1,0 +1,663 @@
+row 90   kristofferR/ha-adjustable-bed#254
+============================================================================
+CONTRACT custom_components.adjustable_bed.beds.base:BedController   kind=abc abstract_methods=17.0 implementers=40.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file custom_components/adjustable_bed/beds/base.py
+       44  class BedController(ABC):
+       45      """Abstract base class for bed controllers.
+       46  
+       47      Subclasses must implement:
+       48      - control_characteristic_uuid: The BLE characteristic UUID for sending commands
+       49      - Motor control methods (move_head_up, move_head_down, etc.)
+       50      - Preset methods (preset_flat, preset_memory, program_memory)
+       51  
+       52      Methods with default implementations (override if needed):
+       53      - write_command: Delegates to _write_gatt_with_retry (override for custom writes)
+       54      - start_notify/stop_notify: No-op (override for position feedback)
+       55      - read_positions: No-op (override for position reading)
+       56      - _move_with_stop: Movement with guaranteed STOP (requires _send_stop)
+       57      - _preset_with_stop: Preset with guaranteed STOP (requires _send_stop)
+       58  
+       59      Optional methods that can be overridden:
+       60      - preset_zero_g, preset_anti_snore, preset_tv
+       61      - lights_on, lights_off, lights_toggle
+       62      - massage_* methods
+       63      """
+       64  
+       65      def __init__(self, coordinator: AdjustableBedCoordinator) -> None:
+       66          """Initialize the controller.
+       67  
+       68          Args:
+       69              coordinator: The AdjustableBedCoordinator managing the BLE connection
+       70          """
+       71          self._coordinator = coordinator
+       72          self._notify_callback: Callable[[str, float], None] | None = None
+       73          self._raw_notify_callback: Callable[[str, bytes], None] | None = None
+       74          self._ble_lock = asyncio.Lock()
+       75  
+       76      @property
+       77      def ble_lock(self) -> asyncio.Lock:
+       78          """Return the BLE operation lock.
+       79  
+       80          This lock should be acquired by any code that performs BLE read/write
+       81          operations to prevent concurrent GATT operations which can cause
+       82          'operation in progress' errors on some BLE backends.
+       83          """
+       84          return self._ble_lock
+       85  
+       86      def set_raw_notify_callback(self, callback: Callable[[str, bytes], None] | None) -> None:
+       87          """Set a callback to receive raw notification data.
+       88  
+       89          This is used by diagnostics to capture raw BLE notifications without
+       90          disrupting normal notification handling. The callback receives the
+       91          characteristic UUID and raw bytes for each notification.
+       92  
+       93          Args:
+       94              callback: Function to call with (characteristic_uuid, data), or None to clear.
+       95          """
+       96          self._raw_notify_callback = callback
+       97  
+       98      def forward_raw_notification(self, characteristic_uuid: str, data: bytes) -> None:
+       99          """Forward raw notification data to the registered callback.
+      100  
+      101          Subclasses should call this from their notification handlers to
+      102          enable diagnostics capture.
+      103  
+      104          Args:
+      105              characteristic_uuid: The UUID of the characteristic that sent the notification.
+      106              data: The raw notification data bytes.
+      107          """
+      108          _LOGGER.debug(
+      109              "GATT notify from %s (%s): %s",
+      110              self._coordinator.address,
+      111              characteristic_uuid,
+      112              data.hex(),
+      113          )
+      114          if self._raw_notify_callback is not None:
+      115              try:
+      116                  self._raw_notify_callback(characteristic_uuid, data)
+      117              except Exception:
+      118                  _LOGGER.debug("Error in raw notification callback", exc_info=True)
+      119  
+      120      @property
+      121      def client(self) -> BleakClient | None:
+      122          """Return the BLE client."""
+      123          return self._coordinator.client
+      124  
+      125      @property
+      126      def auto_stops_on_idle(self) -> bool:
+      127          """Return True if motors auto-stop when commands stop arriving.
+      128  
+      129          Controllers that auto-stop (like Linak) should override this to return True.
+      130          This allows the coordinator to skip explicit STOP commands which can cause
+      131          brief reverse movements on some bed types.
+      132          """
+      133          return False
+      134  
+      135      def log_discovered_services(self, level: int = logging.DEBUG) -> None:
+      136          """Log all discovered GATT services and characteristics.
+      137  
+      138          Useful for debugging when expected services/characteristics are not found.
+      139          Call this method when the controller fails to find the expected BLE
+      140          services to help users report issues with new device variants.
+      141  
+      142          Args:
+      143              level: Logging level (default: DEBUG). Use logging.INFO for
+      144                     more visibility when debugging connection issues.
+      145          """
+      146          client = self.client
+      147          if client is None or client.services is None:
+      148              _LOGGER.log(level, "No BLE services discovered (client not connected)")
+      149              return
+      150  
+      151          services_count = len(list(client.services))
+      152          _LOGGER.log(
+      153              level,
+      154              "Discovered %d GATT services on %s:",
+      155              services_count,
+      156              self._coordinator.address,
+      157          )
+      158  
+      159          for service in client.services:
+      160              _LOGGER.log(
+      161                  level,
+      162                  "  Service: %s",
+      163                  service.uuid,
+      164              )
+      165              for char in service.characteristics:
+      166                  props = ", ".join(char.properties)
+      167                  _LOGGER.log(
+      168                      level,
+      169                      "    Char: %s [%s]",
+      170                      char.uuid,
+      171                      props,
+      172                  )
+      173  
+      174      @property
+      175      @abstractmethod
+      176      def control_characteristic_uuid(self) -> str:
+      177          """Return the UUID of the control characteristic.
+      178  
+      179          This is the BLE characteristic that accepts motor/preset commands.
+      180          """
+      181  
+      182      async def _write_gatt_with_retry(
+      183          self,
+      184          char_uuid: str,
+      185          command: bytes,
+      186          repeat_count: int = 1,
+      187          repeat_delay_ms: int = 100,
+      188          cancel_event: asyncio.Event | None = None,
+      189          response: bool = True,
+      190      ) -> None:
+      191          """Write a command to a GATT characteristic with retry support.
+      192  
+      193          This is a helper method that handles the common pattern of:
+      194          - Checking connection state
+      195          - Writing to a characteristic with optional response
+      196          - Repeating the command with delays
+      197          - Checking for cancellation between writes
+      198  
+      199          Args:
+      200              char_uuid: The characteristic UUID to write to
+      201              command: The command bytes to send
+      202              repeat_count: Number of times to repeat the command (default: 1)
+      203              repeat_delay_ms: Delay between repeats in milliseconds (default: 100)
+      204              cancel_event: Optional event that signals cancellation. If set,
+      205                           the command loop will exit early.
+      206              response: Whether to wait for a write response from the device.
+      207                       True = write-with-response (more reliable, slower) [default]
+      208                       False = write-without-response (faster, less reliable)
+      209  
+      210          Raises:
+      211              ConnectionError: If not connected to the bed
+      212              BleakError: If the GATT write fails
+      213          """
+      214          client = self.client
+      215          if client is None or not client.is_connected:
+      216              _LOGGER.error("Cannot write command: BLE client not connected")
+      217              raise ConnectionError("Not connected to bed")
+      218  
+      219          effective_cancel = cancel_event or self._coordinator.cancel_command
+      220  
+      221          _LOGGER.debug(
+      222              "GATT write to %s (%s): %s (response=%s, repeat=%d, delay=%dms)",
+      223              self._coordinator.address,
+      224              char_uuid,
+      225              command.hex(),
+      226              response,
+      227              repeat_count,
+      228              repeat_delay_ms,
+      229          )
+      230  
+      231          characteristic_handle: int | None = None
+      232          if client.services:
+      233              for service in client.services:
+      234                  for characteristic in service.characteristics:
+      235                      if characteristic.uuid == char_uuid:
+      236                          characteristic_handle = getattr(characteristic, "handle", None)
+      237                          break
+      238                  if characteristic_handle is not None:
+      239                      break
+      240  
+      241          caller_frame = inspect.currentframe()
+      242          command_origin = None
+      243          if caller_frame is not None and caller_frame.f_back is not None:
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER custom_components.adjustable_bed.beds.bedtech:BedTechController  stubs=0/17 ----------
+      131  class BedTechController(BedController):
+      155      @property
+      156      def control_characteristic_uuid(self) -> str:
+      157          """Return the UUID of the control characteristic."""
+      158          return self._char_uuid
+      255      async def move_head_up(self) -> None:
+      256          """Move head up."""
+      257          try:
+      258              await self._send_command(BedTechCommands.HEAD_UP)
+      259          finally:
+      260              await self._send_stop_command()
+      262      async def move_head_down(self) -> None:
+      263          """Move head down."""
+      264          try:
+      265              await self._send_command(BedTechCommands.HEAD_DOWN)
+      266          finally:
+      267              await self._send_stop_command()
+      269      async def move_head_stop(self) -> None:
+      270          """Stop head motor."""
+      271          await self._send_stop_command()
+      273      async def move_back_up(self) -> None:
+      274          """Move back up (same as head for BedTech)."""
+      275          await self.move_head_up()
+      277      async def move_back_down(self) -> None:
+      278          """Move back down (same as head for BedTech)."""
+      279          await self.move_head_down()
+      281      async def move_back_stop(self) -> None:
+      282          """Stop back motor."""
+      283          await self.move_head_stop()
+      285      async def move_legs_up(self) -> None:
+      286          """Move legs up (same as feet for BedTech)."""
+      287          try:
+      288              await self._send_command(BedTechCommands.FOOT_UP)
+      289          finally:
+      290              await self._send_stop_command()
+      292      async def move_legs_down(self) -> None:
+      293          """Move legs down (same as feet for BedTech)."""
+      294          try:
+      295              await self._send_command(BedTechCommands.FOOT_DOWN)
+      296          finally:
+      297              await self._send_stop_command()
+      299      async def move_legs_stop(self) -> None:
+      300          """Stop legs motor."""
+      301          await self._send_stop_command()
+      303      async def move_feet_up(self) -> None:
+      304          """Move feet up."""
+      305          try:
+      306              await self._send_command(BedTechCommands.FOOT_UP)
+      307          finally:
+      308              await self._send_stop_command()
+      310      async def move_feet_down(self) -> None:
+      311          """Move feet down."""
+      312          try:
+      313              await self._send_command(BedTechCommands.FOOT_DOWN)
+      314          finally:
+      315              await self._send_stop_command()
+      317      async def move_feet_stop(self) -> None:
+      318          """Stop feet motor."""
+      319          await self._send_stop_command()
+      339      async def stop_all(self) -> None:
+      340          """Stop all motors."""
+      341          await self._send_stop_command()
+      344      async def preset_flat(self) -> None:
+      345          """Go to flat position."""
+      346          await self.write_command(self._build_command(BedTechCommands.PRESET_FLAT))
+      348      async def preset_memory(self, memory_num: int) -> None:
+      349          """Go to memory preset."""
+      350          commands = {
+      351              1: BedTechCommands.MEMORY_GO,
+      352              2: BedTechCommands.MEMORY2_GO if self._is_dual_base else BedTechCommands.MEMORY_GO,
+      353          }
+      354          if cmd_char := commands.get(memory_num):
+      355              await self.write_command(self._build_command(cmd_char))
+      356          else:
+      357              _LOGGER.warning("Invalid memory number %d (valid: 1-2)", memory_num)
+      359      async def program_memory(self, memory_num: int) -> None:
+      360          """Program current position to memory."""
+      361          commands = {
+      362              1: BedTechCommands.MEMORY_SAVE,
+      363              2: BedTechCommands.MEMORY2_SAVE if self._is_dual_base else BedTechCommands.MEMORY_SAVE,
+      364          }
+      365          if cmd_char := commands.get(memory_num):
+      366              await self.write_command(self._build_command(cmd_char))
+      367          else:
+      368              _LOGGER.warning("Invalid memory number %d (valid: 1-2)", memory_num)
+
+---------- IMPLEMENTER custom_components.adjustable_bed.beds.coolbase:CoolBaseController  stubs=0/17 ----------
+       65  class CoolBaseController(BedController):
+       89      @property
+       90      def control_characteristic_uuid(self) -> str:
+       91          """Return the UUID of the control characteristic."""
+       92          return self._char_uuid
+      297      async def move_head_up(self) -> None:
+      298          """Move head up."""
+      299          await self._move_motor("head", True)
+      301      async def move_head_down(self) -> None:
+      302          """Move head down."""
+      303          await self._move_motor("head", False)
+      305      async def move_head_stop(self) -> None:
+      306          """Stop head motor."""
+      307          await self._move_motor("head", None)
+      309      async def move_back_up(self) -> None:
+      310          """Move back up (same as head)."""
+      311          await self.move_head_up()
+      313      async def move_back_down(self) -> None:
+      314          """Move back down (same as head)."""
+      315          await self.move_head_down()
+      317      async def move_back_stop(self) -> None:
+      318          """Stop back motor."""
+      319          await self.move_head_stop()
+      321      async def move_legs_up(self) -> None:
+      322          """Move legs up (same as feet)."""
+      323          await self._move_motor("feet", True)
+      325      async def move_legs_down(self) -> None:
+      326          """Move legs down (same as feet)."""
+      327          await self._move_motor("feet", False)
+      329      async def move_legs_stop(self) -> None:
+      330          """Stop legs motor."""
+      331          await self._move_motor("feet", None)
+      333      async def move_feet_up(self) -> None:
+      334          """Move feet up."""
+      335          await self._move_motor("feet", True)
+      337      async def move_feet_down(self) -> None:
+      338          """Move feet down."""
+      339          await self._move_motor("feet", False)
+      341      async def move_feet_stop(self) -> None:
+      342          """Stop feet motor."""
+      343          await self._move_motor("feet", None)
+      345      async def stop_all(self) -> None:
+      346          """Stop all motors."""
+      347          self._motor_state = {}
+      348          await self.write_command(
+      349              self._build_command(),  # All zeros = stop
+      350              cancel_event=asyncio.Event(),
+      351          )
+      354      async def preset_flat(self) -> None:
+      355          """Go to flat position."""
+      356          await self.write_command(self._build_command_from_value(CoolBaseCommands.PRESET_FLAT))
+      358      async def preset_memory(self, memory_num: int) -> None:
+      359          """Go to memory preset."""
+      360          if memory_num == 1:
+      361              await self.write_command(self._build_command_from_value(CoolBaseCommands.PRESET_MEMORY_1))
+      362          else:
+      363              _LOGGER.warning("Cool Base only supports Memory 1, requested: %d", memory_num)
+      365      async def program_memory(self, memory_num: int) -> None:
+      366          """Program current position to memory (not supported)."""
+      367          _LOGGER.warning("Cool Base doesn't support programming memory presets")
+
+---------- IMPLEMENTER custom_components.adjustable_bed.beds.diagnostic:DiagnosticBedController  stubs=15/17 ----------
+       26  class DiagnosticBedController(BedController):
+       42      @property
+       43      def control_characteristic_uuid(self) -> str:
+       44          """Return empty string - no control characteristic for diagnostic devices."""
+       45          return ""
+       82      async def move_head_up(self) -> None:
+       83          """Not available in diagnostic mode."""
+       84          raise NotImplementedError("Diagnostic mode: no motor control available")
+       86      async def move_head_down(self) -> None:
+       87          """Not available in diagnostic mode."""
+       88          raise NotImplementedError("Diagnostic mode: no motor control available")
+       90      async def move_head_stop(self) -> None:
+       91          """Not available in diagnostic mode."""
+       92          raise NotImplementedError("Diagnostic mode: no motor control available")
+       94      async def move_back_up(self) -> None:
+       95          """Not available in diagnostic mode."""
+       96          raise NotImplementedError("Diagnostic mode: no motor control available")
+       98      async def move_back_down(self) -> None:
+       99          """Not available in diagnostic mode."""
+      100          raise NotImplementedError("Diagnostic mode: no motor control available")
+      102      async def move_back_stop(self) -> None:
+      103          """Not available in diagnostic mode."""
+      104          raise NotImplementedError("Diagnostic mode: no motor control available")
+      106      async def move_legs_up(self) -> None:
+      107          """Not available in diagnostic mode."""
+      108          raise NotImplementedError("Diagnostic mode: no motor control available")
+      110      async def move_legs_down(self) -> None:
+      111          """Not available in diagnostic mode."""
+      112          raise NotImplementedError("Diagnostic mode: no motor control available")
+      114      async def move_legs_stop(self) -> None:
+      115          """Not available in diagnostic mode."""
+      116          raise NotImplementedError("Diagnostic mode: no motor control available")
+      118      async def move_feet_up(self) -> None:
+      119          """Not available in diagnostic mode."""
+      120          raise NotImplementedError("Diagnostic mode: no motor control available")
+      122      async def move_feet_down(self) -> None:
+      123          """Not available in diagnostic mode."""
+      124          raise NotImplementedError("Diagnostic mode: no motor control available")
+      126      async def move_feet_stop(self) -> None:
+      127          """Not available in diagnostic mode."""
+      128          raise NotImplementedError("Diagnostic mode: no motor control available")
+      130      async def stop_all(self) -> None:
+      131          """No-op - nothing to stop in diagnostic mode."""
+      132          _LOGGER.debug("Diagnostic mode: stop_all ignored (no motor control)")
+      134      async def preset_flat(self) -> None:
+      135          """Not available in diagnostic mode."""
+      136          raise NotImplementedError("Diagnostic mode: no preset control available")
+      138      async def preset_memory(self, memory_num: int) -> None:
+      139          """Not available in diagnostic mode."""
+      140          raise NotImplementedError("Diagnostic mode: no preset control available")
+      142      async def program_memory(self, memory_num: int) -> None:
+      143          """Not available in diagnostic mode."""
+      144          raise NotImplementedError("Diagnostic mode: no preset control available")
+
+---------- IMPLEMENTER custom_components.adjustable_bed.beds.jensen:JensenController  stubs=0/17 ----------
+      100  class JensenController(BedController):
+      138      @property
+      139      def control_characteristic_uuid(self) -> str:
+      140          """Return the UUID of the control characteristic."""
+      141          return JENSEN_CHAR_UUID
+      520      async def move_head_up(self) -> None:
+      521          """Move head up."""
+      522          await self._move_with_stop(JensenCommands.MOTOR_HEAD_UP)
+      524      async def move_head_down(self) -> None:
+      525          """Move head down."""
+      526          await self._move_with_stop(JensenCommands.MOTOR_HEAD_DOWN)
+      528      async def move_head_stop(self) -> None:
+      529          """Stop head motor."""
+      530          await self.write_command(
+      531              JensenCommands.MOTOR_STOP,
+      532              cancel_event=asyncio.Event(),
+      533          )
+      535      async def move_back_up(self) -> None:
+      536          """Move back up (same as head for Jensen)."""
+      537          await self.move_head_up()
+      539      async def move_back_down(self) -> None:
+      540          """Move back down (same as head for Jensen)."""
+      541          await self.move_head_down()
+      543      async def move_back_stop(self) -> None:
+      544          """Stop back motor (same as head for Jensen)."""
+      545          await self.move_head_stop()
+      547      async def move_legs_up(self) -> None:
+      548          """Move legs/feet up."""
+      549          await self._move_with_stop(JensenCommands.MOTOR_FOOT_UP)
+      551      async def move_legs_down(self) -> None:
+      552          """Move legs/feet down."""
+      553          await self._move_with_stop(JensenCommands.MOTOR_FOOT_DOWN)
+      555      async def move_legs_stop(self) -> None:
+      556          """Stop legs motor."""
+      557          await self.write_command(
+      558              JensenCommands.MOTOR_STOP,
+      559              cancel_event=asyncio.Event(),
+      560          )
+      562      async def move_feet_up(self) -> None:
+      563          """Move feet up (same as legs for Jensen)."""
+      564          await self.move_legs_up()
+      566      async def move_feet_down(self) -> None:
+      567          """Move feet down (same as legs for Jensen)."""
+      568          await self.move_legs_down()
+      570      async def move_feet_stop(self) -> None:
+      571          """Stop feet motor."""
+      572          await self.write_command(
+      573              JensenCommands.MOTOR_STOP,
+      574              cancel_event=asyncio.Event(),
+      575          )
+      577      async def stop_all(self) -> None:
+      578          """Stop all motors."""
+      579          await self.write_command(
+      580              JensenCommands.MOTOR_STOP,
+      581              cancel_event=asyncio.Event(),
+      582          )
+      585      async def preset_flat(self) -> None:
+      586          """Go to flat position."""
+      587          # Flat preset reliability improves when sent as a short burst.
+      588          pulse_count = max(2, self._coordinator.motor_pulse_count)
+      589          pulse_delay = max(1, self._coordinator.motor_pulse_delay_ms)
+      590          await self.write_command(
+      591              JensenCommands.PRESET_FLAT,
+      592              repeat_count=pulse_count,
+      593              repeat_delay_ms=pulse_delay,
+      594          )
+      596      async def preset_memory(self, memory_num: int) -> None:
+      597          """Go to memory preset (Jensen only has 1 slot)."""
+      598          if memory_num != 1:
+      599              _LOGGER.warning("Invalid memory preset number: %d (Jensen only supports slot 1)", memory_num)
+      600              return
+      601          await self.write_command(JensenCommands.PRESET_MEMORY_RECALL)
+      603      async def program_memory(self, memory_num: int) -> None:
+      604          """Program current position to memory (Jensen only has 1 slot)."""
+      605          if memory_num == 1:
+      606              await self.write_command(JensenCommands.PRESET_MEMORY_SAVE)
+      607          else:
+      608              _LOGGER.warning("Invalid memory program number: %d (Jensen only supports slot 1)", memory_num)
+
+---------- IMPLEMENTER custom_components.adjustable_bed.beds.jiecang:JiecangController  stubs=0/17 ----------
+      101  class JiecangController(BedController):
+      144      @property
+      145      def control_characteristic_uuid(self) -> str:
+      146          """Return the UUID of the control characteristic."""
+      147          return self._char_uuid
+      231      async def move_head_up(self) -> None:
+      232          """Move head/back up."""
+      233          await self._move_motor(JiecangCommands.HEAD_UP)
+      235      async def move_head_down(self) -> None:
+      236          """Move head/back down."""
+      237          await self._move_motor(JiecangCommands.HEAD_DOWN)
+      239      async def move_head_stop(self) -> None:
+      240          """Stop head motor."""
+      241          await self.write_command(
+      242              JiecangCommands.BUTTON_RELEASE, cancel_event=asyncio.Event()
+      243          )
+      245      async def move_back_up(self) -> None:
+      246          """Move back up (same as head)."""
+      247          await self.move_head_up()
+      249      async def move_back_down(self) -> None:
+      250          """Move back down (same as head)."""
+      251          await self.move_head_down()
+      253      async def move_back_stop(self) -> None:
+      254          """Stop back motor."""
+      255          await self.move_head_stop()
+      257      async def move_legs_up(self) -> None:
+      258          """Move legs up."""
+      259          await self._move_motor(JiecangCommands.LEG_UP)
+      261      async def move_legs_down(self) -> None:
+      262          """Move legs down."""
+      263          await self._move_motor(JiecangCommands.LEG_DOWN)
+      265      async def move_legs_stop(self) -> None:
+      266          """Stop legs motor."""
+      267          await self.write_command(
+      268              JiecangCommands.BUTTON_RELEASE, cancel_event=asyncio.Event()
+      269          )
+      271      async def move_feet_up(self) -> None:
+      272          """Move feet up (same as legs)."""
+      273          await self.move_legs_up()
+      275      async def move_feet_down(self) -> None:
+      276          """Move feet down (same as legs)."""
+      277          await self.move_legs_down()
+      279      async def move_feet_stop(self) -> None:
+      280          """Stop feet motor."""
+      281          await self.move_legs_stop()
+      283      async def stop_all(self) -> None:
+      284          """Stop all motors using BUTTON_RELEASE command."""
+      285          await self.write_command(
+      286              JiecangCommands.BUTTON_RELEASE, cancel_event=asyncio.Event()
+      287          )
+      290      async def preset_flat(self) -> None:
+      291          """Go to flat position."""
+      292          await self.write_command(
+      293              JiecangCommands.FLAT,
+      294              repeat_count=3,
+      295              repeat_delay_ms=100,
+      296          )
+      314      async def preset_memory(self, memory_num: int) -> None:
+      315          """Go to memory preset (1-3)."""
+      316          commands = {
+      317              1: JiecangCommands.MEMORY_1,
+      318              2: JiecangCommands.MEMORY_2,
+      319              3: JiecangCommands.MEMORY_3,
+      320          }
+      321          if command := commands.get(memory_num):
+      322              await self.write_command(command, repeat_count=3, repeat_delay_ms=100)
+      323          else:
+      324              _LOGGER.warning("Jiecang beds support memory presets 1-3 only")
+      326      async def program_memory(self, memory_num: int) -> None:
+      327          """Program current position to memory (1-3)."""
+      328          commands = {
+      329              1: JiecangCommands.MEMORY_1_SET,
+      330              2: JiecangCommands.MEMORY_2_SET,
+      331              3: JiecangCommands.MEMORY_3_SET,
+      332          }
+      333          if command := commands.get(memory_num):
+      334              await self.write_command(command)
+      335          else:
+      336              _LOGGER.warning("Jiecang beds support memory presets 1-3 only")
+
+---------- IMPLEMENTER custom_components.adjustable_bed.beds.kaidi:KaidiController  stubs=0/17 ----------
+      358  class KaidiController(BedController):
+      481      @property
+      482      def control_characteristic_uuid(self) -> str:
+      483          """Return the UUID of the control characteristic."""
+      484          return KAIDI_WRITE_CHAR_UUID
+      885      async def move_head_up(self) -> None:
+      886          await self._move_with_stop_command(
+      887              self._command_profile.head_up,
+      888              self._command_profile.head_stop,
+      889          )
+      891      async def move_head_down(self) -> None:
+      892          await self._move_with_stop_command(
+      893              self._command_profile.head_down,
+      894              self._command_profile.head_stop,
+      895          )
+      897      async def move_head_stop(self) -> None:
+      898          await self._write_control_command(
+      899              self._command_profile.head_stop,
+      900              cancel_event=asyncio.Event(),
+      901          )
+      903      async def move_back_up(self) -> None:
+      904          p = self._command_profile
+      905          if p.back_up is not None and self._product_family.has_back:
+      906              await self._move_with_stop_command(p.back_up, p.back_stop)
+      907          else:
+      908              await self.move_head_up()
+      910      async def move_back_down(self) -> None:
+      911          p = self._command_profile
+      912          if p.back_down is not None and self._product_family.has_back:
+      913              await self._move_with_stop_command(p.back_down, p.back_stop)
+      914          else:
+      915              await self.move_head_down()
+      917      async def move_back_stop(self) -> None:
+      918          p = self._command_profile
+      919          if p.back_stop is not None and self._product_family.has_back:
+      920              await self._write_control_command(p.back_stop, cancel_event=asyncio.Event())
+      921          else:
+      922              await self.move_head_stop()
+      924      async def move_legs_up(self) -> None:
+      925          await self._move_with_stop_command(
+      926              self._command_profile.foot_up,
+      927              self._command_profile.foot_stop,
+      928          )
+      930      async def move_legs_down(self) -> None:
+      931          await self._move_with_stop_command(
+      932              self._command_profile.foot_down,
+      933              self._command_profile.foot_stop,
+      934          )
+      936      async def move_legs_stop(self) -> None:
+      937          await self._write_control_command(
+      938              self._command_profile.foot_stop,
+      939              cancel_event=asyncio.Event(),
+      940          )
+      942      async def move_feet_up(self) -> None:
+      943          await self.move_legs_up()
+      945      async def move_feet_down(self) -> None:
+      946          await self.move_legs_down()
+      948      async def move_feet_stop(self) -> None:
+      949          await self.move_legs_stop()
+      951      async def stop_all(self) -> None:
+      952          if self._command_profile.stop_all is not None:
+      953              await self._write_control_command(
+      954                  self._command_profile.stop_all,
+      955                  cancel_event=asyncio.Event(),
+      956              )
+      957              return
+      958  
+      959          await self.move_head_stop()
+      960          await self.move_legs_stop()
+      966      async def preset_flat(self) -> None:
+      967          await self._write_optional_control_command(
+      968              self._command_profile.preset_flat,
+      969              "the flat preset",
+      970          )
+      984      async def preset_memory(self, memory_num: int) -> None:
+      985          command_id = self._require_memory_command(
+      986              self._command_profile.memory_recall,
+      987              memory_num,
+      988          )
+      989          await self._write_control_command(command_id)
+      991      async def program_memory(self, memory_num: int) -> None:
+      992          command_id = self._require_memory_command(
+      993              self._command_profile.memory_save,
+      994              memory_num,
+      995          )
+      996          await self._write_control_command(command_id)
+
+(34 further implementers not shown)

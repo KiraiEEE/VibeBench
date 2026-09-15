@@ -1,0 +1,1046 @@
+row 65   ibis-project/ibis#11612
+============================================================================
+CONTRACT ibis.backends.sql:SQLBackend   kind=abc abstract_methods=9.0 implementers=20.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file ibis/backends/sql/__init__.py
+       28  class SQLBackend(BaseBackend):
+       29      compiler: ClassVar[SQLGlotCompiler]
+       30      name: ClassVar[str]
+       31  
+       32      _top_level_methods = ("from_connection",)
+       33  
+       34      @property
+       35      def dialect(self) -> sg.Dialect:
+       36          """Return the SQL dialect used by the backend."""
+       37          return self.compiler.dialect
+       38  
+       39      @classmethod
+       40      def has_operation(cls, operation: type[ops.Value], /) -> bool:
+       41          """Return whether the backend supports the given operation.
+       42  
+       43          Parameters
+       44          ----------
+       45          operation
+       46              Operation type, a Python class object.
+       47          """
+       48          compiler = cls.compiler
+       49          if operation in compiler.extra_supported_ops:
+       50              return True
+       51          method = getattr(compiler, f"visit_{operation.__name__}", None)
+       52          return method not in (
+       53              None,
+       54              compiler.visit_Undefined,
+       55              compiler.visit_Unsupported,
+       56          )
+       57  
+       58      def _fetch_from_cursor(self, cursor, schema: sch.Schema) -> pd.DataFrame:
+       59          import pandas as pd
+       60  
+       61          from ibis.formats.pandas import PandasData
+       62  
+       63          try:
+       64              df = pd.DataFrame.from_records(
+       65                  cursor, columns=schema.names, coerce_float=True
+       66              )
+       67          except Exception:
+       68              # clean up the cursor if we fail to create the DataFrame
+       69              #
+       70              # in the sqlite case failing to close the cursor results in
+       71              # artificially locked tables
+       72              cursor.close()
+       73              raise
+       74          df = PandasData.convert_table(df, schema)
+       75          return df
+       76  
+       77      def table(
+       78          self, name: str, /, *, database: tuple[str, str] | str | None = None
+       79      ) -> ir.Table:
+       80          table_loc = self._to_sqlglot_table(database)
+       81  
+       82          catalog = table_loc.catalog or None
+       83          database = table_loc.db or None
+       84  
+       85          table_schema = self.get_schema(name, catalog=catalog, database=database)
+       86          return ops.DatabaseTable(
+       87              name,
+       88              schema=table_schema,
+       89              source=self,
+       90              namespace=ops.Namespace(catalog=catalog, database=database),
+       91          ).to_expr()
+       92  
+       93      def compile(
+       94          self,
+       95          expr: ir.Expr,
+       96          /,
+       97          *,
+       98          limit: str | int | None = None,
+       99          params: Mapping[ir.Expr, Any] | None = None,
+      100          pretty: bool = False,
+      101      ) -> str:
+      102          """Compile an expression to a SQL string.
+      103  
+      104          Parameters
+      105          ----------
+      106          expr
+      107              An ibis expression to compile.
+      108          limit
+      109              An integer to effect a specific row limit. A value of `None` means no limit.
+      110          params
+      111              Mapping of scalar parameter expressions to value.
+      112          pretty
+      113              Pretty print the SQL query during compilation.
+      114  
+      115          Returns
+      116          -------
+      117          str
+      118              Compiled expression
+      119          """
+      120          query = self.compiler.to_sqlglot(expr, limit=limit, params=params)
+      121          sql = query.sql(dialect=self.dialect, pretty=pretty, copy=False)
+      122          self._log(sql)
+      123          return sql
+      124  
+      125      def _log(self, sql: str) -> None:
+      126          """Log `sql`.
+      127  
+      128          This method can be implemented by subclasses. Logging occurs when
+      129          `ibis.options.verbose` is `True`.
+      130          """
+      131          from ibis import util
+      132  
+      133          util.log(sql)
+      134  
+      135      def sql(
+      136          self,
+      137          query: str,
+      138          /,
+      139          *,
+      140          schema: SchemaLike | None = None,
+      141          dialect: str | None = None,
+      142      ) -> ir.Table:
+      143          """Create an Ibis table expression from a SQL query.
+      144  
+      145          Parameters
+      146          ----------
+      147          query
+      148              A SQL query string
+      149          schema
+      150              The schema of the query. If not provided, Ibis will try to infer
+      151              the schema of the query.
+      152          dialect
+      153              The SQL dialect of the query. If not provided, the backend's dialect
+      154              is assumed. This argument can be useful when the query is written
+      155              in a different dialect from the backend.
+      156  
+      157          Returns
+      158          -------
+      159          ir.Table
+      160              The table expression representing the query
+      161          """
+      162          query = self._transpile_sql(query, dialect=dialect)
+      163          if schema is None:
+      164              schema = self._get_schema_using_query(query)
+      165          return ops.SQLQueryResult(query, ibis.schema(schema), self).to_expr()
+      166  
+      167      @abc.abstractmethod
+      168      def _get_schema_using_query(self, query: str) -> sch.Schema:
+      169          """Return an ibis Schema from a backend-specific SQL string.
+      170  
+      171          Parameters
+      172          ----------
+      173          query
+      174              Backend-specific SQL string
+      175  
+      176          Returns
+      177          -------
+      178          Schema
+      179              The schema inferred from `query`
+      180          """
+      181  
+      182      def _get_sql_string_view_schema(
+      183          self, *, name: str, table: ir.Table, query: str
+      184      ) -> sch.Schema:
+      185          sql = self.compiler.add_query_to_expr(name=name, table=table, query=query)
+      186          return self._get_schema_using_query(sql)
+      187  
+      188      def _register_udfs(self, expr: ir.Expr) -> None:
+      189          udf_sources = []
+      190          compiler = self.compiler
+      191          for udf_node in expr.op().find(ops.ScalarUDF):
+      192              compile_func = getattr(
+      193                  compiler, f"_compile_{udf_node.__input_type__.name.lower()}_udf"
+      194              )
+      195              if sql := compile_func(udf_node):
+      196                  udf_sources.append(sql)
+      197          if udf_sources:
+      198              # define every udf in one execution to avoid the overhead of db
+      199              # round trips per udf
+      200              with self._safe_raw_sql(";\n".join(udf_sources)):
+      201                  pass
+      202  
+      203      def create_view(
+      204          self,
+      205          name: str,
+      206          /,
+      207          obj: ir.Table,
+      208          *,
+      209          database: str | None = None,
+      210          overwrite: bool = False,
+      211      ) -> ir.Table:
+      212          """Create a view from an Ibis expression.
+      213  
+      214          Parameters
+      215          ----------
+      216          name
+      217              The name of the view to create.
+      218          obj
+      219              The Ibis expression to create the view from.
+      220          database
+      221              The database that the view should be created in.
+      222          overwrite
+      223              If `True`, replace an existing view with the same name.
+      224  
+      225          Returns
+      226          -------
+      227          ir.Table
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER ibis.backends.athena:Backend  stubs=1/9 ----------
+       40  class Backend(SQLBackend, CanCreateDatabase, UrlFromPath, NoExampleLoader):
+       71      def create_table(
+       72          self,
+       73          name: str,
+       74          /,
+       75          obj: ir.Table
+       76          | pd.DataFrame
+       77          | pa.Table
+       78          | pl.DataFrame
+       79          | pl.LazyFrame
+       80          | None = None,
+       81          *,
+       82          schema: sch.SchemaLike | None = None,
+       83          database: str | None = None,
+       84          temp: bool = False,
+       85          overwrite: bool | None = None,
+       86          comment: str | None = None,
+       87          properties: Mapping[str, Any] | None = None,
+       88          location: str | None = None,
+       89          stored_as: str = "PARQUET",
+       90          partitioned_by: sch.SchemaLike = (),
+       91      ) -> ir.Table:
+       92          """Create a table in Amazon Athena.
+       93  
+       94          Parameters
+       95          ----------
+       96          name
+       97              Name of the table to create
+       98          obj
+       99              The data with which to populate the table; optional, but one of `obj`
+      100              or `schema` must be specified
+      101          schema
+      102              The schema of the table to create; optional, but one of `obj` or
+      103              `schema` must be specified
+      104          database
+      105              The database to insert the table into.
+      106              If not provided, the current database is used.
+      107              You can provide a single database name, like `"mydb"`. For
+      108              multi-level hierarchies, you can pass in a dotted string path like
+      109              `"catalog.database"` or a tuple of strings like `("catalog",
+      110              "database")`.
+      111          temp
+      112              This parameter is not yet supported in the Amazon Athena backend, because
+      113              Amazon Athena doesn't implement temporary tables
+      114          overwrite
+      115              If `True`, replace the table if it already exists, otherwise fail if
+      116              the table exists
+      117          comment
+      118              Add a comment to the table
+      119          properties
+      120              Table properties to set on creation
+      121          location
+      122              s3 location to store table data. Defaults to the `s3_staging_dir`
+      123              bucket with the table name as the bucket key.
+      124          stored_as
+      125              The file format in which to store table data. Defaults to parquet.
+      126          partitioned_by
+      127              Iterable of column name and type pairs/mapping/schema by which to
+      128              partition the table.
+      129          """
+      130          if temp:
+       ... truncated at 60 lines ...
+      324      @property
+      325      def version(self) -> str:
+      326          raise NotImplementedError(
+      327              "athena does not provide a way to programmatically access its version"
+      328          )
+      395      def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
+      396          import pyarrow.parquet as pq
+      397  
+      398          compiler = self.compiler
+      399          quoted = compiler.quoted
+      400          name = op.name
+      401          schema = op.schema
+      402  
+      403          upstream_path = f"{self._memtable_volume_path}/{name}"
+      404          sql = sge.Create(
+      405              kind="TABLE",
+      406              this=sge.Schema(
+      407                  this=sg.table(
+      408                      name,
+      409                      db=self.current_database,
+      410                      catalog=self.current_catalog,
+      411                      quoted=quoted,
+      412                  ),
+      413                  expressions=schema.to_sqlglot_column_defs(self.dialect),
+      414              ),
+      415              properties=sge.Properties(
+      416                  expressions=[
+      417                      sge.ExternalProperty(),
+      418                      sge.FileFormatProperty(this=compiler.v.PARQUET),
+      419                      sge.LocationProperty(this=sge.convert(upstream_path)),
+      420                  ]
+      421              ),
+      422          )
+      423  
+      424          raw_upstream_dir = upstream_path.removeprefix("s3://")
+      425          raw_upstream_path = f"{raw_upstream_dir}/data.parquet"
+      426  
+      427          data = op.data.to_pyarrow(schema=schema)
+      428          with util.mktempd() as tmpdir:
+      429              path = Path(tmpdir, name)
+      430              # optimize for bandwidth so use zstd which typically compresses
+      431              # better than the other options without much loss in speed
+      432              pq.write_table(data, path, compression="zstd")
+      433              self._fs.put(path, raw_upstream_path)
+      434  
+      435              with self._safe_raw_sql(sql, unload=False):
+      436                  pass
+      483      def list_tables(
+      484          self, *, like: str | None = None, database: tuple[str, str] | str | None = None
+      485      ) -> list[str]:
+      486          table_loc = self._to_sqlglot_table(database)
+      487  
+      488          catalog = table_loc.catalog or self.current_catalog
+      489          database = table_loc.db or self.current_database
+      490  
+      491          with self.con.cursor() as cur:
+      492              tables = cur.list_table_metadata(
+      493                  catalog_name=catalog, schema_name=database, expression=like
+      494              )
+      495  
+      496          return sorted(table.name for table in tables)
+      557      def _get_schema_using_query(self, query: str) -> sch.Schema:
+      558          view_name = util.gen_name("temp_view_athena")
+      559  
+      560          compiler = self.compiler
+      561          quoted = compiler.quoted
+      562          dialect = self.dialect
+      563  
+      564          create_view = sge.Create(
+      565              this=sg.to_identifier(view_name, quoted=quoted),
+      566              kind="VIEW",
+      567              expression=sg.parse_one(query, dialect=dialect),
+      568          )
+      569          drop_view = sge.Drop(
+      570              kind="VIEW", this=sg.to_identifier(view_name, quoted=quoted)
+      571          ).sql(dialect)
+      572  
+      573          catalog_name = self.current_catalog
+      574          schema_name = self.current_database
+      575          with self._safe_raw_sql(create_view, unload=False) as cur:
+      576              table_meta = cur.get_table_metadata(
+      577                  catalog_name=catalog_name, schema_name=schema_name, table_name=view_name
+      578              )
+      579              cur.execute(drop_view)
+      580  
+      581          type_mapper = compiler.type_mapper
+      582          return sch.Schema(
+      583              {
+      584                  metacol.name: type_mapper.from_string(metacol.type, nullable=True)
+      585                  for metacol in table_meta.columns
+      586              }
+      587          )
+      (does not define: read_csv, read_delta, read_json, read_parquet; inherited or absent)
+
+---------- IMPLEMENTER ibis.backends.bigquery:Backend  stubs=0/9 ----------
+      167  class Backend(
+      252      def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
+      253          table_ref = bq.TableReference(self._session_dataset, op.name)
+      254  
+      255          schema = op.schema
+      256          bq_schema = BigQuerySchema.from_ibis(schema)
+      257  
+      258          data = op.data.to_frame()
+      259  
+      260          if decimal_columns := [
+      261              name for name, dtype in schema.items() if dtype.is_decimal()
+      262          ]:
+      263              data = data.assign(
+      264                  **{col: data[col].map(Decimal) for col in decimal_columns}
+      265              )
+      266  
+      267          load_job = self._client_load_table_from_dataframe(
+      268              data,
+      269              table_ref,
+      270              job_config=bq.LoadJobConfig(
+      271                  # fail if the table already exists and contains data
+      272                  write_disposition=bq.WriteDisposition.WRITE_EMPTY,
+      273                  schema=bq_schema,
+      274              ),
+      275          )
+      276          load_job.result()
+      343      def read_parquet(
+      344          self, path: str | Path, /, *, table_name: str | None = None, **kwargs: Any
+      345      ):
+      346          """Read Parquet data into a BigQuery table.
+      347  
+      348          If the table already exists, it will be dropped before loading.
+      349  
+      350          Parameters
+      351          ----------
+      352          path
+      353              Path to a Parquet file on GCS or the local filesystem. Globs are supported.
+      354          table_name
+      355              Optional table name
+      356          kwargs
+      357              Additional keyword arguments passed to `google.cloud.bigquery.LoadJobConfig`.
+      358  
+      359          Returns
+      360          -------
+      361          Table
+      362              An Ibis table expression
+      363          """
+      364          return self._read_file(
+      365              path,
+      366              table_name=table_name,
+      367              job_config=bq.LoadJobConfig(
+      368                  source_format=bq.SourceFormat.PARQUET, **kwargs
+      369              ),
+      370          )
+      372      def read_csv(
+      373          self, path: str | Path, /, *, table_name: str | None = None, **kwargs: Any
+      374      ) -> ir.Table:
+      375          """Read CSV data into a BigQuery table.
+      376  
+      377          If the table already exists, it will be dropped before loading.
+      378  
+      379          Parameters
+      380          ----------
+      381          path
+      382              Path to a CSV file on GCS or the local filesystem. Globs are supported.
+      383          table_name
+      384              Optional table name
+      385          kwargs
+      386              Additional keyword arguments passed to
+      387              `google.cloud.bigquery.LoadJobConfig`.
+      388  
+      389          Returns
+      390          -------
+      391          Table
+      392              An Ibis table expression
+      393          """
+      394          job_config = bq.LoadJobConfig(
+      395              source_format=bq.SourceFormat.CSV,
+      396              autodetect=True,
+      397              skip_leading_rows=1,
+      398              **kwargs,
+      399          )
+      400          return self._read_file(path, table_name=table_name, job_config=job_config)
+      402      def read_json(
+      403          self, path: str | Path, /, *, table_name: str | None = None, **kwargs: Any
+      404      ) -> ir.Table:
+      405          """Read newline-delimited JSON data into a BigQuery table.
+      406  
+      407          If the table already exists, it will be dropped before loading.
+      408  
+      409          Parameters
+      410          ----------
+      411          path
+      412              Path to a newline-delimited JSON file on GCS or the local
+      413              filesystem. Globs are supported.
+      414          table_name
+      415              Optional table name
+      416          kwargs
+      417              Additional keyword arguments passed to
+      418              `google.cloud.bigquery.LoadJobConfig`.
+      419  
+      420          Returns
+      421          -------
+      422          Table
+      423              An Ibis table expression
+      424          """
+      425          job_config = bq.LoadJobConfig(
+      426              source_format=bq.SourceFormat.NEWLINE_DELIMITED_JSON,
+      427              autodetect=True,
+      428              **kwargs,
+      429          )
+      430          return self._read_file(path, table_name=table_name, job_config=job_config)
+      781      def _get_schema_using_query(self, query: str) -> sch.Schema:
+      782          job = self.client.query(
+      783              query,
+      784              job_config=bq.QueryJobConfig(dry_run=True, use_query_cache=False),
+      785              project=self.billing_project,
+      786              job_id_prefix=self._generate_job_id_prefix(),
+      787          )
+      788          return BigQuerySchema.to_ibis(job.schema)
+     1058      def list_tables(
+     1059          self, *, like: str | None = None, database: tuple[str, str] | str | None = None
+     1060      ) -> list[str]:
+     1061          table_loc = self._to_sqlglot_table(database)
+     1062  
+     1063          project, dataset = self._parse_project_and_dataset(table_loc)
+     1064          dataset_ref = bq.DatasetReference(project, dataset)
+     1065          result = [table.table_id for table in self.client.list_tables(dataset_ref)]
+     1066          return self._filter_with_like(result, like)
+     1071      @property
+     1072      def version(self):
+     1073          return bq.__version__
+     1075      def create_table(
+     1076          self,
+     1077          name: str,
+     1078          /,
+     1079          obj: ir.Table
+     1080          | pd.DataFrame
+     1081          | pa.Table
+     1082          | pl.DataFrame
+     1083          | pl.LazyFrame
+     1084          | None = None,
+     1085          *,
+     1086          schema: sch.SchemaLike | None = None,
+     1087          database: str | None = None,
+     1088          temp: bool = False,
+     1089          overwrite: bool = False,
+     1090          default_collate: str | None = None,
+     1091          partition_by: str | None = None,
+     1092          cluster_by: Iterable[str] | None = None,
+     1093          options: Mapping[str, Any] | None = None,
+     1094      ) -> ir.Table:
+     1095          """Create a table in BigQuery.
+     1096  
+     1097          Parameters
+     1098          ----------
+     1099          name
+     1100              Name of the table to create
+     1101          obj
+     1102              The data with which to populate the table; optional, but one of `obj`
+     1103              or `schema` must be specified
+     1104          schema
+     1105              The schema of the table to create; optional, but one of `obj` or
+     1106              `schema` must be specified
+     1107          database
+     1108              The BigQuery *dataset* in which to create the table; optional
+     1109          temp
+     1110              Whether the table is temporary
+     1111          overwrite
+     1112              If `True`, replace the table if it already exists, otherwise fail if
+     1113              the table exists
+     1114          default_collate
+     1115              Default collation for string columns. See BigQuery's documentation
+     1116              for more details: https://cloud.google.com/bigquery/docs/reference/standard-sql/collation-concepts
+     1117          partition_by
+     1118              Partition the table by the given expression. See BigQuery's documentation
+     1119              for more details: https://cloud.google.com/bigquery/docs/reference/standard-sql/data-definition-language#partition_expression
+     1120          cluster_by
+     1121              List of columns to cluster the table by. See BigQuery's documentation
+     1122              for more details: https://cloud.google.com/bigquery/docs/reference/standard-sql/data-definition-language#clustering_column_list
+     1123          options
+     1124              BigQuery-specific table options; see the BigQuery documentation for
+     1125              details: https://cloud.google.com/bigquery/docs/reference/standard-sql/data-definition-language#table_option_list
+     1126  
+     1127          Returns
+     1128          -------
+     1129          Table
+     1130              The table that was just created
+     1131          """
+     1132          if obj is None and schema is None:
+     1133              raise com.IbisError("One of the `schema` or `obj` parameter is required")
+     1134          if schema is not None:
+       ... truncated at 60 lines ...
+      (does not define: read_delta; inherited or absent)
+
+---------- IMPLEMENTER ibis.backends.bigquery.tests.unit.test_compiler:MockBackend  stubs=0/9 ----------
+      269      class MockBackend(ibis.backends.bigquery.Backend):
+      (does not define: _get_schema_using_query, _register_in_memory_table, create_table, list_tables, read_csv, read_delta, read_json, read_parquet, version; inherited or absent)
+
+---------- IMPLEMENTER ibis.backends.clickhouse:Backend  stubs=1/9 ----------
+       52  class Backend(SupportsTempTables, SQLBackend, CanCreateDatabase, DirectExampleLoader):
+       68      def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
+       69          """No-op."""
+      171      @property
+      172      def version(self) -> str:
+      173          return self.con.server_version
+      198      def list_tables(
+      199          self, *, like: str | None = None, database: str | None = None
+      200      ) -> list[str]:
+      201          query = sg.select(C.name).from_(sg.table("tables", db="system"))
+      202  
+      203          if database is None:
+      204              database = self.compiler.f.currentDatabase()
+      205          else:
+      206              database = sge.convert(database)
+      207  
+      208          query = query.where(C.database.eq(database).or_(C.is_temporary))
+      209  
+      210          with self._safe_raw_sql(query) as result:
+      211              results = result.result_columns
+      212  
+      213          if results:
+      214              (tables,) = results
+      215          else:
+      216              tables = []
+      217          return self._filter_with_like(tables, like)
+      516      def _get_schema_using_query(self, query: str) -> sch.Schema:
+      517          name = util.gen_name("clickhouse_metadata")
+      518          with closing(self.raw_sql(f"CREATE VIEW {name} AS {query}")):
+      519              pass
+      520          try:
+      521              return self.get_schema(name)
+      522          finally:
+      523              with closing(self.raw_sql(f"DROP VIEW {name}")):
+      524                  pass
+      554      def read_parquet(
+      555          self,
+      556          path: str | Path,
+      557          /,
+      558          *,
+      559          table_name: str | None = None,
+      560          engine: str = "MergeTree",
+      561          **kwargs: Any,
+      562      ) -> ir.Table:
+      563          import pyarrow.dataset as ds
+      564          from clickhouse_connect.driver.tools import insert_file
+      565  
+      566          from ibis.formats.pyarrow import PyArrowSchema
+      567  
+      568          paths = list(glob.glob(str(path)))
+      569          schema = PyArrowSchema.to_ibis(ds.dataset(paths, format="parquet").schema)
+      570  
+      571          name = table_name or util.gen_name("read_parquet")
+      572          table = self.create_table(name, engine=engine, schema=schema, temp=True)
+      573  
+      574          for file_path in paths:
+      575              insert_file(
+      576                  client=self.con,
+      577                  table=name,
+      578                  file_path=file_path,
+      579                  fmt="Parquet",
+      580                  **kwargs,
+      581              )
+      582          return table
+      584      def read_csv(
+      585          self,
+      586          path: str | Path,
+      587          /,
+      588          *,
+      589          table_name: str | None = None,
+      590          engine: str = "MergeTree",
+      591          **kwargs: Any,
+      592      ) -> ir.Table:
+      593          import pyarrow.dataset as ds
+      594          from clickhouse_connect.driver.tools import insert_file
+      595  
+      596          from ibis.formats.pyarrow import PyArrowSchema
+      597  
+      598          paths = list(glob.glob(str(path)))
+      599          schema = PyArrowSchema.to_ibis(ds.dataset(paths, format="csv").schema)
+      600  
+      601          name = table_name or util.gen_name("read_csv")
+      602          table = self.create_table(name, engine=engine, schema=schema, temp=True)
+      603  
+      604          for file_path in paths:
+      605              insert_file(client=self.con, table=name, file_path=file_path, **kwargs)
+      606          return table
+      608      def create_table(
+      609          self,
+      610          name: str,
+      611          /,
+      612          obj: ir.Table
+      613          | pd.DataFrame
+      614          | pa.Table
+      615          | pl.DataFrame
+      616          | pl.LazyFrame
+      617          | None = None,
+      618          *,
+      619          schema: sch.SchemaLike | None = None,
+      620          database: str | None = None,
+      621          temp: bool = False,
+      622          overwrite: bool = False,
+      623          # backend specific arguments
+      624          engine: str = "MergeTree",
+      625          order_by: Iterable[str] | None = None,
+      626          partition_by: Iterable[str] | None = None,
+      627          sample_by: str | None = None,
+      628          settings: Mapping[str, Any] | None = None,
+      629      ) -> ir.Table:
+      630          """Create a table in a ClickHouse database.
+      631  
+      632          Parameters
+      633          ----------
+      634          name
+      635              Name of the table to create
+      636          obj
+      637              Optional data to create the table with
+      638          schema
+      639              Optional names and types of the table
+      640          database
+      641              Database to create the table in
+      642          temp
+      643              Create a temporary table. This is not yet supported, and exists for
+      644              API compatibility.
+      645          overwrite
+      646              Whether to overwrite the table
+      647          engine
+      648              The table engine to use. See [ClickHouse's `CREATE TABLE` documentation](https://clickhouse.com/docs/en/sql-reference/statements/create/table)
+      649              for specifics. Defaults to [`MergeTree`](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree)
+      650              with `ORDER BY tuple()` because `MergeTree` is the most
+      651              feature-complete engine.
+      652          order_by
+      653              String column names to order by. Required for some table engines like `MergeTree`.
+      654          partition_by
+      655              String column names to partition by
+      656          sample_by
+      657              String column names to sample by
+      658          settings
+      659              Key-value pairs of settings for table creation
+      660  
+      661          Returns
+      662          -------
+      663          Table
+      664              The new table
+      665          """
+      666          if temp and overwrite:
+      667              raise com.IbisInputError(
+       ... truncated at 60 lines ...
+      (does not define: read_delta, read_json; inherited or absent)
+
+---------- IMPLEMENTER ibis.backends.databricks:Backend  stubs=0/9 ----------
+       91  class Backend(SQLBackend, CanCreateDatabase, UrlFromPath, PyArrowExampleLoader):
+      118      def create_table(
+      119          self,
+      120          name: str,
+      121          /,
+      122          obj: ir.Table
+      123          | pd.DataFrame
+      124          | pa.Table
+      125          | pl.DataFrame
+      126          | pl.LazyFrame
+      127          | None = None,
+      128          *,
+      129          schema: SchemaLike | None = None,
+      130          database: str | None = None,
+      131          temp: bool = False,
+      132          overwrite: bool = False,
+      133          using: str = "delta",
+      134          location: str | None = None,
+      135          tblproperties: Mapping[str, str] | None = None,
+      136      ):
+      137          """Create a table in Databricks.
+      138  
+      139          Parameters
+      140          ----------
+      141          name
+      142              Name of the table to create
+      143          obj
+      144              The data with which to populate the table; optional, but at least
+      145              one of `obj` or `schema` must be specified
+      146          schema
+      147              The schema of the table to create; optional, but at least one of
+      148              `obj` or `schema` must be specified
+      149          database
+      150              The name of the database in which to create the table; if not
+      151              passed, the current database is used.
+      152  
+      153              For multi-level table hierarchies, you can pass in a dotted string
+      154              path like `"catalog.database"` or a tuple of strings like
+      155              `("catalog", "database")`.
+      156          temp
+      157              Create a temporary table
+      158          overwrite
+      159              If `True`, replace the table if it already exists, otherwise fail
+      160              if the table exists
+      161          using
+      162              Data source format
+      163          location
+      164              Storage location for the table
+      165          tblproperties
+      166              Table properties
+      167          """
+      168          if temp:
+      169              raise exc.UnsupportedOperationError("Temporary tables not yet supported")
+      170  
+      171          table_loc = self._to_sqlglot_table(database)
+      172  
+      173          catalog = table_loc.catalog or self.current_catalog
+      174          database = table_loc.db or self.current_database
+      175  
+      176          if obj is None and schema is None:
+      177              raise ValueError("Either `obj` or `schema` must be specified")
+       ... truncated at 60 lines ...
+      363      @functools.cached_property
+      364      def version(self) -> str:
+      365          query = sg.select(self.compiler.f.current_version())
+      366          with self._safe_raw_sql(query) as cur:
+      367              [(version_info,)] = cur.fetchall()
+      368          return version_info["dbsql_version"]
+      452      def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
+      453          import pyarrow.parquet as pq
+      454  
+      455          quoted = self.compiler.quoted
+      456          name = op.name
+      457          stem = f"{name}.parquet"
+      458  
+      459          upstream_path = f"{self._memtable_volume_path}/{stem}"
+      460          sql = sge.Create(
+      461              kind="VIEW",
+      462              this=sg.table(name, quoted=quoted),
+      463              expression=sg.select(STAR).from_(
+      464                  sg.table(upstream_path, db="parquet", quoted=quoted)
+      465              ),
+      466              properties=sge.Properties(expressions=[sge.TemporaryProperty()]),
+      467          ).sql(self.dialect)
+      468          data = op.data.to_pyarrow(schema=op.schema)
+      469          with util.mktempd() as tmpdir:
+      470              path = Path(tmpdir, stem)
+      471              put_into = f"PUT '{path}' INTO '{upstream_path}' OVERWRITE"
+      472              # optimize for bandwidth so use zstd which typically compresses
+      473              # better than the other options without much loss in speed
+      474              pq.write_table(data, path, compression="zstd")
+      475              with self.con.cursor() as cur:
+      476                  cur.execute(put_into)
+      477                  cur.execute(sql)
+      514      def list_tables(
+      515          self, *, like: str | None = None, database: tuple[str, str] | str | None = None
+      516      ) -> list[str]:
+      517          table_loc = self._to_sqlglot_table(database)
+      518  
+      519          catalog = table_loc.catalog or self.current_catalog
+      520          database = table_loc.db or self.current_database
+      521  
+      522          with self.con.cursor() as cur:
+      523              cur.tables(catalog_name=catalog, schema_name=database)
+      524              out = cur.fetchall_arrow()
+      525  
+      526          return self._filter_with_like(out["TABLE_NAME"].to_pylist(), like)
+      598      def _get_schema_using_query(self, query: str) -> sch.Schema:
+      599          with self._safe_raw_sql(
+      600              sge.Describe(this=sg.parse_one(query, read=self.dialect))
+      601          ) as cur:
+      602              rows = cur.fetchall_arrow()
+      603  
+      604          rows = rows.to_pydict()
+      605  
+      606          type_mapper = self.compiler.type_mapper
+      607          return sch.Schema(
+      608              {
+      609                  name: type_mapper.from_string(typ, nullable=True)
+      610                  for name, typ in zip(rows["col_name"], rows["data_type"])
+      611              }
+      612          )
+      (does not define: read_csv, read_delta, read_json, read_parquet; inherited or absent)
+
+---------- IMPLEMENTER ibis.backends.datafusion:Backend  stubs=0/9 ----------
+       79  class Backend(
+       93      @property
+       94      def version(self):
+       95          import importlib.metadata
+       96  
+       97          return importlib.metadata.version("datafusion")
+      171      def _get_schema_using_query(self, query: str) -> sch.Schema:
+      172          name = gen_name("datafusion_metadata_view")
+      173          table = sg.table(name, quoted=self.compiler.quoted)
+      174          src = sge.Create(
+      175              this=table,
+      176              kind="VIEW",
+      177              expression=sg.parse_one(query, read=self.dialect),
+      178          )
+      179  
+      180          with self._safe_raw_sql(src):
+      181              pass
+      182  
+      183          try:
+      184              df = self.con.table(name)
+      185          finally:
+      186              self.drop_view(name)
+      187  
+      188          return PyArrowSchema.to_ibis(df.schema())
+      374      def list_tables(
+      375          self, *, like: str | None = None, database: str | None = None
+      376      ) -> list[str]:
+      377          if database is None:
+      378              database = self.current_database
+      379          query = (
+      380              sg.select("table_name")
+      381              .from_("information_schema.tables")
+      382              .where(sg.column("table_schema").eq(sge.convert(database)))
+      383              .order_by("table_name")
+      384          )
+      385          return self._filter_with_like(
+      386              self.raw_sql(query).to_pydict()["table_name"], like
+      387          )
+      418      def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
+      419          # self.con.register_table is broken, so we do this roundabout thing
+      420          # of constructing a datafusion DataFrame, which has a side effect
+      421          # of registering the table
+      422          self.con.from_arrow(op.data.to_pyarrow(op.schema), op.name)
+      424      def read_csv(
+      425          self,
+      426          paths: str | Path | list[str | Path] | tuple[str | Path],
+      427          /,
+      428          *,
+      429          table_name: str | None = None,
+      430          **kwargs: Any,
+      431      ) -> ir.Table:
+      432          """Register a CSV file as a table in the current database.
+      433  
+      434          Parameters
+      435          ----------
+      436          paths
+      437              The data source. A string or Path to the CSV file.
+      438          table_name
+      439              An optional name to use for the created table. This defaults to
+      440              a sequentially generated name.
+      441          **kwargs
+      442              Additional keyword arguments passed to DataFusion loading function.
+      443  
+      444          Returns
+      445          -------
+      446          ir.Table
+      447              The just-registered table
+      448          """
+      449          path = normalize_filenames(paths)
+      450          table_name = table_name or gen_name("read_csv")
+      451          # Our other backends support overwriting views / tables when re-registering
+      452          self.con.deregister_table(table_name)
+      453          self.con.register_csv(table_name, path, **kwargs)
+      454          return self.table(table_name)
+      456      def read_parquet(
+      457          self, path: str | Path, /, *, table_name: str | None = None, **kwargs: Any
+      458      ) -> ir.Table:
+      459          """Register a parquet file as a table in the current database.
+      460  
+      461          Parameters
+      462          ----------
+      463          path
+      464              The data source.
+      465          table_name
+      466              An optional name to use for the created table. This defaults to
+      467              a sequentially generated name.
+      468          **kwargs
+      469              Additional keyword arguments passed to DataFusion loading function.
+      470  
+      471          Returns
+      472          -------
+      473          ir.Table
+      474              The just-registered table
+      475          """
+      476          path = normalize_filename(path)
+      477          table_name = table_name or gen_name("read_parquet")
+      478          # Our other backends support overwriting views / tables when reregistering
+      479          self.con.deregister_table(table_name)
+      480          self.con.register_parquet(table_name, path, **kwargs)
+      481          return self.table(table_name)
+      483      def read_delta(
+      484          self, path: str | Path, /, table_name: str | None = None, **kwargs: Any
+      485      ) -> ir.Table:
+      486          """Register a Delta Lake table as a table in the current database.
+      487  
+      488          Parameters
+      489          ----------
+      490          path
+      491              The data source. Must be a directory containing a Delta Lake table.
+      492          table_name
+      493              An optional name to use for the created table. This defaults to
+      494              a sequentially generated name.
+      495          **kwargs
+      496              Additional keyword arguments passed to deltalake.DeltaTable.
+      497  
+      498          Returns
+      499          -------
+      500          ir.Table
+      501              The just-registered table
+      502          """
+      503          path = normalize_filename(path)
+      504  
+      505          table_name = table_name or gen_name("read_delta")
+      506  
+      507          # Our other backends support overwriting views / tables when reregistering
+      508          self.con.deregister_table(table_name)
+      509  
+      510          try:
+      511              from deltalake import DeltaTable
+      512          except ImportError:
+      513              raise ImportError(
+      514                  "The deltalake extra is required to use the "
+      515                  "read_delta method. You can install it using pip:\n\n"
+      516                  "pip install 'ibis-framework[deltalake]'\n"
+      517              )
+      518  
+      519          delta_table = DeltaTable(path, **kwargs)
+      520          self.con.register_dataset(table_name, delta_table.to_pyarrow_dataset())
+      521          return self.table(table_name)
+      595      def create_table(
+      596          self,
+      597          name: str,
+      598          /,
+      599          obj: ir.Table
+      600          | pd.DataFrame
+      601          | pa.Table
+      602          | pa.RecordBatchReader
+      603          | pa.RecordBatch
+      604          | pl.DataFrame
+      605          | pl.LazyFrame
+      606          | None = None,
+      607          *,
+      608          schema: sch.SchemaLike | None = None,
+      609          database: str | None = None,
+      610          temp: bool = False,
+      611          overwrite: bool = False,
+      612      ):
+      613          """Create a table in DataFusion.
+      614  
+      615          Parameters
+      616          ----------
+      617          name
+      618              Name of the table to create
+      619          obj
+      620              The data with which to populate the table; optional, but at least
+      621              one of `obj` or `schema` must be specified
+      622          schema
+      623              The schema of the table to create; optional, but at least one of
+      624              `obj` or `schema` must be specified
+      625          database
+      626              The name of the database in which to create the table; if not
+      627              passed, the current database is used.
+      628          temp
+      629              Create a temporary table
+      630          overwrite
+      631              If `True`, replace the table if it already exists, otherwise fail
+      632              if the table exists
+      633          """
+      634          if obj is None and schema is None:
+      635              raise ValueError("Either `obj` or `schema` must be specified")
+      636          if schema is not None:
+      637              schema = ibis.schema(schema)
+      638  
+      639          properties = []
+      640  
+      641          if temp:
+      642              properties.append(sge.TemporaryProperty())
+      643  
+      644          quoted = self.compiler.quoted
+      645  
+      646          if isinstance(obj, ir.Expr):
+      647              table = obj
+      648  
+      649              # If it's a memtable, it will get registered in the pre-execute hooks
+      650              self._run_pre_execute_hooks(table)
+      651  
+      652              compiler = self.compiler
+      653              relname = "_"
+      654              query = sg.select(
+       ... truncated at 60 lines ...
+      (does not define: read_json; inherited or absent)
+
+(14 further implementers not shown)

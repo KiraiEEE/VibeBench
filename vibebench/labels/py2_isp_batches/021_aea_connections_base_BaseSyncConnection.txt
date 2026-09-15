@@ -1,0 +1,215 @@
+row 21   valory-xyz/open-aea#839
+============================================================================
+CONTRACT aea.connections.base:BaseSyncConnection   kind=abc abstract_methods=3.0 implementers=3.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file aea/connections/base.py
+      335  class BaseSyncConnection(Connection):
+      336      """Base sync connection class to write connections with sync code."""
+      337  
+      338      MAX_WORKER_THREADS = 5
+      339  
+      340      _executor_pool: ThreadPoolExecutor
+      341      _incoming_messages_queue: asyncio.Queue  # [Optional[Envelope]]
+      342      _loop: asyncio.AbstractEventLoop
+      343  
+      344      def __init__(  # pylint: disable=too-many-positional-arguments
+      345          self,
+      346          configuration: ConnectionConfig,
+      347          data_dir: str,
+      348          identity: Optional[Identity] = None,
+      349          crypto_store: Optional[CryptoStore] = None,
+      350          restricted_to_protocols: Optional[Set[PublicId]] = None,
+      351          excluded_protocols: Optional[Set[PublicId]] = None,
+      352          **kwargs: Any,
+      353      ) -> None:
+      354          """
+      355          Initialize the connection.
+      356  
+      357          The configuration must be specified if and only if the following
+      358          parameters are None: connection_id, excluded_protocols or restricted_to_protocols.
+      359  
+      360          :param configuration: the connection configuration.
+      361          :param data_dir: directory where to put local files.
+      362          :param identity: the identity object held by the agent.
+      363          :param crypto_store: the crypto store for encrypted communication.
+      364          :param restricted_to_protocols: the set of protocols ids of the only supported protocols for this connection.
+      365          :param excluded_protocols: the set of protocols ids that we want to exclude for this connection.
+      366          :param kwargs: keyword arguments passed to connection base
+      367          """
+      368          super().__init__(
+      369              configuration=configuration,
+      370              data_dir=data_dir,
+      371              identity=identity,
+      372              crypto_store=crypto_store,
+      373              restricted_to_protocols=restricted_to_protocols,
+      374              excluded_protocols=excluded_protocols,
+      375              **kwargs,
+      376          )
+      377  
+      378          self._tasks: Set[asyncio.Task] = set()
+      379  
+      380      def _set_executor_pool(self, max_workers: Optional[int] = None) -> None:
+      381          """Set executors pool."""
+      382          max_workers = self.configuration.config.get(
+      383              "max_thread_workers", self.MAX_WORKER_THREADS
+      384          )
+      385          thread_name_prefix = f"conn:{self.connection_id}:"
+      386          self._executor_pool = ThreadPoolExecutor(
+      387              max_workers=max_workers, thread_name_prefix=thread_name_prefix
+      388          )
+      389  
+      390      def _task_done_callback(self, task: asyncio.Task) -> None:
+      391          """Remove task on done, log error if happened."""
+      392          self._tasks.remove(task)
+      393          if task.exception():
+      394              # cause task.get_name for python3.8+
+      395              task_name = getattr(task, "task_name", "TASK NAME NOT SET")
+      396              self.logger.exception(
+      397                  f"in task `{task_name}`, exception occurred",
+      398                  exc_info=task.exception(),
+      399              )
+      400  
+      401      async def _run_in_pool(self, fn: Callable, *args: Any) -> Any:
+      402          """Run sync function in threaded executor pool."""
+      403          return await self._loop.run_in_executor(self._executor_pool, fn, *args)
+      404  
+      405      def put_envelope(self, envelope: Optional["Envelope"]) -> None:
+      406          """Put envelope in to the incoming queue."""
+      407          self._ensure_connected()
+      408          self._loop.call_soon_threadsafe(
+      409              self._incoming_messages_queue.put_nowait, envelope
+      410          )
+      411  
+      412      async def connect(self) -> None:
+      413          """Connect connection."""
+      414          with self._connect_context():
+      415              self._loop = asyncio.get_event_loop()
+      416              self._incoming_messages_queue = asyncio.Queue()
+      417              self._set_executor_pool()
+      418              await self._run_in_pool(self.on_connect)
+      419          self.start_main()
+      420  
+      421      async def disconnect(self) -> None:
+      422          """Disconnect connection."""
+      423          self._ensure_connected()
+      424          with self._state.transit(
+      425              initial=ConnectionStates.disconnecting,
+      426              success=ConnectionStates.disconnected,
+      427              fail=ConnectionStates.disconnected,
+      428          ):
+      429              if self._tasks:
+      430                  await asyncio.wait(self._tasks)
+      431              await self._run_in_pool(self.on_disconnect)
+      432              self._executor_pool.shutdown(wait=False)
+      433  
+      434      async def send(self, envelope: "Envelope") -> None:
+      435          """Send envelope to connection."""
+      436          self._ensure_connected()
+      437          task = self._loop.create_task(self._run_in_pool(self._send_wrapper, envelope))
+      438          # cause task.set_name for python3.8+
+      439          setattr(task, "task_name", f"On send({envelope})")  # noqa
+      440          task.add_done_callback(self._task_done_callback)
+      441          self._tasks.add(task)
+      442  
+      443      def _send_wrapper(self, *args: Any) -> None:
+      444          """Check is connected and call on_send method."""
+      445          self._ensure_connected()
+      446          self.on_send(*args)
+      447  
+      448      async def receive(self, *args: Any, **kwargs: Any) -> Optional["Envelope"]:
+      449          """Get an envelope from the connection."""
+      450          self._ensure_connected()
+      451          return await self._incoming_messages_queue.get()
+      452  
+      453      def start_main(self) -> None:
+      454          """Start main function of the connection."""
+      455  
+      456          def _() -> None:
+      457              task = self._loop.create_task(self._run_in_pool(self.main))
+      458              # cause task.set_name for python3.8+
+      459              setattr(task, "task_name", "Connection main")  # noqa
+      460              task.add_done_callback(self._task_done_callback)
+      461              self._tasks.add(task)
+      462  
+      463          self._loop.call_soon_threadsafe(_)
+      464  
+      465      def main(self) -> None:
+      466          """Run main body of the connection in dedicated thread."""
+      467  
+      468      @abstractmethod
+      469      def on_connect(self) -> None:
+      470          """Run on connect method called."""
+      471  
+      472      @abstractmethod
+      473      def on_disconnect(self) -> None:
+      474          """Run on disconnect method called."""
+      475  
+      476      @abstractmethod
+      477      def on_send(self, envelope: "Envelope") -> None:
+      478          """Run on send method called."""
+
+---------- IMPLEMENTER aea.connections.scaffold.connection:MyScaffoldSyncConnection  stubs=3/3 ----------
+       96  class MyScaffoldSyncConnection(BaseSyncConnection):
+      150      def on_send(self, envelope: Envelope) -> None:
+      151          """
+      152          Send an envelope.
+      153  
+      154          :param envelope: the envelope to send.
+      155          """
+      156          raise NotImplementedError  # pragma: no cover
+      158      def on_connect(self) -> None:
+      159          """
+      160          Tear down the connection.
+      161  
+      162          Connection status set automatically.
+      163          """
+      164          raise NotImplementedError  # pragma: no cover
+      166      def on_disconnect(self) -> None:
+      167          """
+      168          Tear down the connection.
+      169  
+      170          Connection status set automatically.
+      171          """
+      172          raise NotImplementedError  # pragma: no cover
+
+---------- IMPLEMENTER packages.valory.connections.test_libp2p.connection:MyScaffoldSyncConnection  stubs=3/3 ----------
+       95  class MyScaffoldSyncConnection(BaseSyncConnection):
+      149      def on_send(self, envelope: Envelope) -> None:
+      150          """
+      151          Send an envelope.
+      152  
+      153          :param envelope: the envelope to send.
+      154          """
+      155          raise NotImplementedError  # pragma: no cover
+      157      def on_connect(self) -> None:
+      158          """
+      159          Tear down the connection.
+      160  
+      161          Connection status set automatically.
+      162          """
+      163          raise NotImplementedError  # pragma: no cover
+      165      def on_disconnect(self) -> None:
+      166          """
+      167          Tear down the connection.
+      168  
+      169          Connection status set automatically.
+      170          """
+      171          raise NotImplementedError  # pragma: no cover
+
+---------- IMPLEMENTER tests.test_connections.test_sync_connection:SampleConnection  stubs=0/3 ----------
+       34  class SampleConnection(BaseSyncConnection):
+       57      def on_send(self, envelope: Envelope) -> None:
+       58          """Run on send."""
+       59          time.sleep(self.PAUSE)
+       60          resp_envelope = Mock()
+       61          resp_envelope.message = f"resp for {str(envelope.message)}"
+       62          self.put_envelope(resp_envelope)
+       63          self.send_counter += 1
+       65      def on_connect(self):
+       66          """Run on connect."""
+       67          self.on_connect_called = True
+       69      def on_disconnect(self):
+       70          """Run on disconnect."""
+       71          self.on_disconnect_called = True

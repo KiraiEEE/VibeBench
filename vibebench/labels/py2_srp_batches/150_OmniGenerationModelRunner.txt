@@ -1,0 +1,259 @@
+row 150   vllm-project/vllm-omni#2241
+============================================================================
+CLASS OmniGenerationModelRunner in vllm_omni/worker_v2/omni_generation_model_runner.py   loc=254 methods=4 wmc=35 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       32  class OmniGenerationModelRunner(OmniGPUModelRunner):
+       33      """Non-autoregressive generation runner (e.g. Code2Wav).
+       34  
+       35      Overrides ``execute_model`` to skip the tensor-only assertion and
+       36      ``sample_tokens`` to construct ``pooler_output`` from multimodal
+       37      model outputs without performing token sampling.
+       38      """
+       39  
+       40      def __init__(self, *args: Any, **kwargs: Any) -> None:
+       41          super().__init__(*args, **kwargs)
+       42          self._gen_model_output: Any = None
+       43          self._gen_input_batch: Any = None
+       44          self._gen_kv_connector_output: Any = None
+       45  
+       46      # ------------------------------------------------------------------
+       47      # profile / warmup — skip sampler since there are no logits
+       48      # ------------------------------------------------------------------
+       49  
+       50      @torch.inference_mode()
+       51      def profile_run(self) -> None:
+       52          """Generation models have no KV cache — skip full dummy forward.
+       53  
+       54          Only allocate a small dummy tensor to measure baseline memory.
+       55          Running the real model with random input_ids causes out-of-bounds
+       56          indexing in codec lookup tables.
+       57          """
+       58          dummy = torch.empty(1, device=self.device, dtype=self.dtype)
+       59          del dummy
+       60          torch.accelerator.synchronize()
+       61  
+       62      # ------------------------------------------------------------------
+       63      # execute_model — run the generation model, store raw output
+       64      # ------------------------------------------------------------------
+       65  
+       66      @torch.inference_mode()
+       67      def execute_model(
+       68          self,
+       69          scheduler_output: SchedulerOutput,
+       70          intermediate_tensors: IntermediateTensors | None = None,
+       71          dummy_run: bool = False,
+       72          skip_attn_for_dummy_run: bool = False,
+       73      ) -> ModelRunnerOutput | IntermediateTensors | None:
+       74          if not dummy_run:
+       75              self.finish_requests(scheduler_output)
+       76              self.free_states(scheduler_output)
+       77              self.add_requests(scheduler_output)
+       78              self.update_requests(scheduler_output)
+       79              self.block_tables.apply_staged_writes()
+       80              if scheduler_output.total_num_scheduled_tokens == 0:
+       81                  return self.kv_connector.no_forward(scheduler_output)
+       82  
+       83          num_reqs = len(scheduler_output.num_scheduled_tokens)
+       84          num_toks = scheduler_output.total_num_scheduled_tokens
+       85          max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+       86          uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+       87          batch_desc = self.cudagraph_manager.dispatch(num_reqs, num_toks, uniform_tok_count)
+       88  
+       89          if batch_desc.num_tokens == 0:
+       90              return self.kv_connector.no_forward(scheduler_output)
+       91  
+       92          if not dummy_run:
+       93              input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+       94          else:
+       95              from vllm.v1.worker.gpu.input_batch import InputBatch
+       96  
+       97              input_batch = InputBatch.make_dummy(
+       98                  batch_desc.num_reqs or num_reqs,
+       99                  batch_desc.num_tokens,
+      100                  self.input_buffers,
+      101              )
+      102  
+      103          attn_metadata = None
+      104          slot_mappings_by_layer = None
+      105  
+      106          inputs_embeds = None
+      107          if self.supports_mm_inputs and self.is_first_pp_rank:
+      108              inputs_embeds = self.model_state.get_mm_embeddings(
+      109                  scheduler_output.scheduled_encoder_inputs,
+      110                  input_batch,
+      111                  self.req_states,
+      112              )
+      113  
+      114          model_inputs = {
+      115              "input_ids": input_batch.input_ids,
+      116              "positions": input_batch.positions,
+      117              "inputs_embeds": inputs_embeds,
+      118              "intermediate_tensors": intermediate_tensors,
+      119              **self.model_state.prepare_inputs(input_batch, self.req_states),
+      120          }
+      121  
+      122          batch_descriptor = BatchDescriptor(
+      123              num_tokens=input_batch.num_tokens_after_padding,
+      124              has_lora=self.lora_config is not None,
+      125          )
+      126          with set_forward_context(
+      127              attn_metadata,
+      128              self.vllm_config,
+      129              num_tokens=input_batch.num_tokens_after_padding,
+      130              cudagraph_runtime_mode=batch_desc.cg_mode,
+      131              batch_descriptor=batch_descriptor,
+      132              slot_mapping=slot_mappings_by_layer,
+      133          ):
+      134              self.kv_connector.pre_forward(scheduler_output)
+      135              model_output = self.model(**model_inputs)
+      136  
+      137          kv_connector_output = self.kv_connector.post_forward(scheduler_output)
+      138  
+      139          # Convert via make_omni_output if available
+      140          if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
+      141              buffer_list = self.model_state.intermediate_buffer.gather(input_batch)
+      142              try:
+      143                  model_output = self.model.make_omni_output(
+      144                      model_output,
+      145                      model_intermediate_buffer=buffer_list,
+      146                      runtime_additional_information=buffer_list,
+      147                  )
+      148              except Exception:
+      149                  logger.error(
+      150                      "make_omni_output failed for generation output; "
+      151                      "raw output will be used as multimodal_outputs",
+      152                      exc_info=True,
+      153                  )
+      154  
+      155          self._gen_model_output = model_output
+      156          self._gen_input_batch = input_batch
+      157          self._gen_kv_connector_output = kv_connector_output
+      158  
+      159          # Set execute_model_state so _dummy_run (profile/warmup) doesn't
+      160          # trip on the assertion.  hidden_states is a dummy tensor because
+      161          # generation stages don't go through the normal sampling path.
+      162          dummy_hidden = torch.zeros(
+      163              1,
+      164              dtype=self.dtype,
+      165              device=self.device,
+      166          )
+      167          self.execute_model_state = ExecuteModelState(
+      168              input_batch=input_batch,
+      169              attn_metadata=attn_metadata,
+      170              slot_mappings_by_layer=slot_mappings_by_layer,
+      171              hidden_states=dummy_hidden,
+      172              aux_hidden_states=None,
+      173              kv_connector_output=kv_connector_output,
+      174              num_tokens_across_dp=None,
+      175          )
+      176          return None
+      177  
+      178      # ------------------------------------------------------------------
+      179      # sample_tokens — build pooler_output, no actual sampling
+      180      # ------------------------------------------------------------------
+      181  
+      182      @torch.inference_mode()
+      183      def sample_tokens(self, grammar_output: GrammarOutput | None = None) -> OmniModelRunnerOutput | None:
+      184          model_output = self._gen_model_output
+      185          input_batch = self._gen_input_batch
+      186          kv_connector_output = self._gen_kv_connector_output
+      187          self._gen_model_output = None
+      188          self._gen_input_batch = None
+      189          self._gen_kv_connector_output = None
+      190          self.execute_model_state = None
+      191  
+      192          if model_output is None or input_batch is None:
+      193              return None
+      194  
+      195          num_reqs = input_batch.num_reqs
+      196  
+      197          # Resolve the EOS token once.  Used both for postprocess
+      198          # (advancing num_computed_tokens) and for the returned
+      199          # sampled_token_ids (triggering scheduler's check_stop).
+      200          # OmniModelConfig may not expose eos_token_id directly;
+      201          # fall back through hf_text_config, then default to 0.
+      202          eos_id = getattr(self.model_config, "eos_token_id", None)
+      203          if eos_id is None:
+      204              eos_id = getattr(
+      205                  getattr(self.model_config, "hf_text_config", None),
+      206                  "eos_token_id",
+      207                  None,
+      208              )
+      209          if eos_id is None:
+      210              eos_id = 0
+      211  
+      212          # Advance num_computed_tokens via the upstream postprocess
+      213          # kernel.  Without this the scheduler re-schedules the same
+      214          # tokens every step (infinite loop).
+      215          dummy_sampled = torch.full(
+      216              (num_reqs, 1), eos_id, dtype=torch.long, device=self.device
+      217          )
+      218          dummy_num_sampled = torch.ones(
+      219              num_reqs, dtype=torch.int32, device=self.device
+      220          )
+      221          dummy_num_rejected = torch.zeros(
+      222              num_reqs, dtype=torch.int32, device=self.device
+      223          )
+      224          self.postprocess(
+      225              input_batch, dummy_sampled, dummy_num_sampled, dummy_num_rejected
+      226          )
+      227  
+      228          # Build pooler_output from multimodal model outputs.
+      229          multimodal_outputs: dict | list | torch.Tensor | None = None
+      230          if isinstance(model_output, OmniOutput):
+      231              multimodal_outputs = model_output.multimodal_outputs
+      232          else:
+      233              multimodal_outputs = model_output
+      234  
+      235          pooler_output: list[object] = []
+      236          if isinstance(multimodal_outputs, torch.Tensor):
+      237              for i in range(num_reqs):
+      238                  pooler_output.append(
+      239                      {"model_outputs": multimodal_outputs[i].detach().cpu().contiguous()}
+      240                  )
+      241          elif isinstance(multimodal_outputs, list):
+      242              for out in multimodal_outputs:
+      243                  pooler_output.append(
+      244                      {"model_outputs": out.detach().cpu().contiguous() if out is not None else None}
+      245                  )
+      246          elif isinstance(multimodal_outputs, dict):
+      247              for i in range(num_reqs):
+      248                  mm_payload: dict[str, Any] = {}
+      249                  for key, val in multimodal_outputs.items():
+      250                      if isinstance(val, torch.Tensor):
+      251                          if val.dim() > 0 and val.shape[0] == num_reqs:
+      252                              mm_payload[key] = val[i].detach().cpu().contiguous()
+      253                          else:
+      254                              mm_payload[key] = val.detach().cpu().contiguous()
+      255                      elif isinstance(val, list) and len(val) == num_reqs:
+      256                          out = val[i]
+      257                          mm_payload[key] = (
+      258                              out.detach().cpu().contiguous()
+      259                              if isinstance(out, torch.Tensor) else out
+      260                          )
+      261                      else:
+      262                          mm_payload[key] = val
+      263                  pooler_output.append(mm_payload)
+      264          else:
+      265              pooler_output = [None] * num_reqs
+      266  
+      267          req_ids = input_batch.req_ids[:]
+      268  
+      269          # Generation models don't do token sampling, but V2's scheduler
+      270          # relies on sampled_token_ids to detect request completion via
+      271          # check_stop().  Emit one EOS token per request so the scheduler
+      272          # marks them FINISHED_STOPPED and frees the request slot.
+      273          sampled_token_ids: list[list[int]] = [[eos_id]] * len(req_ids)
+      274  
+      275          return OmniModelRunnerOutput(
+      276              req_ids=req_ids,
+      277              req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+      278              sampled_token_ids=sampled_token_ids,
+      279              pooler_output=pooler_output,
+      280              multimodal_outputs=(
+      281                  multimodal_outputs if isinstance(multimodal_outputs, dict)
+      282                  else {"model_outputs": multimodal_outputs}
+      283              ),
+      284              kv_connector_output=kv_connector_output,
+      285          )

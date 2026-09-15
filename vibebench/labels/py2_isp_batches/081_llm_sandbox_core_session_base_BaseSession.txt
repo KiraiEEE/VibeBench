@@ -1,0 +1,588 @@
+row 81   vndee/llm-sandbox#108
+============================================================================
+CONTRACT llm_sandbox.core.session_base:BaseSession   kind=abc abstract_methods=8.0 implementers=6.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file llm_sandbox/core/session_base.py
+       36  class BaseSession(
+       37      ABC,
+       38      TimeoutMixin,
+       39      FileOperationsMixin,
+       40      CommandExecutionMixin,
+       41  ):
+       42      """Base session implementation with common functionality."""
+       43  
+       44      def __init__(self, config: SessionConfig, **kwargs: Any) -> None:  # noqa: ARG002
+       45          """Initialize base session."""
+       46          self.config = config
+       47          self.verbose = config.verbose
+       48          self.logger = logging.getLogger(__name__)
+       49  
+       50          # Configure logging if verbose is enabled
+       51          if self.verbose and not self.logger.handlers:
+       52              handler = logging.StreamHandler()
+       53              formatter = logging.Formatter(
+       54                  "%(asctime)s - %(name)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+       55              )
+       56              handler.setFormatter(formatter)
+       57              self.logger.addHandler(handler)
+       58              self.logger.setLevel(logging.DEBUG)
+       59  
+       60          # Initialize language handler
+       61          self.language_handler = LanguageHandlerFactory.create_handler(config.lang, self.logger)
+       62  
+       63          # Session timing
+       64          self._session_start_time: float | None = None
+       65          self._session_timer: threading.Timer | None = None
+       66  
+       67          # Container state
+       68          self.container: Any = None
+       69          self.is_open = False
+       70          self.using_existing_container = config.is_using_existing_container()
+       71  
+       72          self.container_api: ContainerAPI
+       73  
+       74      def _log(self, message: str, level: str = "info") -> None:
+       75          """Log message if verbose."""
+       76          if self.verbose:
+       77              getattr(self.logger, level)(message)
+       78  
+       79      def _check_session_timeout(self) -> None:
+       80          """Check if session has exceeded maximum lifetime."""
+       81          if self.config.session_timeout and self._session_start_time:
+       82              elapsed = time.time() - self._session_start_time
+       83              if elapsed > self.config.session_timeout:
+       84                  msg = f"Session exceeded maximum lifetime of {self.config.session_timeout} seconds"
+       85                  raise SandboxTimeoutError(msg)
+       86  
+       87      def _start_session_timer(self) -> None:
+       88          """Start session timeout timer."""
+       89          self._session_start_time = time.time()
+       90  
+       91          if self.config.session_timeout:
+       92  
+       93              def timeout_handler() -> None:
+       94                  self._log(f"Session timed out after {self.config.session_timeout} seconds", "warning")
+       95                  try:
+       96                      self.close()
+       97                  except Exception as e:  # noqa: BLE001
+       98                      self._log(f"Error during timeout cleanup: {e}", "error")
+       99  
+      100              self._session_timer = threading.Timer(self.config.session_timeout, timeout_handler)
+      101              self._session_timer.daemon = True
+      102              self._session_timer.start()
+      103  
+      104      def _stop_session_timer(self) -> None:
+      105          """Stop session timeout timer."""
+      106          if self._session_timer:
+      107              self._session_timer.cancel()
+      108              self._session_timer = None
+      109  
+      110      def _add_restricted_module_patterns(self) -> None:
+      111          """Add patterns for restricted modules to the security policy."""
+      112          if not self.config.security_policy or not self.config.security_policy.restricted_modules:
+      113              return
+      114  
+      115          for module in self.config.security_policy.restricted_modules:
+      116              pattern = SecurityPattern(
+      117                  pattern=self.language_handler.get_import_patterns(module.name),
+      118                  description=module.description,
+      119                  severity=module.severity,
+      120              )
+      121              self.config.security_policy.add_pattern(pattern)
+      122  
+      123      def _check_pattern_violations(self, filtered_code: str) -> tuple[bool, list[SecurityPattern]]:
+      124          """Check for pattern violations in the filtered code.
+      125  
+      126          Args:
+      127              filtered_code (str): Code with comments filtered out.
+      128  
+      129          Returns:
+      130              tuple[bool, list[SecurityPattern]]: A tuple containing safety status and violations.
+      131  
+      132          """
+      133          violations: list[SecurityPattern] = []
+      134  
+      135          if not self.config.security_policy or not self.config.security_policy.patterns:
+      136              return True, []
+      137  
+      138          for pattern_obj in self.config.security_policy.patterns:
+      139              if not pattern_obj.pattern:
+      140                  continue
+      141  
+      142              violation_found = self._check_single_pattern(pattern_obj, filtered_code)
+      143              if violation_found:
+      144                  violations.append(pattern_obj)
+      145  
+      146                  # Check if this violation should cause immediate failure
+      147                  if self._should_fail_on_violation(pattern_obj):
+      148                      return False, violations
+      149  
+      150          return True, violations
+      151  
+      152      def _check_single_pattern(self, pattern_obj: SecurityPattern, filtered_code: str) -> bool:
+      153          """Check a single security pattern against the code.
+      154  
+      155          Args:
+      156              pattern_obj (SecurityPattern): The pattern to check.
+      157              filtered_code (str): Code with comments filtered out.
+      158  
+      159          Returns:
+      160              bool: True if pattern matches (violation found), False otherwise.
+      161  
+      162          """
+      163          try:
+      164              return bool(re.search(pattern_obj.pattern, filtered_code))
+      165          except re.error as e:
+      166              self._log(f"Invalid regex pattern '{pattern_obj.pattern}': {e}", "error")
+      167              return False
+      168  
+      169      def _should_fail_on_violation(self, pattern_obj: SecurityPattern) -> bool:
+      170          """Determine if a security violation should cause immediate failure.
+      171  
+      172          Args:
+      173              pattern_obj (SecurityPattern): The pattern that was violated.
+      174  
+      175          Returns:
+      176              bool: True if execution should fail immediately, False otherwise.
+      177  
+      178          """
+      179          if not self.config.security_policy or not self.config.security_policy.severity_threshold:
+      180              return False
+      181  
+      182          return (
+      183              self.config.security_policy.severity_threshold > SecurityIssueSeverity.SAFE
+      184              and pattern_obj.severity >= self.config.security_policy.severity_threshold
+      185          )
+      186  
+      187      def _check_security_policy(self, code: str) -> tuple[bool, list[SecurityPattern]]:
+      188          r"""Check code against security policy.
+      189  
+      190          Args:
+      191              code (str): The code to check.
+      192  
+      193          Returns:
+      194              tuple[bool, list[SecurityPattern]]: A tuple containing a boolean indicating if the code is safe
+      195                                                  and a list of security patterns that were violated.
+      196  
+      197          """
+      198          if not self.config.security_policy:
+      199              return True, []
+      200  
+      201          if not self.language_handler:
+      202              raise LanguageHandlerNotInitializedError(self.config.lang)
+      203  
+      204          # Add patterns for restricted modules
+      205          self._add_restricted_module_patterns()
+      206  
+      207          # If no patterns are configured, code is safe
+      208          if not self.config.security_policy.patterns:
+      209              return True, []
+      210  
+      211          # Check for pattern violations
+      212          filtered_code = self.language_handler.filter_comments(code)
+      213          return self._check_pattern_violations(filtered_code)
+      214  
+      215      def is_safe(self, code: str) -> tuple[bool, list[SecurityPattern]]:
+      216          r"""Check if code is safe to execute.
+      217  
+      218          Args:
+      219              code (str): The code to check.
+      220  
+      221          Returns:
+      222              tuple[bool, list[SecurityPattern]]: A tuple containing a boolean indicating if the code is safe
+      223                                                  and a list of security patterns that were violated.
+      224  
+      225          """
+      226          return self._check_security_policy(code)
+      227  
+      228      def install(self, libraries: list[str] | None = None) -> None:
+      229          r"""Install libraries into the sandbox environment.
+      230  
+      231          This method uses the language-specific handler to determine the correct installation
+      232          commands for the given libraries. It then executes these commands within the sandbox.
+      233  
+      234          Args:
+      235              libraries (list[str] | None, optional): A list of library names to install.
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER llm_sandbox.docker:SandboxDockerSession  stubs=0/8 ----------
+       75  class SandboxDockerSession(BaseSession):
+      175      def _ensure_directory_exists(self, path: str) -> None:
+      176          r"""Ensure the directory exists.
+      177  
+      178          Args:
+      179              path (str): The path to ensure exists.
+      180  
+      181          """
+      182          mkdir_result = self.container_api.execute_command(self.container, f"mkdir -p '{path}'")
+      183          if mkdir_result[0] != 0:
+      184              stdout_output, stderr_output = self._process_non_stream_output(mkdir_result[1])
+      185              error_msg = stderr_output if stderr_output else stdout_output
+      186              self._log(f"Failed to create directory {path}: {error_msg}", "error")
+      188      def _ensure_ownership(self, paths: list[str]) -> None:
+      189          r"""Ensure ownership of the given paths.
+      190  
+      191          This method changes the ownership of specified paths to the current user
+      192  
+      193          Args:
+      194              paths (list[str]): The paths to ensure ownership of.
+      195  
+      196          """
+      197          current_user = self.config.runtime_configs.get("user") if self.config.runtime_configs else None
+      198          if current_user and current_user != "root":
+      199              self.container.exec_run(f"chown -R {current_user} {' '.join(paths)}", user="root")
+      201      def _process_non_stream_output(self, output: Any) -> tuple[str, str]:
+      202          """Process non-streaming Docker output."""
+      203          stdout_output = ""
+      204          stderr_output = ""
+      205  
+      206          if output:
+      207              stdout_data, stderr_data = output
+      208              if stdout_data:
+      209                  stdout_output = stdout_data.decode("utf-8")
+      210              if stderr_data:
+      211                  stderr_output = stderr_data.decode("utf-8")
+      212  
+      213          return stdout_output, stderr_output
+      215      def _process_stream_output(self, output: Any) -> tuple[str, str]:
+      216          """Process streaming Docker output."""
+      217          stdout_output, stderr_output = "", ""
+      218  
+      219          try:
+      220              for stdout_chunk, stderr_chunk in output:
+      221                  if stdout_chunk:
+      222                      stdout_output += (
+      223                          stdout_chunk.decode("utf-8") if isinstance(stdout_chunk, bytes) else str(stdout_chunk)
+      224                      )
+      225                  if stderr_chunk:
+      226                      stderr_output += (
+      227                          stderr_chunk.decode("utf-8") if isinstance(stderr_chunk, bytes) else str(stderr_chunk)
+      228                      )
+      229          except Exception as e:
+      230              from llm_sandbox.exceptions import SandboxTimeoutError
+      231  
+      232              if isinstance(e, SandboxTimeoutError):
+      233                  raise
+      234  
+      235              self._log(f"Error processing stream output: {e}", "warning")
+      236  
+      237          return stdout_output, stderr_output
+      239      def _handle_timeout(self) -> None:
+      240          """Handle Docker timeout cleanup."""
+      241          if self.using_existing_container:
+      242              try:
+      243                  self.close()
+      244              except Exception as e:  # noqa: BLE001
+      245                  self._log(f"Error during timeout cleanup: {e}", "error")
+      247      def _connect_to_existing_container(self, container_id: str) -> None:
+      248          """Connect to an existing Docker container.
+      249  
+      250          Args:
+      251              container_id (str): The ID of the existing container to connect to.
+      252  
+      253          Raises:
+      254              ContainerError: If the container cannot be found or accessed.
+      255  
+      256          """
+      257          try:
+      258              self.container = self.client.containers.get(container_id)
+      259              self._log(f"Connected to existing container {container_id}")
+      260  
+      261              # Verify container is running
+      262              if self.container.status != "running":
+      263                  self._log(f"Container {container_id} is not running, attempting to start...")
+      264                  self.container.start()
+      265                  self._log(f"Started container {container_id}")
+      266  
+      267          except NotFound as e:
+      268              msg = f"Container {container_id} not found"
+      269              self._log(msg, "error")
+      270              raise ContainerError(msg) from e
+      271          except Exception as e:
+      272              msg = f"Failed to connect to container {container_id}: {e}"
+      273              self._log(msg, "error")
+      274              raise ContainerError(msg) from e
+      314      def open(self) -> None:
+      315          r"""Open Docker session.
+      316  
+      317          This method prepares the Docker environment for code execution by:
+      318          - Building or pulling the Docker image (if not using existing container)
+      319          - Creating a container or connecting to existing one
+      320          - Setting up the environment (if not using existing container)
+      321  
+      322          Raises:
+      323              ImagePullError: If the image cannot be pulled.
+      324              ImageNotFoundError: If the image cannot be found.
+      325              ContainerError: If existing container cannot be found or accessed.
+      326  
+      327          """
+      328          super().open()
+      329  
+      330          if self.using_existing_container and self.config.container_id:
+      331              # Connect to existing container
+      332              self._connect_to_existing_container(self.config.container_id)
+      333          else:
+      334              # Create new container
+      335              self._prepare_image()
+      336  
+      337              container_config = {"image": self.docker_image, "detach": True, "tty": True, "user": "root"}
+      338              container_config.update(self.config.runtime_configs)
+      339  
+      340              self.container = self.container_api.create_container(container_config)
+      341              self.container_api.start_container(self.container)
+      342  
+      343          # Setup environment (skipped for existing containers)
+      344          self.environment_setup()
+      346      def close(self) -> None:
+      347          r"""Close the Docker sandbox session.
+      348  
+      349          This method cleans up Docker resources by:
+      350          1. Committing the container to a new image if `commit_container` is True.
+      351          2. Stopping and removing the running Docker container (only if we created it).
+      352          3. Removing the Docker image if `is_create_template` is True (image was built or pulled
+      353              during this session), `keep_template` is False, and the image is not in use by
+      354              other containers.
+      355  
+      356          Note: When using existing containers, we only disconnect but don't stop/remove the container.
+      357  
+      358          Raises:
+      359              ImageNotFoundError: If the image to be removed is not found (should not typically occur).
+      360  
+      361          """
+      362          super().close()
+      363  
+      364          if self.container:
+      365              if self.commit_container and self.docker_image:
+      366                  self._commit_container()
+      367  
+      368              # Only stop/remove container if we created it (not existing container)
+      369              if not self.using_existing_container:
+      370                  try:
+      371                      self.container.stop()
+      372                      self.container.wait()
+      373                      self.container.remove(force=True)
+      374                      self._log("Stopped and removed container")
+      375                  except Exception:  # noqa: BLE001
+      376                      self._log("Error cleaning up container")
+      377              else:
+      378                  self._log("Disconnected from existing container")
+      379  
+      380              self.container = None
+      381  
+      382          if self.is_create_template and not self.keep_template and self.docker_image:
+      383              self._cleanup_image()
+
+---------- IMPLEMENTER llm_sandbox.hyperlight:SandboxHyperlightSession  stubs=0/8 ----------
+      258  class SandboxHyperlightSession(BaseSession):
+      449      def open(self) -> None:
+      450          """Open the Hyperlight session.
+      451  
+      452          This prepares the guest binary for execution.
+      453          """
+      454          if self.is_open:
+      455              return
+      456  
+      457          self._check_hyperlight_dependencies()
+      458  
+      459          # Compile or load guest binary
+      460          if self.guest_binary_path:
+      461              self._guest_binary = Path(self.guest_binary_path)
+      462              if not self._guest_binary.exists():
+      463                  msg = f"Guest binary not found: {self.guest_binary_path}"
+      464                  raise ContainerError(msg)
+      465          else:
+      466              self._guest_binary = self._compile_guest_binary()
+      467  
+      468          # Create container (prepare for execution)
+      469          self.container = self.container_api.create_container(
+      470              {"guest_binary_path": str(self._guest_binary)}
+      471          )
+      472  
+      473          self.is_open = True
+      474          self._start_session_timer()
+      475          self._log("Hyperlight session opened", "info")
+      477      def close(self) -> None:
+      478          """Close the Hyperlight session and clean up resources."""
+      479          if not self.is_open:
+      480              return
+      481  
+      482          self._stop_session_timer()
+      483  
+      484          # Clean up temporary directories
+      485          if not self.config.keep_template:
+      486              if self._temp_guest_dir and self._temp_guest_dir.exists():
+      487                  shutil.rmtree(self._temp_guest_dir, ignore_errors=True)
+      488                  self._log("Cleaned up guest binary directory", "debug")
+      489  
+      490          self.container_api.cleanup()
+      491          self.is_open = False
+      492          self._log("Hyperlight session closed", "info")
+      505      def _handle_timeout(self) -> None:
+      506          """Handle timeout cleanup for Hyperlight backend.
+      507  
+      508          Hyperlight VMs are automatically destroyed after execution,
+      509          so minimal cleanup is needed on timeout.
+      510          """
+      511          if self.verbose:
+      512              self._log("Hyperlight VM execution timed out", "warning")
+      513  
+      514          # Clean up temporary resources
+      515          if not self.config.keep_template:
+      516              if self._temp_guest_dir and self._temp_guest_dir.exists():
+      517                  shutil.rmtree(self._temp_guest_dir, ignore_errors=True)
+      519      def _connect_to_existing_container(self, container_id: str) -> None:
+      520          """Connect to existing Hyperlight container (not supported).
+      521  
+      522          Args:
+      523              container_id: Container ID (not used for Hyperlight)
+      524  
+      525          Raises:
+      526              NotImplementedError: Hyperlight does not support connecting to existing VMs
+      527          """
+      528          msg = (
+      529              "Hyperlight backend does not support connecting to existing containers. "
+      530              "Each session creates a new micro VM that is destroyed after execution."
+      531          )
+      532          raise NotImplementedError(msg)
+      (does not define: _ensure_directory_exists, _ensure_ownership, _process_non_stream_output, _process_stream_output; inherited or absent)
+
+---------- IMPLEMENTER llm_sandbox.kubernetes:SandboxKubernetesSession  stubs=0/8 ----------
+      273  class SandboxKubernetesSession(BaseSession):
+      457      def _connect_to_existing_container(self, pod_id: str) -> None:
+      458          """Connect to an existing Kubernetes pod.
+      459  
+      460          Args:
+      461              pod_id (str): The name of the existing pod to connect to.
+      462  
+      463          Raises:
+      464              ContainerError: If the pod cannot be found or accessed.
+      465  
+      466          """
+      467          try:
+      468              # Verify pod exists and get its status
+      469              pod = self.client.read_namespaced_pod(name=pod_id, namespace=self.kube_namespace)
+      470              self._log(f"Connected to existing pod {pod_id}")
+      471  
+      472              # Validate pod is running or can be made running
+      473              self._validate_pod_status(pod_id, pod)
+      474  
+      475              # Store pod name for operations
+      476              self.container = pod_id
+      477  
+      478              # Extract container name from the existing pod
+      479              containers = pod.spec.containers
+      480              if containers:
+      481                  self.container_name = containers[0].name
+      482              else:
+      483                  self.container_name = "sandbox-container"  # fallback
+      484  
+      485          except ApiException as e:
+      486              if e.status == KUBERNETES_POD_NOT_FOUND_ERROR_CODE:
+      487                  msg = f"Pod {pod_id} not found in namespace {self.kube_namespace}"
+      488                  self._log(msg, "error")
+      489                  raise ContainerError(msg) from e
+      490              msg = f"Failed to access pod {pod_id}: {e}"
+      491              self._log(msg, "error")
+      492              raise ContainerError(msg) from e
+      493          except Exception as e:
+      494              msg = f"Failed to connect to pod {pod_id}: {e}"
+      495              self._log(msg, "error")
+      496              raise ContainerError(msg) from e
+      498      def _ensure_directory_exists(self, path: str) -> None:
+      499          """Ensure directory exists in Kubernetes pod."""
+      500          mkdir_result = self.container_api.execute_command(
+      501              self.container, f"mkdir -p '{path}'", container_name=self.container_name
+      502          )
+      503          if mkdir_result[0] != 0:
+      504              stdout_output, stderr_output = mkdir_result[1]
+      505              error_msg = stderr_output if stderr_output else stdout_output
+      506              self._log(f"Failed to create directory {path}: {error_msg}", "error")
+      508      def _ensure_ownership(self, paths: list[str]) -> None:
+      509          """Ensure correct ownership of paths in Kubernetes pod."""
+      510          # Check if we're running as root
+      511          user_check = self.execute_command("id -u")
+      512          is_root = user_check.stdout.strip() == "0"
+      513  
+      514          if not is_root:
+      515              # For non-root pods, ensure directories are owned by current user
+      516              self.execute_command(f"chown -R $(id -u):$(id -g) {' '.join(paths)}")
+      518      def _process_non_stream_output(self, output: Any) -> tuple[str, str]:
+      519          """Process non-streaming Kubernetes output."""
+      520          if isinstance(output, tuple) and len(output) == 2:  # noqa: PLR2004
+      521              stdout_data, stderr_data = output
+      522              return str(stdout_data), str(stderr_data)
+      523          return "", ""
+      525      def _process_stream_output(self, output: Any) -> tuple[str, str]:
+      526          """Process streaming Kubernetes output (not used but required by mixin)."""
+      527          return self._process_non_stream_output(output)
+      529      def _handle_timeout(self) -> None:
+      530          """Handle Kubernetes timeout cleanup."""
+      531          if self.container:
+      532              try:
+      533                  self.close()
+      534              except Exception as e:  # noqa: BLE001
+      535                  self._log(f"Error during timeout cleanup: {e}", "error")
+      537      def open(self) -> None:
+      538          """Open Kubernetes session."""
+      539          super().open()
+      540  
+      541          if self.using_existing_container and self.config.container_id:
+      542              # Connect to existing pod
+      543              self._connect_to_existing_container(self.config.container_id)
+      544          else:
+      545              # Create new pod
+      546              container_config = {"pod_manifest": self.pod_manifest}
+      547              self.container = self.container_api.create_container(container_config)
+      548  
+      549          # Setup environment only for newly-created pods
+      550          if not self.using_existing_container:
+      551              self.environment_setup()
+      553      def close(self) -> None:
+      554          """Close Kubernetes session."""
+      555          super().close()
+      556  
+      557          if self.container:
+      558              # Only delete pod if we created it (not existing pod)
+      559              if not self.using_existing_container:
+      560                  try:
+      561                      self.container_api.stop_container(self.container)
+      562                      self._log("Deleted pod")
+      563                  except Exception as e:  # noqa: BLE001
+      564                      self._log(f"Error cleaning up pod: {e}", "error")
+      565              else:
+      566                  self._log("Disconnected from existing pod")
+      567  
+      568              self.container = None
+
+---------- IMPLEMENTER llm_sandbox.micromamba:MicromambaSession  stubs=0/8 ----------
+       26  class MicromambaSession(SandboxDockerSession):
+      (does not define: _connect_to_existing_container, _ensure_directory_exists, _ensure_ownership, _handle_timeout, _process_non_stream_output, _process_stream_output, close, open; inherited or absent)
+
+---------- IMPLEMENTER llm_sandbox.podman:SandboxPodmanSession  stubs=0/8 ----------
+       44  class SandboxPodmanSession(SandboxDockerSession):
+      (does not define: _connect_to_existing_container, _ensure_directory_exists, _ensure_ownership, _handle_timeout, _process_non_stream_output, _process_stream_output, close, open; inherited or absent)
+
+---------- IMPLEMENTER tests.test_session_base:MockBaseSession  stubs=4/8 ----------
+       57  class MockBaseSession(BaseSession):
+       65      def _handle_timeout(self) -> None:
+       66          """Mock implementation of timeout handler."""
+       68      def open(self) -> None:
+       69          """Mock implementation of open."""
+       70          super().open()
+       72      def close(self) -> None:
+       73          """Mock implementation of close."""
+       74          super().close()
+       76      def _ensure_directory_exists(self, path: str) -> None:
+       77          """Mock implementation."""
+       79      def _ensure_ownership(self, paths: list[str]) -> None:
+       80          """Mock implementation."""
+       82      def _process_non_stream_output(self, output: str) -> tuple[str, str]:
+       83          """Mock implementation."""
+       84          return "stdout", "stderr"
+       86      def _process_stream_output(self, output: str) -> tuple[str, str]:
+       87          """Mock implementation."""
+       88          return "stream_stdout", "stream_stderr"
+       90      def _connect_to_existing_container(self, pod_id: str) -> None:
+       91          """Mock implementation."""

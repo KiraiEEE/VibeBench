@@ -1,0 +1,239 @@
+row 160   zfit/zfit#713
+============================================================================
+CONTRACT zfit.core.basemodel:BaseModel   kind=abc abstract_methods=8.0 implementers=58.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file src/zfit/core/basemodel.py
+       92  class BaseModel(BaseNumeric, GraphCachable, BaseDimensional, ZfitModel):
+       93      """Base class for any generic model.
+       94  
+       95      # TODO instructions on how to use
+       96      """
+       97  
+       98      DEFAULTS_integration = DotMap()
+       99      DEFAULTS_integration.mc_sampler = lambda *args, **kwargs: mc.sample_halton_sequence(
+      100          *args, randomized=False, **kwargs
+      101      )
+      102      DEFAULTS_integration.draws_per_dim = "auto"
+      103      DEFAULTS_integration.draws_simpson = "auto"
+      104      DEFAULTS_integration.max_draws = 1_200_000
+      105      DEFAULTS_integration.tol = 3e-6
+      106      DEFAULTS_integration.auto_numeric_integrator = zintegrate.auto_integrate
+      107  
+      108      _analytic_integral = None
+      109      _inverse_analytic_integral = None
+      110      _additional_repr = None
+      111  
+      112      def __init__(
+      113          self,
+      114          obs: ztyping.ObsTypeInput,
+      115          params: dict[str, ZfitParameter] | None = None,
+      116          name: str = "BaseModel",
+      117          dtype=ztypes.float,
+      118          **kwargs,
+      119      ):
+      120          """The base model to inherit from and overwrite ``_unnormalized_pdf``.
+      121  
+      122          Args:
+      123              dtype: the dtype of the model
+      124              name: the name of the model
+      125              params: A dictionary with the internal name of the parameter and
+      126                  the parameters itself the model depends on
+      127          """
+      128          super().__init__(name=name, dtype=dtype, params=params, **kwargs)
+      129          self._check_set_space(obs)
+      130  
+      131          self._integration = DotMap()
+      132          self._integration.auto_numeric_integrator = self.DEFAULTS_integration.auto_numeric_integrator
+      133          self.integration = Integration(
+      134              mc_sampler=self.DEFAULTS_integration.mc_sampler,
+      135              draws_per_dim=self.DEFAULTS_integration.draws_per_dim,
+      136              max_draws=self.DEFAULTS_integration.max_draws,
+      137              tol=self.DEFAULTS_integration.tol,
+      138              draws_simpson=None,
+      139          )
+      140          self.update_integration_options(
+      141              draws_per_dim=self.DEFAULTS_integration.draws_per_dim,
+      142              draws_simpson=self.DEFAULTS_integration.draws_simpson,
+      143          )
+      144  
+      145          self._sample_and_weights = UniformSampleAndWeights
+      146  
+      147      @classmethod
+      148      def __init_subclass__(cls, **kwargs):
+      149          super().__init_subclass__(**kwargs)
+      150          # check if subclass has decorator if required
+      151          cls._subclass_check_support(
+      152              methods_to_check=_BaseModel_USER_IMPL_METHODS_TO_CHECK,
+      153              wrapper_not_overwritten=_BaseModel_register_check_support,
+      154          )
+      155          cls._analytic_integral = zintegrate.AnalyticIntegral()
+      156          cls._inverse_analytic_integral = []
+      157          cls._additional_repr = {}
+      158  
+      159      @classmethod
+      160      def _subclass_check_support(cls, methods_to_check, wrapper_not_overwritten):
+      161          for method_name, has_support in methods_to_check.items():
+      162              method = getattr(cls, method_name)
+      163              if hasattr(method, "__wrapped__") and method.__wrapped__ == wrapper_not_overwritten:
+      164                  continue  # not overwritten, fine
+      165  
+      166              # here means: overwritten
+      167              if hasattr(method, "__wrapped__"):
+      168                  if method.__wrapped__ == supports:
+      169                      if has_support:
+      170                          continue  # needs support, has been wrapped
+      171  
+      172                      msg = (
+      173                          f"Method {method_name} has been wrapped with supports but"
+      174                          f" is not allowed to. Has to handle all arguments."
+      175                      )
+      176                      raise BasePDFSubclassingError(msg)
+      177                  if has_support:
+      178                      msg = (
+      179                          f"Method {method_name} has been overwritten and *has to* be"
+      180                          f" wrapped by `supports` decorator (don't forget () ) to call the decorator"
+      181                          f" as it takes arguments"
+      182                      )
+      183                      raise BasePDFSubclassingError(msg)
+      184                  if not has_support:
+      185                      continue  # no support, has not been wrapped with
+      186              elif not has_support:
+      187                  continue  # not wrapped, no support, need no
+      188  
+      189              # if we reach this points, somethings was implemented wrongly
+      190              if method_name not in ["_pdf"]:
+      191                  msg = (
+      192                      f"Method {method_name} has not been correctly wrapped with @supports "
+      193                      "OR has been wrapped but it should not be"
+      194                  )
+      195                  raise BasePDFSubclassingError(msg)
+      196              warnings.warn(
+      197                  "For the future, also decorate _pdf with @supports and specify what you support"
+      198                  " (such as 'norm=True' to keep the same behavior as before)",
+      199                  FutureWarning,
+      200                  stacklevel=2,
+      201              )
+      202  
+      203      # since subclasses can be funcs of pdfs, we need to now what to sample/integrate from
+      204      @abc.abstractmethod
+      205      def _func_to_integrate(self, x: ztyping.XType, *, params=None) -> tf.Tensor:
+      206          raise NotImplementedError
+      207  
+      208      @abc.abstractmethod
+      209      def _func_to_sample_from(self, x: ztyping.XType, *, params=None) -> Data:
+      210          raise NotImplementedError
+      211  
+      212      @property
+      213      def space(self) -> ZfitSpace:
+      214          return self._space
+      215  
+      216      def _check_set_space(self, obs) -> None:
+      217          if not isinstance(obs, ZfitSpace):
+      218              obs = Space(obs=obs)
+      219          self._check_n_obs(space=obs)
+      220          self._space = obs.with_autofill_axes(overwrite=True)
+      221  
+      222      @contextlib.contextmanager
+      223      def _convert_sort_x(
+      224          self, x: ztyping.XTypeInput, partial: bool = False, allow_none: bool = False, fallback_obs=None
+      225      ) -> typing.Generator[Data | None]:
+      226          del partial  # TODO: implement partial
+      227          fallback_obs = self.obs if fallback_obs is None else fallback_obs
+      228          if x is None:
+      229              if not allow_none:
+      230                  msg = f"x {x} given to {self} must be non-empty (not None)."
+      231                  raise ValueError(msg)
+      232              else:
+      233                  yield None
+      234          else:
+      235              x = convert_to_data(x, obs=fallback_obs)
+      236              if x.obs is not None:
+      237                  x = x.with_obs(self.obs, guarantee_limits=True)
+      238                  # with x.sort_by_obs(obs=self.obs, allow_superset=True):
+      239                  yield x
+      240              elif x.axes is not None:
+      241                  x = x.with_axes(self.space.axes, guarantee_limits=True)
+      242                  # with x.sort_by_axes(axes=self.axes):
+      243                  yield x
+      244              else:
+      245                  msg = "Neither the `obs` nor the `axes` are specified in `Data`"
+      246                  raise AssertionError(msg)
+      247  
+      248      def update_integration_options(
+      249          self,
+      250          draws_per_dim=None,
+      251          mc_sampler=None,
+      252          tol=None,
+      253          max_draws=None,
+      254          draws_simpson=None,
+      255      ):
+      256          """Set the integration options.
+      257  
+      258          Args:
+      259              max_draws (default ~1'000'000): Maximum number of draws when integrating . Typically 500'000 - 5'000'000.
+      260              tol: Tolerance on the error of the integral. typically 1e-4 to 1e-8
+      261              draws_per_dim: The draws for MC integration to do per iteration. Can be set to ``'auto``'.
+      262              draws_simpson: Number of points in one dimensional Simpson integration. Can be set to ``'auto'``.
+      263          """
+      264  
+      265          if draws_per_dim is not None:
+      266              self.integration.draws_per_dim = draws_per_dim
+      267          if mc_sampler is not None:
+      268              self.integration.mc_sampler = mc_sampler
+      269          if max_draws is not None:
+      270              self.integration.max_draws = max_draws
+      271          if tol is not None:
+      272              if tol > 1 or tol < 0:
+      273                  msg = "tol has to be between 0 and 1 (larger does not make sense)"
+      274                  raise ValueError(msg)
+      275              self.integration.tol = tol
+      276  
+      277          if draws_per_dim == "auto":
+      278              logtolonly = max(int(abs(math.log10(self.integration.tol))), 0)
+      279              logexp = max(int(abs(math.log(self.integration.tol))), 2)
+      280              logtol = int((logexp) ** 0.6)
+      281              high_draws = 2**logtol * 10**logtol
+      282              draws = min({0: 10, 1: 15, 2: 150, 3: 300, 4: 600}.get(logtolonly, 1e30), high_draws)
+      283              draws = int(min(draws, self.integration.max_draws))
+      284          if draws_per_dim is not None:
+      285              self.integration.draws_per_dim = draws
+      286  
+      287          if draws_simpson == "auto":
+      288              logtol = abs(math.log10(self.integration.tol * 0.005))
+      289              npoints = 10 + 100 * (logtol + 1) + 1.8**logtol
+      290              draws_simpson = int(npoints)
+      291          if draws_simpson is not None:
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER zfit.core.basepdf:BasePDF  stubs=0/8 ----------
+      106  class BasePDF(ZfitPDF, BaseModel, metaclass=PDFMeta):
+      158      def _func_to_integrate(self, x: ztyping.XType, *, params=None):
+      159          del params  # unused
+      160          return self.pdf(x, norm=False)
+      162      def _func_to_sample_from(self, x):
+      163          return self.pdf(x, norm=False)
+      (does not define: axes, dtype, get_params, n_obs, obs, params; inherited or absent)
+
+---------- IMPLEMENTER zfit.models.basic:Exponential  stubs=0/8 ----------
+       34  class Exponential(BasePDF, SerializableMixin):
+      (does not define: _func_to_integrate, _func_to_sample_from, axes, dtype, get_params, n_obs, obs, params; inherited or absent)
+
+---------- IMPLEMENTER zfit.models.basic:Voigt  stubs=0/8 ----------
+      253  class Voigt(BasePDF, SerializableMixin):
+      (does not define: _func_to_integrate, _func_to_sample_from, axes, dtype, get_params, n_obs, obs, params; inherited or absent)
+
+---------- IMPLEMENTER zfit.models.cache:CachedPDF  stubs=0/8 ----------
+       53  class CachedPDF(BaseFunctor, SerializableMixin):
+      (does not define: _func_to_integrate, _func_to_sample_from, axes, dtype, get_params, n_obs, obs, params; inherited or absent)
+
+---------- IMPLEMENTER zfit.models.conditional:ConditionalPDFV1  stubs=0/8 ----------
+       46  class ConditionalPDFV1(BaseFunctor):
+      (does not define: _func_to_integrate, _func_to_sample_from, axes, dtype, get_params, n_obs, obs, params; inherited or absent)
+
+---------- IMPLEMENTER zfit.models.convolution:FFTConvPDFV1  stubs=0/8 ----------
+       33  class FFTConvPDFV1(BaseFunctor, SerializableMixin):
+      (does not define: _func_to_integrate, _func_to_sample_from, axes, dtype, get_params, n_obs, obs, params; inherited or absent)
+
+(52 further implementers not shown)

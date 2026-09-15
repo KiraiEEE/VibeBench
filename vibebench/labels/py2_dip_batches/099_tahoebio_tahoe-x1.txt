@@ -1,0 +1,271 @@
+row 99   tahoebio/tahoe-x1#24
+============================================================================
+PR tahoebio/tahoe-x1#24   cycles touched before=1.0 after=1.0
+QUESTION: does this PR make a module depend on a CONCRETE module in a
+          way that closes an import cycle, or otherwise invert the
+          dependency direction?
+
+NEWLY CYCLIC PAIRS involving a module this PR changed (8):
+    mosaicfm.data  <->  mosaicfm.model.model
+    mosaicfm.data.collator  <->  mosaicfm.model.model
+    mosaicfm.data.dataloader  <->  mosaicfm.model.model
+    mosaicfm.model.blocks  <->  mosaicfm.model.model
+    mosaicfm.model.blocks  <->  mosaicfm.utils
+    mosaicfm.model.blocks  <->  mosaicfm.utils.util
+    mosaicfm.model.model  <->  mosaicfm.utils
+    mosaicfm.model.model  <->  mosaicfm.utils.util
+(3 other pairs became cyclic, in modules this PR did not change.)
+pre-existing cyclic pairs (NOT this PR): 13
+
+NEW IMPORT EDGES (absent from the before tree; target marked abstract or CONCRETE):
+  mosaicfm.utils.util -> mosaicfm.model.model   [CONCRETE]
+  scripts.msigdb.get_msigdb_embs -> mosaicfm.model   [CONCRETE]
+  scripts.msigdb.get_msigdb_embs -> mosaicfm.tasks   [CONCRETE]
+  scripts.msigdb.get_msigdb_embs -> mosaicfm.tokenizer   [CONCRETE]
+  scripts.msigdb.get_msigdb_embs -> mosaicfm.utils.util   [CONCRETE]
+
+---------- CHANGED MODULE mosaicfm.model.model (mosaicfm/model/model.py) ----------
+        1  # Copyright (C) Vevo Therapeutics 2024-2025. All rights reserved.
+        2  import logging
+        3  from typing import Mapping, Optional
+        4  
+        5  import torch
+        6  import torch.nn.functional as F
+        7  from composer.models import ComposerModel
+        8  from composer.utils import dist
+        9  from llmfoundry.layers_registry import param_init_fns
+       10  from omegaconf import DictConfig
+       11  from torch import Tensor, nn
+       12  
+       13  from mosaicfm.loss import MaskedMseMetric, MaskedSpearmanMetric, masked_mse_loss
+       14  from mosaicfm.model.blocks import (
+       15      CategoryValueEncoder,
+       16      ChemEncoder,
+       17      ContinuousValueEncoder,
+       18      ExprDecoder,
+       19      GeneEncoder,
+       20      MVCDecoder,
+       21      SCGPTBlock,
+       22      SCGPTEncoder,
+       23      gene_encoder_defaults,
+       24      init_config_defaults,
+       25  )
+       26  
+       27  log = logging.getLogger(__name__)
+       28  
+       29  
+       30  class SCGPTModel(nn.Module):
+       31      def __init__(
+       32          self,
+       33          model_config: DictConfig,
+       34          collator_config: DictConfig,
+       35          device: Optional[str] = None,
+       36      ):
+       37          super().__init__()
+       38          self.model_type = "Transformer"
+       39          self.device = device
+       40          self.vocab_size = model_config.vocab_size
+       41          self.n_layers = model_config.n_layers
+       42          self.n_heads = model_config.n_heads
+       43          self.d_model = model_config.d_model
+       44          self.expansion_ratio = model_config.expansion_ratio
+       45          self.norm_scheme = model_config.get("norm_scheme", "pre")
+       46          self.transformer_activation = model_config.get("transformer_activation", "gelu")
+       47          self.use_chem_token = collator_config.get("use_chem_token", False)
+       48          assert (
+       49              not self.use_chem_token or "chemical_encoder" in model_config
+       50          ), "If use_chem_token is set to True, chemical_encoder submodule needs to be specified!"
+       51          assert (
+       52              "chemical_encoder" not in model_config or self.use_chem_token
+       53          ), "If chemical_encoder submodule is specified, use_chem_token needs to be set to True!"
+       54  
+       55          self.init_device = model_config.get("init_device", "cpu")
+       56          if self.init_device == "mixed":
+       57              if dist.get_local_rank() == 0:
+       58                  self.init_device = "cpu"
+       59              else:
+       60                  self.init_device = "meta"
+       61          self.cell_emb_style = model_config.get("cell_emb_style", "cls")
+       62          self.pad_token_id = collator_config.pad_token_id
+       63          self.pad_value = collator_config.pad_value
+       64          self.n_input_bins = collator_config.num_bins
+       65          self.attn_config = model_config.get("attn_config", None)
+       66          self.norm_config = model_config.get("norm_config", None)
+       67          self.init_config = model_config.get("init_config", None)
+       68          self.gene_encoder_config = model_config.get("gene_encoder", None)
+       69          self.keep_first_n_tokens = collator_config.get("keep_first_n_tokens", 1)
+       70          self.return_gene_embeddings = model_config.get("return_gene_embeddings", False)
+       71  
+       72          if self.init_config is None:
+       73              self.init_config = init_config_defaults
+       74          if self.gene_encoder_config is None:
+       75              self.gene_encoder_config = gene_encoder_defaults
+       76          if self.cell_emb_style not in ["cls", "avg-pool", "w-pool"]:
+       77              raise ValueError(f"Unknown cell_emb_style: {self.cell_emb_style}")
+       78  
+       79          self.gene_encoder = GeneEncoder(
+       80              self.vocab_size,
+       81              self.d_model,
+       82              padding_idx=self.pad_token_id,
+       83              use_norm=self.gene_encoder_config["use_norm"],
+       84              gene_encoder_cfg=self.gene_encoder_config,
+       85          )
+       86          self.flag_encoder = nn.Embedding(2, self.d_model)
+       87  
+       88          expression_encoder_config = model_config.expression_encoder
+       89          self.input_emb_style = expression_encoder_config.get(
+       90              "input_emb_style",
+       91              "continuous",
+       92          )
+       93          if self.input_emb_style not in ["category", "continuous"]:
+       94              raise ValueError(
+       95                  f"input_emb_style should be one of category or continuous"
+       96                  f"got {self.input_emb_style}",
+       97              )
+       98          if self.input_emb_style == "continuous":
+       99              self.expression_encoder = ContinuousValueEncoder(
+      100                  d_model=self.d_model,
+      101                  dropout=expression_encoder_config.get("dropout", 0.1),
+      102                  max_value=expression_encoder_config.get("max_value", 512),
+      103                  activation=expression_encoder_config.get("activation", "relu"),
+      104                  use_norm=expression_encoder_config.get("use_norm", False),
+      105              )
+      106          elif self.input_emb_style == "category":
+      107              assert self.n_input_bins > 0
+      108              self.expression_encoder = CategoryValueEncoder(
+      109                  self.n_input_bins,
+      110                  self.d_model,
+      111                  padding_idx=self.pad_value,
+      112                  use_norm=False,
+      113              )
+      114          else:
+      115              raise ValueError(f"Unknown input_emb_style: {self.input_emb_style}")
+      116  
+      117          if self.use_chem_token:
+      118              chem_encoder_config = model_config.chemical_encoder
+      119              self.chem_encoder = ChemEncoder(
+      120                  drug_fps_path=chem_encoder_config.get("drug_fps_path"),
+       ... truncated at 120 lines ...
+
+---------- CHANGED MODULE mosaicfm.model.model (mosaicfm/model/model.py) ----------
+        1  # Copyright (C) Vevo Therapeutics 2024-2025. All rights reserved.
+        2  import logging
+        3  from typing import Mapping, Optional
+        4  
+        5  import torch
+        6  import torch.nn.functional as F
+        7  from composer.models import ComposerModel
+        8  from composer.utils import dist
+        9  from llmfoundry.layers_registry import param_init_fns
+       10  from omegaconf import DictConfig
+       11  from torch import Tensor, nn
+       12  
+       13  from mosaicfm.loss import MaskedMseMetric, MaskedSpearmanMetric, masked_mse_loss
+       14  from mosaicfm.model.blocks import (
+       15      CategoryValueEncoder,
+       16      ChemEncoder,
+       17      ContinuousValueEncoder,
+       18      ExprDecoder,
+       19      GeneEncoder,
+       20      MVCDecoder,
+       21      SCGPTBlock,
+       22      SCGPTEncoder,
+       23      gene_encoder_defaults,
+       24      init_config_defaults,
+       25  )
+       26  
+       27  log = logging.getLogger(__name__)
+       28  
+       29  
+       30  class SCGPTModel(nn.Module):
+       31      def __init__(
+       32          self,
+       33          model_config: DictConfig,
+       34          collator_config: DictConfig,
+       35          device: Optional[str] = None,
+       36      ):
+       37          super().__init__()
+       38          self.model_type = "Transformer"
+       39          self.device = device
+       40          self.vocab_size = model_config.vocab_size
+       41          self.n_layers = model_config.n_layers
+       42          self.n_heads = model_config.n_heads
+       43          self.d_model = model_config.d_model
+       44          self.expansion_ratio = model_config.expansion_ratio
+       45          self.norm_scheme = model_config.get("norm_scheme", "pre")
+       46          self.transformer_activation = model_config.get("transformer_activation", "gelu")
+       47          self.use_chem_token = collator_config.get("use_chem_token", False)
+       48          assert (
+       49              not self.use_chem_token or "chemical_encoder" in model_config
+       50          ), "If use_chem_token is set to True, chemical_encoder submodule needs to be specified!"
+       51          assert (
+       52              "chemical_encoder" not in model_config or self.use_chem_token
+       53          ), "If chemical_encoder submodule is specified, use_chem_token needs to be set to True!"
+       54  
+       55          self.init_device = model_config.get("init_device", "cpu")
+       56          if self.init_device == "mixed":
+       57              if dist.get_local_rank() == 0:
+       58                  self.init_device = "cpu"
+       59              else:
+       60                  self.init_device = "meta"
+       61          self.cell_emb_style = model_config.get("cell_emb_style", "cls")
+       62          self.pad_token_id = collator_config.pad_token_id
+       63          self.pad_value = collator_config.pad_value
+       64          self.n_input_bins = collator_config.num_bins
+       65          self.attn_config = model_config.get("attn_config", None)
+       66          self.norm_config = model_config.get("norm_config", None)
+       67          self.init_config = model_config.get("init_config", None)
+       68          self.gene_encoder_config = model_config.get("gene_encoder", None)
+       69          self.keep_first_n_tokens = collator_config.get("keep_first_n_tokens", 1)
+       70          self.return_gene_embeddings = model_config.get("return_gene_embeddings", False)
+       71  
+       72          if self.init_config is None:
+       73              self.init_config = init_config_defaults
+       74          if self.gene_encoder_config is None:
+       75              self.gene_encoder_config = gene_encoder_defaults
+       76          if self.cell_emb_style not in ["cls", "avg-pool", "w-pool"]:
+       77              raise ValueError(f"Unknown cell_emb_style: {self.cell_emb_style}")
+       78  
+       79          self.gene_encoder = GeneEncoder(
+       80              self.vocab_size,
+       81              self.d_model,
+       82              padding_idx=self.pad_token_id,
+       83              use_norm=self.gene_encoder_config["use_norm"],
+       84              gene_encoder_cfg=self.gene_encoder_config,
+       85          )
+       86          self.flag_encoder = nn.Embedding(2, self.d_model)
+       87  
+       88          expression_encoder_config = model_config.expression_encoder
+       89          self.input_emb_style = expression_encoder_config.get(
+       90              "input_emb_style",
+       91              "continuous",
+       92          )
+       93          if self.input_emb_style not in ["category", "continuous"]:
+       94              raise ValueError(
+       95                  f"input_emb_style should be one of category or continuous"
+       96                  f"got {self.input_emb_style}",
+       97              )
+       98          if self.input_emb_style == "continuous":
+       99              self.expression_encoder = ContinuousValueEncoder(
+      100                  d_model=self.d_model,
+      101                  dropout=expression_encoder_config.get("dropout", 0.1),
+      102                  max_value=expression_encoder_config.get("max_value", 512),
+      103                  activation=expression_encoder_config.get("activation", "relu"),
+      104                  use_norm=expression_encoder_config.get("use_norm", False),
+      105              )
+      106          elif self.input_emb_style == "category":
+      107              assert self.n_input_bins > 0
+      108              self.expression_encoder = CategoryValueEncoder(
+      109                  self.n_input_bins,
+      110                  self.d_model,
+      111                  padding_idx=self.pad_value,
+      112                  use_norm=False,
+      113              )
+      114          else:
+      115              raise ValueError(f"Unknown input_emb_style: {self.input_emb_style}")
+      116  
+      117          if self.use_chem_token:
+      118              chem_encoder_config = model_config.chemical_encoder
+      119              self.chem_encoder = ChemEncoder(
+      120                  drug_fps_path=chem_encoder_config.get("drug_fps_path"),
+       ... truncated at 120 lines ...

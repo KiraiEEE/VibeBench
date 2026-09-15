@@ -1,0 +1,388 @@
+row 103   DessimozLab/FastOMA#89
+============================================================================
+CLASS LevelHOGProcessor in FastOMA/_infer_subhog.py   loc=383 methods=17 wmc=121 lcom=0.0666666666666666
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      307  class LevelHOGProcessor:
+      308      def __init__(self, node_species_tree:TreeNode, subhogs:List[HOG], rhogid:str, conf):
+      309          self.node_species_tree = node_species_tree
+      310          self._frozen_hogs_before = set([])
+      311          self.subhogs = {}
+      312          for hog in subhogs:
+      313              if hog.active:
+      314                  self.subhogs[hog.hogid] = hog
+      315              else:
+      316                  self._frozen_hogs_before.add(hog)
+      317          self.rhogid = rhogid
+      318          self.conf = conf
+      319          self._base_msa_tree_filename = "HOG_"+rhogid+"_"+str(node_species_tree.name)
+      320          self._outname_step = 0
+      321          self._removed_rep = set([])
+      322          self._rep_lookup = self._prepare_lookups()
+      323          self._msa_filter = self._instantiate_msa_filter()
+      324  
+      325      def _instantiate_msa_filter(self):
+      326          if self.conf.msa_filter_method == "col-row-threshold":
+      327              return MSAFilter(self, self.conf)
+      328          elif self.conf.msa_filter_method == "col-elbow-row-threshold":
+      329              return MSAFilterElbow(self, self.conf)
+      330          elif self.conf.msa_filter_method == "trimal":
+      331              return MSAFilterTrimAL(self, self.conf)
+      332          else:
+      333              raise ValueError("Invalid msa_filter_method value")
+      334  
+      335      def get_name_of_output(self, is_msa=False, is_tree=False):
+      336          if (is_msa and self.conf.msa_write) or (is_tree and self.conf.gene_trees_write):
+      337              self._outname_step += 1
+      338              return f"{self._base_msa_tree_filename}_it{self._outname_step}"
+      339          return None
+      340  
+      341      def _prepare_lookups(self):
+      342          lookup = {}
+      343          for hog in self.subhogs.values():
+      344              for rep in hog.get_representatives():
+      345                  if rep.get_id() not in self._removed_rep:
+      346                      lookup[rep.get_id()] = RepLookup(hog, rep)
+      347          return lookup
+      348  
+      349      def find_most_divergent_representatives_from_genetree(self, genetree_subtree:TreeNode):
+      350          """this method returns the N most divergent representatives from a rooted tree. within each cluster
+      351          it selects the one representative sequence that corresponds to the the median distance from the root
+      352          among the sequnces in the cluster.
+      353  
+      354          :param genetree: the rooted tree (with distances) that should be processed
+      355          :return: the N most divergent representatives for that tree. N is taken from self.conf"""
+      356          genetree = copy_tree(genetree_subtree)
+      357  
+      358          # we remove the non-enabled representatives from the tree
+      359          keep = [n for n in genetree.iter_leaves() if self._rep_lookup[n.name].representative.enabled]
+      360          if len(keep) < len(genetree):
+      361              genetree.prune(keep, preserve_branch_length=True)
+      362          if len(genetree) <= self.conf.number_of_samples_per_hog:
+      363              return [Representative(self._rep_lookup[n.name].representative) for n in genetree.iter_leaves()]
+      364  
+      365          # first, annotate the distance from the root
+      366          for n in genetree.traverse():
+      367              n.add_feature('dist_from_root', n.dist + (n.up.dist_from_root if n.up is not None and hasattr(n.up, 'dist_from_root') else 0))
+      368          # now, let's get a list of all the internal nodes ordered with the dist_from_root and find which distance
+      369          # results in number_of_samples_per_hog subtrees that are most divergent
+      370          ordered = sorted([n for n in genetree.traverse() if not n.is_leaf()], key=lambda x: x.dist_from_root)
+      371          idx = min(len(ordered), self.conf.number_of_samples_per_hog) - 1  # in case of multi-fucations, len(ordered) can be shorter than number_of_samples_per_hog
+      372          cutoff = ordered[idx].dist_from_root
+      373          sub_clades = [sub for sub in genetree.iter_leaves(
+      374              is_leaf_fn=lambda n: len(n.children) == 0 or n.dist_from_root >= cutoff
+      375          )]
+      376          # now, let's select for each sub_clade the one leave that is close to the median dist_from_root (no outliers)
+      377          representatives = []
+      378          for sub in sub_clades:
+      379              order_by_dist = sorted((n for n in sub.iter_leaves()), key=lambda n: n.dist_from_root)
+      380              median_elem = order_by_dist[len(order_by_dist)//2]
+      381              new_rep = Representative(self._rep_lookup[median_elem.name].representative,
+      382                                       [self._rep_lookup[z.name].representative for z in order_by_dist])
+      383              representatives.append(new_rep)
+      384          return representatives
+      385  
+      386      def _get_merge_candidates_with_hogids(self, reconciled_genetree:TreeNode):
+      387          for top_speciation_node in reconciled_genetree.iter_leaves(
+      388                  is_leaf_fn=lambda n: len(n.children) == 0 or (hasattr(n, 'evoltype') and n.evoltype == "S")
+      389          ):
+      390              hogids_in_subtree = set([])
+      391              for n in top_speciation_node.iter_leaves():
+      392                  n.add_feature('hogid', self._rep_lookup[n.name].hog.hogid)
+      393                  hogids_in_subtree.add(n.hogid)
+      394              top_speciation_node.add_feature('hogids', hogids_in_subtree)
+      395              yield top_speciation_node
+      396  
+      397      def write_msa_or_tree_if_necessary(self, elem, fn_suffix="", features=[]):
+      398          is_tree = isinstance(elem, TreeNode)
+      399          is_msa = isinstance(elem, MultipleSeqAlignment)
+      400          fn = self.get_name_of_output(is_tree=is_tree, is_msa=is_msa)
+      401          if fn is not None:
+      402              fn = Path(fn + fn_suffix)
+      403              with open(fn, 'wt') as fout:
+      404                  if is_tree:
+      405                      fout.write(elem.write(format=1, features=features, format_root_node=True))
+      406                  elif is_msa:
+      407                      SeqIO.write(elem, fout, format="fasta")
+      408              if is_tree:
+      409                  fn2 = fn.stem + ".tsv"
+      410                  with open(fn2, 'wt') as fout:
+      411                      writer = csv.writer(fout, dialect="excel-tab")
+      412                      writer.writerow(["id", "hogid", "hog_size", "representative_size", "enabled"])
+      413                      for n in elem.iter_leaves():
+      414                          rep_val = self._rep_lookup[n.name]
+      415                          writer.writerow([n.name, rep_val.hog.hogid, len(rep_val.hog.get_members()), len(rep_val.representative.get_subelements()), rep_val.representative.enabled])
+      416                  fn3 = fn.stem + "-rep.tsv.gz"
+      417                  with gzip.open(fn3, 'wt') as fout:
+      418                      writer = csv.writer(fout, dialect="excel-tab")
+      419                      writer.writerow(["id", "representative"])
+      420                      for n in elem.iter_leaves():
+      421                          rep_val = self._rep_lookup[n.name]
+      422                          for member in rep_val.representative.get_subelements():
+      423                              writer.writerow([n.name, member])
+      424  
+      425      def align_subhogs(self):
+      426          sub_msas = [hog.get_msa() for hog in self.subhogs.values() if len(hog.get_msa()) > 0]
+      427          logger.debug(f"Merging {len(sub_msas)} MSAs for rhog: {self.rhogid}, level: {self.node_species_tree.name}")
+      428          if len(sub_msas) == 0:
+      429              logger.info(
+      430                  f"Issue 1455, merged_msa is empty {self.rhogid}, for taxonomic level: {self.node_species_tree.name}")
+      431              raise ValueError("Issue 1455, merged_msa is empty")
+      432          if len(sub_msas) > 1:
+      433              merged_msa = _wrappers.merge_msa(sub_msas)
+      434              self.write_msa_or_tree_if_necessary(merged_msa, fn_suffix=".fa")
+      435  
+      436              if fragment_detection:
+      437                  prot_dubious_msa_list, seq_dubious_msa_list = _utils_frag_SO_detection.find_prot_dubious_msa(
+      438                      merged_msa, self.conf)
+      439                  if len(prot_dubious_msa_list) > 0:
+      440                      logger.info(f"found fragments: {prot_dubious_msa_list} with {seq_dubious_msa_list}")
+      441                      logger.error("Handling of fragments not yet implemented. Ignoring for now")
+      442          else:
+      443              merged_msa = sub_msas[0]   # when only on  child, the rest msa is empty.
+      444          logger.debug(f"All sub-hogs are merged, merged_msa ({len(merged_msa)},{len(merged_msa[0])}) for "
+      445                       f"rhog: {self.rhogid}, taxonomic level: {self.node_species_tree.name}")
+      446          return merged_msa
+      447  
+      448      def filter_msa(self, msa):
+      449          if self._msa_filter is None:
+      450              self._msa_filter = MSAFilter(self, self.conf)
+      451          filtered_msa, removed_ids = self._msa_filter.filter_msa(msa)
+      452          if len(removed_ids) > 0:
+      453              self._remove_representatives(ids=removed_ids)
+      454          return filtered_msa
+      455  
+      456      def _remove_representatives(self, ids):
+      457          self._removed_rep.update(ids)
+      458          hogids_to_remove = []
+      459          for hog_id, hog in self.subhogs.items():
+      460              for rep in hog.get_representatives():
+      461                  if rep.get_id() not in self._removed_rep:
+      462                      break
+      463              else:
+      464                  # going here if not a break -> hog disappeared. remove it from current level and freeze it at level below
+      465                  hogids_to_remove.append(hog_id)
+      466                  hog.active = False
+      467                  self._frozen_hogs_before.add(hog)
+      468          for h in hogids_to_remove:
+      469              self.subhogs.pop(h)
+      470          self._rep_lookup = self._prepare_lookups()
+      471  
+      472  
+      473      def infer_genetree_from_msa(self, msa):
+      474          genetree_nwk = _wrappers.infer_gene_tree(msa)
+      475          try:
+      476              genetree = Tree(genetree_nwk + ";", format=0, quoted_node_names=True)
+      477          except ValueError:
+      478              logger.error(f"cannot load genetree from {genetree_nwk}")
+      479              raise RuntimeError("cannot load genetree from {}".format(genetree_nwk))
+      480          self.write_msa_or_tree_if_necessary(genetree, fn_suffix=".nwk")
+      481          return genetree
+      482  
+      483      def infer_rooted_genetree(self, gene_tree: TreeNode):
+      484          if self.conf.gene_rooting_method == "midpoint":
+      485              r_outgroup = gene_tree.get_midpoint_outgroup()
+      486              gene_tree.set_outgroup(r_outgroup)  # print("Midpoint rooting is done for gene tree.")
+      487  
+      488          elif self.conf.gene_rooting_method == "midpoint-dendropy":
+      489              dt = dendropy.Tree.get_from_string(gene_tree.write(format=1), schema="newick")
+      490              dt.reroot_at_midpoint()
+      491              nw = dt.as_string(schema="newick", suppress_rooting=True)
+      492              gene_tree = Tree(nw, format=1, quoted_node_names=True)
+      493  
+      494          elif self.conf.gene_rooting_method == "Nevers_rooting":
+      495              logger.info("Nevers_rooting started for " + str(gene_tree.write(format=1, format_root_node=True)))
+      496              species = Tree("species_tree.nwk", format=1)
+      497              gene_tree = _utils_subhog.get_score_all_root(gene_tree, species)
+      498              logger.info("Nevers_rooting finished for " + str(gene_tree.write(format=1, format_root_node=True)))
+      499  
+      500          elif self.conf.gene_rooting_method == "mad":
+      501              gene_tree = _wrappers.mad_rooting(gene_tree)  # todo check with qouted gene tree
+      502  
+      503          elif self.conf.gene_rooting_method == "outlier":  # not yet implmented completely, todo need check with new gene tree
+      504              outliers = _utils_subhog.find_outlier_leaves(gene_tree)
+      505              r_outgroup = _utils_subhog.midpoint_rooting_outgroup(gene_tree, leaves_to_exclude=outliers)
+      506              gene_tree.set_outgroup(r_outgroup)
+      507          else:
+      508              logger.warning("rooting method not found !!   * * * * *  *")
+      509              raise ValueError("invalid rooting method: {}".format(self.conf.gene_rooting_method))
+      510          return gene_tree
+      511  
+      512      def infer_reconciliation(self, genetree:TreeNode, sos_threshold=0.0):
+      513          """Annotate each internal node with a 'evoltype' and 'sos' attribute.
+      514  
+      515          The evoltype attribute will be either 'S' or 'D' (speciation or duplication),
+      516          and the 'sos' attribute will contain the fraction of species that overlap among the
+      517          subtrees. The parameter sos_threshold specifies the minimum fraction of species that
+      518          must overlap among the subtrees in order to be considered a duplication.
+      519  
+      520          :param genetree: the rooted tree that should be processed
+      521          :param sos_threshold: the minimum fraction of species that must overlap among the
+      522                                subtrees in order to be considered a duplication.
+      523          """
+      524          logger.info("\n" + genetree.get_ascii(show_internal=True, attributes=['name', 'hogid']))
+      525          cnt_D, cnt_S = 0, 0
+      526          for n in genetree.traverse('postorder'):
+      527              if n.is_leaf():
+      528                  n.add_feature('species', self._rep_lookup[n.name].representative.get_species())
+      529                  n.add_feature('hogid', self._rep_lookup[n.name].hog.hogid)
+      530              else:
+      531                  assert len(n.children) >= 2, f"{n.name} has {len(n.children)} children"
+      532                  specs = tuple(c.species for c in n.children)
+      533                  for c in n.children:
+      534                      c.del_feature('species')  # cleanup to avoid excessive memory
+      535                  sp_inter = set.intersection(*specs)
+      536                  sp_union = set.union(*specs)
+      537                  sos = len(sp_inter) / len(sp_union)
+      538                  n.add_feature('species', sp_union)
+      539                  n.add_feature('sos', sos)
+      540                  n.add_feature('so_tuple', (len(sp_inter), len(sp_union)))
+      541                  n.add_feature('evoltype', 'D' if sos > sos_threshold else 'S')
+      542                  if sos > sos_threshold:
+      543                      cnt_D += 1
+      544                      n.name = f"D{cnt_D}_{len(sp_inter)}_{len(sp_union)}"
+      545                  else:
+      546                      cnt_S += 1
+      547                      n.name = f"S{cnt_S}"
+      548          genetree.del_feature('species')
+      549          self.write_msa_or_tree_if_necessary(genetree, fn_suffix="_rec.nwk", features=['evoltype', 'sos', 'so_tuple', 'hogid'])
+      550  
+      551      def _compute_between_and_within_distances(self, genetree, subtrees_node, partitions):
+      552          mrca = genetree.get_common_ancestor(*subtrees_node)
+      553          id2part = {id_: i for i, p in enumerate(partitions) for id_ in p}
+      554          N = len(partitions)
+      555          dists = collections.defaultdict(list)
+      556          for l1, l2 in itertools.combinations(mrca.iter_leaves(), 2):
+      557              i1 = id2part.get(l1.name, N)
+      558              i2 = id2part.get(l2.name, N)
+      559              dists[(i1, i2)].append(mrca.get_distance(l1, l2))
+      560  
+      561          return dists
+      562  
+      563      def _resolve_conflicts(self, gene_tree: TreeNode, subtrees_node, partitions) -> bool:
+      564          """resolves cases of conflicting subhog splittings where
+      565          the representatives of a subhog are split among different subtrees
+      566          and have been merged even before the previous level.
+      567  
+      568          the method returns a boolean value indicating whether a new reconciliation
+      569          is necessary (e.g. in case the tree has been modified and hence the labeling
+      570          of speciation/duplication might have changed).
+      571          """
+      572          updated_subtree_nodes = []
+      573          for n in subtrees_node:
+      574              # previous rounds of _resolve_conflicts might have left disconnected subtree_nodes
+      575              # so we identify the first node which is either a leaf or a bifurcating node.
+      576              while len(n.children) == 1:
+      577                  n = n.children[0]
+      578              updated_subtree_nodes.append(n)
+      579          subtrees_node = updated_subtree_nodes
+      580          mrca = gene_tree.get_common_ancestor(*subtrees_node)
+      581          min_support = min(n.support for n in subtrees_node)
+      582          min_branch_to_subtree = min(gene_tree.get_distance(mrca, n) for n in subtrees_node)
+      583          partitions = sorted(partitions, key=lambda x: [-sum(len(self._rep_lookup[r].representative.get_subelements()) for r in x), -len(x),])
+      584          if False and (min_support < 0.7 or min_branch_to_subtree < 0.01):
+      585              # we collapse things, i.e. separate nodes in tree based on hogid
+      586              # we mv all leaves from the non-biggest partitions to the mrca of the biggest partion
+      587              if len(partitions[0]) > 1:
+      588                  target_node = gene_tree.get_common_ancestor(partitions[0])
+      589              else:
+      590                  target_node = gene_tree.search_nodes(name=partitions[0][0])[0].up
+      591              for small_partition in partitions[1:]:
+      592                  for name in small_partition:
+      593                      n = gene_tree.search_nodes(name=name)[0]
+      594                      parent = n.up
+      595                      n = n.detach()
+      596                      target_node.add_child(n)
+      597                      if len(parent.children) == 1 and parent.up is None:
+      598                          parent.children[0].delete(prevent_nondicotomic=True, preserve_branch_length=True)
+      599                      elif len(parent.children) == 1:
+      600                          parent.delete(prevent_nondicotomic=True, preserve_branch_length=True)
+      601                      # deactivate representative for next level
+      602                      self._rep_lookup[n.name].representative.enabled = False
+      603              return True
+      604          else:
+      605              # we remove the bogus representatives, but keep the labeling of the
+      606              # speciation/duplication nodes. that way, the two subhogs will not get merged
+      607              # at this level (since they are in different subtrees).
+      608              stats = [{'len': len(p),
+      609                        'rep_size': sum(len(self._rep_lookup[r].representative.get_subelements()) for r in p),
+      610                       } for p in partitions]
+      611              logger.info(f"Resolving conflict for {self._rep_lookup[partitions[0][0]].hog.hogid} by ignoring representatives {partitions[1:]}")
+      612              logger.debug(f"{len(partitions)} partitions: {stats}")
+      613              for small_partition in partitions[1:]:
+      614                  for name in small_partition:
+      615                      n = gene_tree.search_nodes(name=name)[0]
+      616                      n.delete(prevent_nondicotomic=True, preserve_branch_length=True)
+      617              return False
+      618  
+      619      def merge_subhogs(self, reconciled_genetree:TreeNode, msa:MultipleSeqAlignment):
+      620          while True:
+      621              hogids_in_subtrees = collections.defaultdict(list)
+      622              for n in self._get_merge_candidates_with_hogids(reconciled_genetree):
+      623                  for hogid in n.hogids:
+      624                      hogids_in_subtrees[hogid].append(n)
+      625              if any(len(z) > 1 for z in hogids_in_subtrees.values()):
+      626                  logger.info("At least one subhog is split. here is the full labeled genetree:\n"
+      627                              + reconciled_genetree.get_ascii(show_internal=True, attributes=['evoltype', 'sos', 'hogids', 'hogid']))
+      628              else:
+      629                  break
+      630              redo_reconcilation = False
+      631              for hogid, subtrees in hogids_in_subtrees.items():
+      632                  if len(subtrees) > 1:
+      633                      logger.info(f"Representaives of {hogid} are split among {len(subtrees)} candidate subtrees.")
+      634                      split_parts = [list(n.name for n in sub.iter_leaves() if n.hogid == hogid) for sub in subtrees]
+      635                      split_hogs = split_hog(self.subhogs[hogid], self.node_species_tree.name, *split_parts)
+      636                      if split_hogs and len(split_hogs) > 1:
+      637                          # we could split the current hog.
+      638                          self.subhogs.pop(hogid)
+      639                          self.subhogs.update({h.hogid: h for h in split_hogs})
+      640                      else:
+      641                          redo_reconcilation |= self._resolve_conflicts(reconciled_genetree, subtrees, split_parts)
+      642              self._rep_lookup = self._prepare_lookups()
+      643              if redo_reconcilation:
+      644                  if len(reconciled_genetree.children) == 1:
+      645                      reconciled_genetree.children[0].delete(preserve_branch_length=True)
+      646                  self.infer_reconciliation(reconciled_genetree, sos_threshold=self.conf.threshold_dubious_sd)
+      647          new_hogs = []
+      648          processed_nodes = set([])
+      649          for subtrees in hogids_in_subtrees.values():
+      650              for subtree in subtrees:
+      651                  if subtree in processed_nodes:
+      652                      continue
+      653                  processed_nodes.add(subtree)
+      654                  new_repr = self.find_most_divergent_representatives_from_genetree(subtree)
+      655                  hog = HOG([self.subhogs[h] for h in subtree.hogids],
+      656                            self.node_species_tree,
+      657                            rhogid=self.rhogid,
+      658                            msa=msa,
+      659                            representatives=new_repr,
+      660                            conf_infer_subhhogs=self.conf)
+      661                  new_hogs.append(hog)
+      662          return new_hogs
+      663  
+      664      def process(self) -> List[HOG]:
+      665          """Process the given roothog at the given taxonomic level.
+      666  
+      667          This method does all the processessing of the subhogs from the
+      668          previous taxonomic levels. It does
+      669  
+      670          1. Align the subhogs from the previous levels as a new MSA.
+      671          2. Filter the initial MSA (remove gappy columns and rows)
+      672          3. Infer a genetree for the new filtered MSA
+      673          4. Root (mid-point) and reconcile (with species-overlap) the gene tree
+      674          5. Merge the subhogs from the previous levels into new HOGs
+      675          """
+      676          msa = self.align_subhogs()
+      677          filtered_msa = self.filter_msa(msa)
+      678          if len(filtered_msa) == 0:
+      679              return list(self.subhogs.values())
+      680          gene_tree = self.infer_genetree_from_msa(filtered_msa)
+      681          if len(gene_tree) > 1:
+      682              rooted_gene_tree = self.infer_rooted_genetree(gene_tree)
+      683              # TODO: dealing with fragments is not done yet.
+      684              self.infer_reconciliation(rooted_gene_tree, sos_threshold=self.conf.threshold_dubious_sd)
+      685          else:
+      686              rooted_gene_tree = gene_tree
+      687          new_hogs = self.merge_subhogs(rooted_gene_tree, msa=filtered_msa)
+      688          new_hogs.extend(self._frozen_hogs_before)
+      689          return new_hogs

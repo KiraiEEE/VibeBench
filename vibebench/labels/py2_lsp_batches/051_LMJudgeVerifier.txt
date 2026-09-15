@@ -1,0 +1,113 @@
+row 51   allenai/open-instruct#1504
+============================================================================
+OVERRIDE  open_instruct.ground_truth_utils.LMJudgeVerifier.async_call
+BASE      open_instruct.ground_truth_utils.VerifierFunction.async_call
+QUESTION: can an instance of the SUBCLASS be used anywhere the BASE
+          is expected, without breaking the caller?
+
+---------------- BASE CLASS HEADER (open_instruct/ground_truth_utils.py) ----------------
+      109  class VerifierFunction(ABC):
+---------------- BASE METHOD ----------------
+      155      async def async_call(
+      156          self,
+      157          tokenized_prediction: list[int],
+      158          prediction: str,
+      159          label: Any,
+      160          query: str | None = None,
+      161          rollout_state: dict | None = None,
+      162      ) -> VerificationResult:
+      163          """
+      164          Asynchronous version of __call__. By default, it runs the synchronous __call__ in a thread pool.
+      165          Subclasses can override this method for truly asynchronous implementation.
+      166  
+      167          Args:
+      168              tokenized_prediction (List[int]): Tokenized representation (unused by most verifiers).
+      169              prediction (str): The model output.
+      170              label (Any): The ground truth answer or evaluation constraint.
+      171              query (Optional[str]): The original query.
+      172              rollout_state (Optional[dict]): Rollout state dict for env verifiers.
+      173  
+      174          Returns:
+      175              VerificationResult
+      176          """
+      177          # Run the synchronous __call__ in a thread pool to avoid blocking
+      178          loop = asyncio.get_event_loop()
+      179          return await loop.run_in_executor(
+      180              None, lambda: self.__call__(tokenized_prediction, prediction, label, query, rollout_state)
+      181          )
+
+---------------- SUBCLASS HEADER (open_instruct/ground_truth_utils.py) ----------------
+      698  class LMJudgeVerifier(VerifierFunction):
+---------------- OVERRIDE ----------------
+      754      async def async_call(
+      755          self,
+      756          tokenized_prediction: list[int],
+      757          prediction: str,
+      758          label: str,
+      759          query: str,
+      760          rollout_state: dict | None = None,
+      761      ) -> VerificationResult:
+      762          """
+      763          Asynchronous version of __call__ that properly handles the async OpenAI client.
+      764          """
+      765          # client = self._get_client()
+      766          final_answer = extract_final_answer(prediction)
+      767          prompt = self.prompt_template.format(input=query, output=final_answer, label=label)
+      768  
+      769          max_retries = 3  # for rate limits
+      770          retry_delay = 1.0
+      771  
+      772          for attempt in range(max_retries):
+      773              # judges the quality of a response
+      774              try:
+      775                  messages = build_messages(prompt)
+      776  
+      777                  # Check if the request would exceed context window
+      778                  if not context_window_checker.check_context_window_limit(
+      779                      messages=messages,
+      780                      max_completion_tokens=self.verifier_config.llm_judge_max_tokens,
+      781                      model_name=self.verifier_config.llm_judge_model,
+      782                      max_context_length=self.verifier_config.llm_judge_max_context_length,  # Adjust based on your model
+      783                      safety_margin=150,
+      784                  ):
+      785                      # Try to truncate messages to fit
+      786                      messages = context_window_checker.truncate_messages_to_fit_context(
+      787                          messages=messages,
+      788                          max_completion_tokens=self.verifier_config.llm_judge_max_tokens,
+      789                          model_name=self.verifier_config.llm_judge_model,
+      790                          max_context_length=self.verifier_config.llm_judge_max_context_length,
+      791                          safety_margin=200,
+      792                      )
+      793  
+      794                      # Check again after truncation
+      795                      if not context_window_checker.check_context_window_limit(
+      796                          messages=messages,
+      797                          max_completion_tokens=self.verifier_config.llm_judge_max_tokens,
+      798                          model_name=self.verifier_config.llm_judge_model,
+      799                          max_context_length=self.verifier_config.llm_judge_max_context_length,
+      800                          safety_margin=150,
+      801                      ):
+      802                          logger.error("Cannot fit request within context window even after truncation.")
+      803                          return VerificationResult(score=0.0, cost=0.0, reasoning="Error: Context window exceeded")
+      804                  # end of Faeze's context window check
+      805                  response = await acompletion(
+      806                      model=self.verifier_config.llm_judge_model,
+      807                      messages=messages,
+      808                      temperature=self.verifier_config.llm_judge_temperature,
+      809                      max_completion_tokens=self.verifier_config.llm_judge_max_tokens,
+      810                      seed=self.verifier_config.seed,
+      811                      timeout=self.verifier_config.llm_judge_timeout,
+      812                  )
+      813                  reasoning, score = self.parse_completion(response)
+      814                  cost = self.get_cost(response, self.verifier_config.llm_judge_model)
+      815                  # normalize score to be between 0 and 1
+      816                  return VerificationResult(score=score, cost=cost, reasoning=reasoning)
+      817  
+      818              except Exception as e:
+      819                  logger.warning(f"LLM judge attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+      820                  if attempt == max_retries - 1:
+      821                      logger.error(f"LLM judge failed after {max_retries} attempts. Returning default score of 0.0")
+      822                      return VerificationResult(score=0.0, cost=0.0, reasoning=f"Error: {str(e)}")
+      823                  else:
+      824                      await asyncio.sleep(retry_delay * (2**attempt))  # Exponential backoff
+      825          return VerificationResult(score=0.0, cost=0.0, reasoning="Unknown error after all retries.")

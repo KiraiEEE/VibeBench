@@ -1,0 +1,140 @@
+row 45   letta-ai/letta#3183
+============================================================================
+OVERRIDE  letta.agents.voice_agent.VoiceAgent._rebuild_memory_async
+BASE      letta.agents.base_agent.BaseAgent._rebuild_memory_async
+QUESTION: can an instance of the SUBCLASS be used anywhere the BASE
+          is expected, without breaking the caller?
+
+---------------- BASE CLASS HEADER (letta/agents/base_agent.py) ----------------
+       28  class BaseAgent(ABC):
+---------------- BASE METHOD ----------------
+       86      async def _rebuild_memory_async(
+       87          self,
+       88          in_context_messages: List[Message],
+       89          agent_state: AgentState,
+       90          tool_rules_solver: Optional[ToolRulesSolver] = None,
+       91          num_messages: Optional[int] = None,  # storing these calculations is specific to the voice agent
+       92          num_archival_memories: Optional[int] = None,
+       93      ) -> List[Message]:
+       94          """
+       95          Async version of function above. For now before breaking up components, changes should be made in both places.
+       96          """
+       97          try:
+       98              # [DB Call] loading blocks (modifies: agent_state.memory.blocks)
+       99              agent_state = await self.agent_manager.refresh_memory_async(agent_state=agent_state, actor=self.actor)
+      100  
+      101              tool_constraint_block = None
+      102              if tool_rules_solver is not None:
+      103                  tool_constraint_block = tool_rules_solver.compile_tool_rule_prompts()
+      104  
+      105              # compile archive tags if there's an attached archive
+      106              from letta.services.archive_manager import ArchiveManager
+      107  
+      108              archive_manager = ArchiveManager()
+      109              archive = await archive_manager.get_default_archive_for_agent_async(
+      110                  agent_id=agent_state.id,
+      111                  actor=self.actor,
+      112              )
+      113  
+      114              if archive:
+      115                  archive_tags = await self.passage_manager.get_unique_tags_for_archive_async(
+      116                      archive_id=archive.id,
+      117                      actor=self.actor,
+      118                  )
+      119              else:
+      120                  archive_tags = None
+      121  
+      122              # TODO: This is a pretty brittle pattern established all over our code, need to get rid of this
+      123              curr_system_message = in_context_messages[0]
+      124              curr_system_message_text = curr_system_message.content[0].text
+      125  
+      126              # extract the dynamic section that includes memory blocks, tool rules, and directories
+      127              # this avoids timestamp comparison issues
+      128              def extract_dynamic_section(text):
+      129                  start_marker = "</base_instructions>"
+      130                  end_marker = "<memory_metadata>"
+      131  
+      132                  start_idx = text.find(start_marker)
+      133                  end_idx = text.find(end_marker)
+      134  
+      135                  if start_idx != -1 and end_idx != -1:
+      136                      return text[start_idx:end_idx]
+      137                  return text  # fallback to full text if markers not found
+      138  
+      139              curr_dynamic_section = extract_dynamic_section(curr_system_message_text)
+      140  
+      141              # generate just the memory string with current state for comparison
+      142              curr_memory_str = agent_state.memory.compile(
+      143                  tool_usage_rules=tool_constraint_block,
+      144                  sources=agent_state.sources,
+      145                  max_files_open=agent_state.max_files_open,
+      146                  llm_config=agent_state.llm_config,
+      147              )
+      148              new_dynamic_section = extract_dynamic_section(curr_memory_str)
+      149  
+      150              # compare just the dynamic sections (memory blocks, tool rules, directories)
+      151              if curr_dynamic_section == new_dynamic_section:
+      152                  logger.debug(
+      153                      f"Memory and sources haven't changed for agent id={agent_state.id} and actor=({self.actor.id}, {self.actor.name}), skipping system prompt rebuild"
+      154                  )
+      155                  return in_context_messages
+      156  
+      157              memory_edit_timestamp = get_utc_time()
+      158  
+      159              # size of messages and archival memories
+      160              if num_messages is None:
+      161                  num_messages = await self.message_manager.size_async(actor=self.actor, agent_id=agent_state.id)
+      162              if num_archival_memories is None:
+      163                  num_archival_memories = await self.passage_manager.agent_passage_size_async(actor=self.actor, agent_id=agent_state.id)
+      164  
+      165              new_system_message_str = PromptGenerator.get_system_message_from_compiled_memory(
+      166                  system_prompt=agent_state.system,
+      167                  memory_with_sources=curr_memory_str,
+      168                  in_context_memory_last_edit=memory_edit_timestamp,
+      169                  timezone=agent_state.timezone,
+      170                  previous_message_count=num_messages - len(in_context_messages),
+      171                  archival_memory_size=num_archival_memories,
+      172                  archive_tags=archive_tags,
+      173              )
+      174  
+      175              diff = united_diff(curr_system_message_text, new_system_message_str)
+      176              if len(diff) > 0:
+      177                  logger.debug(f"Rebuilding system with new memory...\nDiff:\n{diff}")
+      178  
+      179                  # [DB Call] Update Messages
+      180                  new_system_message = await self.message_manager.update_message_by_id_async(
+      181                      curr_system_message.id,
+      182                      message_update=MessageUpdate(content=new_system_message_str),
+      183                      actor=self.actor,
+      184                      project_id=agent_state.project_id,
+      185                  )
+      186                  return [new_system_message] + in_context_messages[1:]
+      187  
+      188              else:
+      189                  return in_context_messages
+      190          except:
+      191              logger.exception(f"Failed to rebuild memory for agent id={agent_state.id} and actor=({self.actor.id}, {self.actor.name})")
+      192              raise
+
+---------------- SUBCLASS HEADER (letta/agents/voice_agent.py) ----------------
+       50  class VoiceAgent(BaseAgent):
+---------------- OVERRIDE ----------------
+      303      async def _rebuild_memory_async(
+      304          self,
+      305          in_context_messages: List[Message],
+      306          agent_state: AgentState,
+      307      ) -> List[Message]:
+      308          if not self.num_messages:
+      309              self.num_messages = await self.message_manager.size_async(
+      310                  agent_id=agent_state.id,
+      311                  actor=self.actor,
+      312              )
+      313          if not self.num_archival_memories:
+      314              self.num_archival_memories = await self.passage_manager.agent_passage_size_async(
+      315                  agent_id=agent_state.id,
+      316                  actor=self.actor,
+      317              )
+      318  
+      319          return await super()._rebuild_memory_async(
+      320              in_context_messages, agent_state, num_messages=self.num_messages, num_archival_memories=self.num_archival_memories
+      321          )

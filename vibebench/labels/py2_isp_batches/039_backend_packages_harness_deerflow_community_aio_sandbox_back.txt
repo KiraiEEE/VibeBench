@@ -1,0 +1,227 @@
+row 39   bytedance/deer-flow#1611
+============================================================================
+CONTRACT backend.packages.harness.deerflow.community.aio_sandbox.backend:SandboxBackend   kind=abc abstract_methods=4.0 implementers=2.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file backend/packages/harness/deerflow/community/aio_sandbox/backend.py
+       38  class SandboxBackend(ABC):
+       39      """Abstract base for sandbox provisioning backends.
+       40  
+       41      Two implementations:
+       42      - LocalContainerBackend: starts Docker/Apple Container locally, manages ports
+       43      - RemoteSandboxBackend: connects to a pre-existing URL (K8s service, external)
+       44      """
+       45  
+       46      @abstractmethod
+       47      def create(self, thread_id: str, sandbox_id: str, extra_mounts: list[tuple[str, str, bool]] | None = None) -> SandboxInfo:
+       48          """Create/provision a new sandbox.
+       49  
+       50          Args:
+       51              thread_id: Thread ID for which the sandbox is being created. Useful for backends that want to organize sandboxes by thread.
+       52              sandbox_id: Deterministic sandbox identifier.
+       53              extra_mounts: Additional volume mounts as (host_path, container_path, read_only) tuples.
+       54                  Ignored by backends that don't manage containers (e.g., remote).
+       55  
+       56          Returns:
+       57              SandboxInfo with connection details.
+       58          """
+       59          ...
+       60  
+       61      @abstractmethod
+       62      def destroy(self, info: SandboxInfo) -> None:
+       63          """Destroy/cleanup a sandbox and release its resources.
+       64  
+       65          Args:
+       66              info: The sandbox metadata to destroy.
+       67          """
+       68          ...
+       69  
+       70      @abstractmethod
+       71      def is_alive(self, info: SandboxInfo) -> bool:
+       72          """Quick check whether a sandbox is still alive.
+       73  
+       74          This should be a lightweight check (e.g., container inspect)
+       75          rather than a full health check.
+       76  
+       77          Args:
+       78              info: The sandbox metadata to check.
+       79  
+       80          Returns:
+       81              True if the sandbox appears to be alive.
+       82          """
+       83          ...
+       84  
+       85      @abstractmethod
+       86      def discover(self, sandbox_id: str) -> SandboxInfo | None:
+       87          """Try to discover an existing sandbox by its deterministic ID.
+       88  
+       89          Used for cross-process recovery: when another process started a sandbox,
+       90          this process can discover it by the deterministic container name or URL.
+       91  
+       92          Args:
+       93              sandbox_id: The deterministic sandbox ID to look for.
+       94  
+       95          Returns:
+       96              SandboxInfo if found and healthy, None otherwise.
+       97          """
+       98          ...
+       99  
+      100      def list_running(self) -> list[SandboxInfo]:
+      101          """Enumerate all running sandboxes managed by this backend.
+      102  
+      103          Used for startup reconciliation: when the process restarts, it needs
+      104          to discover containers started by previous processes so they can be
+      105          adopted into the warm pool or destroyed if idle too long.
+      106  
+      107          The default implementation returns an empty list, which is correct
+      108          for backends that don't manage local containers (e.g., RemoteSandboxBackend
+      109          delegates lifecycle to the provisioner which handles its own cleanup).
+      110  
+      111          Returns:
+      112              A list of SandboxInfo for all currently running sandboxes.
+      113          """
+      114          return []
+
+---------- IMPLEMENTER backend.packages.harness.deerflow.community.aio_sandbox.local_backend:LocalContainerBackend  stubs=0/4 ----------
+       89  class LocalContainerBackend(SandboxBackend):
+      161      def create(self, thread_id: str, sandbox_id: str, extra_mounts: list[tuple[str, str, bool]] | None = None) -> SandboxInfo:
+      162          """Start a new container and return its connection info.
+      163  
+      164          Args:
+      165              thread_id: Thread ID for which the sandbox is being created. Useful for backends that want to organize sandboxes by thread.
+      166              sandbox_id: Deterministic sandbox identifier (used in container name).
+      167              extra_mounts: Additional volume mounts as (host_path, container_path, read_only) tuples.
+      168  
+      169          Returns:
+      170              SandboxInfo with container details.
+      171  
+      172          Raises:
+      173              RuntimeError: If the container fails to start.
+      174          """
+      175          container_name = f"{self._container_prefix}-{sandbox_id}"
+      176  
+      177          # Retry loop: if Docker rejects the port (e.g. a stale container still
+      178          # holds the binding after a process restart), skip that port and try the
+      179          # next one.  The socket-bind check in get_free_port mirrors Docker's
+      180          # 0.0.0.0 bind, but Docker's port-release can be slightly asynchronous,
+      181          # so a reactive fallback here ensures we always make progress.
+      182          _next_start = self._base_port
+      183          container_id: str | None = None
+      184          port: int = 0
+      185          for _attempt in range(10):
+      186              port = get_free_port(start_port=_next_start)
+      187              try:
+      188                  container_id = self._start_container(container_name, port, extra_mounts)
+      189                  break
+      190              except RuntimeError as exc:
+      191                  release_port(port)
+      192                  err = str(exc)
+      193                  err_lower = err.lower()
+      194                  # Port already bound: skip this port and retry with the next one.
+      195                  if "port is already allocated" in err or "address already in use" in err_lower:
+      196                      logger.warning(f"Port {port} rejected by Docker (already allocated), retrying with next port")
+      197                      _next_start = port + 1
+      198                      continue
+      199                  # Container-name conflict: another process may have already started
+      200                  # the deterministic sandbox container for this sandbox_id. Try to
+      201                  # discover and adopt the existing container instead of failing.
+      202                  if "is already in use by container" in err_lower or "conflict. the container name" in err_lower:
+      203                      logger.warning(f"Container name {container_name} already in use, attempting to discover existing sandbox instance")
+      204                      existing = self.discover(sandbox_id)
+      205                      if existing is not None:
+      206                          return existing
+      207                  raise
+      208          else:
+      209              raise RuntimeError("Could not start sandbox container: all candidate ports are already allocated by Docker")
+      210  
+      211          # When running inside Docker (DooD), sandbox containers are reachable via
+      212          # host.docker.internal rather than localhost (they run on the host daemon).
+      213          sandbox_host = os.environ.get("DEER_FLOW_SANDBOX_HOST", "localhost")
+      214          return SandboxInfo(
+      215              sandbox_id=sandbox_id,
+      216              sandbox_url=f"http://{sandbox_host}:{port}",
+      217              container_name=container_name,
+      218              container_id=container_id,
+      219          )
+      221      def destroy(self, info: SandboxInfo) -> None:
+      222          """Stop the container and release its port."""
+      223          # Prefer container_id, fall back to container_name (both accepted by docker stop).
+      224          # This ensures containers discovered via list_running() (which only has the name)
+      225          # can also be stopped.
+      226          stop_target = info.container_id or info.container_name
+      227          if stop_target:
+      228              self._stop_container(stop_target)
+      229          # Extract port from sandbox_url for release
+      230          try:
+      231              from urllib.parse import urlparse
+      232  
+      233              port = urlparse(info.sandbox_url).port
+      234              if port:
+      235                  release_port(port)
+      236          except Exception:
+      237              pass
+      239      def is_alive(self, info: SandboxInfo) -> bool:
+      240          """Check if the container is still running (lightweight, no HTTP)."""
+      241          if info.container_name:
+      242              return self._is_container_running(info.container_name)
+      243          return False
+      245      def discover(self, sandbox_id: str) -> SandboxInfo | None:
+      246          """Discover an existing container by its deterministic name.
+      247  
+      248          Checks if a container with the expected name is running, retrieves its
+      249          port, and verifies it responds to health checks.
+      250  
+      251          Args:
+      252              sandbox_id: The deterministic sandbox ID (determines container name).
+      253  
+      254          Returns:
+      255              SandboxInfo if container found and healthy, None otherwise.
+      256          """
+      257          container_name = f"{self._container_prefix}-{sandbox_id}"
+      258  
+      259          if not self._is_container_running(container_name):
+      260              return None
+      261  
+      262          port = self._get_container_port(container_name)
+      263          if port is None:
+      264              return None
+      265  
+      266          sandbox_host = os.environ.get("DEER_FLOW_SANDBOX_HOST", "localhost")
+      267          sandbox_url = f"http://{sandbox_host}:{port}"
+      268          if not wait_for_sandbox_ready(sandbox_url, timeout=5):
+      269              return None
+      270  
+      271          return SandboxInfo(
+      272              sandbox_id=sandbox_id,
+      273              sandbox_url=sandbox_url,
+      274              container_name=container_name,
+      275          )
+
+---------- IMPLEMENTER backend.packages.harness.deerflow.community.aio_sandbox.remote_backend:RemoteSandboxBackend  stubs=0/4 ----------
+       30  class RemoteSandboxBackend(SandboxBackend):
+       58      def create(
+       59          self,
+       60          thread_id: str,
+       61          sandbox_id: str,
+       62          extra_mounts: list[tuple[str, str, bool]] | None = None,
+       63      ) -> SandboxInfo:
+       64          """Create a sandbox Pod + Service via the provisioner.
+       65  
+       66          Calls ``POST /api/sandboxes`` which creates a dedicated Pod +
+       67          NodePort Service in k3s.
+       68          """
+       69          return self._provisioner_create(thread_id, sandbox_id, extra_mounts)
+       71      def destroy(self, info: SandboxInfo) -> None:
+       72          """Destroy a sandbox Pod + Service via the provisioner."""
+       73          self._provisioner_destroy(info.sandbox_id)
+       75      def is_alive(self, info: SandboxInfo) -> bool:
+       76          """Check whether the sandbox Pod is running."""
+       77          return self._provisioner_is_alive(info.sandbox_id)
+       79      def discover(self, sandbox_id: str) -> SandboxInfo | None:
+       80          """Discover an existing sandbox via the provisioner.
+       81  
+       82          Calls ``GET /api/sandboxes/{sandbox_id}`` and returns info if
+       83          the Pod exists.
+       84          """
+       85          return self._provisioner_discover(sandbox_id)

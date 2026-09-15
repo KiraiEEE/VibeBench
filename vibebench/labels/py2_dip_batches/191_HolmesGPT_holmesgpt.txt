@@ -1,0 +1,283 @@
+row 191   HolmesGPT/holmesgpt#1294
+============================================================================
+PR HolmesGPT/holmesgpt#1294   cycles touched before=1.0 after=1.0
+QUESTION: does this PR make a module depend on a CONCRETE module in a
+          way that closes an import cycle, or otherwise invert the
+          dependency direction?
+
+NEWLY CYCLIC PAIRS involving a module this PR changed (75):
+    holmes.config  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.core.llm  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.core.models  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.core.safeguards  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.core.tool_calling_llm  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.core.tools  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.core.tools_utils.token_counting  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.core.tools_utils.tool_context_window_limiter  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.core.tools_utils.tool_executor  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.core.tools_utils.toolset_utils  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.core.toolset_manager  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.core.transformers  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.core.transformers.llm_summarize  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.core.truncation.compaction  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.core.truncation.input_context_window_limiter  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.plugins.destinations.slack  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.plugins.destinations.slack.plugin  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.plugins.interfaces  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.plugins.sources.github  <->  holmes.plugins.toolsets.kubernetes_get
+    holmes.plugins.sources.jira  <->  holmes.plugins.toolsets.kubernetes_get
+    ... and 55 more
+pre-existing cyclic pairs (NOT this PR): 2779
+
+NEW IMPORT EDGES (absent from the before tree; target marked abstract or CONCRETE):
+  holmes.plugins.toolsets -> holmes.plugins.toolsets.kubernetes_get   [CONCRETE]
+  holmes.plugins.toolsets.kubernetes_get -> holmes.core.tools   [abstract]
+  holmes.plugins.toolsets.kubernetes_get -> holmes.plugins.toolsets.utils   [CONCRETE]
+  tests.plugins.toolsets.kubernetes.test_kubernetes_get -> holmes.core.tools   [abstract]
+  tests.plugins.toolsets.kubernetes.test_kubernetes_get -> holmes.plugins.toolsets.kubernetes_get   [CONCRETE]
+
+---------- CHANGED MODULE holmes.plugins.toolsets.kubernetes_get (holmes/plugins/toolsets/kubernetes_get.py) ----------
+        1  import json
+        2  import logging
+        3  import os
+        4  import re
+        5  from typing import Any, Dict, Iterable, List, Optional, Sequence
+        6  
+        7  from kubernetes import config
+        8  from kubernetes.client import ApiClient  # type: ignore
+        9  from kubernetes.dynamic import DynamicClient  # type: ignore
+       10  from kubernetes.dynamic.exceptions import (  # type: ignore
+       11      ResourceNotFoundError,
+       12      ResourceNotUniqueError,
+       13  )
+       14  
+       15  from holmes.core.tools import (
+       16      CallablePrerequisite,
+       17      StructuredToolResult,
+       18      StructuredToolResultStatus,
+       19      Tool,
+       20      ToolInvokeContext,
+       21      ToolParameter,
+       22      Toolset,
+       23      ToolsetTag,
+       24  )
+       25  from holmes.plugins.toolsets.utils import toolset_name_for_one_liner
+       26  
+       27  _cached_dynamic_client: Optional[DynamicClient] = None
+       28  
+       29  
+       30  def _get_dynamic_client() -> DynamicClient:
+       31      global _cached_dynamic_client
+       32      if _cached_dynamic_client:
+       33          return _cached_dynamic_client
+       34  
+       35      try:
+       36          if os.getenv("KUBERNETES_SERVICE_HOST"):
+       37              config.load_incluster_config()
+       38          else:
+       39              config.load_kube_config()
+       40          _cached_dynamic_client = DynamicClient(ApiClient())
+       41          return _cached_dynamic_client
+       42      except config.config_exception.ConfigException as exc:  # type: ignore[attr-defined]
+       43          raise RuntimeError(f"Kubernetes configuration not found: {exc}") from exc
+       44      except Exception as exc:  # pragma: no cover - defensive catch
+       45          raise RuntimeError(f"Failed to initialize Kubernetes client: {exc}") from exc
+       46  
+       47  
+       48  def _normalize_kind(kind: str) -> str:
+       49      cleaned = kind.strip()
+       50      if "/" in cleaned:
+       51          cleaned = cleaned.split("/")[-1]
+       52      if "." in cleaned:
+       53          cleaned = cleaned.split(".")[0]
+       54  
+       55      if cleaned.endswith("ses"):
+       56          cleaned = cleaned[:-2]
+       57      elif cleaned.endswith("ies"):
+       58          cleaned = cleaned[:-3] + "y"
+       59      elif cleaned.endswith("s") and len(cleaned) > 1:
+       60          cleaned = cleaned[:-1]
+       61  
+       62      return cleaned[:1].upper() + cleaned[1:]
+       63  
+       64  
+       65  def _extract_continue(metadata: Dict[str, Any]) -> Optional[str]:
+       66      return metadata.get("_continue") or metadata.get("continue")
+       67  
+       68  
+       69  def _extract_field(item: Dict[str, Any], path: str) -> Optional[Any]:
+       70      parts = [part for part in path.split(".") if part]
+       71      value: Any = item
+       72      for part in parts:
+       73          if isinstance(value, dict):
+       74              value = value.get(part)
+       75          elif isinstance(value, list):
+       76              try:
+       77                  index = int(part)
+       78              except ValueError:
+       79                  return None
+       80              if index < 0 or index >= len(value):
+       81                  return None
+       82              value = value[index]
+       83          else:
+       84              return None
+       85      return value
+       86  
+       87  
+       88  def _candidate_strings(item_dict: Dict[str, Any], filter_paths: Sequence[str]) -> List[str]:
+       89      candidates: List[str] = []
+       90      for path in filter_paths:
+       91          value = _extract_field(item_dict, path)
+       92          if value is None:
+       93              continue
+       94          if isinstance(value, (dict, list)):
+       95              candidates.append(
+       96                  json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+       97              )
+       98          else:
+       99              candidates.append(str(value))
+      100  
+      101      if candidates:
+      102          return candidates
+      103  
+      104      return [json.dumps(item_dict, ensure_ascii=False, separators=(",", ":"))]
+      105  
+      106  
+      107  def _item_matches_filter(
+      108      item_dict: Dict[str, Any],
+      109      filter_value: Optional[str],
+      110      filter_paths: Sequence[str],
+      111      use_regex: bool,
+      112  ) -> bool:
+      113      if not filter_value:
+      114          return True
+      115  
+      116      candidates = _candidate_strings(item_dict, filter_paths)
+      117      if not candidates:
+      118          return False
+      119  
+      120      if use_regex:
+       ... truncated at 120 lines ...
+
+---------- CHANGED MODULE holmes.plugins.toolsets.kubernetes_get (holmes/plugins/toolsets/kubernetes_get.py) ----------
+        1  import json
+        2  import logging
+        3  import os
+        4  import re
+        5  from typing import Any, Dict, Iterable, List, Optional, Sequence
+        6  
+        7  from kubernetes import config
+        8  from kubernetes.client import ApiClient  # type: ignore
+        9  from kubernetes.dynamic import DynamicClient  # type: ignore
+       10  from kubernetes.dynamic.exceptions import (  # type: ignore
+       11      ResourceNotFoundError,
+       12      ResourceNotUniqueError,
+       13  )
+       14  
+       15  from holmes.core.tools import (
+       16      CallablePrerequisite,
+       17      StructuredToolResult,
+       18      StructuredToolResultStatus,
+       19      Tool,
+       20      ToolInvokeContext,
+       21      ToolParameter,
+       22      Toolset,
+       23      ToolsetTag,
+       24  )
+       25  from holmes.plugins.toolsets.utils import toolset_name_for_one_liner
+       26  
+       27  _cached_dynamic_client: Optional[DynamicClient] = None
+       28  
+       29  
+       30  def _get_dynamic_client() -> DynamicClient:
+       31      global _cached_dynamic_client
+       32      if _cached_dynamic_client:
+       33          return _cached_dynamic_client
+       34  
+       35      try:
+       36          if os.getenv("KUBERNETES_SERVICE_HOST"):
+       37              config.load_incluster_config()
+       38          else:
+       39              config.load_kube_config()
+       40          _cached_dynamic_client = DynamicClient(ApiClient())
+       41          return _cached_dynamic_client
+       42      except config.config_exception.ConfigException as exc:  # type: ignore[attr-defined]
+       43          raise RuntimeError(f"Kubernetes configuration not found: {exc}") from exc
+       44      except Exception as exc:  # pragma: no cover - defensive catch
+       45          raise RuntimeError(f"Failed to initialize Kubernetes client: {exc}") from exc
+       46  
+       47  
+       48  def _normalize_kind(kind: str) -> str:
+       49      cleaned = kind.strip()
+       50      if "/" in cleaned:
+       51          cleaned = cleaned.split("/")[-1]
+       52      if "." in cleaned:
+       53          cleaned = cleaned.split(".")[0]
+       54  
+       55      if cleaned.endswith("ses"):
+       56          cleaned = cleaned[:-2]
+       57      elif cleaned.endswith("ies"):
+       58          cleaned = cleaned[:-3] + "y"
+       59      elif cleaned.endswith("s") and len(cleaned) > 1:
+       60          cleaned = cleaned[:-1]
+       61  
+       62      return cleaned[:1].upper() + cleaned[1:]
+       63  
+       64  
+       65  def _extract_continue(metadata: Dict[str, Any]) -> Optional[str]:
+       66      return metadata.get("_continue") or metadata.get("continue")
+       67  
+       68  
+       69  def _extract_field(item: Dict[str, Any], path: str) -> Optional[Any]:
+       70      parts = [part for part in path.split(".") if part]
+       71      value: Any = item
+       72      for part in parts:
+       73          if isinstance(value, dict):
+       74              value = value.get(part)
+       75          elif isinstance(value, list):
+       76              try:
+       77                  index = int(part)
+       78              except ValueError:
+       79                  return None
+       80              if index < 0 or index >= len(value):
+       81                  return None
+       82              value = value[index]
+       83          else:
+       84              return None
+       85      return value
+       86  
+       87  
+       88  def _candidate_strings(item_dict: Dict[str, Any], filter_paths: Sequence[str]) -> List[str]:
+       89      candidates: List[str] = []
+       90      for path in filter_paths:
+       91          value = _extract_field(item_dict, path)
+       92          if value is None:
+       93              continue
+       94          if isinstance(value, (dict, list)):
+       95              candidates.append(
+       96                  json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+       97              )
+       98          else:
+       99              candidates.append(str(value))
+      100  
+      101      if candidates:
+      102          return candidates
+      103  
+      104      return [json.dumps(item_dict, ensure_ascii=False, separators=(",", ":"))]
+      105  
+      106  
+      107  def _item_matches_filter(
+      108      item_dict: Dict[str, Any],
+      109      filter_value: Optional[str],
+      110      filter_paths: Sequence[str],
+      111      use_regex: bool,
+      112  ) -> bool:
+      113      if not filter_value:
+      114          return True
+      115  
+      116      candidates = _candidate_strings(item_dict, filter_paths)
+      117      if not candidates:
+      118          return False
+      119  
+      120      if use_regex:
+       ... truncated at 120 lines ...

@@ -1,0 +1,504 @@
+row 30   3ll3d00d/ezbeq#88
+============================================================================
+CONTRACT ezbeq.device:PersistentDevice   kind=abc abstract_methods=13.0 implementers=5.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file ezbeq/device.py
+      205  class PersistentDevice(Device, ABC, Generic[T]):
+      206  
+      207      def __init__(self, cache_path: str, name: str, ws_server: WsServer):
+      208          self.__name = name
+      209          self.__file_name = os.path.join(cache_path, f'{name}.json')
+      210          self.__hydrated = False
+      211          self._current_state: Optional[T] = None
+      212          self.__ws_server = ws_server
+      213  
+      214      @property
+      215      def name(self) -> str:
+      216          return self.__name
+      217  
+      218      def state(self, refresh: bool = False) -> T:
+      219          self._hydrate(refresh=refresh)
+      220          return self._current_state
+      221  
+      222      def _hydrate(self, refresh: bool = False) -> bool:
+      223          if not self.__hydrated or refresh is True:
+      224              self._current_state = self._load_initial_state()
+      225              if os.path.exists(self.__file_name):
+      226                  try:
+      227                      with open(self.__file_name, 'r') as f:
+      228                          cached_state = json.load(f)
+      229                      logger.info(f"Loaded {cached_state} from {self.__file_name}")
+      230                      self._current_state = self._merge_state(self._current_state, cached_state)
+      231                  except Exception:
+      232                      logger.exception(f'Failed to load content from {self.__file_name}')
+      233              else:
+      234                  logger.info(f"No cached state found at {self.__file_name}")
+      235              if refresh is False:
+      236                  self.__ws_server.factory.init_state_provider(self.__get_state_msg)
+      237                  self.__hydrated = True
+      238              return True
+      239          return False
+      240  
+      241      @abstractmethod
+      242      def _load_initial_state(self) -> T:
+      243          pass
+      244  
+      245      @abstractmethod
+      246      def _merge_state(self, loaded: T, cached: dict) -> T:
+      247          return loaded
+      248  
+      249      def _persist(self):
+      250          assert self._current_state, 'hydrate cannot return None'
+      251          tmp = self.__file_name + '.tmp'
+      252          with open(tmp, 'w') as f:
+      253              json.dump(self._current_state.serialise(), f, sort_keys=True)
+      254          os.replace(tmp, self.__file_name)
+      255  
+      256      def _broadcast(self):
+      257          if self.ws_server:
+      258              self.ws_server.broadcast(self.__get_state_msg())
+      259  
+      260      def __get_state_msg(self):
+      261          assert self._current_state, 'hydrate cannot return None'
+      262          return json.dumps({'message': 'DeviceState', 'data': self._current_state.serialise()}, ensure_ascii=False)
+      263  
+      264      def _hydrate_cache_broadcast(self, func: callable):
+      265          self._hydrate()
+      266          try:
+      267              return func()
+      268          finally:
+      269              self._persist()
+      270              self._broadcast()
+      271  
+      272      @property
+      273      def ws_server(self) -> WsServer:
+      274          return self.__ws_server
+
+---------- IMPLEMENTER ezbeq.camilladsp:CamillaDsp  stubs=2/13 ----------
+       69  class CamillaDsp(PersistentDevice[CamillaDspState]):
+      137      def _load_initial_state(self) -> CamillaDspState:
+      138          return CamillaDspState(self.name)
+      140      def _merge_state(self, loaded: CamillaDspState, cached: dict) -> CamillaDspState:
+      141          if 'has_volume' in cached:
+      142              loaded.has_volume = cached['has_volume']
+      143          if 'masterVolume' in cached:
+      144              loaded.master_volume = cached['masterVolume']
+      145          if 'slots' in cached:
+      146              for slot in cached['slots']:
+      147                  if 'id' in slot:
+      148                      if slot['id'] == SLOT_ID:
+      149                          if slot['last']:
+      150                              loaded.slot.last = slot['last']
+      151                          if slot['author']:
+      152                              loaded.slot.last_author = slot['author']
+      153                          if slot['gains']:
+      154                              loaded.slot.gains = slot['gains']
+      155                          if slot['mutes']:
+      156                              loaded.slot.mutes = slot['mutes']
+      157          return loaded
+      159      @property
+      160      def device_type(self) -> str:
+      161          return self.__class__.__name__.lower()
+      163      def update(self, params: dict) -> bool:
+      164          def __do_it() -> bool:
+      165              any_update = False
+      166              if 'slots' in params:
+      167                  for slot in params['slots']:
+      168                      if slot['id'] == SLOT_ID:
+      169                          if 'entry' in slot:
+      170                              if slot['entry']:
+      171                                  match = self.__catalogue.find(slot['entry'])
+      172                                  if match:
+      173                                      mv = 0.0
+      174                                      if 'gains' in slot and slot['gains']:
+      175                                          mv = float(slot['gains'][0]['value'])
+      176                                      self.load_filter(SLOT_ID, match, mv)
+      177                                      any_update = True
+      178                              else:
+      179                                  self.clear_filter(SLOT_ID)
+      180                                  any_update = True
+      181                          elif 'gains' in slot or 'mutes' in slot:
+      182                              merged = defaultdict(dict)
+      183                              for g in slot.get('gains', []):
+      184                                  c_id = int(g['id'])
+      185                                  if c_id in self.__beq_channels:
+      186                                      merged[c_id]['gain'] = g['value']
+      187                                  else:
+      188                                      raise ValueError(f'Invalid channel id for gain setting {c_id}')
+      189                              for g in slot.get('mutes', []):
+      190                                  c_id = int(g['id'])
+      191                                  if c_id in self.__beq_channels:
+      192                                      merged[c_id]['mute'] = g['value']
+      193                                  else:
+      194                                      raise ValueError(f'Invalid channel id for gain setting {c_id}')
+      195  
+      196                              def completed(success: bool):
+      197                                  logger.log(logging.INFO if success else logging.WARNING,
+      198                                             f'Completed gain update {success}')
+      199                                  if success:
+      200                                      css = self._current_state.slot
+      201                                      for k, v in merged.items():
+      202                                          if 'gain' in v:
+      203                                              to_update = next(g for g in css.gains if g['id'] == k)
+      204                                              to_update['value'] = v['gain']
+      205                                          if 'mute' in v:
+      206                                              to_update = next(g for g in css.mutes if g['id'] == k)
+      207                                              to_update['value'] = v['mute']
+      208  
+      209                              self.__update_channel_levels(merged,
+      210                                                           lambda b: self._hydrate_cache_broadcast(lambda: completed(b)))
+      211                              any_update = True
+      212              if 'mute' in params and params['mute'] != self._current_state.mute:
+      213                  if self._current_state.mute:
+      214                      self.unmute(None, None)
+      215                  else:
+      216                      self.mute(None, None)
+      217                  any_update = True
+      218              if 'masterVolume' in params and not math.isclose(params['masterVolume'], self._current_state.master_volume):
+      219                  self.set_gain(None, None, params['masterVolume'])
+      220                  any_update = True
+      221              return any_update
+      222  
+       ... truncated at 60 lines ...
+      251      def activate(self, slot: str) -> None:
+      252          def __do_it():
+      253              self._current_state.slot.active = True
+      254  
+      255          self._hydrate_cache_broadcast(__do_it)
+      257      def load_biquads(self, slot: str, overwrite: bool, inputs: List[int], outputs: List[int],
+      258                       biquads: List[dict]) -> None:
+      259          raise NotImplementedError()
+      261      def send_commands(self, slot: str, inputs: List[int], outputs: List[int], commands: List[str]) -> None:
+      262          raise NotImplementedError()
+      264      def load_filter(self, slot: str, entry: CatalogueEntry, mv_adjust: float = 0.0) -> None:
+      265          self._hydrate_cache_broadcast(lambda: self.__do_load_filter(entry, mv_adjust))
+      293      def clear_filter(self, slot: str) -> None:
+      294          self._hydrate_cache_broadcast(lambda: self.__do_load_filter(None))
+      296      def mute(self, slot: Optional[str], channel: Optional[int]) -> None:
+      297          self._hydrate_cache_broadcast(lambda: self.__do_mute_op(True))
+      305      def unmute(self, slot: Optional[str], channel: Optional[int]) -> None:
+      306          self._hydrate_cache_broadcast(lambda: self.__do_mute_op(False))
+      308      def set_gain(self, slot: Optional[str], channel: Optional[int], gain: float) -> None:
+      309          if channel is None:
+      310              self._hydrate_cache_broadcast(lambda: self.__do_volume_op(gain))
+      311          else:
+      312              self._hydrate_cache_broadcast(lambda: self.__do_gain_op(channel, gain))
+      327      def levels(self) -> dict:
+      328          return {
+      329              'name': self.name,
+      330              'ts': time.time(),
+      331              'levels': self.__format_levels()
+      332          }
+
+---------- IMPLEMENTER ezbeq.htp1:Htp1  stubs=5/13 ----------
+       38  class Htp1(PersistentDevice[Htp1State]):
+       55      def _load_initial_state(self) -> Htp1State:
+       56          return Htp1State(self.name)
+       58      def _merge_state(self, loaded: Htp1State, cached: dict) -> Htp1State:
+       59          if 'slots' in cached:
+       60              for slot in cached['slots']:
+       61                  if 'id' in slot:
+       62                      if slot['id'] == 'HTP1':
+       63                          if slot['last']:
+       64                              loaded.slot.last = slot['last']
+       65                          if slot['author']:
+       66                              loaded.slot.last_author = slot['author']
+       67          return loaded
+       69      @property
+       70      def device_type(self) -> str:
+       71          return self.__class__.__name__.lower()
+       73      def update(self, params: dict) -> bool:
+       74          any_update = False
+       75          if 'slots' in params:
+       76              for slot in params['slots']:
+       77                  if slot['id'] == 'HTP1':
+       78                      if 'entry' in slot:
+       79                          if slot['entry']:
+       80                              match = self.__catalogue.find(slot['entry'])
+       81                              if match:
+       82                                  self.load_filter('HTP1', match)
+       83                                  any_update = True
+       84                          else:
+       85                              self.clear_filter('HTP1')
+       86                              any_update = True
+       87          return any_update
+      102      def activate(self, slot: str) -> None:
+      103          def __do_it():
+      104              self._current_state.slot.active = True
+      105          self._hydrate_cache_broadcast(__do_it)
+      107      def load_biquads(self, slot: str, overwrite: bool, inputs: List[int], outputs: List[int], biquads: List[dict]) -> None:
+      108          raise NotImplementedError()
+      110      def send_commands(self, slot: str, inputs: List[int], outputs: List[int], commands: List[str]) -> None:
+      111          raise NotImplementedError()
+      113      def load_filter(self, slot: str, entry: CatalogueEntry, mv_adjust: float = 0.0) -> None:
+      114          to_load = [PEQ(idx, fc=f['freq'], q=f['q'], gain=f['gain'], filter_type_name=f['type'])
+      115                     for idx, f in enumerate(entry.filters)]
+      116          self._hydrate_cache_broadcast(lambda: self.__do_it(to_load, entry.formatted_title, entry.author))
+      128      def clear_filter(self, slot: str) -> None:
+      129          self._hydrate_cache_broadcast(lambda: self.__do_it([], 'Empty'))
+      131      def mute(self, slot: Optional[str], channel: Optional[int]) -> None:
+      132          raise NotImplementedError()
+      134      def unmute(self, slot: Optional[str], channel: Optional[int]) -> None:
+      135          raise NotImplementedError()
+      137      def set_gain(self, slot: Optional[str], channel: Optional[int], gain: float) -> None:
+      138          raise NotImplementedError()
+      140      def levels(self) -> dict:
+      141          # TODO implement
+      142          return {}
+
+---------- IMPLEMENTER ezbeq.jriver:JRiver  stubs=5/13 ----------
+       67  class JRiver(PersistentDevice[JRiverState]):
+       86      def device_type(self) -> str:
+       87          return self.__class__.__name__.lower()
+       89      def _load_initial_state(self) -> JRiverState:
+       90          return JRiverState(self.name, self.__mcws.get_zones())
+       92      def _merge_state(self, loaded: JRiverState, cached: dict) -> JRiverState:
+       93          if 'slots' in cached:
+       94              for slot in cached['slots']:
+       95                  if 'id' in slot and 'last' in slot:
+       96                      loaded.set_title(slot['id'], slot['last'], author=slot.get('author', None), ignore=True)
+       97          return loaded
+       99      def activate(self, slot: str) -> None:
+      100          self._hydrate_cache_broadcast(lambda: self._current_state.activate(slot))
+      102      def update(self, params: dict) -> bool:
+      103          any_update = False
+      104          if 'slots' in params:
+      105              for slot in params['slots']:
+      106                  if self._current_state.has_zone(slot['id']):
+      107                      if 'entry' in slot:
+      108                          if slot['entry']:
+      109                              match = self.__catalogue.find(slot['entry'])
+      110                              if match:
+      111                                  self.load_filter(slot['id'], match)
+      112                                  any_update = True
+      113                          else:
+      114                              self.clear_filter(slot['id'])
+      115                              any_update = True
+      116          return any_update
+      118      def load_biquads(self, slot: str, overwrite: bool, inputs: List[int], outputs: List[int], biquads: List[dict]) -> None:
+      119          raise NotImplementedError()
+      121      def send_commands(self, slot: str, inputs: List[int], outputs: List[int], commands: List[str]) -> None:
+      122          raise NotImplementedError()
+      124      def load_filter(self, slot: str, entry: CatalogueEntry, mv_adjust: float = 0.0) -> None:
+      125          def __do_it():
+      126              mc_filts = [make_meta(entry.title, True)] \
+      127                         + [convert_filter_to_mc_dsp(f, self.__channels) for f in entry.filters] \
+      128                         + [make_meta(entry.title, False)]
+      129              xml_filts = [filts_to_xml(f) for f in mc_filts]
+      130              zone_id = self._current_state.get_zone_id(slot)
+      131              current_config_txt = self.__mcws.get_dsp(zone_id)
+      132              new_config_txt = self.__remove_all_beq(current_config_txt)
+      133              new_config_txt = include_filters_in_dsp(self.__peq_block, new_config_txt, xml_filts, replace=False)
+      134              logger.info(new_config_txt)
+      135              try:
+      136                  self.__mcws.set_dsp(zone_id, new_config_txt)
+      137                  self._current_state.set_title(slot, entry.formatted_title, author=entry.author)
+      138              except Exception as e:
+      139                  self._current_state.slot.last = 'ERROR'
+      140                  self._current_state.slot.last_author = None
+      141                  raise e
+      142          self._hydrate_cache_broadcast(__do_it)
+      155      def clear_filter(self, slot: str) -> None:
+      156          def __do_it():
+      157              zone_id = self._current_state.get_zone_id(slot)
+      158              current_config_txt = self.__mcws.get_dsp(zone_id)
+      159              new_config_txt = self.__remove_all_beq(current_config_txt)
+      160              try:
+      161                  if new_config_txt != current_config_txt:
+      162                      self.__mcws.set_dsp(zone_id, new_config_txt)
+      163                  self._current_state.set_title(slot, 'Empty')
+      164              except Exception as e:
+      165                  self._current_state.error(slot)
+      166                  raise e
+      167          self._hydrate_cache_broadcast(__do_it)
+      169      def mute(self, slot: Optional[str], channel: Optional[int]) -> None:
+      170          raise NotImplementedError()
+      172      def unmute(self, slot: Optional[str], channel: Optional[int]) -> None:
+      173          raise NotImplementedError()
+      175      def set_gain(self, slot: Optional[str], channel: Optional[int], gain: float) -> None:
+      176          raise NotImplementedError()
+      178      def levels(self) -> dict:
+      179          # TODO implement
+      180          return {}
+
+---------- IMPLEMENTER ezbeq.minidsp:Minidsp  stubs=0/13 ----------
+      462  class Minidsp(PersistentDevice[MinidspState]):
+      484      @property
+      485      def device_type(self) -> str:
+      486          return self.__class__.__name__.lower()
+      538      def activate(self, slot: str):
+      539          def __do_it():
+      540              target_slot_idx = self.__as_idx(slot)
+      541              self.__validate_slot_idx(target_slot_idx)
+      542              self.__send_cmds(target_slot_idx, [])
+      543              self._current_state.activate(slot)
+      544  
+      545          self._hydrate_cache_broadcast(__do_it)
+      552      def load_biquads(self, slot: str, overwrite: bool, inputs: List[int], outputs: List[int],
+      553                       biquads: List[dict]) -> None:
+      554          def __do_it():
+      555              target_slot_idx = self.__as_idx(slot)
+      556              self.__validate_slot_idx(target_slot_idx)
+      557              cmds = MinidspBeqCommandGenerator.biquads(overwrite, inputs, outputs, biquads)
+      558              try:
+      559                  self.__send_cmds(target_slot_idx, cmds)
+      560                  if inputs:
+      561                      self._current_state.load(slot, 'CUSTOM')
+      562                  else:
+      563                      self._current_state.activate(slot)
+      564              except Exception as e:
+      565                  self._current_state.error(slot)
+      566                  raise e
+      567  
+      568          self._hydrate_cache_broadcast(__do_it)
+      570      def send_commands(self, slot: str, inputs: List[int], outputs: List[int], commands: List[str]) -> None:
+      571          def __do_it():
+      572              target_slot_idx = self.__as_idx(slot)
+      573              self.__validate_slot_idx(target_slot_idx)
+      574              cmds = MinidspBeqCommandGenerator.commands(inputs, outputs, commands)
+      575              try:
+      576                  self.__send_cmds(target_slot_idx, cmds)
+      577                  if inputs:
+      578                      self._current_state.load(slot, 'CUSTOM')
+      579                  else:
+      580                      self._current_state.activate(slot)
+      581              except Exception as e:
+      582                  self._current_state.error(slot)
+      583                  raise e
+      584  
+      585          self._hydrate_cache_broadcast(__do_it)
+      587      def load_filter(self, slot: str, entry: CatalogueEntry, mv_adjust: float = 0.0) -> None:
+      588          def __do_it():
+      589              target_slot_idx = self.__as_idx(slot)
+      590              self.__validate_slot_idx(target_slot_idx)
+      591              cmds = MinidspBeqCommandGenerator.filt(entry, self.__descriptor)
+      592              try:
+      593                  self.__send_cmds(target_slot_idx, cmds)
+      594                  self._current_state.load(slot, entry.formatted_title, entry.author)
+      595              except Exception as e:
+      596                  self._current_state.error(slot)
+      597                  raise e
+      598  
+      599          self._hydrate_cache_broadcast(__do_it)
+      601      def clear_filter(self, slot: str) -> None:
+      602          def __do_it():
+      603              target_slot_idx = self.__as_idx(slot)
+      604              self.__validate_slot_idx(target_slot_idx)
+      605              cmds = MinidspBeqCommandGenerator.filt(None, self.__descriptor)
+      606              beq_slots = self.__descriptor.to_allocator()
+      607              levels = []
+      608              handled = []
+      609              s = beq_slots.pop()
+      610              while s is not None:
+      611                  for c in s.channels:
+      612                      if s.name == INPUT_NAME and c not in handled:
+      613                          levels.extend(MinidspBeqCommandGenerator.mute(False, target_slot_idx, c, side=s.name))
+      614                          levels.extend(MinidspBeqCommandGenerator.gain(0.0, target_slot_idx, c, side=s.name))
+      615                          handled.append(c)
+      616                  s = beq_slots.pop()
+      617              if levels:
+      618                  cmds.extend(levels)
+      619              try:
+      620                  self.__send_cmds(target_slot_idx, cmds)
+      621                  self._current_state.clear(slot)
+      622              except Exception as e:
+      623                  self._current_state.error(slot)
+      624                  raise e
+      625  
+      626          self._hydrate_cache_broadcast(__do_it)
+      628      def mute(self, slot: Optional[str], channel: Optional[int]) -> None:
+      629          self.__do_mute_op(slot, channel, True)
+      642      def unmute(self, slot: Optional[str], channel: Optional[int]) -> None:
+      643          self.__do_mute_op(slot, channel, False)
+      645      def set_gain(self, slot: Optional[str], channel: Optional[int], gain: float) -> None:
+      646          def __do_it():
+      647              target_channel_idx, target_slot_idx = self.__as_idxes(channel, slot)
+      648              cmds = MinidspBeqCommandGenerator.gain(gain, target_slot_idx, target_channel_idx)
+      649              self.__send_cmds(target_slot_idx, cmds)
+      650              self._current_state.gain(slot, channel, gain)
+      651  
+      652          self._hydrate_cache_broadcast(__do_it)
+      692      def _load_initial_state(self) -> MinidspState:
+      693          return self.__load_state()
+      701      def _merge_state(self, loaded: MinidspState, cached: dict) -> MinidspState:
+      702          loaded.merge_with(cached)
+      703          return loaded
+      705      def update(self, params: dict) -> bool:
+      706          def __do_it() -> bool:
+      707              any_update = False
+      708              if 'slots' in params:
+      709                  for slot in params['slots']:
+      710                      any_update |= self.__update_slot(slot)
+      711              if 'mute' in params and params['mute'] != self._current_state.mute:
+      712                  if self._current_state.mute:
+      713                      self.unmute(None, None)
+      714                  else:
+      715                      self.mute(None, None)
+      716                  any_update = True
+      717              if 'masterVolume' in params and not math.isclose(params['masterVolume'], self._current_state.master_volume):
+      718                  self.set_gain(None, None, params['masterVolume'])
+      719                  any_update = True
+      720              return any_update
+      721  
+      722          return self._hydrate_cache_broadcast(__do_it)
+      756      def levels(self) -> dict:
+      757          return self.__executor.submit(self.__read_levels_from_device).result(timeout=self.__cmd_timeout)
+
+---------- IMPLEMENTER ezbeq.qsys:Qsys  stubs=5/13 ----------
+       38  class Qsys(PersistentDevice[QsysState]):
+       53      def _load_initial_state(self) -> QsysState:
+       54          return QsysState(self.name)
+       56      def _merge_state(self, loaded: QsysState, cached: dict) -> QsysState:
+       57          if 'slots' in cached:
+       58              for slot in cached['slots']:
+       59                  if 'id' in slot:
+       60                      if slot['id'] == 'Qsys':
+       61                          if slot['last']:
+       62                              loaded.slot.last = slot['last']
+       63                          if slot['author']:
+       64                              loaded.slot.author = slot['author']
+       65          return loaded
+       67      @property
+       68      def device_type(self) -> str:
+       69          return self.__class__.__name__.lower()
+       71      def update(self, params: dict) -> bool:
+       72          any_update = False
+       73          if 'slots' in params:
+       74              for slot in params['slots']:
+       75                  if slot['id'] == SLOT_NAME:
+       76                      if 'entry' in slot:
+       77                          if slot['entry']:
+       78                              match = self.__catalogue.find(slot['entry'])
+       79                              if match:
+       80                                  self.load_filter(SLOT_NAME, match)
+       81                                  any_update = True
+       82                          else:
+       83                              self.clear_filter(SLOT_NAME)
+       84                              any_update = True
+       85          return any_update
+      182      def activate(self, slot: str) -> None:
+      183          def __do_it():
+      184              self._current_state.slot.active = True
+      185  
+      186          self._hydrate_cache_broadcast(__do_it)
+      188      def load_biquads(self, slot: str, overwrite: bool, inputs: List[int], outputs: List[int],
+      189                       biquads: List[dict]) -> None:
+      190          raise NotImplementedError()
+      192      def send_commands(self, slot: str, inputs: List[int], outputs: List[int], commands: List[str]) -> None:
+      193          raise NotImplementedError()
+      195      def load_filter(self, slot: str, entry: CatalogueEntry, mv_adjust: float = 0.0) -> None:
+      196          to_load = [PEQ(f['freq'], f['q'], f['gain'], f['type']) for f in entry.filters]
+      197          self._hydrate_cache_broadcast(lambda: self.__do_it(to_load, entry))
+      213      def clear_filter(self, slot: str) -> None:
+      214          self._hydrate_cache_broadcast(lambda: self.__do_it([], 'Empty'))
+      216      def mute(self, slot: Optional[str], channel: Optional[int]) -> None:
+      217          raise NotImplementedError()
+      219      def unmute(self, slot: Optional[str], channel: Optional[int]) -> None:
+      220          raise NotImplementedError()
+      222      def set_gain(self, slot: Optional[str], channel: Optional[int], gain: float) -> None:
+      223          raise NotImplementedError()
+      225      def levels(self) -> dict:
+      226          # TODO implement
+      227          return {}

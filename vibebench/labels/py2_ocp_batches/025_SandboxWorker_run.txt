@@ -1,0 +1,410 @@
+row 25   kivo360/OmoiOS#70
+============================================================================
+CHAIN in backend.omoi_os.workers.claude_sandbox_worker.SandboxWorker.run   kind=isinstance subject='self.config.system_prompt' branches=2
+QUESTION: is the set of variants OPEN (a new one is expected, and
+          would force editing this chain) or CLOSED by nature?
+SHOWING THE WHOLE ENCLOSING FUNCTION -- a branch count alone cannot answer this.
+>>> marks the first line of the dispatch chain itself.
+
+file backend/omoi_os/workers/claude_sandbox_worker.py
+     4139      async def run(self):
+     4140          """Main worker loop with comprehensive event tracking."""
+     4141          self._setup_signal_handlers()
+     4142          self.running = True
+     4143  
+     4144          logger.info("=" * 60)
+     4145          logger.info("CLAUDE SANDBOX WORKER (Production)")
+     4146          logger.info("=" * 60)
+     4147          logger.info("Configuration: %s", self.config.to_dict())
+     4148  
+     4149          # Validate config
+     4150          errors = self.config.validate()
+     4151          if errors:
+     4152              logger.error("Configuration errors", extra={"errors": errors})
+     4153              return 1
+     4154  
+     4155          if not SDK_AVAILABLE:
+     4156              logger.error(
+     4157                  "claude_agent_sdk package not installed - Run: pip install claude-agent-sdk"
+     4158              )
+     4159              return 1
+     4160  
+     4161          # Setup workspace
+     4162          Path(self.config.cwd).mkdir(parents=True, exist_ok=True)
+     4163          setup_github_workspace(self.config)
+     4164  
+     4165          # Install skill dependencies FIRST (spec_cli.py needs pyyaml, httpx, etc.)
+     4166          # This is separate from workspace deps because skills are in /root/.claude/skills/
+     4167          skill_scripts_dir = "/root/.claude/skills/spec-driven-dev/scripts"
+     4168          if os.path.isdir(skill_scripts_dir):
+     4169              skill_req = os.path.join(skill_scripts_dir, "requirements.txt")
+     4170              if os.path.exists(skill_req):
+     4171                  logger.info(f"Installing skill dependencies from {skill_req}")
+     4172                  try:
+     4173                      proc = subprocess.run(
+     4174                          ["pip", "install", "-r", "requirements.txt"],
+     4175                          cwd=skill_scripts_dir,
+     4176                          capture_output=True,
+     4177                          text=True,
+     4178                          timeout=120
+     4179                      )
+     4180                      if proc.returncode == 0:
+     4181                          logger.info("Skill dependencies installed successfully")
+     4182                      else:
+     4183                          logger.warning(f"Skill dependency install failed: {proc.stderr}")
+     4184                  except Exception as e:
+     4185                      logger.warning(f"Error installing skill dependencies: {e}")
+     4186              else:
+     4187                  logger.debug(f"No requirements.txt found in {skill_scripts_dir}")
+     4188          else:
+     4189              logger.debug(f"Skills directory not found: {skill_scripts_dir}")
+     4190  
+     4191          # Auto-install project dependencies (UV, Poetry, pip, pnpm, yarn, npm)
+     4192          # This runs BEFORE the agent starts to ensure dependencies are available
+     4193          dep_result = install_project_dependencies(self.config.cwd)
+     4194          if dep_result["errors"]:
+     4195              logger.warning(
+     4196                  "Some dependency installation errors occurred",
+     4197                  extra={"errors": dep_result["errors"]}
+     4198              )
+     4199  
+     4200          # Add dependency status to system prompt so agent knows what's installed
+     4201          if dep_result["summary"]:
+     4202              dep_prompt_section = f"""
+     4203  ## Pre-Installed Dependencies
+     4204  
+     4205  The following dependencies were automatically installed before you started:
+     4206  
+     4207  {dep_result["summary"]}
+     4208  
+     4209  **Do NOT re-run dependency installation commands** unless you encounter errors or need to add new packages.
+     4210  """
+     4211              # Handle both string and dict (preset pattern) system_prompt
+>>>  4212              if isinstance(self.config.system_prompt, dict):
+     4213                  # Preset pattern: append to the "append" field
+     4214                  current_append = self.config.system_prompt.get("append", "")
+     4215                  self.config.system_prompt["append"] = current_append + "\n" + dep_prompt_section
+     4216              elif isinstance(self.config.system_prompt, str):
+     4217                  # String prompt: concatenate directly
+     4218                  self.config.system_prompt = self.config.system_prompt + "\n" + dep_prompt_section
+     4219              else:
+     4220                  # None or unexpected: create new preset with just the dep section
+     4221                  self.config.system_prompt = {
+     4222                      "type": "preset",
+     4223                      "preset": "claude_code",
+     4224                      "append": dep_prompt_section,
+     4225                  }
+     4226              logger.info("Added dependency status to system prompt")
+     4227  
+     4228          # Import session transcript if provided (for cross-sandbox resumption)
+     4229          if self.config.session_transcript_b64 and self.config.resume_session_id:
+     4230              logger.info("Importing session transcript for cross-sandbox resumption")
+     4231              if self.config.import_session_transcript():
+     4232                  logger.info("Session transcript imported successfully")
+     4233              else:
+     4234                  logger.warning("Session transcript import failed, starting fresh")
+     4235                  self.config.resume_session_id = None  # Reset to avoid resume failure
+     4236  
+     4237          # =================================================================
+     4238          # SPEC STATE MACHINE EXECUTION
+     4239          # =================================================================
+     4240          # If SPEC_PHASE is set, try to run the spec-driven state machine.
+     4241          # If SpecStateMachine is not available (sandbox environment without
+     4242          # omoi_os package), fall back to prompt-driven spec workflow.
+     4243          #
+     4244          # The state machine handles multiple short query() invocations
+     4245          # within a SINGLE sandbox (not multiple sandboxes per phase).
+     4246          # spawn_for_phase() is only used for CRASH RECOVERY.
+     4247          #
+     4248          # IMPORTANT: We wrap this in an EventReporter context so heartbeats
+     4249          # are sent during state machine execution. Without this, the idle
+     4250          # sandbox monitor would terminate the sandbox prematurely.
+     4251          if self.config.spec_phase and self.config.spec_id:
+     4252              async with EventReporter(self.config) as reporter:
+     4253                  self.reporter = reporter
+     4254  
+     4255                  # Report startup for spec state machine
+     4256                  await reporter.report(
+     4257                      "agent.started",
+     4258                      {
+     4259                          "timestamp": datetime.now(timezone.utc).isoformat(),
+     4260                          "sdk": "spec_state_machine",
+     4261                          "model": self.config.model or "default",
+     4262                          "spec_id": self.config.spec_id,
+     4263                          "spec_phase": self.config.spec_phase,
+     4264                          "mode": "spec_driven",
+     4265                      },
+     4266                      source="worker",
+     4267                  )
+     4268  
+     4269                  result = await self._run_spec_state_machine_with_heartbeats(reporter)
+     4270  
+     4271                  # If result is None, SpecStateMachine wasn't available - continue with regular execution
+     4272                  # The spec-driven-dev skill has been injected into the prompt, so Claude will
+     4273                  # follow the spec workflow without needing the Python state machine
+     4274                  if result is not None:
+     4275                      # Read phase data from file checkpoints to send back to server
+     4276                      # The state machine saves to .omoi_os/phase_data/*.json
+     4277                      phase_data = await self._read_spec_phase_data()
+     4278  
+     4279                      # Report completion with phase data
+     4280                      await reporter.report(
+     4281                          "agent.completed",
+     4282                          {
+     4283                              "timestamp": datetime.now(timezone.utc).isoformat(),
+     4284                              "success": result == 0,
+     4285                              "spec_id": self.config.spec_id,
+     4286                              "spec_phase": self.config.spec_phase,
+     4287                              "phase_data": phase_data,  # Include generated spec data
+     4288                          },
+     4289                          source="worker",
+     4290                      )
+     4291                      return result
+     4292  
+     4293              logger.info("Continuing with prompt-driven spec execution (no state machine)")
+     4294  
+     4295          async with EventReporter(self.config) as reporter:
+     4296              self.reporter = reporter
+     4297  
+     4298              # Collect stderr lines for error reporting
+     4299              cli_stderr_lines = []
+     4300  
+     4301              def stderr_collector(line: str):
+     4302                  """Collect CLI stderr output for debugging.
+     4303  
+     4304                  This captures stderr from the Claude CLI subprocess.
+     4305                  Critical for diagnosing initialization failures.
+     4306                  """
+     4307                  stripped = line.strip()
+     4308                  if stripped:
+     4309                      cli_stderr_lines.append(stripped)
+     4310                      # Log immediately at WARNING level so we see it
+     4311                      logger.warning("CLI stderr: %s", stripped)
+     4312  
+     4313              async with MessagePoller(self.config) as poller:
+     4314                  # Create hooks and options
+     4315                  pre_tool_hook = await self._create_pre_tool_hook()
+     4316                  post_tool_hook = await self._create_post_tool_hook()
+     4317                  sdk_options = self.config.to_sdk_options(
+     4318                      pre_tool_hook=pre_tool_hook,
+     4319                      post_tool_hook=post_tool_hook,
+     4320                      stderr_callback=stderr_collector,
+     4321                  )
+     4322  
+     4323                  # Report startup
+     4324                  await reporter.report(
+     4325                      "agent.started",
+     4326                      {
+     4327                          "timestamp": datetime.now(timezone.utc).isoformat(),
+     4328                          "sdk": "claude_agent_sdk",
+     4329                          "model": self.config.model or "default",
+     4330                          "task": self.config.task_description
+     4331                          or self.config.initial_prompt
+     4332                          or self.config.ticket_description,
+     4333                          "task_description_length": len(self.config.task_description),
+     4334                          "ticket_title": self.config.ticket_title,
+     4335                          "resumed_session_id": self.config.resume_session_id,
+     4336                          "is_resuming": bool(self.config.resume_session_id),
+     4337                          "fork_session": self.config.fork_session,
+     4338                      },
+     4339                      source="worker",
+     4340                  )
+     4341  
+     4342                  try:
+     4343                      # Debug: Log options structure before creating client
+     4344                      logger.debug("Creating SDK client with options")
+     4345                      logger.debug(
+     4346                          "SDK options type",
+     4347                          extra={"options_type": str(type(sdk_options))},
+     4348                      )
+     4349                      if hasattr(sdk_options, "hooks") and sdk_options.hooks:
+     4350                          logger.debug(
+     4351                              "Hooks present in SDK options",
+     4352                              extra={"hooks": list(sdk_options.hooks.keys())},
+     4353                          )
+     4354  
+     4355                      async with ClaudeSDKClient(options=sdk_options) as client:
+     4356                          # Process initial prompt
+     4357                          # Priority: task_description (from TASK_DATA_BASE64) > initial_prompt > ticket_description > ticket_title
+     4358                          initial_task = (
+     4359                              self.config.task_description  # Full task spec from orchestrator
+     4360                              or self.config.initial_prompt
+     4361                              or self.config.ticket_description
+     4362                              or f"Analyze ticket: {self.config.ticket_title}"
+     4363                          )
+     4364  
+     4365                          if initial_task and initial_task.strip():
+     4366                              # Initialize iteration state
+     4367                              import time
+     4368  
+     4369                              self.iteration_state.start_time = time.time()
+     4370  
+     4371                              # =================================================================
+     4372                              # COMPREHENSIVE LOGGING: Initial Task/Prompt
+     4373                              # =================================================================
+     4374                              logger.info("=" * 80)
+     4375                              logger.info("WORKER RUN: Initial Task Configuration")
+     4376                              logger.info("=" * 80)
+     4377                              logger.info(f"WORKER RUN: Task ID = {self.config.task_id}")
+     4378                              logger.info(f"WORKER RUN: Execution Mode = {self.config.execution_mode}")
+     4379                              logger.info(f"WORKER RUN: Continuous Mode = {self.config.continuous_mode}")
+     4380                              logger.info(f"WORKER RUN: Ticket Title = {self.config.ticket_title or '(none)'}")
+     4381                              logger.info(f"WORKER RUN: Ticket ID = {self.config.ticket_id or '(none)'}")
+     4382                              logger.info(f"WORKER RUN: Branch Name = {self.config.branch_name or '(none)'}")
+     4383                              logger.info(f"WORKER RUN: GitHub Repo = {self.config.github_repo or '(none)'}")
+     4384  
+     4385                              # Log prompt source priority
+     4386                              logger.info("-" * 80)
+     4387                              logger.info("WORKER RUN: Prompt Source Priority (first non-empty wins):")
+     4388                              logger.info(f"  1. task_description (from TASK_DATA_BASE64): {len(self.config.task_description)} chars")
+     4389                              logger.info(f"  2. initial_prompt (from INITIAL_PROMPT env): {len(self.config.initial_prompt)} chars")
+     4390                              logger.info(f"  3. ticket_description: {len(self.config.ticket_description or '')} chars")
+     4391                              logger.info(f"  4. ticket_title fallback: {len(self.config.ticket_title or '')} chars")
+     4392  
+     4393                              # Log the full initial task
+     4394                              logger.info("-" * 80)
+     4395                              logger.info(f"WORKER RUN: Initial Task Length = {len(initial_task)} chars")
+     4396                              logger.info("WORKER RUN: Initial Task Content:")
+     4397                              logger.info("=" * 40 + " BEGIN INITIAL TASK " + "=" * 40)
+     4398                              for line in initial_task.split('\n'):
+     4399                                  logger.info(f"  {line}")
+     4400                              logger.info("=" * 40 + " END INITIAL TASK " + "=" * 40)
+     4401                              logger.info("=" * 80)
+     4402  
+     4403                              # Log mode decision for debugging
+     4404                              logger.info(
+     4405                                  "WORKER RUN: Mode decision point",
+     4406                                  extra={
+     4407                                      "continuous_mode": self.config.continuous_mode,
+     4408                                      "execution_mode": self.config.execution_mode,
+     4409                                      "task_id": self.config.task_id,
+     4410                                      "initial_task_preview": initial_task[:200],
+     4411                                  },
+     4412                              )
+     4413  
+     4414                              if self.config.continuous_mode:
+     4415                                  # =================================================
+     4416                                  # CONTINUOUS MODE: Iterate until task truly completes
+     4417                                  # =================================================
+     4418                                  logger.info("=" * 60)
+     4419                                  logger.info("WORKER RUN: CONTINUOUS MODE ACTIVATED")
+     4420                                  logger.info("=" * 60)
+     4421                                  logger.info(
+     4422                                      "Will iterate until: validation_passed OR max_iterations=%d OR max_cost=$%.2f OR max_duration=%ds",
+     4423                                      self.config.max_iterations,
+     4424                                      self.config.max_total_cost_usd,
+     4425                                      self.config.max_duration_seconds,
+     4426                                  )
+     4427  
+     4428                                  # Report continuous mode start
+     4429                                  await reporter.report(
+     4430                                      "continuous.started",
+     4431                                      {
+     4432                                          "goal": initial_task[:500],
+     4433                                          "limits": {
+     4434                                              "max_iterations": self.config.max_iterations,
+     4435                                              "max_cost_usd": self.config.max_total_cost_usd,
+     4436                                              "max_duration_seconds": self.config.max_duration_seconds,
+     4437                                          },
+     4438                                          "completion_signal": self.config.completion_signal,
+     4439                                          "completion_threshold": self.config.completion_threshold,
+     4440                                          "validation_requirements": {
+     4441                                              "require_clean_git": self.config.require_clean_git,
+     4442                                              "require_code_pushed": self.config.require_code_pushed,
+     4443                                              "require_pr_created": self.config.require_pr_created,
+     4444                                          },
+     4445                                      },
+     4446                                      source="worker",
+     4447                                  )
+     4448  
+     4449                                  # Iteration loop
+     4450                                  while self._should_continue_iteration():
+     4451                                      self.iteration_state.iteration_num += 1
+     4452                                      iteration_prompt = self._build_iteration_prompt(
+     4453                                          initial_task
+     4454                                      )
+     4455  
+     4456                                      # Report iteration start
+     4457                                      await reporter.report(
+     4458                                          "iteration.started",
+     4459                                          {
+     4460                                              "iteration_num": self.iteration_state.iteration_num,
+     4461                                              "prompt_preview": iteration_prompt[:500],
+     4462                                              **self.iteration_state.to_event_data(),
+     4463                                          },
+     4464                                      )
+     4465  
+     4466                                      logger.info(
+     4467                                          "Starting iteration %d",
+     4468                                          self.iteration_state.iteration_num,
+     4469                                          extra={
+     4470                                              "state": self.iteration_state.to_event_data()
+     4471                                          },
+     4472                                      )
+     4473  
+     4474                                      try:
+     4475                                          await client.query(iteration_prompt)
+     4476                                          result, output = await self._process_messages(
+     4477                                              client
+     4478                                          )
+     4479  
+     4480                                          if result:
+     4481                                              # Track cost
+     4482                                              iteration_cost = (
+     4483                                                  getattr(result, "total_cost_usd", 0.0)
+     4484                                                  or 0.0
+     4485                                              )
+     4486                                              self.iteration_state.total_cost += (
+     4487                                                  iteration_cost
+     4488                                              )
+     4489                                              self.iteration_state.last_session_id = (
+     4490                                                  getattr(result, "session_id", None)
+     4491                                              )
+     4492  
+     4493                                              # Check for completion signal in output
+     4494                                              output_text = (
+     4495                                                  "\n".join(output) if output else ""
+     4496                                              )
+     4497                                              if (
+     4498                                                  self.config.completion_signal
+     4499                                                  in output_text
+     4500                                              ):
+     4501                                                  self.iteration_state.completion_signal_count += 1
+     4502                                                  logger.info(
+     4503                                                      "Completion signal detected (%d/%d)",
+     4504                                                      self.iteration_state.completion_signal_count,
+     4505                                                      self.config.completion_threshold,
+     4506                                                  )
+     4507  
+     4508                                                  await reporter.report(
+     4509                                                      "iteration.completion_signal",
+     4510                                                      {
+     4511                                                          "iteration_num": self.iteration_state.iteration_num,
+     4512                                                          "signal_count": self.iteration_state.completion_signal_count,
+     4513                                                          "threshold": self.config.completion_threshold,
+     4514                                                      },
+     4515                                                  )
+     4516  
+     4517                                                  # Run git validation
+     4518                                                  await self._run_validation()
+     4519  
+     4520                                                  # If validation passed, we're done!
+     4521                                                  if self.iteration_state.validation_passed:
+     4522                                                      logger.info(
+     4523                                                          "Validation PASSED - task truly complete!"
+     4524                                                      )
+     4525                                                      break
+     4526                                              else:
+     4527                                                  # No completion signal - reset counter
+     4528                                                  self.iteration_state.completion_signal_count = 0
+     4529  
+     4530                                              self.iteration_state.successful_iterations += 1
+     4531                                              self.iteration_state.error_count = 0
+     4532  
+     4533                                              # Report iteration completion
+     4534                                              await reporter.report(
+     4535                                                  "iteration.completed",
+     4536                                                  {
+     4537                                                      "iteration_num": self.iteration_state.iteration_num,
+     4538                                                      "cost_usd": iteration_cost,
+       ... truncated at 400 lines ...

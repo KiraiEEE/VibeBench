@@ -1,0 +1,406 @@
+row 198   Netflix-Skunkworks/service-capacity-modeling#251
+============================================================================
+CLASS CapacityPlanner in service_capacity_modeling/capacity_planner.py   loc=809 methods=19 wmc=118 lcom=0.0588235294117647
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      470  class CapacityPlanner:
+      471      def __init__(
+      472          self,
+      473          default_num_simulations: int = 128,
+      474          default_num_results: int = 2,
+      475          default_lifecycles: Tuple[Lifecycle, ...] = (Lifecycle.stable, Lifecycle.beta),
+      476      ) -> None:
+      477          self._shapes: HardwareShapes = shapes
+      478          self._models: Dict[str, CapacityModel] = {}
+      479          self._cluster_types: Dict[str, str] = {}  # cluster_type -> model_name
+      480  
+      481          self._default_num_simulations = default_num_simulations
+      482          self._default_num_results = default_num_results
+      483          self._default_regret_params = CapacityRegretParameters()
+      484          self._default_lifecycles = default_lifecycles
+      485  
+      486      def register_group(self, group: Callable[[], Dict[str, CapacityModel]]) -> None:
+      487          for name, model in group().items():
+      488              self.register_model(name, model)
+      489  
+      490      def register_model(self, name: str, capacity_model: CapacityModel) -> None:
+      491          if isinstance(capacity_model, CostAwareModel):
+      492              # Validate required attributes
+      493              sn = getattr(capacity_model, "service_name", None)
+      494              ct = getattr(capacity_model, "cluster_type", None)
+      495              if not sn or not ct:
+      496                  raise ValueError(
+      497                      f"CostAwareModel '{name}' must define service_name and "
+      498                      f"cluster_type (got service_name={sn!r}, cluster_type={ct!r})"
+      499                  )
+      500  
+      501              # Duplicate cluster_type would cause double-counting
+      502              if ct in self._cluster_types:
+      503                  raise ValueError(
+      504                      f"Duplicate cluster_type '{ct}': '{name}' "
+      505                      f"conflicts with '{self._cluster_types[ct]}'. Must be unique "
+      506                      f"to avoid double-counting costs."
+      507                  )
+      508              self._cluster_types[ct] = name
+      509  
+      510          self._models[name] = capacity_model
+      511  
+      512      @property
+      513      def models(self) -> Dict[str, CapacityModel]:
+      514          return self._models
+      515  
+      516      @property
+      517      def hardware_shapes(self) -> HardwareShapes:
+      518          return self._shapes
+      519  
+      520      def instance(self, name: str, region: Optional[str] = None) -> Instance:
+      521          return self.hardware_shapes.instance(name, region=region)
+      522  
+      523      def _prepare_context(
+      524          self,
+      525          region: str,
+      526          num_regions: int,
+      527      ) -> Tuple[Hardware, RegionContext]:
+      528          """Prepare hardware and region context for capacity planning.
+      529  
+      530          Loads hardware catalog for region and creates RegionContext.
+      531          """
+      532          hardware = self._shapes.region(region)
+      533          context = RegionContext(
+      534              zones_in_region=hardware.zones_in_region,
+      535              services={n: s.model_copy(deep=True) for n, s in hardware.services.items()},
+      536              num_regions=num_regions,
+      537          )
+      538          return hardware, context
+      539  
+      540      def _plan_percentiles(  # pylint: disable=too-many-positional-arguments
+      541          self,
+      542          model_name: str,
+      543          percentiles: Tuple[int, ...],
+      544          region: str,
+      545          desires: CapacityDesires,
+      546          lifecycles: Optional[Sequence[Lifecycle]] = None,
+      547          instance_families: Optional[Sequence[str]] = None,
+      548          drives: Optional[Sequence[str]] = None,
+      549          num_results: Optional[int] = None,
+      550          num_regions: int = 3,
+      551          extra_model_arguments: Optional[Dict[str, Any]] = None,
+      552      ) -> Tuple[Sequence[CapacityPlan], Dict[int, Sequence[CapacityPlan]]]:
+      553          if model_name not in self._models:
+      554              raise ValueError(
+      555                  f"model_name={model_name} does not exist. "
+      556                  f"Try {sorted(list(self._models.keys()))}"
+      557              )
+      558  
+      559          desires = desires.model_copy(deep=True)
+      560          _resolve_cluster_instances(desires)
+      561          extra_model_arguments = extra_model_arguments or {}
+      562          lifecycles = lifecycles or self._default_lifecycles
+      563  
+      564          model_mean_desires: Dict[str, CapacityDesires] = {}
+      565          sorted_percentiles = sorted(percentiles)
+      566          model_percentile_desires: List[Dict[str, CapacityDesires]] = []
+      567          for _ in sorted_percentiles:
+      568              model_percentile_desires.append({})
+      569  
+      570          for sub_model, sub_desires in self._sub_models(
+      571              model_name=model_name,
+      572              desires=desires,
+      573              extra_model_arguments=extra_model_arguments,
+      574          ):
+      575              percentile_inputs, mean_desires = model_desires_percentiles(
+      576                  desires=sub_desires, percentiles=sorted_percentiles
+      577              )
+      578              model_mean_desires[sub_model] = mean_desires
+      579              index = 0
+      580              for percentile_input in percentile_inputs:
+      581                  model_percentile_desires[index][sub_model] = percentile_input
+      582                  index = index + 1
+      583  
+      584          mean_plan = self._mean_plan(
+      585              drives,
+      586              extra_model_arguments,
+      587              instance_families,
+      588              lifecycles,
+      589              num_regions,
+      590              num_results,
+      591              region,
+      592              model_mean_desires,
+      593          )
+      594          percentile_plans = self._group_plans_by_percentile(
+      595              drives,
+      596              extra_model_arguments,
+      597              instance_families,
+      598              lifecycles,
+      599              num_regions,
+      600              num_results,
+      601              region,
+      602              model_percentile_desires,
+      603              sorted_percentiles,
+      604          )
+      605  
+      606          return mean_plan, percentile_plans
+      607  
+      608      def _group_plans_by_percentile(  # pylint: disable=too-many-positional-arguments
+      609          self,
+      610          drives: Optional[Sequence[str]],
+      611          extra_model_arguments: Dict[str, Any],
+      612          instance_families: Optional[Sequence[str]],
+      613          lifecycles: Sequence[Lifecycle],
+      614          num_regions: int,
+      615          num_results: Optional[int],
+      616          region: str,
+      617          model_percentile_desires: Any,
+      618          sorted_percentiles: List[int],
+      619      ) -> Dict[int, Sequence[CapacityPlan]]:
+      620          percentile_plans = {}
+      621          for index, percentile in enumerate(sorted_percentiles):
+      622              percentile_plan = []
+      623              for percentile_sub_model, percentile_sub_desire in model_percentile_desires[
+      624                  index
+      625              ].items():
+      626                  percentile_sub_result = self._plan_certain(
+      627                      model_name=percentile_sub_model,
+      628                      region=region,
+      629                      desires=percentile_sub_desire,
+      630                      num_results=num_results,
+      631                      num_regions=num_regions,
+      632                      extra_model_arguments=extra_model_arguments,
+      633                      lifecycles=lifecycles,
+      634                      instance_families=instance_families,
+      635                      drives=drives,
+      636                  )
+      637                  if percentile_sub_result.plans:
+      638                      percentile_plan.append(percentile_sub_result.plans)
+      639  
+      640              percentile_plans[percentile] = cast(
+      641                  Sequence[CapacityPlan],
+      642                  [
+      643                      functools.reduce(merge_plan, composed)
+      644                      for composed in zip(*percentile_plan)
+      645                  ],
+      646              )
+      647          return percentile_plans
+      648  
+      649      def _mean_plan(  # pylint: disable=too-many-positional-arguments
+      650          self,
+      651          drives: Optional[Sequence[str]],
+      652          extra_model_arguments: Dict[str, Any],
+      653          instance_families: Optional[Sequence[str]],
+      654          lifecycles: Sequence[Lifecycle],
+      655          num_regions: int,
+      656          num_results: Optional[int],
+      657          region: str,
+      658          model_mean_desires: Dict[str, CapacityDesires],
+      659      ) -> Sequence[CapacityPlan]:
+      660          mean_plans = []
+      661          for mean_sub_model, mean_sub_desire in model_mean_desires.items():
+      662              mean_sub_result = self._plan_certain(
+      663                  model_name=mean_sub_model,
+      664                  region=region,
+      665                  desires=mean_sub_desire,
+      666                  num_results=num_results,
+      667                  num_regions=num_regions,
+      668                  extra_model_arguments=extra_model_arguments,
+      669                  lifecycles=lifecycles,
+      670                  instance_families=instance_families,
+      671                  drives=drives,
+      672              )
+      673              if mean_sub_result.plans:
+      674                  mean_plans.append(mean_sub_result.plans)
+      675          mean_plan = cast(
+      676              Sequence[CapacityPlan],
+      677              [functools.reduce(merge_plan, composed) for composed in zip(*mean_plans)],
+      678          )
+      679          return mean_plan
+      680  
+      681      def plan_certain(  # pylint: disable=too-many-positional-arguments
+      682          self,
+      683          model_name: str,
+      684          region: str,
+      685          desires: CapacityDesires,
+      686          lifecycles: Optional[Sequence[Lifecycle]] = None,
+      687          instance_families: Optional[Sequence[str]] = None,
+      688          drives: Optional[Sequence[str]] = None,
+      689          num_results: Optional[int] = None,
+      690          num_regions: int = 3,
+      691          extra_model_arguments: Optional[Dict[str, Any]] = None,
+      692          max_results_per_family: int = 1,
+      693          planner_arguments: Optional[PlannerArguments] = None,
+      694      ) -> Sequence[CapacityPlan]:
+      695          return self.plan_certain_explained(
+      696              model_name=model_name,
+      697              region=region,
+      698              desires=desires,
+      699              lifecycles=lifecycles,
+      700              instance_families=instance_families,
+      701              drives=drives,
+      702              num_results=num_results,
+      703              num_regions=num_regions,
+      704              extra_model_arguments=extra_model_arguments,
+      705              max_results_per_family=max_results_per_family,
+      706              planner_arguments=planner_arguments,
+      707          ).plans
+      708  
+      709      def plan_certain_explained(  # pylint: disable=too-many-positional-arguments
+      710          self,
+      711          model_name: str,
+      712          region: str,
+      713          desires: CapacityDesires,
+      714          lifecycles: Optional[Sequence[Lifecycle]] = None,
+      715          instance_families: Optional[Sequence[str]] = None,
+      716          drives: Optional[Sequence[str]] = None,
+      717          num_results: Optional[int] = None,
+      718          num_regions: int = 3,
+      719          extra_model_arguments: Optional[Dict[str, Any]] = None,
+      720          max_results_per_family: int = 1,
+      721          planner_arguments: Optional[PlannerArguments] = None,
+      722      ) -> ExplainedPlans:
+      723          """Like plan_certain() but returns excuses and family graph too."""
+      724          if model_name not in self._models:
+      725              raise ValueError(
+      726                  f"model_name={model_name} does not exist. "
+      727                  f"Try {sorted(list(self._models.keys()))}"
+      728              )
+      729  
+      730          # planner_arguments takes precedence over explicit max_results_per_family
+      731          pargs = planner_arguments or PlannerArguments(
+      732              max_results_per_family=max_results_per_family
+      733          )
+      734  
+      735          desires = desires.model_copy(deep=True)
+      736          _resolve_cluster_instances(desires)
+      737          extra_model_arguments = extra_model_arguments or {}
+      738          lifecycles = lifecycles or self._default_lifecycles
+      739  
+      740          all_plans: List[Sequence[CapacityPlan]] = []
+      741          all_excuses: List[Excuse] = []
+      742  
+      743          for sub_model, sub_desires in self._sub_models(
+      744              model_name=model_name,
+      745              desires=desires,
+      746              extra_model_arguments=extra_model_arguments,
+      747          ):
+      748              sub_result = self._plan_certain(
+      749                  model_name=sub_model,
+      750                  region=region,
+      751                  desires=sub_desires,
+      752                  num_results=num_results,
+      753                  num_regions=num_regions,
+      754                  extra_model_arguments=extra_model_arguments,
+      755                  lifecycles=lifecycles,
+      756                  instance_families=instance_families,
+      757                  drives=drives,
+      758                  planner_arguments=pargs,
+      759              )
+      760              if sub_result.plans:
+      761                  all_plans.append(sub_result.plans)
+      762              all_excuses.extend(sub_result.excuses)
+      763  
+      764          plans = (
+      765              [functools.reduce(merge_plan, composed) for composed in zip(*all_plans)]
+      766              if all_plans
+      767              else []
+      768          )
+      769  
+      770          excuses = deduplicate_excuses(all_excuses)
+      771  
+      772          # Build M×N FamilyGraph from hardware traits. preferred_families comes
+      773          # from the model (None → empty base, only the current cluster's family).
+      774          # Current cluster's family is always included regardless of preferred set.
+      775          # Use shapes.region() directly — we only need the hardware catalog, not
+      776          # a full RegionContext (which would do unnecessary deep-copies of services).
+      777          hardware = self._shapes.region(region)
+      778          model = self._models[model_name]
+      779          graph = FamilyGraph.build(excuses, hardware, model.preferred_families())
+      780  
+      781          return ExplainedPlans(
+      782              plans=plans,
+      783              excuses=excuses,
+      784              family_graph=graph,
+      785          )
+      786  
+      787      def _plan_certain(  # pylint: disable=too-many-positional-arguments
+      788          self,
+      789          model_name: str,
+      790          region: str,
+      791          desires: CapacityDesires,
+      792          num_results: Optional[int] = None,
+      793          num_regions: int = 3,
+      794          lifecycles: Optional[Sequence[Lifecycle]] = None,
+      795          instance_families: Optional[Sequence[str]] = None,
+      796          drives: Optional[Sequence[str]] = None,
+      797          extra_model_arguments: Optional[Dict[str, Any]] = None,
+      798          planner_arguments: Optional[PlannerArguments] = None,
+      799      ) -> _CertainResult:
+      800          extra_model_arguments = extra_model_arguments or {}
+      801          pargs = planner_arguments or PlannerArguments()
+      802          model = self._models[model_name]
+      803  
+      804          plans: List[CapacityPlan] = []
+      805          excuses: List[Excuse] = []
+      806          pref_families = model.preferred_families()
+      807          current_inst = current_instance_name(desires)
+      808          for instance, drive, context in self.generate_scenarios(
+      809              model, region, desires, num_regions, lifecycles, instance_families, drives
+      810          ):
+      811              match model.capacity_plan(
+      812                  instance=instance,
+      813                  drive=drive,
+      814                  context=context,
+      815                  desires=desires,
+      816                  extra_model_arguments=extra_model_arguments,
+      817              ):
+      818                  case CapacityPlan() as plan:
+      819                      if (
+      820                          pref_families is not None
+      821                          and instance.family not in pref_families
+      822                          and pargs.preferred_family_penalty > 0
+      823                      ):
+      824                          service_cost = sum(
+      825                              s.annual_cost for s in plan.candidate_clusters.services
+      826                          )
+      827                          compute_cost = (
+      828                              plan.candidate_clusters.total_annual_cost - service_cost
+      829                          )
+      830                          plan = plan.model_copy(
+      831                              update={
+      832                                  "rank": plan.rank
+      833                                  + compute_cost * pargs.preferred_family_penalty
+      834                              }
+      835                          )
+      836                      plans.append(plan)
+      837                  case Excuse() as excuse:
+      838                      tags = compute_excuse_tags(excuse.instance, current_inst)
+      839                      excuses.append(
+      840                          excuse.model_copy(update={"tags": tags}) if tags else excuse
+      841                      )
+      842                  case None:
+      843                      pass
+      844  
+      845          # lowest cost first
+      846          plans.sort(key=lambda p: (p.rank, p.candidate_clusters.total_annual_cost))
+      847  
+      848          num_results = num_results or self._default_num_results
+      849          return _CertainResult(
+      850              plans=reduce_by_family(
+      851                  plans, max_results_per_family=pargs.max_results_per_family
+      852              )[:num_results],
+      853              excuses=excuses,
+      854          )
+      855  
+      856      def _get_model_costs(
+      857          self,
+      858          *,
+      859          model_name: str,
+      860          context: RegionContext,
+      861          desires: CapacityDesires,
+      862          zonal_clusters: Sequence[ClusterCapacity],
+      863          regional_clusters: Sequence[ClusterCapacity],
+      864          extra_model_arguments: Dict[str, Any],
+      865      ) -> Tuple[Dict[str, float], List[ServiceCapacity]]:
+      866          """Get total costs for a model and any models it composes with."""
+      867          costs: Dict[str, float] = {}
+      868          services: List[ServiceCapacity] = []
+      869  
+       ... truncated at 400 lines ...

@@ -1,0 +1,254 @@
+row 137   espnet/espnet#6399
+============================================================================
+CLASS S4 in espnet2/asr/state_spaces/s4.py   loc=249 methods=6 wmc=31 lcom=0.25
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+     1568  class S4(nn.Module):
+     1569      def __init__(
+     1570          self,
+     1571          d_model,
+     1572          d_state=64,
+     1573          l_max=None,
+     1574          channels=1,
+     1575          bidirectional=False,
+     1576          # Arguments for position-wise feedforward components
+     1577          activation="gelu",
+     1578          postact="glu",
+     1579          hyper_act=None,
+     1580          dropout=0.0,
+     1581          tie_dropout=False,
+     1582          bottleneck=None,
+     1583          gate=None,
+     1584          transposed=True,
+     1585          verbose=False,
+     1586          # SSM Kernel arguments
+     1587          **kernel_args,
+     1588      ):
+     1589          """Initialize S4 module.
+     1590  
+     1591          d_state: the dimension of the state, also denoted by N
+     1592          l_max: the maximum kernel length, also denoted by L.
+     1593                  Set l_max=None to always use a global kernel
+     1594          channels: can be interpreted as a number of "heads";
+     1595                  the SSM is a map from a 1-dim to C-dim sequence.
+     1596                  It's not recommended to change this unless desperate for things to tune;
+     1597                  instead, increase d_model for larger models
+     1598          bidirectional: if True, convolution kernel will be two-sided
+     1599  
+     1600          Position-wise feedforward components:
+     1601          --------------------
+     1602          activation: activation in between SS and FF
+     1603          postact: activation after FF
+     1604          hyper_act: use a "hypernetwork" multiplication (experimental)
+     1605          dropout: standard dropout argument. tie_dropout=True ties the dropout
+     1606                  mask across the sequence length, emulating nn.Dropout1d
+     1607  
+     1608          Other arguments:
+     1609          --------------------
+     1610          transposed: choose backbone axis ordering of
+     1611                  (B, L, H) (if False) or (B, H, L) (if True)
+     1612                  [B=batch size, L=sequence length, H=hidden dimension]
+     1613          gate: add gated activation (GSS)
+     1614          bottleneck: reduce SSM dimension (GSS)
+     1615  
+     1616          See the class SSKernel for the kernel constructor which accepts kernel_args.
+     1617          Relevant options that are worth considering
+     1618          and tuning include "mode" + "measure", "dt_min", "dt_max", "lr"
+     1619  
+     1620          Other options are all experimental and should not need to be configured
+     1621          """
+     1622          super().__init__()
+     1623          if verbose:
+     1624              log.info(f"Constructing S4 (H, N, L) = ({d_model}, {d_state}, {l_max})")
+     1625  
+     1626          self.d_model = d_model
+     1627          self.H = d_model
+     1628          self.N = d_state
+     1629          self.L = l_max
+     1630          self.bidirectional = bidirectional
+     1631          self.channels = channels
+     1632          self.transposed = transposed
+     1633  
+     1634          self.gate = gate
+     1635          self.bottleneck = bottleneck
+     1636  
+     1637          if bottleneck is not None:
+     1638              self.H = self.H // bottleneck
+     1639              self.input_linear = LinearActivation(
+     1640                  self.d_model,
+     1641                  self.H,
+     1642                  transposed=not self.transposed,
+     1643                  activation=activation,
+     1644                  activate=True,
+     1645              )
+     1646  
+     1647          if gate is not None:
+     1648              self.input_gate = LinearActivation(
+     1649                  self.d_model,
+     1650                  self.d_model * gate,
+     1651                  transposed=not self.transposed,
+     1652                  activation=activation,
+     1653                  activate=True,
+     1654              )
+     1655              self.output_gate = LinearActivation(
+     1656                  self.d_model * gate,
+     1657                  self.d_model,
+     1658                  transposed=self.transposed,
+     1659                  activation=None,
+     1660                  activate=False,
+     1661              )
+     1662  
+     1663          # optional multiplicative modulation GLU-style
+     1664          # https://arxiv.org/abs/2002.05202
+     1665          self.hyper = hyper_act is not None
+     1666          if self.hyper:
+     1667              channels *= 2
+     1668              self.hyper_activation = Activation(hyper_act)
+     1669  
+     1670          self.D = nn.Parameter(torch.randn(channels, self.H))
+     1671  
+     1672          if self.bidirectional:
+     1673              channels *= 2
+     1674  
+     1675          # SSM Kernel
+     1676          self.kernel = SSKernel(
+     1677              self.H,
+     1678              N=self.N,
+     1679              L=self.L,
+     1680              channels=channels,
+     1681              verbose=verbose,
+     1682              **kernel_args,
+     1683          )
+     1684  
+     1685          # Pointwise
+     1686          self.activation = Activation(activation)
+     1687          dropout_fn = DropoutNd if tie_dropout else nn.Dropout
+     1688          self.dropout = dropout_fn(dropout) if dropout > 0.0 else nn.Identity()
+     1689          # position-wise output transform to mix features
+     1690          self.output_linear = LinearActivation(
+     1691              self.H * self.channels,
+     1692              self.d_model * (1 if self.gate is None else self.gate),
+     1693              transposed=self.transposed,
+     1694              activation=postact,
+     1695              activate=True,
+     1696          )
+     1697  
+     1698      def forward(self, u, state=None, rate=1.0, lengths=None, **kwargs):
+     1699          """Forward pass.
+     1700  
+     1701          u: (B H L) if self.transposed else (B L H)
+     1702          state: (H N) never needed unless you know what you're doing
+     1703  
+     1704          Returns: same shape as u
+     1705          """
+     1706          if not self.transposed:
+     1707              u = u.transpose(-1, -2)
+     1708          L = u.size(-1)
+     1709  
+     1710          # Mask out padding tokens
+     1711          if isinstance(lengths, int):
+     1712              if lengths != L:
+     1713                  lengths = torch.tensor(lengths, dtype=torch.long, device=u.device)
+     1714              else:
+     1715                  lengths = None
+     1716          if lengths is not None:
+     1717              if lengths.ndim == 0:
+     1718                  lengths = lengths.unsqueeze(0)
+     1719              assert (
+     1720                  isinstance(lengths, torch.Tensor)
+     1721                  and lengths.ndim == 1
+     1722                  and lengths.size(0) in [1, u.size(0)]
+     1723              ), print(f"l:{lengths.ndim}, {lengths.size()}, {u.size()}")
+     1724              mask = torch.where(
+     1725                  torch.arange(L, device=lengths.device) < lengths[:, None, None],
+     1726                  1.0,
+     1727                  0.0,
+     1728              )
+     1729              u = u * mask
+     1730  
+     1731          if self.gate is not None:
+     1732              v = self.input_gate(u)
+     1733          if self.bottleneck is not None:
+     1734              u = self.input_linear(u)
+     1735  
+     1736          # Compute SS Kernel
+     1737          L_kernel = L if self.L is None else min(L, round(self.L / rate))
+     1738          k, k_state = self.kernel(
+     1739              L=L_kernel, rate=rate, state=state
+     1740          )  # (C H L) (B C H L)
+     1741  
+     1742          # Convolution
+     1743          if self.bidirectional:
+     1744              k0, k1 = rearrange(k, "(s c) h l -> s c h l", s=2)
+     1745              k = F.pad(k0, (0, L)) + F.pad(k1.flip(-1), (L, 0))
+     1746          k_f = torch.fft.rfft(k, n=L_kernel + L)  # (C H L)
+     1747          u_f = torch.fft.rfft(u, n=L_kernel + L)  # (B H L)
+     1748          y_f = contract("bhl,chl->bchl", u_f, k_f)
+     1749          y = torch.fft.irfft(y_f, n=L_kernel + L)[..., :L]  # (B C H L)
+     1750  
+     1751          # Compute D term in state space equation - essentially a skip connection
+     1752          y = y + contract("bhl,ch->bchl", u, self.D)
+     1753  
+     1754          # Compute state update
+     1755          if state is not None:
+     1756              assert (
+     1757                  not self.bidirectional
+     1758              ), "Bidirectional not supported with state forwarding"
+     1759              y = y + k_state  #
+     1760              next_state = self.kernel.forward_state(u, state)
+     1761          else:
+     1762              next_state = None
+     1763  
+     1764          # Optional hyper-network multiplication
+     1765          if self.hyper:
+     1766              y, yh = rearrange(y, "b (s c) h l -> s b c h l", s=2)
+     1767              y = self.hyper_activation(yh) * y
+     1768  
+     1769          # Reshape to flatten channels
+     1770          y = rearrange(y, "... c h l -> ... (c h) l")
+     1771  
+     1772          y = self.dropout(self.activation(y))
+     1773  
+     1774          if not self.transposed:
+     1775              y = y.transpose(-1, -2)
+     1776  
+     1777          y = self.output_linear(y)
+     1778  
+     1779          if self.gate is not None:
+     1780              if not self.transposed:
+     1781                  v = v.transpose(-1, -2)
+     1782              y = self.output_gate(y * v)
+     1783  
+     1784          return y, next_state
+     1785  
+     1786      def setup_step(self, **kwargs):
+     1787          self.kernel._setup_step(**kwargs)
+     1788  
+     1789      def step(self, u, state, **kwargs):
+     1790          """Step one time step as a recurrent model.
+     1791  
+     1792          Intended to be used during validation.
+     1793  
+     1794          u: (B H)
+     1795          state: (B H N)
+     1796          Returns: output (B H), state (B H N)
+     1797          """
+     1798          assert not self.training
+     1799          y, next_state = self.kernel.step(u, state)  # (B C H)
+     1800          y = y + u.unsqueeze(-2) * self.D
+     1801          y = rearrange(y, "b c h -> b (c h)")
+     1802          y = self.activation(y)
+     1803          if self.transposed:
+     1804              y = self.output_linear(y.unsqueeze(-1)).squeeze(-1)
+     1805          else:
+     1806              y = self.output_linear(y)
+     1807          return y, next_state
+     1808  
+     1809      def default_state(self, *batch_shape, device=None):
+     1810          # kernel is not a SequenceModule so it doesn't need to adhere to same interface
+     1811          # the kernel will know the device of its own parameters
+     1812          return self.kernel.default_state(*batch_shape)
+     1813  
+     1814      @property
+     1815      def d_output(self):
+     1816          return self.d_model

@@ -1,0 +1,406 @@
+row 190   NousResearch/hermes-agent#43
+============================================================================
+CLASS ProcessRegistry in tools/process_registry.py   loc=672 methods=23 wmc=133 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       80  class ProcessRegistry:
+       81      """
+       82      In-memory registry of running and finished background processes.
+       83  
+       84      Thread-safe. Accessed from:
+       85        - Executor threads (terminal_tool, process tool handlers)
+       86        - Gateway asyncio loop (watcher tasks, session reset checks)
+       87        - Cleanup thread (sandbox reaping coordination)
+       88      """
+       89  
+       90      # Noise lines emitted by interactive shells when stdin is not a terminal.
+       91      _SHELL_NOISE = frozenset({
+       92          "bash: no job control in this shell",
+       93          "bash: no job control in this shell\n",
+       94          "no job control in this shell",
+       95          "no job control in this shell\n",
+       96      })
+       97  
+       98      def __init__(self):
+       99          self._running: Dict[str, ProcessSession] = {}
+      100          self._finished: Dict[str, ProcessSession] = {}
+      101          self._lock = threading.Lock()
+      102  
+      103          # Side-channel for check_interval watchers (gateway reads after agent run)
+      104          self.pending_watchers: List[Dict[str, Any]] = []
+      105  
+      106      @staticmethod
+      107      def _clean_shell_noise(text: str) -> str:
+      108          """Strip shell startup warnings from the beginning of output."""
+      109          lines = text.split("\n", 2)
+      110          if lines and lines[0].strip() in ProcessRegistry._SHELL_NOISE:
+      111              return "\n".join(lines[1:])
+      112          return text
+      113  
+      114      # ----- Spawn -----
+      115  
+      116      def spawn_local(
+      117          self,
+      118          command: str,
+      119          cwd: str = None,
+      120          task_id: str = "",
+      121          session_key: str = "",
+      122          env_vars: dict = None,
+      123          use_pty: bool = False,
+      124      ) -> ProcessSession:
+      125          """
+      126          Spawn a background process locally.
+      127  
+      128          Only for TERMINAL_ENV=local. Other backends use spawn_via_env().
+      129  
+      130          Args:
+      131              use_pty: If True, use a pseudo-terminal via ptyprocess for interactive
+      132                       CLI tools (Codex, Claude Code, Python REPL). Falls back to
+      133                       subprocess.Popen if ptyprocess is not installed.
+      134          """
+      135          session = ProcessSession(
+      136              id=f"proc_{uuid.uuid4().hex[:12]}",
+      137              command=command,
+      138              task_id=task_id,
+      139              session_key=session_key,
+      140              cwd=cwd or os.getcwd(),
+      141              started_at=time.time(),
+      142          )
+      143  
+      144          if use_pty:
+      145              # Try PTY mode for interactive CLI tools
+      146              try:
+      147                  import ptyprocess
+      148                  user_shell = os.environ.get("SHELL") or shutil.which("bash") or "/bin/bash"
+      149                  pty_proc = ptyprocess.PtyProcess.spawn(
+      150                      [user_shell, "-lic", command],
+      151                      cwd=session.cwd,
+      152                      env=os.environ | (env_vars or {}),
+      153                      dimensions=(30, 120),
+      154                  )
+      155                  session.pid = pty_proc.pid
+      156                  # Store the pty handle on the session for read/write
+      157                  session._pty = pty_proc
+      158  
+      159                  # PTY reader thread
+      160                  reader = threading.Thread(
+      161                      target=self._pty_reader_loop,
+      162                      args=(session,),
+      163                      daemon=True,
+      164                      name=f"proc-pty-reader-{session.id}",
+      165                  )
+      166                  session._reader_thread = reader
+      167                  reader.start()
+      168  
+      169                  with self._lock:
+      170                      self._prune_if_needed()
+      171                      self._running[session.id] = session
+      172  
+      173                  self._write_checkpoint()
+      174                  return session
+      175  
+      176              except ImportError:
+      177                  logger.warning("ptyprocess not installed, falling back to pipe mode")
+      178              except Exception as e:
+      179                  logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+      180  
+      181          # Standard Popen path (non-PTY or PTY fallback)
+      182          # Use the user's login shell for consistency with LocalEnvironment --
+      183          # ensures rc files are sourced and user tools are available.
+      184          user_shell = os.environ.get("SHELL") or shutil.which("bash") or "/bin/bash"
+      185          proc = subprocess.Popen(
+      186              [user_shell, "-lic", command],
+      187              text=True,
+      188              cwd=session.cwd,
+      189              env=os.environ | (env_vars or {}),
+      190              encoding="utf-8",
+      191              errors="replace",
+      192              stdout=subprocess.PIPE,
+      193              stderr=subprocess.STDOUT,
+      194              stdin=subprocess.PIPE,
+      195              preexec_fn=os.setsid,
+      196          )
+      197  
+      198          session.process = proc
+      199          session.pid = proc.pid
+      200  
+      201          # Start output reader thread
+      202          reader = threading.Thread(
+      203              target=self._reader_loop,
+      204              args=(session,),
+      205              daemon=True,
+      206              name=f"proc-reader-{session.id}",
+      207          )
+      208          session._reader_thread = reader
+      209          reader.start()
+      210  
+      211          with self._lock:
+      212              self._prune_if_needed()
+      213              self._running[session.id] = session
+      214  
+      215          self._write_checkpoint()
+      216          return session
+      217  
+      218      def spawn_via_env(
+      219          self,
+      220          env: Any,
+      221          command: str,
+      222          cwd: str = None,
+      223          task_id: str = "",
+      224          session_key: str = "",
+      225          timeout: int = 10,
+      226      ) -> ProcessSession:
+      227          """
+      228          Spawn a background process through a non-local environment backend.
+      229  
+      230          For Docker/Singularity/Modal/SSH: runs the command inside the sandbox
+      231          using the environment's execute() interface. We wrap the command to
+      232          capture the in-sandbox PID and redirect output to a log file inside
+      233          the sandbox, then poll the log via subsequent execute() calls.
+      234  
+      235          This is less capable than local spawn (no live stdout pipe, no stdin),
+      236          but it ensures the command runs in the correct sandbox context.
+      237          """
+      238          session = ProcessSession(
+      239              id=f"proc_{uuid.uuid4().hex[:12]}",
+      240              command=command,
+      241              task_id=task_id,
+      242              session_key=session_key,
+      243              cwd=cwd,
+      244              started_at=time.time(),
+      245              env_ref=env,
+      246          )
+      247  
+      248          # Run the command in the sandbox with output capture
+      249          log_path = f"/tmp/hermes_bg_{session.id}.log"
+      250          pid_path = f"/tmp/hermes_bg_{session.id}.pid"
+      251          quoted_command = shlex.quote(command)
+      252          bg_command = (
+      253              f"nohup bash -c {quoted_command} > {log_path} 2>&1 & "
+      254              f"echo $! > {pid_path} && cat {pid_path}"
+      255          )
+      256  
+      257          try:
+      258              result = env.execute(bg_command, timeout=timeout)
+      259              output = result.get("output", "").strip()
+      260              # Try to extract the PID from the output
+      261              for line in output.splitlines():
+      262                  line = line.strip()
+      263                  if line.isdigit():
+      264                      session.pid = int(line)
+      265                      break
+      266          except Exception as e:
+      267              session.exited = True
+      268              session.exit_code = -1
+      269              session.output_buffer = f"Failed to start: {e}"
+      270  
+      271          if not session.exited:
+      272              # Start a poller thread that periodically reads the log file
+      273              reader = threading.Thread(
+      274                  target=self._env_poller_loop,
+      275                  args=(session, env, log_path, pid_path),
+      276                  daemon=True,
+      277                  name=f"proc-poller-{session.id}",
+      278              )
+      279              session._reader_thread = reader
+      280              reader.start()
+      281  
+      282          with self._lock:
+      283              self._prune_if_needed()
+      284              self._running[session.id] = session
+      285  
+      286          self._write_checkpoint()
+      287          return session
+      288  
+      289      # ----- Reader / Poller Threads -----
+      290  
+      291      def _reader_loop(self, session: ProcessSession):
+      292          """Background thread: read stdout from a local Popen process."""
+      293          first_chunk = True
+      294          try:
+      295              while True:
+      296                  chunk = session.process.stdout.read(4096)
+      297                  if not chunk:
+      298                      break
+      299                  if first_chunk:
+      300                      chunk = self._clean_shell_noise(chunk)
+      301                      first_chunk = False
+      302                  with session._lock:
+      303                      session.output_buffer += chunk
+      304                      if len(session.output_buffer) > session.max_output_chars:
+      305                          session.output_buffer = session.output_buffer[-session.max_output_chars:]
+      306          except Exception as e:
+      307              logger.debug("Process stdout reader ended: %s", e)
+      308  
+      309          # Process exited
+      310          try:
+      311              session.process.wait(timeout=5)
+      312          except Exception as e:
+      313              logger.debug("Process wait timed out or failed: %s", e)
+      314          session.exited = True
+      315          session.exit_code = session.process.returncode
+      316          self._move_to_finished(session)
+      317  
+      318      def _env_poller_loop(
+      319          self, session: ProcessSession, env: Any, log_path: str, pid_path: str
+      320      ):
+      321          """Background thread: poll a sandbox log file for non-local backends."""
+      322          while not session.exited:
+      323              time.sleep(2)  # Poll every 2 seconds
+      324              try:
+      325                  # Read new output from the log file
+      326                  result = env.execute(f"cat {log_path} 2>/dev/null", timeout=10)
+      327                  new_output = result.get("output", "")
+      328                  if new_output:
+      329                      with session._lock:
+      330                          session.output_buffer = new_output
+      331                          if len(session.output_buffer) > session.max_output_chars:
+      332                              session.output_buffer = session.output_buffer[-session.max_output_chars:]
+      333  
+      334                  # Check if process is still running
+      335                  check = env.execute(
+      336                      f"kill -0 $(cat {pid_path} 2>/dev/null) 2>/dev/null; echo $?",
+      337                      timeout=5,
+      338                  )
+      339                  check_output = check.get("output", "").strip()
+      340                  if check_output and check_output.splitlines()[-1].strip() != "0":
+      341                      # Process has exited -- get exit code
+      342                      exit_result = env.execute(
+      343                          f"wait $(cat {pid_path} 2>/dev/null) 2>/dev/null; echo $?",
+      344                          timeout=5,
+      345                      )
+      346                      exit_str = exit_result.get("output", "").strip()
+      347                      try:
+      348                          session.exit_code = int(exit_str.splitlines()[-1].strip())
+      349                      except (ValueError, IndexError):
+      350                          session.exit_code = -1
+      351                      session.exited = True
+      352                      self._move_to_finished(session)
+      353                      return
+      354  
+      355              except Exception:
+      356                  # Environment might be gone (sandbox reaped, etc.)
+      357                  session.exited = True
+      358                  session.exit_code = -1
+      359                  self._move_to_finished(session)
+      360                  return
+      361  
+      362      def _pty_reader_loop(self, session: ProcessSession):
+      363          """Background thread: read output from a PTY process."""
+      364          pty = session._pty
+      365          try:
+      366              while pty.isalive():
+      367                  try:
+      368                      chunk = pty.read(4096)
+      369                      if chunk:
+      370                          # ptyprocess returns bytes
+      371                          text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="replace")
+      372                          with session._lock:
+      373                              session.output_buffer += text
+      374                              if len(session.output_buffer) > session.max_output_chars:
+      375                                  session.output_buffer = session.output_buffer[-session.max_output_chars:]
+      376                  except EOFError:
+      377                      break
+      378                  except Exception:
+      379                      break
+      380          except Exception as e:
+      381              logger.debug("PTY stdout reader ended: %s", e)
+      382  
+      383          # Process exited
+      384          try:
+      385              pty.wait()
+      386          except Exception as e:
+      387              logger.debug("PTY wait timed out or failed: %s", e)
+      388          session.exited = True
+      389          session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
+      390          self._move_to_finished(session)
+      391  
+      392      def _move_to_finished(self, session: ProcessSession):
+      393          """Move a session from running to finished."""
+      394          with self._lock:
+      395              self._running.pop(session.id, None)
+      396              self._finished[session.id] = session
+      397          self._write_checkpoint()
+      398  
+      399      # ----- Query Methods -----
+      400  
+      401      def get(self, session_id: str) -> Optional[ProcessSession]:
+      402          """Get a session by ID (running or finished)."""
+      403          with self._lock:
+      404              return self._running.get(session_id) or self._finished.get(session_id)
+      405  
+      406      def poll(self, session_id: str) -> dict:
+      407          """Check status and get new output for a background process."""
+      408          session = self.get(session_id)
+      409          if session is None:
+      410              return {"status": "not_found", "error": f"No process with ID {session_id}"}
+      411  
+      412          with session._lock:
+      413              output_preview = session.output_buffer[-1000:] if session.output_buffer else ""
+      414  
+      415          result = {
+      416              "session_id": session.id,
+      417              "command": session.command,
+      418              "status": "exited" if session.exited else "running",
+      419              "pid": session.pid,
+      420              "uptime_seconds": int(time.time() - session.started_at),
+      421              "output_preview": output_preview,
+      422          }
+      423          if session.exited:
+      424              result["exit_code"] = session.exit_code
+      425          if session.detached:
+      426              result["detached"] = True
+      427              result["note"] = "Process recovered after restart -- output history unavailable"
+      428          return result
+      429  
+      430      def read_log(self, session_id: str, offset: int = 0, limit: int = 200) -> dict:
+      431          """Read the full output log with optional pagination by lines."""
+      432          session = self.get(session_id)
+      433          if session is None:
+      434              return {"status": "not_found", "error": f"No process with ID {session_id}"}
+      435  
+      436          with session._lock:
+      437              full_output = session.output_buffer
+      438  
+      439          lines = full_output.splitlines()
+      440          total_lines = len(lines)
+      441  
+      442          # Default: last N lines
+      443          if offset == 0 and limit > 0:
+      444              selected = lines[-limit:]
+      445          else:
+      446              selected = lines[offset:offset + limit]
+      447  
+      448          return {
+      449              "session_id": session.id,
+      450              "status": "exited" if session.exited else "running",
+      451              "output": "\n".join(selected),
+      452              "total_lines": total_lines,
+      453              "showing": f"{len(selected)} lines",
+      454          }
+      455  
+      456      def wait(self, session_id: str, timeout: int = None) -> dict:
+      457          """
+      458          Block until a process exits, timeout, or interrupt.
+      459  
+      460          Args:
+      461              session_id: The process to wait for.
+      462              timeout: Max seconds to block. Falls back to TERMINAL_TIMEOUT config.
+      463  
+      464          Returns:
+      465              dict with status ("exited", "timeout", "interrupted", "not_found")
+      466              and output snapshot.
+      467          """
+      468          from tools.terminal_tool import _interrupt_event
+      469  
+      470          default_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
+      471          max_timeout = default_timeout
+      472          requested_timeout = timeout
+      473          timeout_note = None
+      474  
+      475          if requested_timeout and requested_timeout > max_timeout:
+      476              effective_timeout = max_timeout
+      477              timeout_note = (
+      478                  f"Requested wait of {requested_timeout}s was clamped "
+      479                  f"to configured limit of {max_timeout}s"
+       ... truncated at 400 lines ...

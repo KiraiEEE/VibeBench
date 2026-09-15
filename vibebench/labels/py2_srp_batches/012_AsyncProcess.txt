@@ -1,0 +1,381 @@
+row 12   music-assistant/server#3484
+============================================================================
+CLASS AsyncProcess in music_assistant/helpers/process.py   loc=376 methods=20 wmc=81 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       38  class AsyncProcess:
+       39      """
+       40      AsyncProcess.
+       41  
+       42      Wrapper around asyncio subprocess to help with using pipe streams and
+       43      taking care of properly closing the process in case of exit (on both success and failures),
+       44      without deadlocking.
+       45      """
+       46  
+       47      _stdin_feeder_task: asyncio.Task[None] | None = None  # used for ffmpeg
+       48      _stderr_reader_task: asyncio.Task[None] | None = None  # used for ffmpeg
+       49  
+       50      def __init__(
+       51          self,
+       52          args: list[str],
+       53          stdin: bool | int | None = None,
+       54          stdout: bool | int | None = None,
+       55          stderr: bool | int | None = False,
+       56          name: str | None = None,
+       57          env: dict[str, str] | None = None,
+       58      ) -> None:
+       59          """Initialize AsyncProcess.
+       60  
+       61          :param args: Command and arguments to execute.
+       62          :param stdin: Stdin configuration (True for PIPE, False for None, or custom).
+       63          :param stdout: Stdout configuration (True for PIPE, False for None, or custom).
+       64          :param stderr: Stderr configuration (True for PIPE, False for DEVNULL, or custom).
+       65          :param name: Process name for logging.
+       66          :param env: Environment variables for the subprocess (None inherits parent env).
+       67          """
+       68          self.proc: asyncio.subprocess.Process | None = None
+       69          if name is None:
+       70              name = args[0].split(os.sep)[-1]
+       71          self.name = name
+       72          self.logger = LOGGER.getChild(name)
+       73          self._args = args
+       74          self._stdin = None if stdin is False else stdin
+       75          self._stdout = None if stdout is False else stdout
+       76          self._stderr = asyncio.subprocess.DEVNULL if stderr is False else stderr
+       77          self._env = get_subprocess_env(env)
+       78          self._stderr_lock = asyncio.Lock()
+       79          self._stdout_lock = asyncio.Lock()
+       80          self._stdin_lock = asyncio.Lock()
+       81          self._close_called = False
+       82          self._returncode: int | None = None
+       83  
+       84      @property
+       85      def closed(self) -> bool:
+       86          """Return if the process was closed."""
+       87          return self._close_called or self.returncode is not None
+       88  
+       89      @property
+       90      def returncode(self) -> int | None:
+       91          """Return the erturncode of the process."""
+       92          if self._returncode is not None:
+       93              return self._returncode
+       94          if self.proc is None:
+       95              return None
+       96          if (ret_code := self.proc.returncode) is not None:
+       97              self._returncode = ret_code
+       98          return ret_code
+       99  
+      100      async def __aenter__(self) -> Self:
+      101          """Enter context manager."""
+      102          await self.start()
+      103          return self
+      104  
+      105      async def __aexit__(
+      106          self,
+      107          exc_type: type[BaseException] | None,
+      108          exc_val: BaseException | None,
+      109          exc_tb: TracebackType | None,
+      110      ) -> bool | None:
+      111          """Exit context manager."""
+      112          # make sure we close and cleanup the process
+      113          await self.close()
+      114          self._returncode = self.returncode
+      115          return None
+      116  
+      117      async def start(self) -> None:
+      118          """Perform Async init of process."""
+      119          self.proc = await asyncio.create_subprocess_exec(
+      120              *self._args,
+      121              stdin=asyncio.subprocess.PIPE if self._stdin is True else self._stdin,
+      122              stdout=asyncio.subprocess.PIPE if self._stdout is True else self._stdout,
+      123              stderr=asyncio.subprocess.PIPE if self._stderr is True else self._stderr,
+      124              env=self._env,
+      125              bufsize=0,
+      126          )
+      127          self.logger.log(
+      128              VERBOSE_LOG_LEVEL, "Process %s started with PID %s", self.name, self.proc.pid
+      129          )
+      130  
+      131      async def iter_chunked(self, n: int = DEFAULT_CHUNKSIZE) -> AsyncGenerator[bytes, None]:
+      132          """Yield chunks of n size from the process stdout."""
+      133          while True:
+      134              chunk = await self.readexactly(n)
+      135              if len(chunk) == 0:
+      136                  break
+      137              yield chunk
+      138  
+      139      async def iter_any(self, n: int = DEFAULT_CHUNKSIZE) -> AsyncGenerator[bytes, None]:
+      140          """Yield chunks as they come in from process stdout."""
+      141          while True:
+      142              chunk = await self.read(n)
+      143              if len(chunk) == 0:
+      144                  break
+      145              yield chunk
+      146  
+      147      async def readexactly(self, n: int) -> bytes:
+      148          """Read exactly n bytes from the process stdout (or less if eof)."""
+      149          if self._close_called:
+      150              return b""
+      151          assert self.proc is not None  # for type checking
+      152          assert self.proc.stdout is not None  # for type checking
+      153          async with self._stdout_lock:
+      154              try:
+      155                  return await self.proc.stdout.readexactly(n)
+      156              except asyncio.IncompleteReadError as err:
+      157                  return err.partial
+      158  
+      159      async def read(self, n: int) -> bytes:
+      160          """Read up to n bytes from the stdout stream.
+      161  
+      162          If n is positive, this function try to read n bytes,
+      163          and may return less or equal bytes than requested, but at least one byte.
+      164          If EOF was received before any byte is read, this function returns empty byte object.
+      165          """
+      166          if self._close_called:
+      167              return b""
+      168          assert self.proc is not None  # for type checking
+      169          assert self.proc.stdout is not None  # for type checking
+      170          async with self._stdout_lock:
+      171              return await self.proc.stdout.read(n)
+      172  
+      173      async def write(self, data: bytes) -> None:
+      174          """Write data to process stdin."""
+      175          if self._close_called or self.proc is None:
+      176              return
+      177          if self.proc.stdin is None:
+      178              return
+      179          async with self._stdin_lock:
+      180              self.proc.stdin.write(data)
+      181              with suppress(BrokenPipeError, ConnectionResetError):
+      182                  await self.proc.stdin.drain()
+      183  
+      184      async def write_eof(self) -> None:
+      185          """Write end of file to to process stdin."""
+      186          if self._close_called or self.proc is None:
+      187              return
+      188          if self.proc.stdin is None:
+      189              return
+      190          async with self._stdin_lock:
+      191              try:
+      192                  if self.proc.stdin.can_write_eof():
+      193                      self.proc.stdin.write_eof()
+      194                  await self.proc.stdin.drain()
+      195              except (
+      196                  AttributeError,
+      197                  AssertionError,
+      198                  BrokenPipeError,
+      199                  RuntimeError,
+      200                  ConnectionResetError,
+      201              ):
+      202                  # already exited, race condition
+      203                  pass
+      204  
+      205      async def read_stderr(self) -> bytes:
+      206          """Read line from stderr."""
+      207          if self.returncode is not None:
+      208              return b""
+      209          assert self.proc is not None  # for type checking
+      210          assert self.proc.stderr is not None  # for type checking
+      211          async with self._stderr_lock:
+      212              try:
+      213                  return await self.proc.stderr.readline()
+      214              except ValueError as err:
+      215                  # we're waiting for a line (separator found), but the line was too big
+      216                  # this may happen with ffmpeg during a long (radio) stream where progress
+      217                  # gets outputted to the stderr but no newline
+      218                  # https://stackoverflow.com/questions/55457370/how-to-avoid-valueerror-separator-is-not-found-and-chunk-exceed-the-limit
+      219                  # NOTE: this consumes the line that was too big
+      220                  if "chunk exceed the limit" in str(err):
+      221                      return await self.proc.stderr.readline()
+      222                  # raise for all other (value) errors
+      223                  raise
+      224  
+      225      async def iter_stderr(self) -> AsyncGenerator[str, None]:
+      226          """Iterate lines from the stderr stream as string."""
+      227          line: str | bytes
+      228          while True:
+      229              line = await self.read_stderr()
+      230              if line == b"":
+      231                  break
+      232              line = line.decode("utf-8", errors="ignore").strip()
+      233              if not line:
+      234                  continue
+      235              yield line
+      236  
+      237      async def communicate(
+      238          self,
+      239          input: bytes | None = None,  # noqa: A002
+      240          timeout: float | None = None,
+      241      ) -> tuple[bytes, bytes]:
+      242          """Communicate with the process and return stdout and stderr."""
+      243          if self.closed:
+      244              raise RuntimeError("communicate called while process already done")
+      245          # abort existing readers on stderr/stdout first before we send communicate
+      246          await self._stderr_lock.acquire()
+      247          await self._stdout_lock.acquire()
+      248          assert self.proc is not None  # for type checking
+      249          stdout, stderr = await asyncio.wait_for(self.proc.communicate(input), timeout)
+      250          return (stdout, stderr)
+      251  
+      252      async def close(self) -> None:
+      253          """Close/terminate the process and wait for exit."""
+      254          self._close_called = True
+      255          if not self.proc:
+      256              return
+      257  
+      258          # cancel existing stdin feeder task if any
+      259          if self._stdin_feeder_task:
+      260              if not self._stdin_feeder_task.done():
+      261                  self._stdin_feeder_task.cancel()
+      262              # Always await the task to consume any exception and prevent
+      263              # "Task exception was never retrieved" errors.
+      264              try:
+      265                  await self._stdin_feeder_task
+      266              except asyncio.CancelledError:
+      267                  pass  # Expected when we cancel the task
+      268              except Exception as err:
+      269                  # Log unexpected exceptions from the stdin feeder before suppressing
+      270                  LOGGER.warning(
+      271                      "Process stdin feeder task ended with error: %s",
+      272                      err,
+      273                  )
+      274  
+      275          # close stdin to signal we're done sending data
+      276          with suppress(TimeoutError, asyncio.CancelledError):
+      277              await asyncio.wait_for(self._stdin_lock.acquire(), 5)
+      278          if self.proc.stdin and not self.proc.stdin.is_closing():
+      279              self.proc.stdin.close()
+      280          elif not self.proc.stdin and self.proc.returncode is None:
+      281              self.proc.send_signal(SIGINT)
+      282  
+      283          # ensure we have no more readers active and stdout is drained
+      284          with suppress(TimeoutError, asyncio.CancelledError):
+      285              await asyncio.wait_for(self._stdout_lock.acquire(), 5)
+      286          if self.proc.stdout and not self.proc.stdout.at_eof():
+      287              with suppress(Exception):
+      288                  await self.proc.stdout.read(-1)
+      289          # if we have a stderr task active, allow it to finish
+      290          if self._stderr_reader_task:
+      291              with suppress(TimeoutError, asyncio.CancelledError):
+      292                  await asyncio.wait_for(self._stderr_reader_task, 5)
+      293          elif self.proc.stderr and not self.proc.stderr.at_eof():
+      294              with suppress(TimeoutError, asyncio.CancelledError):
+      295                  await asyncio.wait_for(self._stderr_lock.acquire(), 5)
+      296              # drain stderr
+      297              with suppress(Exception):
+      298                  await self.proc.stderr.read(-1)
+      299  
+      300          # make sure the process is really cleaned up.
+      301          # especially with pipes this can cause deadlocks if not properly guarded
+      302          # we need to ensure stdout and stderr are flushed and stdin closed
+      303          pid = self.proc.pid
+      304          terminate_attempts = 0
+      305          while self.returncode is None:
+      306              try:
+      307                  # use communicate to flush all pipe buffers
+      308                  await asyncio.wait_for(self.proc.communicate(), 2)
+      309              except TimeoutError:
+      310                  terminate_attempts += 1
+      311                  self.logger.debug(
+      312                      "Process %s with PID %s did not stop in time (attempt %d). Sending SIGKILL...",
+      313                      self.name,
+      314                      pid,
+      315                      terminate_attempts,
+      316                  )
+      317                  # Use os.kill for more direct signal delivery
+      318                  with suppress(ProcessLookupError, OSError):
+      319                      os.kill(pid, 9)  # SIGKILL = 9
+      320                  # Give up after 5 attempts - process may be zombie
+      321                  if terminate_attempts >= 5:
+      322                      self.logger.warning(
+      323                          "Process %s (PID %s) did not terminate after %d SIGKILL attempts",
+      324                          self.name,
+      325                          pid,
+      326                          terminate_attempts,
+      327                      )
+      328                      break
+      329          self.logger.log(
+      330              VERBOSE_LOG_LEVEL,
+      331              "Process %s with PID %s stopped with returncode %s",
+      332              self.name,
+      333              self.proc.pid,
+      334              self.returncode,
+      335          )
+      336  
+      337      async def kill(self) -> None:
+      338          """
+      339          Immediately kill the process with SIGKILL.
+      340  
+      341          Use this for forceful termination when the process doesn't respond to
+      342          normal termination signals. Unlike close(), this doesn't attempt graceful
+      343          shutdown - it immediately sends SIGKILL.
+      344          """
+      345          self._close_called = True
+      346          if not self.proc or self.returncode is not None:
+      347              return
+      348  
+      349          pid = self.proc.pid
+      350  
+      351          # Cancel stdin feeder task if any
+      352          if self._stdin_feeder_task and not self._stdin_feeder_task.done():
+      353              self._stdin_feeder_task.cancel()
+      354              with suppress(asyncio.CancelledError, Exception):
+      355                  await self._stdin_feeder_task
+      356  
+      357          # Cancel stderr reader task if any
+      358          if self._stderr_reader_task and not self._stderr_reader_task.done():
+      359              self._stderr_reader_task.cancel()
+      360              with suppress(asyncio.CancelledError, Exception):
+      361                  await self._stderr_reader_task
+      362  
+      363          # Close stdin to signal we're done sending data
+      364          # Note: Don't manually call feed_eof() on stdout/stderr - this causes
+      365          # "feed_data after feed_eof" assertion errors when the subprocess transport
+      366          # still has buffered data to deliver. Let the process termination naturally
+      367          # close the streams.
+      368          if self.proc.stdin and not self.proc.stdin.is_closing():
+      369              self.proc.stdin.close()
+      370  
+      371          # Send SIGKILL immediately using os.kill for more direct signal delivery
+      372          self.logger.debug("Killing process %s with PID %s", self.name, pid)
+      373          with suppress(ProcessLookupError, OSError):
+      374              os.kill(pid, 9)  # SIGKILL = 9
+      375  
+      376          # Wait for process to actually terminate
+      377          try:
+      378              await asyncio.wait_for(self.proc.wait(), 2)
+      379          except TimeoutError:
+      380              # Try one more time with os.kill
+      381              with suppress(ProcessLookupError, OSError):
+      382                  os.kill(pid, 9)
+      383              try:
+      384                  await asyncio.wait_for(self.proc.wait(), 2)
+      385              except TimeoutError:
+      386                  self.logger.warning(
+      387                      "Process %s with PID %s did not terminate after SIGKILL - may be zombie",
+      388                      self.name,
+      389                      pid,
+      390                  )
+      391  
+      392          self.logger.log(
+      393              VERBOSE_LOG_LEVEL,
+      394              "Process %s with PID %s killed with returncode %s",
+      395              self.name,
+      396              pid,
+      397              self.returncode,
+      398          )
+      399  
+      400      async def wait(self) -> int:
+      401          """Wait for the process and return the returncode."""
+      402          if self._returncode is None:
+      403              assert self.proc is not None
+      404              self._returncode = await self.proc.wait()
+      405          return self._returncode
+      406  
+      407      async def wait_with_timeout(self, timeout: int) -> int:
+      408          """Wait for the process and return the returncode with a timeout."""
+      409          return await asyncio.wait_for(self.wait(), timeout)
+      410  
+      411      def attach_stderr_reader(self, task: asyncio.Task[None]) -> None:
+      412          """Attach a stderr reader task to this process."""
+      413          self._stderr_reader_task = task

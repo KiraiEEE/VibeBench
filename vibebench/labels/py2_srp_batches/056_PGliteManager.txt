@@ -1,0 +1,406 @@
+row 56   wey-gu/py-pglite#38
+============================================================================
+CLASS PGliteManager in src/py_pglite/manager.py   loc=646 methods=20 wmc=92 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       23  class PGliteManager:
+       24      """Manages PGlite process lifecycle for testing.
+       25  
+       26      Framework-agnostic PGlite process manager. Provides database connections
+       27      through framework-specific methods that require their respective dependencies.
+       28      """
+       29  
+       30      def __init__(self, config: PGliteConfig | None = None):
+       31          """Initialize PGlite manager.
+       32  
+       33          Args:
+       34              config: Configuration for PGlite. If None, uses defaults.
+       35          """
+       36          self.config = config or PGliteConfig()
+       37          self.process: subprocess.Popen[str] | None = None
+       38          self.work_dir: Path | None = None
+       39          self._original_cwd: str | None = None
+       40          self._shared_engine: Any | None = None
+       41  
+       42          # Set up logging
+       43          self.logger = logging.getLogger(__name__)
+       44          handler = logging.StreamHandler(sys.stdout)
+       45          handler.setLevel(self.config.log_level_int)
+       46          if not self.logger.handlers:
+       47              self.logger.addHandler(handler)
+       48          self.logger.setLevel(self.config.log_level_int)
+       49  
+       50      def __enter__(self) -> "PGliteManager":
+       51          """Context manager entry."""
+       52          self.start()
+       53          return self
+       54  
+       55      def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+       56          """Context manager exit."""
+       57          self.stop()
+       58  
+       59      def _setup_work_dir(self) -> Path:
+       60          """Setup working directory for PGlite files."""
+       61          if self.config.work_dir:
+       62              work_dir = self.config.work_dir
+       63              work_dir.mkdir(parents=True, exist_ok=True)
+       64          else:
+       65              work_dir = Path(tempfile.mkdtemp(prefix="py-pglite-"))
+       66  
+       67          # Create package.json if it doesn't exist
+       68          package_json = work_dir / "package.json"
+       69          if not package_json.exists():
+       70              package_content = {
+       71                  "name": "py-pglite-env",
+       72                  "version": __version__,
+       73                  "description": "PGlite test environment for py-pglite",
+       74                  "scripts": {"start": "node pglite_manager.js"},
+       75                  "dependencies": {
+       76                      "@electric-sql/pglite": "^0.3.0",
+       77                      "@electric-sql/pglite-socket": "^0.0.8",
+       78                  },
+       79              }
+       80              with open(package_json, "w") as f:
+       81                  json.dump(package_content, f, indent=2)
+       82  
+       83          # Create pglite_manager.js if it doesn't exist
+       84          manager_js = work_dir / "pglite_manager.js"
+       85          if not manager_js.exists():
+       86              # Generate JavaScript for extensions
+       87              ext_requires = []
+       88              ext_configs = []
+       89              if self.config.extensions:
+       90                  for ext_name in self.config.extensions:
+       91                      ext_info = SUPPORTED_EXTENSIONS[ext_name]
+       92                      ext_requires.append(
+       93                          f"const {{ {ext_info['name']} }} = require('{ext_info['module']}');"
+       94                      )
+       95                      ext_configs.append(f"    {ext_name}: {ext_info['name']}")
+       96  
+       97              ext_requires_str = "\n".join(ext_requires)
+       98              ext_configs_str = ",\n".join(ext_configs)
+       99              extensions_obj_str = f"{{\n{ext_configs_str}\n}}" if ext_configs else "{}"
+      100  
+      101              # Generate JavaScript content based on socket mode
+      102              if self.config.use_tcp:
+      103                  js_content = self._generate_tcp_js_content(
+      104                      ext_requires_str, extensions_obj_str
+      105                  )
+      106              else:
+      107                  js_content = self._generate_unix_js_content(
+      108                      ext_requires_str, extensions_obj_str
+      109                  )
+      110              with open(manager_js, "w") as f:
+      111                  f.write(js_content)
+      112  
+      113          return work_dir
+      114  
+      115      def _generate_unix_js_content(
+      116          self, ext_requires_str: str, extensions_obj_str: str
+      117      ) -> str:
+      118          """Generate JavaScript content for Unix socket mode (original logic)."""
+      119          return dedent(f"""
+      120              const {{ PGlite }} = require('@electric-sql/pglite');
+      121              const {{ PGLiteSocketServer }} = require('@electric-sql/pglite-socket');
+      122              const fs = require('fs');
+      123              const path = require('path');
+      124              const {{ unlink }} = require('fs/promises');
+      125              const {{ existsSync }} = require('fs');
+      126              {ext_requires_str}
+      127  
+      128              const SOCKET_PATH = '{self.config.socket_path}';
+      129  
+      130              async function cleanup() {{
+      131                  if (existsSync(SOCKET_PATH)) {{
+      132                      try {{
+      133                          await unlink(SOCKET_PATH);
+      134                          console.log(`Removed old socket at ${{SOCKET_PATH}}`);
+      135                      }} catch (err) {{
+      136                          // Ignore errors during cleanup
+      137                      }}
+      138                  }}
+      139              }}
+      140  
+      141              async function startServer() {{
+      142                  try {{
+      143                      // Create a PGlite instance with extensions
+      144                      const db = new PGlite({{
+      145                          extensions: {extensions_obj_str}
+      146                      }});
+      147  
+      148                      // Clean up any existing socket
+      149                      await cleanup();
+      150  
+      151                      // Create and start a socket server
+      152                      const server = new PGLiteSocketServer({{
+      153                          db,
+      154                          path: SOCKET_PATH,
+      155                      }});
+      156                      await server.start();
+      157                      console.log(`Server started on socket ${{SOCKET_PATH}}`);
+      158  
+      159                      // Handle graceful shutdown
+      160                      process.on('SIGINT', async () => {{
+      161                          console.log('Received SIGINT, shutting down gracefully...');
+      162                          try {{
+      163                              await server.stop();
+      164                              await db.close();
+      165                              console.log('Server stopped and database closed');
+      166                          }} catch (err) {{
+      167                              console.error('Error during shutdown:', err);
+      168                          }}
+      169                          process.exit(0);
+      170                      }});
+      171  
+      172                      process.on('SIGTERM', async () => {{
+      173                          console.log('Received SIGTERM, shutting down gracefully...');
+      174                          try {{
+      175                              await server.stop();
+      176                              await db.close();
+      177                              console.log('Server stopped and database closed');
+      178                          }} catch (err) {{
+      179                              console.error('Error during shutdown:', err);
+      180                          }}
+      181                          process.exit(0);
+      182                      }});
+      183  
+      184                      // Keep the process alive
+      185                      process.on('exit', () => {{
+      186                          console.log('Process exiting...');
+      187                      }});
+      188  
+      189                  }} catch (err) {{
+      190                      console.error('Failed to start PGlite server:', err);
+      191                      process.exit(1);
+      192                  }}
+      193              }}
+      194  
+      195              startServer();
+      196          """).strip()
+      197  
+      198      def _generate_tcp_js_content(
+      199          self, ext_requires_str: str, extensions_obj_str: str
+      200      ) -> str:
+      201          """Generate JavaScript content for TCP socket mode."""
+      202          return dedent(f"""
+      203              const {{ PGlite }} = require('@electric-sql/pglite');
+      204              const {{ PGLiteSocketServer }} = require('@electric-sql/pglite-socket');
+      205              const fs = require('fs');
+      206              const path = require('path');
+      207              {ext_requires_str}
+      208  
+      209              async function startServer() {{
+      210                  try {{
+      211                      // Create a PGlite instance with extensions
+      212                      const db = new PGlite({{
+      213                          extensions: {extensions_obj_str}
+      214                      }});
+      215  
+      216                      // Create and start a TCP server
+      217                      const server = new PGLiteSocketServer({{
+      218                          db,
+      219                          host: '{self.config.tcp_host}',
+      220                          port: {self.config.tcp_port}
+      221                      }});
+      222                      await server.start();
+      223                      console.log(`Server started on TCP {self.config.tcp_host}:{self.config.tcp_port}`);
+      224  
+      225                      // Handle graceful shutdown
+      226                      process.on('SIGINT', async () => {{
+      227                          console.log('Received SIGINT, shutting down gracefully...');
+      228                          try {{
+      229                              await server.stop();
+      230                              await db.close();
+      231                              console.log('Server stopped and database closed');
+      232                          }} catch (err) {{
+      233                              console.error('Error during shutdown:', err);
+      234                          }}
+      235                          process.exit(0);
+      236                      }});
+      237  
+      238                      process.on('SIGTERM', async () => {{
+      239                          console.log('Received SIGTERM, shutting down gracefully...');
+      240                          try {{
+      241                              await server.stop();
+      242                              await db.close();
+      243                              console.log('Server stopped and database closed');
+      244                          }} catch (err) {{
+      245                              console.error('Error during shutdown:', err);
+      246                          }}
+      247                          process.exit(0);
+      248                      }});
+      249  
+      250                      // Keep the process alive
+      251                      process.on('exit', () => {{
+      252                          console.log('Process exiting...');
+      253                      }});
+      254  
+      255                  }} catch (err) {{
+      256                      console.error('Failed to start PGlite server:', err);
+      257                      process.exit(1);
+      258                  }}
+      259              }}
+      260  
+      261              startServer();
+      262          """).strip()
+      263  
+      264      def _cleanup_socket(self) -> None:
+      265          """Clean up the PGlite socket file."""
+      266          # Skip cleanup for TCP mode
+      267          if self.config.use_tcp:
+      268              return
+      269  
+      270          socket_path = Path(self.config.socket_path)
+      271          if socket_path.exists():
+      272              try:
+      273                  socket_path.unlink()
+      274                  self.logger.info(f"Cleaned up socket at {socket_path}")
+      275              except Exception as e:
+      276                  self.logger.warning(f"Failed to clean up socket: {e}")
+      277  
+      278      def _kill_existing_processes(self) -> None:
+      279          """Kill any existing PGlite processes that might conflict with this socket."""
+      280          try:
+      281              # Fix for issue #31: Compare work directory, not socket directory
+      282              # Socket and work directories are different by design for isolation
+      283              # Use work_dir if available, otherwise fall back to socket directory
+      284              if hasattr(self, "work_dir") and self.work_dir:
+      285                  my_target_dir = str(self.work_dir)
+      286                  comparison_type = "work directory"
+      287              else:
+      288                  my_target_dir = str(Path(self.config.socket_path).parent)
+      289                  comparison_type = "socket directory"
+      290  
+      291              for proc in psutil.process_iter(["pid", "name", "cmdline", "cwd"]):
+      292                  if proc.info["cmdline"] and any(
+      293                      "pglite_manager.js" in cmd for cmd in proc.info["cmdline"]
+      294                  ):
+      295                      # Use exact directory match to avoid killing processes in similar paths
+      296                      try:
+      297                          proc_cwd = proc.info.get("cwd", "")
+      298                          if proc_cwd == my_target_dir:
+      299                              pid = proc.info["pid"]
+      300                              self.logger.info(
+      301                                  f"Killing existing PGlite process: {pid} (matching {comparison_type})"
+      302                              )
+      303                              proc.kill()
+      304                              proc.wait(timeout=5)
+      305                      except (psutil.NoSuchProcess, psutil.AccessDenied):
+      306                          # Process already gone or can't access it
+      307                          continue
+      308          except Exception as e:
+      309              self.logger.warning(f"Error killing existing PGlite processes: {e}")
+      310  
+      311      def _kill_all_pglite_processes(self) -> None:
+      312          """Kill all PGlite processes globally (more aggressive cleanup for termination)."""
+      313          try:
+      314              killed_processes = []
+      315              for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+      316                  if proc.info["cmdline"] and any(
+      317                      "pglite_manager.js" in cmd for cmd in proc.info["cmdline"]
+      318                  ):
+      319                      try:
+      320                          pid = proc.info["pid"]
+      321                          self.logger.info(f"Killing PGlite process globally: {pid}")
+      322                          proc.kill()
+      323                          proc.wait(timeout=5)
+      324                          killed_processes.append(pid)
+      325                      except (psutil.NoSuchProcess, psutil.AccessDenied):
+      326                          # Process already gone or can't access it
+      327                          continue
+      328  
+      329              if killed_processes:
+      330                  self.logger.info(
+      331                      f"Killed {len(killed_processes)} PGlite processes: {killed_processes}"
+      332                  )
+      333          except Exception as e:
+      334              self.logger.warning(f"Error killing all PGlite processes: {e}")
+      335  
+      336      def _install_dependencies(self, work_dir: Path) -> None:
+      337          """Install npm dependencies if needed."""
+      338          if not self.config.auto_install_deps:
+      339              return
+      340  
+      341          node_modules = work_dir / "node_modules"
+      342          if self.config.node_modules_check and not node_modules.exists():
+      343              self.logger.info("Installing npm dependencies...")
+      344              # nosec B603,B607 - npm install with fixed args, safe for testing library
+      345              result = subprocess.run(
+      346                  ["npm", "install"],
+      347                  cwd=work_dir,
+      348                  capture_output=True,
+      349                  text=True,
+      350                  check=True,
+      351                  timeout=60,  # Add timeout for npm install
+      352              )
+      353              self.logger.info(f"npm install completed: {result.stdout}")
+      354  
+      355      def start(self) -> None:
+      356          """Start the PGlite server."""
+      357          if self.process is not None:
+      358              self.logger.warning("PGlite process already running")
+      359              return
+      360  
+      361          # Setup work directory first so it's available for cleanup logic
+      362          self.work_dir = self._setup_work_dir()
+      363  
+      364          # Setup
+      365          self._kill_existing_processes()
+      366          self._cleanup_socket()
+      367  
+      368          self._original_cwd = os.getcwd()
+      369          os.chdir(self.work_dir)
+      370  
+      371          try:
+      372              # Install dependencies
+      373              self._install_dependencies(self.work_dir)
+      374  
+      375              # Prepare environment for Node.js process
+      376              env = os.environ.copy()
+      377              if self.config.node_options:
+      378                  env["NODE_OPTIONS"] = self.config.node_options
+      379                  self.logger.info(
+      380                      f"Using custom NODE_OPTIONS: {self.config.node_options}"
+      381                  )
+      382  
+      383              # Ensure Node.js can find the required modules
+      384              node_modules_path = find_pglite_modules(self.work_dir)
+      385              if node_modules_path:
+      386                  env["NODE_PATH"] = str(node_modules_path)
+      387                  self.logger.info(f"Setting NODE_PATH to: {node_modules_path}")
+      388  
+      389              # Start PGlite process with limited output buffering
+      390              self.logger.info("Starting PGlite server...")
+      391              # nosec B603,B607 - node with fixed script, safe for testing library
+      392              self.process = subprocess.Popen(
+      393                  ["node", "pglite_manager.js"],
+      394                  stdout=subprocess.PIPE,
+      395                  stderr=subprocess.STDOUT,  # Combine stderr with stdout
+      396                  text=True,
+      397                  bufsize=0,  # Unbuffered for real-time monitoring
+      398                  universal_newlines=True,
+      399                  env=env,
+      400                  preexec_fn=os.setsid
+      401                  if hasattr(os, "setsid")
+      402                  else None,  # Create new process group on Unix
+      403              )
+      404  
+      405              # Wait for startup with robust monitoring
+      406              start_time = time.time()
+      407              ready_logged = False
+      408  
+      409              while time.time() - start_time < self.config.timeout:
+      410                  # Check if process died
+      411                  if self.process.poll() is not None:
+      412                      # Get output with timeout to prevent hanging
+      413                      try:
+      414                          stdout, _ = self.process.communicate(timeout=2)
+      415                          output = (
+      416                              stdout[:1000] if stdout else "No output"
+      417                          )  # Limit output
+      418                      except subprocess.TimeoutExpired:
+      419                          output = "Process output timeout"
+      420  
+      421                      raise RuntimeError(
+      422                          f"PGlite process died during startup. Output: {output}"
+       ... truncated at 400 lines ...

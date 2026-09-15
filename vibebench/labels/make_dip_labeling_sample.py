@@ -15,9 +15,13 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import config as C  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sample_paths as SP  # noqa: E402
 
 SEED = C.RANDOM_SEED
-OUT = Path(__file__).resolve().parent / "dip_labeling_sample.csv"
+# Resolved at call time now, so --lang can select it. See
+# labels/sample_paths.py for why a bare name is no longer safe.
+OUT = None
 KEEP = ["pr_id", "agent", "full_name", "pr_number", "merge_sha", "status",
         "n_touched_modules", "dip_risk", "dip_risk_hits",
         "delta_touched_cycles", "delta_mean_d", "delta_abstract_dep_ratio",
@@ -59,8 +63,10 @@ def main() -> None:
     out = pd.DataFrame(picked)
     out["llm_dip_risk"] = ""
     out["notes"] = ""
-    out.to_csv(OUT, index=False)
-    print(f"wrote {OUT}  ({len(out)} rows)")
+    out_path = SP.resolve('dip', getattr(args, 'lang', ''),
+                          force=getattr(args, 'force', False))
+    out.to_csv(out_path, index=False)
+    print(f"wrote {out_path}  ({len(out)} rows)")
     print("strata:", out["stratum"].value_counts().to_dict())
     print("flagged (dip_risk) in sample:", int(out["dip_risk"].sum()))
 

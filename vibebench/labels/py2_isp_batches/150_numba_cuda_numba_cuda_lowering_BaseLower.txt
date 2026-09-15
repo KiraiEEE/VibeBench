@@ -1,0 +1,278 @@
+row 150   NVIDIA/numba-cuda#705
+============================================================================
+CONTRACT numba_cuda.numba.cuda.lowering:BaseLower   kind=implicit abstract_methods=3.0 implementers=2.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file numba_cuda/numba/cuda/lowering.py
+       41  class BaseLower(object):
+       42      """
+       43      Lower IR to LLVM
+       44      """
+       45  
+       46      def __init__(self, context, library, fndesc, func_ir, metadata=None):
+       47          self.library = library
+       48          self.fndesc = fndesc
+       49          self.blocks = dict(sorted(func_ir.blocks.items()))
+       50          self.func_ir = func_ir
+       51          self.generator_info = func_ir.generator_info
+       52          self.metadata = metadata
+       53          self.flags = targetconfig.ConfigStack.top_or_none()
+       54  
+       55          # Initialize LLVM
+       56          self.module = self.library.create_ir_module(self.fndesc.unique_name)
+       57  
+       58          # Python execution environment (will be available to the compiled
+       59          # function).
+       60          self.env = Environment.from_fndesc(self.fndesc)
+       61  
+       62          # Internal states
+       63          self.blkmap = {}
+       64          self.pending_phis = {}
+       65          self.varmap = {}
+       66          self.firstblk = min(self.blocks.keys())
+       67          self.loc = -1
+       68  
+       69          # Specializes the target context as seen inside the Lowerer
+       70          # This adds:
+       71          #  - environment: the python execution environment
+       72          self.context = context.subtarget(
+       73              environment=self.env, fndesc=self.fndesc
+       74          )
+       75  
+       76          # Debuginfo
+       77          dibuildercls = (
+       78              self.context.DIBuilder
+       79              if self.context.enable_debuginfo
+       80              else debuginfo.DummyDIBuilder
+       81          )
+       82  
+       83          # debuginfo def location
+       84          self.defn_loc = self._compute_def_location()
+       85  
+       86          directives_only = self.flags.dbg_directives_only
+       87          self.debuginfo = dibuildercls(
+       88              module=self.module,
+       89              filepath=func_ir.loc.filename,
+       90              cgctx=context,
+       91              directives_only=directives_only,
+       92          )
+       93  
+       94          # Loc notify objects
+       95          self._loc_notify_registry = get_registered_loc_notify()
+       96  
+       97          # Subclass initialization
+       98          self.init()
+       99  
+      100      @property
+      101      def call_conv(self):
+      102          return self.context.call_conv
+      103  
+      104      def init(self):
+      105          pass
+      106  
+      107      def init_pyapi(self):
+      108          """
+      109          Init the Python API and Environment Manager for the function being
+      110          lowered.
+      111          """
+      112          if self.pyapi is not None:
+      113              return
+      114          self.pyapi = self.context.get_python_api(self.builder)
+      115  
+      116          # Store environment argument for later use
+      117          self.env_manager = self.context.get_env_manager(self.builder)
+      118          self.env_body = self.env_manager.env_body
+      119          self.envarg = self.env_manager.env_ptr
+      120  
+      121      def _compute_def_location(self):
+      122          # Debuginfo requires source to be accurate. Find it and warn if not
+      123          # found. If it's not found, use the func_ir line + 1, this assumes that
+      124          # the function definition is decorated with a 1 line jit decorator.
+      125          defn_loc = self.func_ir.loc.with_lineno(self.func_ir.loc.line + 1)
+      126          if self.context.enable_debuginfo:
+      127              fn = self.func_ir.func_id.func
+      128              optional_lno = get_func_def_lineno(fn)
+      129              if optional_lno is not None:
+      130                  # Use the def line directly from AST
+      131                  defn_loc = self.func_ir.loc.with_lineno(optional_lno)
+      132              else:
+      133                  msg = (
+      134                      "Could not find source for function: "
+      135                      f"{self.func_ir.func_id.func}. Debug line information "
+      136                      "may be inaccurate."
+      137                  )
+      138                  warnings.warn(NumbaDebugInfoWarning(msg))
+      139          return defn_loc
+      140  
+      141      def pre_lower(self):
+      142          """
+      143          Called before lowering all blocks.
+      144          """
+      145          # A given Lower object can be used for several LL functions
+      146          # (for generators) and it's important to use a new API and
+      147          # EnvironmentManager.
+      148          self.pyapi = None
+      149          self.debuginfo.mark_subprogram(
+      150              function=self.builder.function,
+      151              qualname=self.fndesc.qualname,
+      152              argnames=self.fndesc.args,
+      153              argtypes=self.fndesc.argtypes,
+      154              line=self.defn_loc.line,
+      155          )
+      156  
+      157          # When full debug info is enabled, disable inlining where possible, to
+      158          # improve the quality of the debug experience. 'alwaysinline' functions
+      159          # cannot have inlining disabled.
+      160          attributes = self.builder.function.attributes
+      161          full_debug = self.flags.debuginfo and not self.flags.dbg_directives_only
+      162          if full_debug and "alwaysinline" not in attributes:
+      163              attributes.add("noinline")
+      164  
+      165      def post_lower(self):
+      166          """
+      167          Called after all blocks are lowered
+      168          """
+      169          self.debuginfo.finalize()
+      170          for notify in self._loc_notify_registry:
+      171              notify.close()
+      172  
+      173      def pre_block(self, block):
+      174          """
+      175          Called before lowering a block.
+      176          """
+      177  
+      178      def post_block(self, block):
+      179          """
+      180          Called after lowering a block.
+      181          """
+      182  
+      183      def return_dynamic_exception(self, exc_class, exc_args, nb_types, loc=None):
+      184          self.call_conv.return_dynamic_user_exc(
+      185              self.builder,
+      186              exc_class,
+      187              exc_args,
+      188              nb_types,
+      189              loc=loc,
+      190              func_name=self.func_ir.func_id.func_name,
+      191          )
+      192  
+      193      def return_exception(self, exc_class, exc_args=None, loc=None):
+      194          """Propagate exception to the caller."""
+      195          self.call_conv.return_user_exc(
+      196              self.builder,
+      197              exc_class,
+      198              exc_args,
+      199              loc=loc,
+      200              func_name=self.func_ir.func_id.func_name,
+      201          )
+      202  
+      203      def set_exception(self, exc_class, exc_args=None, loc=None):
+      204          """Set exception state in the current function."""
+      205          self.call_conv.set_static_user_exc(
+      206              self.builder,
+      207              exc_class,
+      208              exc_args,
+      209              loc=loc,
+      210              func_name=self.func_ir.func_id.func_name,
+      211          )
+      212  
+      213      def emit_environment_object(self):
+      214          """Emit a pointer to hold the Environment object."""
+      215          # Define global for the environment and initialize it to NULL
+      216          envname = self.context.get_env_name(self.fndesc)
+      217          self.context.declare_env_global(self.module, envname)
+      218  
+      219      def lower(self):
+      220          # Emit the Env into the module
+      221          self.emit_environment_object()
+      222          if self.generator_info is None:
+      223              self.genlower = None
+      224              self.lower_normal_function(self.fndesc)
+      225          else:
+      226              self.genlower = self.GeneratorLower(self)
+      227              self.gentype = self.genlower.gentype
+      228  
+      229              self.genlower.lower_init_func(self)
+      230              self.genlower.lower_next_func(self)
+      231              if self.gentype.has_finalizer:
+      232                  self.genlower.lower_finalize_func(self)
+      233  
+      234          if config.DUMP_LLVM:
+      235              utils.dump_llvm(self.fndesc, self.module)
+      236  
+      237          # Special optimization to remove NRT on functions that do not need it.
+      238          if self.context.enable_nrt and self.generator_info is None:
+      239              removerefctpass.remove_unnecessary_nrt_usage(
+      240                  self.function, context=self.context, fndesc=self.fndesc
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER numba_cuda.numba.cuda.lowering:Lower  stubs=0/3 ----------
+      394  class Lower(BaseLower):
+      397      def init(self):
+      398          super().init()
+      399          # find all singly assigned variables
+      400          self._find_singly_assigned_variable()
+      457      def pre_block(self, block):
+      458          from numba.cuda.core.unsafe import eh
+      459  
+      460          super(Lower, self).pre_block(block)
+      461          self._cur_ir_block = block
+      462  
+      463          if block == self.firstblk:
+      464              # create slots for all the vars, irrespective of whether they are
+      465              # initialized, SSA will pick this up and warn users about using
+      466              # uninitialized variables. Slots are added as alloca in the first
+      467              # block
+      468              bb = self.blkmap[self.firstblk]
+      469              self.builder.position_at_end(bb)
+      470              all_names = set()
+      471              for block in self.blocks.values():
+      472                  for x in block.find_insts(ir.del_types):
+      473                      if x.value not in all_names:
+      474                          all_names.add(x.value)
+      475              for name in all_names:
+      476                  fetype = self.typeof(name)
+      477                  self._alloca_var(name, fetype)
+      478  
+      479          # Detect if we are in a TRY block by looking for a call to
+      480          # `eh.exception_check`.
+      481          for call in block.find_exprs(op="call"):
+      482              defn = ir_utils.guard(
+      483                  ir_utils.get_definition,
+      484                  self.func_ir,
+      485                  call.func,
+      486              )
+      487              if defn is not None and isinstance(defn, ir.global_types):
+      488                  if defn.value is eh.exception_check:
+      489                      if isinstance(block.terminator, ir.branch_types):
+      490                          targetblk = self.blkmap[block.terminator.truebr]
+      491                          # NOTE: This hacks in an attribute for call_conv to
+      492                          #       pick up. This hack is no longer needed when
+      493                          #       all old-style implementations are gone.
+      494                          self.builder._in_try_block = {"target": targetblk}
+      495                          break
+      497      def post_block(self, block):
+      498          # Clean-up
+      499          try:
+      500              del self.builder._in_try_block
+      501          except AttributeError:
+      502              pass
+
+---------- IMPLEMENTER numba_cuda.numba.cuda.lowering:CUDALower  stubs=0/3 ----------
+     1684  class CUDALower(Lower):
+     1793      def pre_block(self, block):
+     1794          super().pre_block(block)
+     1795  
+     1796          # dbg.value range covered names
+     1797          self.dbg_val_names = set()
+     1798  
+     1799          if self.context.enable_debuginfo and self._disable_sroa_like_opt:
+     1800              for x in block.find_insts(ir.assign_types):
+     1801                  if x.target.name.startswith("$"):
+     1802                      continue
+     1803                  ssa_name = x.target.name
+     1804                  src_name = ssa_name.split(".")[0]
+     1805                  if src_name not in self.dbg_val_names:
+     1806                      self.dbg_val_names.add(src_name)
+      (does not define: init, post_block; inherited or absent)

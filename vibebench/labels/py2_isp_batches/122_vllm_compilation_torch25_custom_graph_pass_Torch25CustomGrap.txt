@@ -1,0 +1,157 @@
+row 122   vllm-project/vllm#26983
+============================================================================
+CONTRACT vllm.compilation.torch25_custom_graph_pass:Torch25CustomGraphPass   kind=abc abstract_methods=2.0 implementers=17.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file vllm/compilation/torch25_custom_graph_pass.py
+        9  class Torch25CustomGraphPass(ABC):  # noqa (redefinition)
+       10      """
+       11      This class replaces CustomGraphPass from torch==2.6 when using torch<2.6.
+       12      It conforms to the 2.6 interface but also supports pickling, as that's what
+       13      the inductor code cache uses to determine the cache key before 2.6.
+       14      (in 2.6 and above, uuid() is used.)
+       15  
+       16      Subclasses can just "pretend" that uuid is used.
+       17      """
+       18  
+       19      @abstractmethod
+       20      def __call__(self, graph: torch.fx.graph.Graph) -> None:
+       21          """
+       22          Implementation of the custom pass.
+       23          """
+       24  
+       25      @abstractmethod
+       26      def uuid(self) -> Any | None:
+       27          """
+       28          Return an ID to uniquely identify your custom pass implementation.
+       29          Return None to skip inductor code caching entirely.
+       30          """
+       31  
+       32      def __getstate__(self):
+       33          """
+       34          Pickling is used instead of uuid() in torch<2.6. Just return uuid()
+       35           to enable subclasses to only have to implement uuid.
+       36          """
+       37          return self.uuid()
+       38  
+       39      def __setstate__(self, state):
+       40          raise ValueError(
+       41              "Cannot unpickle CustomGraphPass because pickling"
+       42              " is used for cache key uuid. Use torch>=2.6 with"
+       43              " native uuid support for custom passes."
+       44          )
+
+---------- IMPLEMENTER tests.compile.backend:LazyInitPass  stubs=0/2 ----------
+       24  class LazyInitPass(InductorPass):
+       35      def __call__(self, graph: fx.Graph) -> None:
+       36          self.pass_ = self.pass_cls(self.vllm_config)
+       37          self.pass_(graph)
+      (does not define: uuid; inherited or absent)
+
+---------- IMPLEMENTER tests.compile.test_pass_manager:ProperPass  stubs=1/2 ----------
+       30  class ProperPass(InductorPass):
+       31      def __call__(self, graph: torch.fx.graph.Graph) -> None:
+       32          pass
+      (does not define: uuid; inherited or absent)
+
+---------- IMPLEMENTER vllm.compilation.activation_quant_fusion:ActivationQuantFusionPass  stubs=0/2 ----------
+      171  class ActivationQuantFusionPass(VllmPatternMatcherPass):
+      198      @VllmInductorPass.time_and_log
+      199      def __call__(self, graph: torch.fx.Graph):
+      200          self.matched_count = self.patterns.apply(graph)
+      201          logger.debug("Replaced %s patterns", self.matched_count)
+      203      def uuid(self):
+      204          return VllmInductorPass.hash_source(
+      205              self,
+      206              ActivationQuantPattern,
+      207              SiluMulFp8StaticQuantPattern,
+      208              SiluMulNvfp4QuantPattern,
+      209          )
+
+---------- IMPLEMENTER vllm.compilation.collective_fusion:AsyncTPPass  stubs=0/2 ----------
+      400  class AsyncTPPass(VllmPatternMatcherPass):
+      446      @VllmInductorPass.time_and_log
+      447      def __call__(self, graph: fx.Graph):
+      448          self.matched_count = self.patterns.apply(graph)
+      449          logger.debug("Replaced %s patterns", self.matched_count)
+      (does not define: uuid; inherited or absent)
+
+---------- IMPLEMENTER vllm.compilation.collective_fusion:AllReduceFusionPass  stubs=0/2 ----------
+     1103  class AllReduceFusionPass(VllmPatternMatcherPass):
+     1219      @VllmInductorPass.time_and_log
+     1220      def __call__(self, graph: fx.Graph):
+     1221          if self.disabled:
+     1222              logger.debug("AllReduceFusionPass disabled")
+     1223              return
+     1224  
+     1225          self.matched_count = self.patterns.apply(graph)
+     1226          logger.debug("Replaced %s patterns", self.matched_count)
+      (does not define: uuid; inherited or absent)
+
+---------- IMPLEMENTER vllm.compilation.fix_functionalization:FixFunctionalizationPass  stubs=0/2 ----------
+       19  class FixFunctionalizationPass(VllmInductorPass):
+       28      @VllmInductorPass.time_and_log
+       29      def __call__(self, graph: torch.fx.Graph):
+       30          # XPU does not support auto-functionalization yet.
+       31          # Will enable this when switch to vllm-xpu-kernels.
+       32          if current_platform.is_xpu():
+       33              logger.debug(
+       34                  "XPU platform does not support fix functionalizationpass currently."
+       35              )
+       36              return
+       37  
+       38          self.nodes_to_remove: list[torch.fx.Node] = []
+       39          count = 0
+       40          for node in graph.nodes:
+       41              if not is_func(node, auto_functionalized):
+       42                  continue  # Avoid deep if-elif nesting
+       43  
+       44              kwargs = node.kwargs
+       45              at_target = node.args[0]
+       46  
+       47              if at_target == torch.ops._C.rotary_embedding.default:
+       48                  query = kwargs["query"]
+       49                  key = kwargs["key"]
+       50                  getitem_nodes = self.getitem_users(node)
+       51  
+       52                  if (
+       53                      is_func(query, operator.getitem)
+       54                      and is_func(key, operator.getitem)
+       55                      and query.args[0] == key.args[0]
+       56                      and is_func(query.args[0], torch.ops.aten.split_with_sizes.default)
+       57                      and all(
+       58                          is_func(user, torch.ops.aten.slice_scatter.default)
+       59                          for getitem_node in getitem_nodes.values()
+       60                          for user in getitem_node.users
+       61                      )
+       62                  ):
+       63                      # Pattern where query and key are slices of an mm_node.
+       64                      # While functionalized, results at [1] and [2] are scattered
+       65                      # back into mm_node. So after de-functionalization, we can
+       66                      # just use mm_node directly.
+       67  
+       68                      mm_node = query.args[0].args[0]
+       69                      for user in getitem_nodes.values():
+       70                          for user_of_getitem in user.users:
+       71                              if is_func(
+       72                                  user_of_getitem, torch.ops.aten.slice_scatter.default
+       73                              ):
+       74                                  user_of_getitem.replace_all_uses_with(mm_node)
+       75                                  self._remove(user_of_getitem)
+       76                          self._remove(user)
+       77  
+       78                      self.insert_defunctionalized(graph, node)
+       79                      self._remove(node)
+       80  
+       81                  else:
+       82                      # Directly replace the auto_functionalize(rotary_embedding)
+       83                      # with the inplace rotary_embedding. In theory, we shouldn't
+       84                      # do this blindly, but in practice in vLLM it's ok. The best
+       85                      # solution is to use auto_functionalization_v2 and then use
+       86                      # inductor's builtin defunctionalization (reinplacing) pass.
+       87                      mutated_args = {1: "query", 2: "key"}
+       ... truncated at 60 lines ...
+      (does not define: uuid; inherited or absent)
+
+(11 further implementers not shown)

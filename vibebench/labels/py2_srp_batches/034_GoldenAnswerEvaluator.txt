@@ -1,0 +1,377 @@
+row 34   vectara/open-rag-eval#153
+============================================================================
+CLASS GoldenAnswerEvaluator in open_rag_eval/evaluators/golden_answer_evaluator.py   loc=372 methods=7 wmc=45 lcom=1.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       42  class GoldenAnswerEvaluator(Evaluator):
+       43      """Evaluator that compares RAG-generated answers against golden/reference answers.
+       44  
+       45      Requires MultiRAGResult objects to have the `expected_answer` field populated.
+       46      """
+       47  
+       48      # Metrics that produce single float scores suitable for consistency
+       49      CONSISTENCY_METRICS = [
+       50          "semantic_similarity",
+       51          "factual_correctness_f1"
+       52      ]
+       53  
+       54      def __init__(
+       55          self,
+       56          llm_model: LLMJudgeModel,
+       57          embedding_model: EmbeddingModel,
+       58          options: Optional[dict] = None
+       59      ):
+       60          """Initialize Golden Answer Evaluator.
+       61  
+       62          Args:
+       63              llm_model: LLM for NLI-based factual correctness
+       64              embedding_model: Model for computing embeddings
+       65              options: Optional configuration:
+       66                  - run_consistency: bool - Whether to support consistency evaluation
+       67                  - metrics_to_run_consistency: List[str] - Which metrics to include
+       68          """
+       69          self.llm_model = llm_model
+       70          self.embedding_model = embedding_model
+       71          self.options = options or {}
+       72  
+       73          # Initialize metrics
+       74          self.semantic_similarity_metric = SemanticSimilarityMetric(embedding_model)
+       75          self.factual_correctness_metric = FactualCorrectnessMetric(llm_model)
+       76  
+       77          # Consistency settings
+       78          self.run_consistency = self.options.get("run_consistency", False)
+       79          if self.run_consistency:
+       80              self.metrics_to_run_consistency = self.options.get(
+       81                  "metrics_to_run_consistency", self.CONSISTENCY_METRICS
+       82              )
+       83          else:
+       84              self.metrics_to_run_consistency = []
+       85  
+       86      def evaluate(self, multi_rag_result: MultiRAGResult) -> MultiScoredRAGResult:
+       87          """Evaluate RAG results against the golden answer.
+       88  
+       89          Args:
+       90              multi_rag_result: Container with RAG results and expected_answer
+       91  
+       92          Returns:
+       93              MultiScoredRAGResult with golden answer comparison scores
+       94          """
+       95          all_scored_results = []
+       96          expected_answer = multi_rag_result.expected_answer
+       97  
+       98          # Skip if no golden answer provided
+       99          if not expected_answer:
+      100              logger.warning(
+      101                  "No expected_answer for query %s. Skipping golden answer evaluation.",
+      102                  multi_rag_result.query_id
+      103              )
+      104              return MultiScoredRAGResult(
+      105                  query_id=multi_rag_result.query_id,
+      106                  query=multi_rag_result.query,
+      107                  scored_rag_results=[]
+      108              )
+      109  
+      110          for i, rag_result in enumerate(multi_rag_result.rag_results):
+      111              # Break after first if not running consistency
+      112              if i > 0 and not self.run_consistency:
+      113                  break
+      114  
+      115              try:
+      116                  # Extract generated answer text
+      117                  generated_answer = " ".join([
+      118                      part.text for part in rag_result.generation_result.generated_answer
+      119                  ])
+      120                  query = rag_result.generation_result.query
+      121  
+      122                  # Compute all metrics
+      123                  similarity_scores = self.semantic_similarity_metric.compute(
+      124                      query, generated_answer, expected_answer
+      125                  )
+      126                  correctness_scores = self.factual_correctness_metric.compute(
+      127                      query, generated_answer, expected_answer
+      128                  )
+      129  
+      130                  # Extract and aggregate token usage
+      131                  factual_tokens = correctness_scores.pop("token_usage", {})
+      132                  total_input_tokens = factual_tokens.get("input_tokens", 0)
+      133                  total_output_tokens = factual_tokens.get("output_tokens", 0)
+      134  
+      135                  aggregated_token_usage = {
+      136                      "factual_correctness_tokens": factual_tokens,
+      137                      "total_input_tokens": total_input_tokens,
+      138                      "total_output_tokens": total_output_tokens,
+      139                      "total_tokens": total_input_tokens + total_output_tokens
+      140                  }
+      141  
+      142                  # Combine into scores structure
+      143                  generation_scores = {
+      144                      **similarity_scores,
+      145                      **correctness_scores,
+      146                      "expected_answer": expected_answer,
+      147                      "token_usage": aggregated_token_usage
+      148                  }
+      149  
+      150                  rag_scores = RAGScores(
+      151                      RetrievalScores(scores={}),  # Not evaluating retrieval
+      152                      AugmentedGenerationScores(scores=generation_scores)
+      153                  )
+      154  
+      155                  scored_result = ScoredRAGResult(
+      156                      rag_result=rag_result,
+      157                      scores=rag_scores
+      158                  )
+      159                  all_scored_results.append(scored_result)
+      160  
+      161              except Exception as e:
+      162                  logger.exception("Error evaluating golden answer result: %s", e)
+      163                  rag_scores = RAGScores(
+      164                      RetrievalScores(scores={}),
+      165                      AugmentedGenerationScores(scores={})
+      166                  )
+      167                  scored_result = ScoredRAGResult(
+      168                      rag_result=rag_result,
+      169                      scores=rag_scores
+      170                  )
+      171                  all_scored_results.append(scored_result)
+      172  
+      173          return MultiScoredRAGResult(
+      174              query_id=multi_rag_result.query_id,
+      175              query=multi_rag_result.query,
+      176              scored_rag_results=all_scored_results
+      177          )
+      178  
+      179      def collect_scores_for_consistency(
+      180          self,
+      181          scored_results: List[MultiScoredRAGResult],
+      182          scores_for_consistency: Dict[str, Dict[str, List[float]]],
+      183          max_workers: Optional[int] = 5
+      184      ) -> Dict[str, Dict[str, List[float]]]:
+      185          """Gather scores for consistency evaluation.
+      186  
+      187          Args:
+      188              scored_results: List of evaluated results
+      189              scores_for_consistency: Dict to update with scores
+      190              max_workers: Thread pool size
+      191  
+      192          Returns:
+      193              Updated scores_for_consistency dict
+      194          """
+      195          lock = threading.Lock()
+      196  
+      197          def _extract_scores(score_dict, target: Dict[str, List[float]], metrics: List[str]):
+      198              for metric in metrics:
+      199                  value = score_dict.get(metric)
+      200                  if isinstance(value, (int, float)):
+      201                      target.setdefault(metric, []).append(float(value))
+      202  
+      203          def process_single_result(multi_scored_result: MultiScoredRAGResult):
+      204              local_scores = {}
+      205              query_id = multi_scored_result.query_id
+      206  
+      207              if not multi_scored_result.scored_rag_results:
+      208                  return
+      209  
+      210              for scored_result in multi_scored_result.scored_rag_results:
+      211                  if scored_result.scores and scored_result.scores.generation_score:
+      212                      _extract_scores(
+      213                          scored_result.scores.generation_score.scores,
+      214                          local_scores,
+      215                          self.metrics_to_run_consistency
+      216                      )
+      217  
+      218              with lock:
+      219                  if query_id not in scores_for_consistency:
+      220                      scores_for_consistency[query_id] = {}
+      221                  for metric, vals in local_scores.items():
+      222                      scores_for_consistency[query_id].setdefault(metric, []).extend(vals)
+      223  
+      224          with ThreadPoolExecutor(max_workers=max_workers) as executor:
+      225              futures = [
+      226                  executor.submit(process_single_result, msr)
+      227                  for msr in scored_results
+      228              ]
+      229              for future in as_completed(futures):
+      230                  future.result()
+      231  
+      232          return scores_for_consistency
+      233  
+      234      @classmethod
+      235      def plot_metrics(
+      236          cls,
+      237          csv_files: List[str],
+      238          output_file: str = "golden_answer_metrics.png",
+      239          metrics_to_plot: Optional[List[str]] = None
+      240      ):
+      241          """Plot golden answer evaluation metrics."""
+      242          if metrics_to_plot is None:
+      243              metrics_to_plot = [
+      244                  "generation_score_semantic_similarity",
+      245                  "generation_score_factual_correctness_precision",
+      246                  "generation_score_factual_correctness_recall",
+      247                  "generation_score_factual_correctness_f1"
+      248              ]
+      249  
+      250          num_metrics = len(metrics_to_plot)
+      251          ncols = min(3, num_metrics)
+      252          nrows = math.ceil(num_metrics / ncols)
+      253          fig, axs = plt.subplots(nrows, ncols, figsize=(7 * ncols, 5 * nrows))
+      254          axs = axs.flatten() if isinstance(axs, np.ndarray) else [axs]
+      255  
+      256          display_names = {
+      257              "generation_score_semantic_similarity": "Semantic Similarity",
+      258              "generation_score_factual_correctness_precision": "Factual Precision",
+      259              "generation_score_factual_correctness_recall": "Factual Recall",
+      260              "generation_score_factual_correctness_f1": "Factual F1"
+      261          }
+      262  
+      263          if len(csv_files) == 1:
+      264              df = pd.read_csv(csv_files[0])
+      265              for i, metric in enumerate(metrics_to_plot):
+      266                  ax = axs[i]
+      267                  col_name = metric if metric in df.columns else f"run_1_{metric}"
+      268  
+      269                  if col_name in df.columns:
+      270                      values = df[col_name].dropna().values
+      271                      ax.boxplot(
+      272                          [values],
+      273                          patch_artist=True,
+      274                          boxprops={"facecolor": "skyblue"}
+      275                      )
+      276                      mean_val = np.mean(values) if len(values) > 0 else 0
+      277                      ax.axhline(
+      278                          mean_val, color="red", linestyle="--",
+      279                          label=f"Mean: {mean_val:.3f}"
+      280                      )
+      281                      ax.set_title(display_names.get(metric, metric))
+      282                      ax.set_ylim(0, 1)
+      283                      ax.legend()
+      284                  else:
+      285                      ax.text(
+      286                          0.5, 0.5, f"No data for {metric}",
+      287                          ha="center", va="center", transform=ax.transAxes
+      288                      )
+      289          else:
+      290              # Multiple CSV comparison
+      291              for i, metric in enumerate(metrics_to_plot):
+      292                  ax = axs[i]
+      293                  data_list = []
+      294                  labels = []
+      295  
+      296                  for csv_file in csv_files:
+      297                      df = pd.read_csv(csv_file)
+      298                      labels.append(os.path.basename(csv_file))
+      299                      col_name = metric if metric in df.columns else f"run_1_{metric}"
+      300  
+      301                      if col_name in df.columns:
+      302                          data_list.append(df[col_name].dropna().values)
+      303                      else:
+      304                          data_list.append(np.array([]))
+      305  
+      306                  ax.boxplot(data_list, patch_artist=True, labels=labels)
+      307                  ax.set_title(display_names.get(metric, metric))
+      308                  ax.set_ylim(0, 1)
+      309                  ax.tick_params(axis='x', rotation=45)
+      310  
+      311          for ax in axs[num_metrics:]:
+      312              ax.set_visible(False)
+      313  
+      314          fig.suptitle("Golden Answer Evaluation Metrics", fontsize=16)
+      315          plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+      316          fig.savefig(output_file, dpi=300, bbox_inches="tight")
+      317          plt.close(fig)
+      318          print(f"Golden answer metrics plot saved to {output_file}")
+      319  
+      320      def to_csv(
+      321          self,
+      322          scored_results: List[MultiScoredRAGResult],
+      323          output_file: str
+      324      ) -> None:
+      325          """Save golden answer evaluation results to CSV."""
+      326          results_dict = []
+      327  
+      328          # Calculate max runs across all results for column generation
+      329          max_runs = 1
+      330          for multi_scored_result in scored_results:
+      331              if multi_scored_result.scored_rag_results:
+      332                  max_runs = max(max_runs, len(multi_scored_result.scored_rag_results))
+      333  
+      334          for multi_scored_result in scored_results:
+      335              if not multi_scored_result.scored_rag_results:
+      336                  continue
+      337  
+      338              result_dict = {
+      339                  "query_id": multi_scored_result.query_id,
+      340                  "query": multi_scored_result.query
+      341              }
+      342  
+      343              for i, result in enumerate(multi_scored_result.scored_rag_results):
+      344                  run_id = f"run_{i + 1}_"
+      345  
+      346                  if result.rag_result and result.rag_result.generation_result:
+      347                      generated_answer = [
+      348                          {"text": part.text, "citations": part.citations}
+      349                          for part in result.rag_result.generation_result.generated_answer
+      350                      ]
+      351                      result_dict[f"{run_id}generated_answer"] = json.dumps(generated_answer)
+      352  
+      353                  if result.scores and result.scores.generation_score:
+      354                      for key, value in result.scores.generation_score.scores.items():
+      355                          if isinstance(value, (int, float, str)):
+      356                              result_dict[f"{run_id}generation_score_{key}"] = value
+      357                          else:
+      358                              result_dict[f"{run_id}generation_score_{key}"] = json.dumps(value)
+      359  
+      360                      # Add flattened token usage columns for easier analysis
+      361                      token_usage = result.scores.generation_score.scores.get(
+      362                          "token_usage", {}
+      363                      )
+      364                      if token_usage:
+      365                          result_dict[f"{run_id}total_input_tokens"] = token_usage.get(
+      366                              "total_input_tokens", 0
+      367                          )
+      368                          result_dict[f"{run_id}total_output_tokens"] = token_usage.get(
+      369                              "total_output_tokens", 0
+      370                          )
+      371                          result_dict[f"{run_id}total_tokens"] = token_usage.get(
+      372                              "total_tokens", 0
+      373                          )
+      374  
+      375              results_dict.append(result_dict)
+      376  
+      377          df = pd.DataFrame(results_dict)
+      378          df.to_csv(output_file, index=False)
+      379          if not df.empty:
+      380              print(f"Golden answer scores saved to {output_file}")
+      381  
+      382      def get_consolidated_columns(self, num_runs: int = 1) -> List[str]:
+      383          """Return columns for consolidated CSV.
+      384  
+      385          Args:
+      386              num_runs: Number of runs to include columns for (default 1)
+      387  
+      388          Returns:
+      389              List of column names for consolidated output
+      390          """
+      391          columns = ["query_id", "query"]
+      392          metrics = [
+      393              "semantic_similarity",
+      394              "factual_correctness_precision",
+      395              "factual_correctness_recall",
+      396              "factual_correctness_f1",
+      397              "expected_answer"
+      398          ]
+      399  
+      400          for i in range(num_runs):
+      401              run_id = f"run_{i + 1}_"
+      402              columns.append(f"{run_id}generated_answer")
+      403              for metric in metrics:
+      404                  columns.append(f"{run_id}generation_score_{metric}")
+      405  
+      406          return columns
+      407  
+      408      def get_metrics_to_plot(self) -> List[str]:
+      409          """Return metrics to plot."""
+      410          return [
+      411              "generation_score_semantic_similarity",
+      412              "generation_score_factual_correctness_f1"
+      413          ]

@@ -1,0 +1,208 @@
+row 104   HKUDS/ClawTeam#117
+============================================================================
+CONTRACT clawteam.store.base:BaseTaskStore   kind=abc abstract_methods=5.0 implementers=1.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file clawteam/store/base.py
+       16  class BaseTaskStore(ABC):
+       17      """Interface for task storage backends.
+       18  
+       19      Implementations must handle their own concurrency control (file locking,
+       20      Redis transactions, etc.) appropriate to the storage medium.
+       21      """
+       22  
+       23      def __init__(self, team_name: str):
+       24          self.team_name = validate_identifier(team_name, "team name")
+       25  
+       26      @abstractmethod
+       27      def create(
+       28          self,
+       29          subject: str,
+       30          description: str = "",
+       31          owner: str = "",
+       32          priority: TaskPriority | None = None,
+       33          blocks: list[str] | None = None,
+       34          blocked_by: list[str] | None = None,
+       35          metadata: dict[str, Any] | None = None,
+       36      ) -> TaskItem:
+       37          """Create a new task and return it."""
+       38  
+       39      @abstractmethod
+       40      def get(self, task_id: str) -> TaskItem | None:
+       41          """Fetch a single task by ID, or None if not found."""
+       42  
+       43      @abstractmethod
+       44      def update(
+       45          self,
+       46          task_id: str,
+       47          status: TaskStatus | None = None,
+       48          owner: str | None = None,
+       49          subject: str | None = None,
+       50          description: str | None = None,
+       51          priority: TaskPriority | None = None,
+       52          add_blocks: list[str] | None = None,
+       53          add_blocked_by: list[str] | None = None,
+       54          metadata: dict[str, Any] | None = None,
+       55          caller: str = "",
+       56          force: bool = False,
+       57      ) -> TaskItem | None:
+       58          """Update fields on an existing task. Returns the updated task or None."""
+       59  
+       60      @abstractmethod
+       61      def list_tasks(
+       62          self,
+       63          status: TaskStatus | None = None,
+       64          owner: str | None = None,
+       65          priority: TaskPriority | None = None,
+       66          sort_by_priority: bool = False,
+       67      ) -> list[TaskItem]:
+       68          """List tasks, optionally filtered and sorted."""
+       69  
+       70      @abstractmethod
+       71      def release_stale_locks(self) -> list[str]:
+       72          """Release locks held by dead agents. Returns list of freed task IDs."""
+       73  
+       74      def get_stats(self) -> dict[str, Any]:
+       75          """Aggregate task timing stats.
+       76  
+       77          Default implementation calls list_tasks(). Backends with native
+       78          aggregation (e.g. SQL) can override for efficiency.
+       79          """
+       80          tasks = self.list_tasks()
+       81          completed = [t for t in tasks if t.status == TaskStatus.completed]
+       82          durations = [
+       83              t.metadata["duration_seconds"]
+       84              for t in completed
+       85              if "duration_seconds" in t.metadata
+       86          ]
+       87          avg_duration = sum(durations) / len(durations) if durations else 0.0
+       88          return {
+       89              "total": len(tasks),
+       90              "completed": len(completed),
+       91              "in_progress": sum(1 for t in tasks if t.status == TaskStatus.in_progress),
+       92              "pending": sum(1 for t in tasks if t.status == TaskStatus.pending),
+       93              "blocked": sum(1 for t in tasks if t.status == TaskStatus.blocked),
+       94              "timed_completed": len(durations),
+       95              "avg_duration_seconds": round(avg_duration, 2),
+       96          }
+
+---------- IMPLEMENTER clawteam.store.file:FileTaskStore  stubs=0/5 ----------
+       45  class FileTaskStore(BaseTaskStore):
+       77      def create(
+       78          self,
+       79          subject: str,
+       80          description: str = "",
+       81          owner: str = "",
+       82          priority: TaskPriority | None = None,
+       83          blocks: list[str] | None = None,
+       84          blocked_by: list[str] | None = None,
+       85          metadata: dict[str, Any] | None = None,
+       86      ) -> TaskItem:
+       87          task = TaskItem(
+       88              subject=subject,
+       89              description=description,
+       90              owner=owner,
+       91              priority=priority or TaskPriority.medium,
+       92              blocks=blocks or [],
+       93              blocked_by=blocked_by or [],
+       94              metadata=metadata or {},
+       95          )
+       96          self._validate_blocked_by_unlocked(task.id, task.blocked_by)
+       97          if task.blocked_by:
+       98              task.status = TaskStatus.blocked
+       99          with self._write_lock():
+      100              self._save_unlocked(task)
+      101          return task
+      103      def get(self, task_id: str) -> TaskItem | None:
+      104          return self._get_unlocked(task_id)
+      116      def update(
+      117          self,
+      118          task_id: str,
+      119          status: TaskStatus | None = None,
+      120          owner: str | None = None,
+      121          subject: str | None = None,
+      122          description: str | None = None,
+      123          priority: TaskPriority | None = None,
+      124          add_blocks: list[str] | None = None,
+      125          add_blocked_by: list[str] | None = None,
+      126          metadata: dict[str, Any] | None = None,
+      127          caller: str = "",
+      128          force: bool = False,
+      129      ) -> TaskItem | None:
+      130          with self._write_lock():
+      131              task = self._get_unlocked(task_id)
+      132              if not task:
+      133                  return None
+      134  
+      135              if status == TaskStatus.in_progress:
+      136                  self._acquire_lock(task, caller, force)
+      137                  if not task.started_at:
+      138                      task.started_at = _now_iso()
+      139  
+      140              if status in (TaskStatus.completed, TaskStatus.pending):
+      141                  task.locked_by = ""
+      142                  task.locked_at = ""
+      143  
+      144              # duration tracking
+      145              if status == TaskStatus.completed and task.started_at:
+      146                  try:
+      147                      start = datetime.fromisoformat(task.started_at)
+      148                      duration_secs = (datetime.now(timezone.utc) - start).total_seconds()
+      149                      task.metadata["duration_seconds"] = round(duration_secs, 2)
+      150                  except (ValueError, TypeError):
+      151                      pass
+      152  
+      153              if status is not None:
+      154                  task.status = status
+      155              if owner is not None:
+      156                  task.owner = owner
+      157              if subject is not None:
+      158                  task.subject = subject
+      159              if description is not None:
+      160                  task.description = description
+      161              if priority is not None:
+      162                  task.priority = priority
+      163              if add_blocks:
+      164                  for b in add_blocks:
+      165                      if b not in task.blocks:
+      166                          task.blocks.append(b)
+      167              if add_blocked_by:
+      168                  proposed_blocked_by = list(task.blocked_by)
+      169                  for b in add_blocked_by:
+      170                      if b not in proposed_blocked_by:
+      171                          proposed_blocked_by.append(b)
+      172                  self._validate_blocked_by_unlocked(task.id, proposed_blocked_by)
+      173                  task.blocked_by = proposed_blocked_by
+      174                  if task.blocked_by and task.status == TaskStatus.pending:
+      175                      task.status = TaskStatus.blocked
+       ... truncated at 60 lines ...
+      198      def release_stale_locks(self) -> list[str]:
+      199          from clawteam.spawn.registry import is_agent_alive
+      200  
+      201          released = []
+      202          with self._write_lock():
+      203              for task in self._list_tasks_unlocked():
+      204                  if not task.locked_by:
+      205                      continue
+      206                  alive = is_agent_alive(self.team_name, task.locked_by)
+      207                  if alive is False:
+      208                      task.locked_by = ""
+      209                      task.locked_at = ""
+      210                      task.updated_at = _now_iso()
+      211                      self._save_unlocked(task)
+      212                      released.append(task.id)
+      213          return released
+      215      def list_tasks(
+      216          self,
+      217          status: TaskStatus | None = None,
+      218          owner: str | None = None,
+      219          priority: TaskPriority | None = None,
+      220          sort_by_priority: bool = False,
+      221      ) -> list[TaskItem]:
+      222          return self._list_tasks_unlocked(
+      223              status=status,
+      224              owner=owner,
+      225              priority=priority,
+      226              sort_by_priority=sort_by_priority,
+      227          )

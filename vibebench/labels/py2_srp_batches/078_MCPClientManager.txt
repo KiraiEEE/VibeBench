@@ -1,0 +1,406 @@
+row 78   study8677/antigravity-workspace-template#21
+============================================================================
+CLASS MCPClientManager in src/mcp_client.py   loc=431 methods=15 wmc=60 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       55  class MCPClientManager:
+       56      """
+       57      Manages connections to multiple MCP servers and provides a unified
+       58      interface for tool discovery and invocation.
+       59  
+       60      This class handles:
+       61      - Loading server configurations from JSON file
+       62      - Establishing and maintaining connections to MCP servers
+       63      - Discovering available tools from each server
+       64      - Creating callable wrappers for MCP tools
+       65      - Error handling and graceful degradation
+       66  
+       67      Example usage:
+       68          manager = MCPClientManager()
+       69          await manager.initialize()
+       70          tools = manager.get_all_tools_as_callables()
+       71          result = await tools['mcp_github_create_issue'](title="Bug", body="...")
+       72      """
+       73  
+       74      def __init__(self, config_path: Optional[str] = None):
+       75          """
+       76          Initialize the MCP Client Manager.
+       77  
+       78          Args:
+       79              config_path: Path to MCP servers configuration file.
+       80                          Defaults to settings.MCP_SERVERS_CONFIG
+       81          """
+       82          self.config_path = config_path or settings.MCP_SERVERS_CONFIG
+       83          self.servers: Dict[str, MCPServerConnection] = {}
+       84          self.tool_prefix = settings.MCP_TOOL_PREFIX
+       85          self._initialized = False
+       86          self._lock = asyncio.Lock()
+       87  
+       88      def _load_server_configs(self) -> List[MCPServerConfig]:
+       89          """
+       90          Load MCP server configurations from JSON file.
+       91  
+       92          Returns:
+       93              List of MCPServerConfig objects
+       94          """
+       95          config_file = Path(self.config_path)
+       96  
+       97          if not config_file.exists():
+       98              print(f"   ⚠️ MCP config file not found: {config_file}")
+       99              return []
+      100  
+      101          try:
+      102              with open(config_file, "r", encoding="utf-8") as f:
+      103                  data = json.load(f)
+      104  
+      105              servers = data.get("servers", [])
+      106              configs = []
+      107  
+      108              for server_data in servers:
+      109                  if server_data.get("enabled", True):
+      110                      configs.append(MCPServerConfig(**server_data))
+      111  
+      112              return configs
+      113  
+      114          except json.JSONDecodeError as e:
+      115              print(f"   ❌ Invalid JSON in MCP config: {e}")
+      116              return []
+      117          except Exception as e:
+      118              print(f"   ❌ Error loading MCP config: {e}")
+      119              return []
+      120  
+      121      async def initialize(self) -> None:
+      122          """
+      123          Initialize connections to all configured MCP servers.
+      124  
+      125          This method:
+      126          1. Loads server configurations
+      127          2. Establishes connections to each server
+      128          3. Discovers available tools from each server
+      129          """
+      130          async with self._lock:
+      131              if self._initialized:
+      132                  return
+      133  
+      134              if not settings.MCP_ENABLED:
+      135                  print("   ℹ️ MCP integration is disabled")
+      136                  return
+      137  
+      138              print("🔌 Initializing MCP Client Manager...")
+      139  
+      140              configs = self._load_server_configs()
+      141  
+      142              if not configs:
+      143                  print("   ℹ️ No MCP servers configured")
+      144                  return
+      145  
+      146              for config in configs:
+      147                  await self._connect_server(config)
+      148  
+      149              connected_count = sum(1 for s in self.servers.values() if s.connected)
+      150              total_tools = sum(len(s.tools) for s in self.servers.values())
+      151  
+      152              print(f"   ✅ Connected to {connected_count}/{len(configs)} MCP servers")
+      153              print(f"   📦 Discovered {total_tools} MCP tools")
+      154  
+      155              self._initialized = True
+      156  
+      157      async def _connect_server(self, config: MCPServerConfig) -> None:
+      158          """
+      159          Establish connection to a single MCP server.
+      160  
+      161          Args:
+      162              config: Server configuration
+      163          """
+      164          connection = MCPServerConnection(config=config)
+      165  
+      166          try:
+      167              print(
+      168                  f"   🔗 Connecting to MCP server: {config.name} ({config.transport})..."
+      169              )
+      170  
+      171              if config.transport == "stdio":
+      172                  await self._connect_stdio(connection)
+      173              elif config.transport in ("http", "streamable-http"):
+      174                  await self._connect_http(connection)
+      175              elif config.transport == "sse":
+      176                  await self._connect_sse(connection)
+      177              else:
+      178                  raise ValueError(f"Unsupported transport: {config.transport}")
+      179  
+      180              # Discover tools if connected
+      181              if connection.connected and connection.session:
+      182                  await self._discover_tools(connection)
+      183                  print(
+      184                      f"      ✓ {config.name}: {len(connection.tools)} tools discovered"
+      185                  )
+      186  
+      187          except ImportError as e:
+      188              connection.error = f"MCP library not installed: {e}"
+      189              print(
+      190                  f"      ⚠️ {config.name}: MCP library not installed. Run: pip install 'mcp[cli]'"
+      191              )
+      192          except Exception as e:
+      193              connection.error = str(e)
+      194              print(f"      ⚠️ {config.name}: Connection failed - {e}")
+      195  
+      196          self.servers[config.name] = connection
+      197  
+      198      async def _connect_stdio(self, connection: MCPServerConnection) -> None:
+      199          """Connect to an MCP server using stdio transport."""
+      200          try:
+      201              from mcp import ClientSession, StdioServerParameters
+      202              from mcp.client.stdio import stdio_client
+      203  
+      204              config = connection.config
+      205  
+      206              if not config.command:
+      207                  raise ValueError("stdio transport requires 'command' field")
+      208  
+      209              server_params = StdioServerParameters(
+      210                  command=config.command,
+      211                  args=config.args,
+      212                  env={**os.environ, **config.env},
+      213              )
+      214  
+      215              # Create the client context
+      216              # Note: We need to manage the async context carefully
+      217              client_cm = stdio_client(server_params)
+      218              read_stream, write_stream = await client_cm.__aenter__()
+      219  
+      220              connection.read_stream = read_stream
+      221              connection.write_stream = write_stream
+      222              connection._client_cm = client_cm  # Store for cleanup
+      223  
+      224              # Create session
+      225              session = ClientSession(read_stream, write_stream)
+      226              await session.__aenter__()
+      227              await session.initialize()
+      228  
+      229              connection.session = session
+      230              connection.connected = True
+      231  
+      232          except Exception as e:
+      233              connection.error = str(e)
+      234              connection.connected = False
+      235              raise
+      236  
+      237      async def _connect_http(self, connection: MCPServerConnection) -> None:
+      238          """Connect to an MCP server using HTTP/Streamable HTTP transport."""
+      239          try:
+      240              from mcp import ClientSession
+      241              from mcp.client.streamable_http import streamablehttp_client
+      242  
+      243              config = connection.config
+      244  
+      245              if not config.url:
+      246                  raise ValueError("http transport requires 'url' field")
+      247  
+      248              # Create the client context
+      249              client_cm = streamablehttp_client(config.url)
+      250              read_stream, write_stream, _ = await client_cm.__aenter__()
+      251  
+      252              connection.read_stream = read_stream
+      253              connection.write_stream = write_stream
+      254              connection._client_cm = client_cm
+      255  
+      256              # Create session
+      257              session = ClientSession(read_stream, write_stream)
+      258              await session.__aenter__()
+      259              await session.initialize()
+      260  
+      261              connection.session = session
+      262              connection.connected = True
+      263  
+      264          except Exception as e:
+      265              connection.error = str(e)
+      266              connection.connected = False
+      267              raise
+      268  
+      269      async def _connect_sse(self, connection: MCPServerConnection) -> None:
+      270          """Connect to an MCP server using SSE transport."""
+      271          # SSE is similar to HTTP but uses different client
+      272          # For now, we'll use the same approach as HTTP
+      273          # The MCP SDK handles the transport details
+      274          await self._connect_http(connection)
+      275  
+      276      async def _discover_tools(self, connection: MCPServerConnection) -> None:
+      277          """
+      278          Discover available tools from a connected MCP server.
+      279  
+      280          Args:
+      281              connection: Active server connection
+      282          """
+      283          if not connection.session:
+      284              return
+      285  
+      286          try:
+      287              tools_response = await connection.session.list_tools()
+      288  
+      289              for tool in tools_response.tools:
+      290                  mcp_tool = MCPTool(
+      291                      name=tool.name,
+      292                      description=tool.description or "No description provided",
+      293                      server_name=connection.config.name,
+      294                      input_schema=tool.inputSchema
+      295                      if hasattr(tool, "inputSchema")
+      296                      else {},
+      297                      original_name=tool.name,
+      298                  )
+      299                  connection.tools.append(mcp_tool)
+      300  
+      301          except Exception as e:
+      302              print(f"      ⚠️ Error discovering tools: {e}")
+      303  
+      304      def get_all_tools(self) -> List[MCPTool]:
+      305          """
+      306          Get all discovered tools from all connected servers.
+      307  
+      308          Returns:
+      309              List of all MCPTool objects
+      310          """
+      311          all_tools = []
+      312          for connection in self.servers.values():
+      313              if connection.connected:
+      314                  all_tools.extend(connection.tools)
+      315          return all_tools
+      316  
+      317      def get_all_tools_as_callables(self) -> Dict[str, Callable[..., Any]]:
+      318          """
+      319          Convert all MCP tools to callable functions.
+      320  
+      321          Returns:
+      322              Dictionary mapping tool names to async callable functions
+      323          """
+      324          callables = {}
+      325  
+      326          for connection in self.servers.values():
+      327              if not connection.connected:
+      328                  continue
+      329  
+      330              for tool in connection.tools:
+      331                  prefixed_name = tool.get_prefixed_name(self.tool_prefix)
+      332                  callables[prefixed_name] = self._create_tool_wrapper(connection, tool)
+      333  
+      334          return callables
+      335  
+      336      def _create_tool_wrapper(
+      337          self, connection: MCPServerConnection, tool: MCPTool
+      338      ) -> Callable[..., Any]:
+      339          """
+      340          Create a callable wrapper for an MCP tool.
+      341  
+      342          Args:
+      343              connection: Server connection containing the tool
+      344              tool: Tool metadata
+      345  
+      346          Returns:
+      347              Async callable function that invokes the MCP tool
+      348          """
+      349  
+      350          async def tool_wrapper(**kwargs) -> Any:
+      351              """
+      352              Wrapper function that calls the MCP tool.
+      353  
+      354              This function is dynamically created for each MCP tool and handles:
+      355              - Argument validation
+      356              - Tool invocation via MCP protocol
+      357              - Result extraction and formatting
+      358              - Error handling
+      359              """
+      360              if not connection.connected or not connection.session:
+      361                  return f"Error: MCP server '{connection.config.name}' is not connected"
+      362  
+      363              try:
+      364                  result = await connection.session.call_tool(
+      365                      tool.original_name, arguments=kwargs
+      366                  )
+      367  
+      368                  # Extract content from result
+      369                  if hasattr(result, "content") and result.content:
+      370                      contents = []
+      371                      for content in result.content:
+      372                          if hasattr(content, "text"):
+      373                              contents.append(content.text)
+      374                          elif hasattr(content, "data"):
+      375                              contents.append(f"[Binary data: {len(content.data)} bytes]")
+      376                      return "\n".join(contents) if contents else str(result)
+      377  
+      378                  # Check for structured content
+      379                  if hasattr(result, "structuredContent") and result.structuredContent:
+      380                      return result.structuredContent
+      381  
+      382                  return str(result)
+      383  
+      384              except Exception as e:
+      385                  return f"Error calling MCP tool '{tool.original_name}': {e}"
+      386  
+      387          # Set function metadata for agent tool discovery
+      388          tool_wrapper.__name__ = tool.get_prefixed_name(self.tool_prefix)
+      389          tool_wrapper.__doc__ = f"""[MCP:{connection.config.name}] {tool.description}
+      390  
+      391  Server: {connection.config.name}
+      392  Original Name: {tool.original_name}
+      393  Transport: {connection.config.transport}
+      394  
+      395  Input Schema:
+      396  {json.dumps(tool.input_schema, indent=2) if tool.input_schema else "No schema defined"}
+      397  """
+      398  
+      399          return tool_wrapper
+      400  
+      401      def get_tool_descriptions(self) -> str:
+      402          """
+      403          Get formatted descriptions of all available MCP tools.
+      404  
+      405          Returns:
+      406              Formatted string with tool descriptions for prompt injection
+      407          """
+      408          descriptions = []
+      409  
+      410          for connection in self.servers.values():
+      411              if not connection.connected:
+      412                  continue
+      413  
+      414              for tool in connection.tools:
+      415                  prefixed_name = tool.get_prefixed_name(self.tool_prefix)
+      416                  desc = tool.description.strip().replace("\n", " ")
+      417                  descriptions.append(
+      418                      f"- {prefixed_name} [MCP:{connection.config.name}]: {desc}"
+      419                  )
+      420  
+      421          return "\n".join(descriptions)
+      422  
+      423      async def call_tool(
+      424          self, tool_name: str, arguments: Dict[str, Any]
+      425      ) -> Tuple[bool, Any]:
+      426          """
+      427          Call an MCP tool by its prefixed name.
+      428  
+      429          Args:
+      430              tool_name: The prefixed tool name
+      431              arguments: Tool arguments
+      432  
+      433          Returns:
+      434              Tuple of (success, result)
+      435          """
+      436          callables = self.get_all_tools_as_callables()
+      437  
+      438          if tool_name not in callables:
+      439              return False, f"Tool '{tool_name}' not found"
+      440  
+      441          try:
+      442              result = await callables[tool_name](**arguments)
+      443              return True, result
+      444          except Exception as e:
+      445              return False, str(e)
+      446  
+      447      async def shutdown(self) -> None:
+      448          """
+      449          Gracefully close all MCP server connections.
+      450          """
+      451          print("🔌 Shutting down MCP connections...")
+      452  
+      453          for name, connection in self.servers.items():
+      454              try:
+       ... truncated at 400 lines ...

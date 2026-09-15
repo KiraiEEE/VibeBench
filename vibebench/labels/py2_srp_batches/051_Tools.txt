@@ -1,0 +1,294 @@
+row 51   Haervwe/open-webui-tools#62
+============================================================================
+CLASS Tools in tools/create_image_cf.py   loc=289 methods=3 wmc=37 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      209  class Tools:
+      210      def __init__(self):
+      211          self.valves = self.Valves()
+      212          self.citation = False
+      213  
+      214      class Valves(BaseModel):
+      215          cloudflare_api_token: str = Field(
+      216              default="", description="Your Cloudflare API Token",
+      217              json_schema_extra={"input": {"type": "password"}},
+      218          )
+      219          cloudflare_account_id: str = Field("", description="Your Cloudflare Account ID")
+      220          default_model: str = Field(
+      221              "@cf/black-forest-labs/flux-1-schnell",
+      222              description="Default image generation model (always used) - FLUX recommended over SDXL",
+      223          )
+      224  
+      225      async def generate_image(
+      226          self,
+      227          prompt: str,
+      228          size: str = "1024x1024",
+      229          negative_prompt: str = "",
+      230          steps: int = 4,
+      231          guidance: float = 7.5,
+      232          seed: Optional[int] = None,
+      233          __user__: Dict[str, Any] = {},
+      234          __request__: Optional[Request] = None,
+      235          __event_emitter__: Optional[Callable] = None,
+      236      ) -> str:
+      237          """
+      238          Generate an image using Cloudflare Workers AI text-to-image models.
+      239  
+      240          :param prompt: Text description of the image to generate
+      241          :param size: Image size in format 'widthxheight' (e.g., '1024x1024')
+      242          :param negative_prompt: Text describing what to avoid in the image
+      243          :param steps: Number of diffusion steps (model-dependent limits)
+      244          :param guidance: How closely to follow the prompt (1.0-20.0)
+      245          :param seed: Random seed for reproducible results
+      246          """
+      247          if (
+      248              not self.valves.cloudflare_api_token
+      249              or not self.valves.cloudflare_account_id
+      250          ):
+      251              return "Error: Cloudflare API Token and Account ID must be configured in the tool settings."
+      252  
+      253          if not prompt.strip():
+      254              return "Error: Please provide a prompt for image generation."
+      255  
+      256          # Always use the configured default model (ignore any LLM model selection)
+      257          model_name = self.valves.default_model
+      258  
+      259          if __event_emitter__:
+      260              await __event_emitter__(
+      261                  {
+      262                      "type": "status",
+      263                      "data": {
+      264                          "description": f"Generating image with {model_name}...",
+      265                          "done": False,
+      266                      },
+      267                  }
+      268              )
+      269  
+      270          try:
+      271              # Validate the default model is supported
+      272              config = _get_model_config(model_name)
+      273  
+      274              # Build request payload with model-specific preprocessing
+      275              payload = _build_request_payload(
+      276                  prompt=prompt,
+      277                  model_name=model_name,
+      278                  size=size,
+      279                  negative_prompt=negative_prompt,
+      280                  steps=steps,
+      281                  guidance=guidance,
+      282                  seed=seed,
+      283              )
+      284  
+      285              # Log a warning if parameters were ignored due to model limitations
+      286              ignored_params = []
+      287  
+      288              if negative_prompt and not config.get("supports_negative_prompt"):
+      289                  ignored_params.append("negative_prompt")
+      290              if size != "1024x1024" and not config.get("supports_size"):
+      291                  ignored_params.append("size")
+      292              if guidance != 7.5 and not config.get("supports_guidance"):
+      293                  ignored_params.append("guidance")
+      294  
+      295              if ignored_params and __event_emitter__:
+      296                  await __event_emitter__(
+      297                      {
+      298                          "type": "status",
+      299                          "data": {
+      300                              "description": f"Note: {', '.join(ignored_params)} not supported by {model_name}",
+      301                              "done": False,
+      302                          },
+      303                      }
+      304                  )
+      305  
+      306              # Make API request
+      307              url = f"https://api.cloudflare.com/client/v4/accounts/{self.valves.cloudflare_account_id}/ai/run/{model_name}"
+      308              headers = {
+      309                  "Authorization": f"Bearer {self.valves.cloudflare_api_token}",
+      310                  "Content-Type": "application/json",
+      311              }
+      312  
+      313              if __event_emitter__:
+      314                  await __event_emitter__(
+      315                      {
+      316                          "type": "status",
+      317                          "data": {
+      318                              "description": "Sending request to Cloudflare Workers AI...",
+      319                              "done": False,
+      320                          },
+      321                      }
+      322                  )
+      323  
+      324              async with aiohttp.ClientSession() as session:
+      325                  async with session.post(
+      326                      url,
+      327                      headers=headers,
+      328                      json=payload,
+      329                      timeout=aiohttp.ClientTimeout(total=60),
+      330                  ) as response:
+      331                      if response.status != 200:
+      332                          error_text = await response.text()
+      333                          error_msg = f"API Error {response.status}: {error_text}"
+      334                          if __event_emitter__:
+      335                              await __event_emitter__(
+      336                                  {
+      337                                      "type": "status",
+      338                                      "data": {
+      339                                          "description": f"Error: {error_msg}",
+      340                                          "done": True,
+      341                                      },
+      342                                  }
+      343                              )
+      344                          return f"Error: {error_msg}"
+      345  
+      346                      # Handle different response formats based on actual Cloudflare API behavior
+      347                      content_type = response.headers.get("content-type", "").lower()
+      348  
+      349                      # Process response and save image using upload_file_handler
+      350                      filename = f"{uuid.uuid4()}.jpg"
+      351                      image_binary = None
+      352  
+      353                      if "application/json" in content_type:
+      354                          # JSON response - FLUX models return base64
+      355                          try:
+      356                              result = await response.json()
+      357  
+      358                              # Extract image data from Cloudflare's nested structure
+      359                              if "result" in result and isinstance(
+      360                                  result["result"], dict
+      361                              ):
+      362                                  image_data = result["result"].get("image")
+      363                              else:
+      364                                  image_data = result.get("image")
+      365  
+      366                              if not image_data:
+      367                                  return f"Error: No image data found in response. Keys: {list(result.keys())}"
+      368  
+      369                              # Decode base64
+      370                              image_binary = base64.b64decode(image_data)
+      371  
+      372                          except (json.JSONDecodeError, Exception) as e:
+      373                              return f"Error processing JSON response: {str(e)}"
+      374  
+      375                      else:
+      376                          # Binary response - other Stable Diffusion models
+      377                          image_binary = await response.read()
+      378                          if len(image_binary) < 100:
+      379                              return f"Error: Invalid binary image data received"
+      380  
+      381              if image_binary:
+      382                  upload_file = UploadFile(
+      383                      file=io.BytesIO(image_binary),
+      384                      filename=filename,
+      385                      headers={"content-type": "image/jpeg"},
+      386                  )
+      387                  current_user = (
+      388                      Users.get_user_by_id(__user__["id"]) if __user__ else None
+      389                  )
+      390  
+      391                  file_item = upload_file_handler(
+      392                      __request__,
+      393                      file=upload_file,
+      394                      metadata={},
+      395                      process=False,
+      396                      user=current_user,
+      397                  )
+      398  
+      399                  if file_item and getattr(file_item, "id", None):
+      400                      file_id = str(getattr(file_item, "id", ""))
+      401                      image_url = __request__.app.url_path_for(
+      402                          "get_file_content_by_id", id=file_id
+      403                      )
+      404                  else:
+      405                      return "Error: Failed to upload image to storage."
+      406  
+      407              # Debug: Log the image URL that was generated
+      408              print(f"[DEBUG] Generated image URL: {image_url}")
+      409              print(f"[DEBUG] Event emitter available: {__event_emitter__ is not None}")
+      410  
+      411              # Try event emitters with error handling
+      412              try:
+      413                  if __event_emitter__:
+      414                      print("[DEBUG] Sending status event...")
+      415                      await __event_emitter__(
+      416                          {
+      417                              "type": "status",
+      418                              "data": {"description": "Image generated", "done": True},
+      419                          }
+      420                      )
+      421  
+      422                      print("[DEBUG] Sending message event...")
+      423                      await __event_emitter__(
+      424                          {
+      425                              "type": "message",
+      426                              "data": {
+      427                                  "content": f"Generated image for prompt: '{prompt}'\n\n![Generated Image]({image_url})"
+      428                              },
+      429                          }
+      430                      )
+      431                      print("[DEBUG] Event emitters completed successfully")
+      432                  else:
+      433                      print("[DEBUG] No event emitter available")
+      434  
+      435              except Exception as e:
+      436                  print(f"[DEBUG] Event emitter error: {str(e)}")
+      437  
+      438              # Also return the image URL in the success message for debugging
+      439              return f"Notify the user that the image has been successfully generated for the prompt: '{prompt}'. Image URL: {image_url} and should be always displayed on UI in image markdown format: ![Alt text]({image_url})"
+      440  
+      441          except ValueError as e:
+      442              # Handle unsupported model errors
+      443              error_msg = str(e)
+      444              if __event_emitter__:
+      445                  await __event_emitter__(
+      446                      {
+      447                          "type": "status",
+      448                          "data": {"description": f"Error: {error_msg}", "done": True},
+      449                      }
+      450                  )
+      451              return f"Error: {error_msg}"
+      452  
+      453          except asyncio.TimeoutError:
+      454              error_msg = "Request timed out. The image generation is taking longer than expected."
+      455              if __event_emitter__:
+      456                  await __event_emitter__(
+      457                      {"type": "status", "data": {"description": error_msg, "done": True}}
+      458                  )
+      459              return f"Error: {error_msg}"
+      460  
+      461          except Exception as e:
+      462              error_msg = f"Unexpected error: {str(e)}"
+      463              if __event_emitter__:
+      464                  await __event_emitter__(
+      465                      {"type": "status", "data": {"description": error_msg, "done": True}}
+      466                  )
+      467              return f"Error: {error_msg}"
+      468  
+      469      async def list_models(self, __event_emitter__: Optional[Callable] = None) -> str:
+      470          """
+      471          List available Cloudflare Workers AI image generation models with their capabilities.
+      472          """
+      473          models_info = {
+      474              "@cf/black-forest-labs/flux-1-schnell": "FLUX.1 Schnell - Fast, high-quality generation (12B params)",
+      475              "@cf/stabilityai/stable-diffusion-xl-base-1.0": "Stable Diffusion XL - High quality, detailed images",
+      476              "@cf/bytedance/stable-diffusion-xl-lightning": "SDXL Lightning - Fast generation with good quality",
+      477              "@cf/lykon/dreamshaper-8-lcm": "DreamShaper 8 LCM - Photorealistic images",
+      478          }
+      479  
+      480          result = "Available Cloudflare Workers AI Image Generation Models:\n\n"
+      481          for model_id, description in models_info.items():
+      482              config = _get_model_config(model_id)
+      483              result += f"**{model_id}**\n"
+      484              result += f"  Description: {description}\n"
+      485              result += (
+      486                  f"  Recommended for: {config.get('recommended_for', 'general use')}\n"
+      487              )
+      488              result += f"  Max steps: {config.get('max_steps', 'N/A')}\n"
+      489              result += f"  Supports negative prompts: {config.get('supports_negative_prompt', False)}\n"
+      490              result += (
+      491                  f"  Supports custom size: {config.get('supports_size', False)}\n\n"
+      492              )
+      493  
+      494          result += f"Current default model: {self.valves.default_model}\n"
+      495          result += "\nNote: Image-to-image and inpainting models are not supported in this tool."
+      496  
+      497          return result

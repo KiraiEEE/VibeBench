@@ -1,0 +1,377 @@
+row 4   NVIDIA/NVFlare#4359
+============================================================================
+CONTRACT nvflare.app_common.ccwf.client_ctl:ClientSideController   kind=abc abstract_methods=6.0 implementers=3.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file nvflare/app_common/ccwf/client_ctl.py
+       45  class ClientSideController(Executor, TaskController):
+       46      def __init__(
+       47          self,
+       48          task_name_prefix: str,
+       49          learn_task_name=AppConstants.TASK_TRAIN,
+       50          persistor_id=AppConstants.DEFAULT_PERSISTOR_ID,
+       51          shareable_generator_id=AppConstants.DEFAULT_SHAREABLE_GENERATOR_ID,
+       52          learn_task_check_interval=Constant.LEARN_TASK_CHECK_INTERVAL,
+       53          learn_task_ack_timeout=Constant.LEARN_TASK_ACK_TIMEOUT,
+       54          learn_task_abort_timeout=Constant.LEARN_TASK_ABORT_TIMEOUT,
+       55          final_result_ack_timeout=Constant.FINAL_RESULT_ACK_TIMEOUT,
+       56          allow_busy_task: bool = False,
+       57      ):
+       58          """
+       59          Constructor of a ClientSideController object.
+       60  
+       61          Args:
+       62              task_name_prefix: prefix of task names. All CCWF task names are prefixed with this.
+       63              learn_task_name: name for the Learning Task (LT)
+       64              persistor_id: ID of the persistor component
+       65              shareable_generator_id: ID of the shareable generator component
+       66              learn_task_check_interval: interval for checking incoming Learning Task (LT)
+       67              learn_task_ack_timeout: timeout for sending the LT to other client(s)
+       68              final_result_ack_timeout: timeout for sending final result to participating clients
+       69              learn_task_abort_timeout: time to wait for the LT to become stopped after aborting it
+       70              allow_busy_task: whether a new learn task is allowed when working on current learn task
+       71          """
+       72          check_non_empty_str("task_name_prefix", task_name_prefix)
+       73          check_positive_number("learn_task_check_interval", learn_task_check_interval)
+       74          check_number_range("learn_task_ack_timeout", learn_task_ack_timeout, min_value=1.0)
+       75          check_positive_number("learn_task_abort_timeout", learn_task_abort_timeout)
+       76          check_number_range("final_result_ack_timeout", final_result_ack_timeout, min_value=1.0)
+       77  
+       78          Executor.__init__(self)
+       79          TaskController.__init__(self)
+       80          self.task_name_prefix = task_name_prefix
+       81          self.start_task_name = make_task_name(task_name_prefix, Constant.BASENAME_START)
+       82          self.configure_task_name = make_task_name(task_name_prefix, Constant.BASENAME_CONFIG)
+       83          self.do_learn_task_name = make_task_name(task_name_prefix, Constant.BASENAME_LEARN)
+       84          self.report_final_result_task_name = make_task_name(task_name_prefix, Constant.BASENAME_REPORT_FINAL_RESULT)
+       85          self.learn_task_name = learn_task_name
+       86          self.learn_task_abort_timeout = learn_task_abort_timeout
+       87          self.learn_task_check_interval = learn_task_check_interval
+       88          self.learn_task_ack_timeout = learn_task_ack_timeout
+       89          self.final_result_ack_timeout = final_result_ack_timeout
+       90          self.allow_busy_task = allow_busy_task
+       91          self.persistor_id = persistor_id
+       92          self.shareable_generator_id = shareable_generator_id
+       93  
+       94          self.persistor = None
+       95          self.shareable_generator = None
+       96  
+       97          self.current_status = StatusReport()
+       98          self.last_status_report_time = time.time()  # time of last status report to server
+       99          self.config = None
+      100          self.workflow_id = None
+      101          self.finalize_lock = threading.Lock()
+      102  
+      103          self.learn_thread = threading.Thread(target=self._do_learn)
+      104          self.learn_thread.daemon = True
+      105          self.learn_task = None
+      106          self.current_task = None
+      107          self.learn_executor = None
+      108          self.learn_task_lock = threading.Lock()
+      109          self.asked_to_stop = False
+      110          self.status_lock = threading.Lock()
+      111          self.engine = None
+      112          self.me = None
+      113          self.is_starting_client = False
+      114          self.last_result = None
+      115          self.last_round = None
+      116          self.best_result = None
+      117          self.best_metric = None
+      118          self.best_round = 0
+      119          self.workflow_done = False
+      120  
+      121      def get_config_prop(self, name: str, default=None):
+      122          """
+      123          Get a specified config property.
+      124  
+      125          Args:
+      126              name: name of the property
+      127              default: default value to return if the property is not defined.
+      128  
+      129          Returns:
+      130  
+      131          """
+      132          if not self.config:
+      133              return default
+      134          return self.config.get(name, default)
+      135  
+      136      def start_run(self, fl_ctx: FLContext):
+      137          self.start_controller(fl_ctx)
+      138          self.engine = fl_ctx.get_engine()
+      139          if not self.engine:
+      140              self.system_panic("no engine", fl_ctx)
+      141              return
+      142  
+      143          runner = fl_ctx.get_prop(FLContextKey.RUNNER)
+      144          if not runner:
+      145              self.system_panic("no client runner", fl_ctx)
+      146              return
+      147  
+      148          self.me = fl_ctx.get_identity_name()
+      149          if self.learn_task_name:
+      150              self.learn_executor = runner.find_executor(self.learn_task_name)
+      151              if not self.learn_executor:
+      152                  self.system_panic(f"no executor for task {self.learn_task_name}", fl_ctx)
+      153                  return
+      154  
+      155          self.persistor = self.engine.get_component(self.persistor_id)
+      156          if not isinstance(self.persistor, LearnablePersistor):
+      157              self.system_panic(
+      158                  f"Persistor {self.persistor_id} must be a Persistor instance, but got {type(self.persistor)}",
+      159                  fl_ctx,
+      160              )
+      161              return
+      162  
+      163          if self.shareable_generator_id:
+      164              self.shareable_generator = self.engine.get_component(self.shareable_generator_id)
+      165              if not isinstance(self.shareable_generator, ShareableGenerator):
+      166                  self.system_panic(
+      167                      f"Shareable generator {self.shareable_generator_id} must be a Shareable Generator instance, "
+      168                      f"but got {type(self.shareable_generator)}",
+      169                      fl_ctx,
+      170                  )
+      171                  return
+      172  
+      173          self.initialize(fl_ctx)
+      174  
+      175          if self.learn_task_name:
+      176              self.log_info(fl_ctx, "Started learn thread")
+      177              self.learn_thread.start()
+      178  
+      179      def handle_event(self, event_type: str, fl_ctx: FLContext):
+      180          if event_type == EventType.START_RUN:
+      181              self.start_run(fl_ctx)
+      182  
+      183          elif event_type == EventType.BEFORE_PULL_TASK:
+      184              # add my status to fl_ctx
+      185              if not self.workflow_id:
+      186                  return
+      187  
+      188              reports = fl_ctx.get_prop(Constant.STATUS_REPORTS)
+      189              if reports:
+      190                  reports.pop(self.workflow_id, None)
+      191  
+      192              if self.workflow_done:
+      193                  return
+      194              report = self._get_status_report()
+      195              if not report:
+      196                  self.log_debug(fl_ctx, "nothing to report this time")
+      197                  return
+      198              self._add_status_report(report, fl_ctx)
+      199              self.last_status_report_time = report.timestamp
+      200  
+      201          elif event_type in [EventType.ABORT_TASK, EventType.END_RUN]:
+      202              if not self.asked_to_stop and not self.workflow_done:
+      203                  self.asked_to_stop = True
+      204                  self._abort_current_task(fl_ctx)
+      205                  self.finalize(fl_ctx)
+      206  
+      207      def _add_status_report(self, report: StatusReport, fl_ctx: FLContext):
+      208          reports = fl_ctx.get_prop(Constant.STATUS_REPORTS)
+      209          if not reports:
+      210              reports = {}
+      211              # set the prop as public, so it will be sent to the peer in peer_context
+      212              fl_ctx.set_prop(Constant.STATUS_REPORTS, reports, sticky=False, private=False)
+      213          reports[self.workflow_id] = report.to_dict()
+      214  
+      215      def initialize(self, fl_ctx: FLContext):
+      216          """Called to initialize the executor.
+      217  
+      218          Args:
+      219              fl_ctx: The FL Context
+      220  
+      221          Returns: None
+      222  
+      223          """
+      224          fl_ctx.set_prop(Constant.EXECUTOR, self, private=True, sticky=False)
+      225          self.fire_event(Constant.EXECUTOR_INITIALIZED, fl_ctx)
+      226  
+      227      def finalize(self, fl_ctx: FLContext):
+      228          """Called to finalize the executor.
+      229  
+      230          Args:
+      231              fl_ctx: the FL Context
+      232  
+      233          Returns: None
+      234  
+      235          """
+      236          with self.finalize_lock:
+      237              if self.workflow_done:
+      238                  return
+      239  
+      240              fl_ctx.set_prop(Constant.EXECUTOR, self, private=True, sticky=False)
+      241              fl_ctx.set_prop(FLContextKey.WORKFLOW, self.workflow_id, private=True, sticky=False)
+      242              self.fire_event(Constant.EXECUTOR_FINALIZED, fl_ctx)
+      243              self.workflow_done = True
+      244  
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER nvflare.app_common.ccwf.cse_client_ctl:CrossSiteEvalClientController  stubs=2/6 ----------
+       31  class CrossSiteEvalClientController(ClientSideController):
+      123      def start_workflow(self, shareable: Shareable, fl_ctx: FLContext, abort_signal: Signal) -> Shareable:
+      124          pass
+      385      def do_learn_task(self, name: str, task_data: Shareable, fl_ctx: FLContext, abort_signal: Signal):
+      386          pass
+      (does not define: control_flow, process_result_of_unknown_task, restore, stop_controller; inherited or absent)
+
+---------- IMPLEMENTER nvflare.app_common.ccwf.cyclic_client_ctl:CyclicClientController  stubs=0/6 ----------
+       26  class CyclicClientController(ClientSideController):
+       60      def start_workflow(self, shareable: Shareable, fl_ctx: FLContext, abort_signal: Signal) -> Shareable:
+       61          clients = self.get_config_prop(Constant.CLIENTS)
+       62          # make sure the starting client is the 1st
+       63          rotate_to_front(self.me, clients)
+       64          cyclic_order = self.get_config_prop(Constant.ORDER)
+       65          self.log_info(fl_ctx, f"Starting cyclic workflow on clients {clients} with order {cyclic_order} ")
+       66          self._set_task_headers(
+       67              task_data=shareable,
+       68              num_rounds=self.get_config_prop(AppConstants.NUM_ROUNDS),
+       69              current_round=self.get_config_prop(Constant.START_ROUND, 0),
+       70              client_order=clients,
+       71          )
+       72          self.set_learn_task(task_data=shareable, fl_ctx=fl_ctx)
+       73          return make_reply(ReturnCode.OK)
+       75      def do_learn_task(self, name: str, data: Shareable, fl_ctx: FLContext, abort_signal: Signal):
+       76          # set status report of starting task
+       77          current_round = data.get_header(AppConstants.CURRENT_ROUND)
+       78          self.update_status(
+       79              last_round=current_round,
+       80              action="start_learn_task",
+       81          )
+       82  
+       83          # need to prepare the GLOBAL_MODEL prop in case the shareable generator needs it
+       84          # for shareable_to_learnable after training.
+       85          # Note: the "data" shareable contains full weight before training.
+       86          # However, the training process may only return weight diffs. To convert to full weights again,
+       87          # the original weights (GLOBAL_MODEL prop) are needed.
+       88          global_weights = self.shareable_generator.shareable_to_learnable(data, fl_ctx)
+       89          fl_ctx.set_prop(AppConstants.GLOBAL_MODEL, global_weights, private=True, sticky=True)
+       90  
+       91          data.set_header(FLContextKey.TASK_NAME, name)
+       92  
+       93          # execute the task
+       94          result = self.execute_learn_task(data, fl_ctx, abort_signal)
+       95  
+       96          rc = result.get_return_code(ReturnCode.OK)
+       97          if rc != ReturnCode.OK:
+       98              self.log_error(fl_ctx, f"learn executor failed: {rc}")
+       99              self.update_status(action="do_learn_task", error=rc)
+      100              return
+      101  
+      102          self.last_result = result
+      103          self.last_round = current_round
+      104  
+      105          # see whether we need to send to next leg
+      106          num_rounds = data.get_header(AppConstants.NUM_ROUNDS)
+      107          current_round = data.get_header(AppConstants.CURRENT_ROUND)
+      108          client_order = data.get_header(Constant.CLIENT_ORDER)
+      109  
+      110          all_done = False
+      111          assert isinstance(client_order, list)
+      112          my_idx = client_order.index(self.me)
+      113  
+      114          if my_idx == len(client_order) - 1:
+      115              # I'm the last leg
+      116              num_rounds_done = current_round - self.get_config_prop(Constant.START_ROUND, 0) + 1
+      117              if num_rounds_done >= num_rounds:
+      118                  # The RR is done!
+      119                  self.log_info(fl_ctx, f"Cyclic Done: number of rounds completed {num_rounds_done}")
+      120                  all_done = True
+      121              else:
+      122                  # decide the next round order
+      123                  cyclic_order = self.get_config_prop(Constant.ORDER)
+      124                  if cyclic_order == CyclicOrder.RANDOM:
+      125                      random.shuffle(client_order)
+      126                      # make sure I'm not the first in the new order
+      127                      if client_order[0] == self.me:
+      128                          # put me at the end
+      129                          client_order.pop(0)
+      130                          client_order.append(self.me)
+      131                      result.set_header(Constant.CLIENT_ORDER, client_order)
+      132  
+      133                  current_round += 1
+      134                  self.log_info(fl_ctx, f"Starting new round {current_round} on clients: {client_order}")
+       ... truncated at 60 lines ...
+      (does not define: control_flow, process_result_of_unknown_task, restore, stop_controller; inherited or absent)
+
+---------- IMPLEMENTER nvflare.app_common.ccwf.swarm_client_ctl:SwarmClientController  stubs=0/6 ----------
+      269  class SwarmClientController(ClientSideController):
+      463      def start_workflow(self, shareable: Shareable, fl_ctx: FLContext, abort_signal: Signal) -> Shareable:
+      464          clients = self.get_config_prop(Constant.CLIENTS)
+      465          aggregator_candidates = self.get_config_prop(Constant.AGGR_CLIENTS, [])
+      466          train_clients = self.get_config_prop(Constant.TRAIN_CLIENTS, [])
+      467  
+      468          self.log_info(
+      469              fl_ctx,
+      470              f"Starting Swarm Workflow on clients {clients}, aggregator candidates {aggregator_candidates}, trainers {train_clients}",
+      471          )
+      472  
+      473          if not self._scatter(
+      474              task_data=shareable, for_round=self.get_config_prop(Constant.START_ROUND, 0), fl_ctx=fl_ctx
+      475          ):
+      476              return make_reply(ReturnCode.EXECUTION_EXCEPTION)
+      477  
+      478          self.log_info(fl_ctx, "Started Swarm Workflow")
+      479          return make_reply(ReturnCode.OK)
+      809      def do_learn_task(self, name: str, task_data: Shareable, fl_ctx: FLContext, abort_signal: Signal):
+      810          # set status report of starting task
+      811          current_round = task_data.get_header(AppConstants.CURRENT_ROUND)
+      812          self.update_status(last_round=current_round, action="start_learn_task")
+      813  
+      814          aggr = task_data.get_header(Constant.AGGREGATOR)
+      815          if not aggr:
+      816              self.log_error(fl_ctx, f"missing aggregation client for round {current_round}")
+      817              self.update_status(action="do_learn_task", error=ReturnCode.EXECUTION_EXCEPTION)
+      818              return
+      819  
+      820          self.log_info(fl_ctx, f"Round {current_round} started.")
+      821  
+      822          task_data.set_header(FLContextKey.TASK_NAME, name)
+      823  
+      824          # Some shareable generators assume the base model (GLOBAL_MODEL) is always available, which is true for
+      825          # server-controlled fed-avg. But this is not true for swarm learning.
+      826          # To make these generators happy, we create an empty global model here if not present.
+      827          base_model = fl_ctx.get_prop(AppConstants.GLOBAL_MODEL)
+      828          if not base_model:
+      829              base_model = Learnable()
+      830              fl_ctx.set_prop(AppConstants.GLOBAL_MODEL, base_model, private=True, sticky=True)
+      831          # If task_data contains LazyDownloadRef (receiver-side decode_pass_through
+      832          # was active), resolve before shareable_to_learnable so GLOBAL_MODEL gets
+      833          # real tensors — required by the WEIGHT_DIFF branch of _end_gather().
+      834          # task_data itself keeps its refs intact for execute_learn_task() below so
+      835          # the subprocess can download directly from the source DownloadService.
+      836          task_data_for_model = (
+      837              self._resolve_lazy_refs(task_data, fl_ctx) if self._has_lazy_refs(task_data) else task_data
+      838          )
+      839          global_weights = self.shareable_generator.shareable_to_learnable(task_data_for_model, fl_ctx)
+      840  
+      841          self.log_debug(fl_ctx, f"current global model: {global_weights}")
+      842  
+      843          fl_ctx.set_prop(AppConstants.GLOBAL_MODEL, global_weights, private=True, sticky=True)
+      844          fl_ctx.set_prop(AppConstants.CURRENT_ROUND, current_round, private=True, sticky=True)
+      845          self.fire_event(AppEventType.ROUND_STARTED, fl_ctx)
+      846  
+      847          if self.me == aggr:
+      848              # set up the aggr waiter
+      849              gatherer = self.gatherer
+      850              if gatherer:
+      851                  # already waiting for aggregation - should never happen
+      852                  self.log_error(
+      853                      fl_ctx,
+      854                      f"logic error: got task for round {current_round} while gathering for round {gatherer.for_round}",
+      855                  )
+      856                  self.update_status(action="do_learn_task", error=ReturnCode.EXECUTION_EXCEPTION)
+      857                  return
+      858  
+      859              self.log_info(fl_ctx, f"setting up the gatherer for round {current_round}")
+      860  
+      861              self.gatherer = Gatherer(
+      862                  fl_ctx=fl_ctx,
+      863                  all_clients=self.get_config_prop(Constant.CLIENTS),
+      864                  metric_comparator=self.metric_comparator,
+      865                  trainers=self.trainers,
+      866                  for_round=current_round,
+      867                  timeout=self.learn_task_timeout,
+      868                  min_responses_required=self.min_responses_required,
+       ... truncated at 60 lines ...
+      (does not define: control_flow, process_result_of_unknown_task, restore, stop_controller; inherited or absent)

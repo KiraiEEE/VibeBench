@@ -1,0 +1,406 @@
+row 48   f-dangel/curvlinops#284
+============================================================================
+CLASS _EmpiricalRiskMixin in curvlinops/_empirical_risk.py   loc=420 methods=10 wmc=60 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       40  class _EmpiricalRiskMixin:
+       41      """Mixin for empirical risk computation over a data set.
+       42  
+       43      Attributes:
+       44          FIXED_DATA_ORDER: Whether the data loader must return batches in a fixed
+       45              order. When ``True``, the deterministic check also verifies that
+       46              each individual mini-batch matches across two passes. Default:
+       47              ``False``.
+       48          NEEDS_NUM_PER_EXAMPLE_LOSS_TERMS: Whether the operator requires the
+       49              number of per-example loss terms (e.g. tokens per sequence). When
+       50              ``True`` and ``num_per_example_loss_terms`` is not provided, it
+       51              will be inferred from the data. Default: ``False``.
+       52      """
+       53  
+       54      FIXED_DATA_ORDER: bool = False
+       55      NEEDS_NUM_PER_EXAMPLE_LOSS_TERMS: bool = False
+       56  
+       57      def __init__(
+       58          self,
+       59          model_func: Module
+       60          | Callable[[dict[str, Tensor], Tensor | MutableMapping], Tensor],
+       61          loss_func: Callable[[Tensor, Tensor], Tensor] | None,
+       62          params: dict[str, Tensor],
+       63          data: Iterable[tuple[Tensor | MutableMapping, Tensor]],
+       64          progressbar: bool = False,
+       65          batch_size_fn: Callable[[MutableMapping | Tensor], int] | None = None,
+       66          num_data: int | None = None,
+       67          num_per_example_loss_terms: int | None = None,
+       68          check_deterministic: bool = True,
+       69      ):
+       70          """Set up the shared state for empirical risk computation.
+       71  
+       72          Args:
+       73              model_func: The neural network's forward pass, defining the functional
+       74                  relationship ``(params, X) -> prediction``. Either an ``nn.Module``
+       75                  (architecture) or a callable ``(params_dict, X) -> prediction``.
+       76                  If a ``Module``, it will be wrapped via ``make_functional_call``.
+       77              loss_func: Loss function criterion. Maps predictions and mini-batch labels
+       78                  to a scalar value. ``None`` means the represented quantity is independent
+       79                  of the loss function.
+       80              params: The parameter values at which the matrix is evaluated.
+       81                  A dictionary mapping parameter names to tensors (use
+       82                  ``dict(model.named_parameters())``).
+       83              data: Source from which mini-batches can be drawn, for instance a list of
+       84                  mini-batches ``[(X, y), ...]`` or a torch ``DataLoader``.
+       85              progressbar: Show a progressbar during computation.
+       86                  Default: ``False``.
+       87              batch_size_fn: Function that computes the batch size from input data. If
+       88                  ``None``, defaults to ``X.shape[0]``.
+       89              num_data: Number of data points. If ``None``, it is inferred from the data
+       90                  at the cost of one traversal through the data loader.
+       91              num_per_example_loss_terms: Number of per-example loss terms, e.g. the
+       92                  number of tokens in a sequence. Only used by subclasses with
+       93                  ``NEEDS_NUM_PER_EXAMPLE_LOSS_TERMS = True``. If ``None``, it is
+       94                  inferred from the data when needed. Default: ``None``.
+       95              check_deterministic: Probe that model and data are deterministic, i.e.
+       96                  that the data does not use ``drop_last`` or data augmentation. Also, the
+       97                  model's forward pass could depend on the order in which mini-batches
+       98                  are presented (BatchNorm, Dropout). Default: ``True``. This is a
+       99                  safeguard, only turn it off if you know what you are doing.
+      100  
+      101          Raises:
+      102              TypeError: If ``params`` is not a ``dict``.
+      103              ValueError: If ``X`` is a ``MutableMapping`` and ``batch_size_fn`` is not
+      104                  specified.
+      105          """
+      106          if isinstance(next(iter(data))[0], MutableMapping) and batch_size_fn is None:
+      107              raise ValueError(
+      108                  "When using dict-like custom data, `batch_size_fn` is required."
+      109              )
+      110  
+      111          if not isinstance(params, dict):
+      112              raise TypeError(
+      113                  f"params must be a dict[str, Tensor], got {type(params).__name__}. "
+      114                  "Use dict(model.named_parameters()) instead of list(model.parameters())."
+      115              )
+      116  
+      117          if isinstance(model_func, Module):
+      118              self._model_func = make_functional_call(model_func)
+      119          elif callable(model_func):
+      120              self._model_func = model_func
+      121          else:
+      122              raise ValueError(
+      123                  "model_func must be an nn.Module or a callable, "
+      124                  f"got {type(model_func).__name__}."
+      125              )
+      126          self._params = params
+      127          self._loss_func = loss_func
+      128          self._data = data
+      129          self._progressbar = progressbar
+      130          self._batch_size_fn = (
+      131              (lambda X: X.shape[0]) if batch_size_fn is None else batch_size_fn
+      132          )
+      133  
+      134          self._N_data, self._num_per_example_loss_terms = self._get_data_statistics(
+      135              num_data, num_per_example_loss_terms
+      136          )
+      137  
+      138          if check_deterministic:
+      139              self._check_deterministic()
+      140  
+      141      def _get_data_statistics(
+      142          self, num_data: int | None, num_per_example_loss_terms: int | None
+      143      ) -> tuple[int, int | None]:
+      144          """Determine the number of data points and per-example loss terms.
+      145  
+      146          Traverses the data at most once, computing whichever statistics were not
+      147          explicitly provided. The number of per-example loss terms is only
+      148          inferred when ``NEEDS_NUM_PER_EXAMPLE_LOSS_TERMS`` is ``True`` and
+      149          ``num_per_example_loss_terms`` is ``None``.
+      150  
+      151          Args:
+      152              num_data: Number of data points, or ``None`` to infer.
+      153              num_per_example_loss_terms: Per-example loss terms, or ``None`` to
+      154                  infer when ``NEEDS_NUM_PER_EXAMPLE_LOSS_TERMS`` is ``True``.
+      155  
+      156          Returns:
+      157              Tuple of ``(N_data, num_per_example_loss_terms)``. The second
+      158              element is ``None`` when not required.
+      159  
+      160          Raises:
+      161              ValueError: If the inferred number of loss terms is not divisible
+      162                  by the number of data points.
+      163          """
+      164          need_N_data = num_data is None
+      165          need_loss_terms = (
+      166              self.NEEDS_NUM_PER_EXAMPLE_LOSS_TERMS
+      167              and self._loss_func is not None
+      168              and num_per_example_loss_terms is None
+      169          )
+      170          if not need_N_data and not need_loss_terms:
+      171              return num_data, num_per_example_loss_terms
+      172  
+      173          # Accumulate number of data points and (maybe) loss terms
+      174          N_data_acc, num_loss_terms_acc = 0, 0
+      175          for X, y in self._loop_over_data(desc="data_statistics"):
+      176              if need_N_data:
+      177                  N_data_acc += self._batch_size_fn(X)
+      178              if need_loss_terms:
+      179                  num_loss_terms_acc += (
+      180                      y.numel()
+      181                      if isinstance(self._loss_func, CrossEntropyLoss)
+      182                      else y.shape[:-1].numel()
+      183                  )
+      184  
+      185          # Maybe update number of passed data points and loss terms
+      186          N_data = N_data_acc if need_N_data else num_data
+      187  
+      188          if need_loss_terms:
+      189              if num_loss_terms_acc % N_data != 0:
+      190                  raise ValueError(
+      191                      "The number of loss terms must be divisible by the number "
+      192                      f"of data points; num_loss_terms="
+      193                      f"{num_loss_terms_acc}, N_data={N_data}."
+      194                  )
+      195              num_per_example_loss_terms = num_loss_terms_acc // N_data
+      196  
+      197          return N_data, num_per_example_loss_terms
+      198  
+      199      def _check_deterministic(self, rtol: float = 5e-5, atol: float = 1e-6):
+      200          """Check that the data and model are deterministic.
+      201  
+      202          Two independent passes over the data must yield identical total losses
+      203          and total gradients. If ``FIXED_DATA_ORDER`` is ``True``, also checks
+      204          that each mini-batch yields identical inputs, predictions, losses, and
+      205          gradients.
+      206  
+      207          Subclasses can override this method to add additional checks (e.g.
+      208          verifying ``vmap`` compatibility). They should call ``super()`` first.
+      209  
+      210          Args:
+      211              rtol: Relative tolerance for comparison. Default: ``5e-5``.
+      212              atol: Absolute tolerance for comparison. Default: ``1e-6``.
+      213  
+      214          Raises:
+      215              RuntimeError: If non-deterministic behavior is detected.
+      216          """
+      217          has_loss = self._loss_func is not None
+      218  
+      219          if has_loss:
+      220              total_grad1 = [zeros_like(p) for p in self._params.values()]
+      221              total_grad2 = [zeros_like(p) for p in self._params.values()]
+      222              total_loss1 = tensor(0.0, device=self.device, dtype=self.dtype)
+      223              total_loss2 = tensor(0.0, device=self.device, dtype=self.dtype)
+      224  
+      225          for ((X1, y1), pred1, loss1, grad1), ((X2, y2), pred2, loss2, grad2) in zip(
+      226              self._data_prediction_loss_gradient(), self._data_prediction_loss_gradient()
+      227          ):
+      228              if self.FIXED_DATA_ORDER:
+      229                  self._check_deterministic_batch(
+      230                      (X1, X2),
+      231                      (y1, y2),
+      232                      (pred1, pred2),
+      233                      (loss1, loss2),
+      234                      (grad1, grad2),
+      235                      has_loss,
+      236                      rtol=rtol,
+      237                      atol=atol,
+      238                  )
+      239  
+      240              if has_loss:
+      241                  total_loss1.add_(loss1)
+      242                  total_loss2.add_(loss2)
+      243                  for tg1, g1 in zip(total_grad1, grad1):
+      244                      tg1.add_(g1)
+      245                  for tg2, g2 in zip(total_grad2, grad2):
+      246                      tg2.add_(g2)
+      247  
+      248          if has_loss:
+      249              if not allclose_report(total_loss1, total_loss2, rtol=rtol, atol=atol):
+      250                  raise RuntimeError("Check for deterministic total loss failed.")
+      251              if any(
+      252                  not allclose_report(g1, g2, atol=atol, rtol=rtol)
+      253                  for g1, g2 in zip(total_grad1, total_grad2)
+      254              ):
+      255                  raise RuntimeError("Check for deterministic total gradient failed.")
+      256  
+      257      @staticmethod
+      258      def _check_deterministic_batch(
+      259          Xs: tuple[Tensor | MutableMapping, Tensor | MutableMapping],
+      260          ys: tuple[Tensor, Tensor],
+      261          predictions: tuple[Tensor, Tensor],
+      262          losses: tuple[Tensor | None, Tensor | None],
+      263          gradients: tuple[list[Tensor] | None, list[Tensor] | None],
+      264          has_loss_func: bool,
+      265          rtol: float = 1e-5,
+      266          atol: float = 1e-8,
+      267      ):
+      268          """Compare two batch outputs of a data-prediction-loss-gradient pass.
+      269  
+      270          Args:
+      271              Xs: The two data inputs to compare.
+      272              ys: The two data targets to compare.
+      273              predictions: The two predictions to compare.
+      274              losses: The two losses to compare.
+      275              gradients: The two gradients to compare.
+      276              has_loss_func: Whether a loss function is present.
+      277              rtol: Relative tolerance for comparison. Default: ``1e-5``.
+      278              atol: Absolute tolerance for comparison. Default: ``1e-8``.
+      279  
+      280          Raises:
+      281              RuntimeError: If any of the pairs mismatch.
+      282          """
+      283          X1, X2 = Xs
+      284          if isinstance(X1, MutableMapping) and isinstance(X2, MutableMapping):
+      285              for k in X1:
+      286                  v1, v2 = X1[k], X2[k]
+      287                  if isinstance(v1, Tensor) and not allclose_report(
+      288                      v1, v2, rtol=rtol, atol=atol
+      289                  ):
+      290                      raise RuntimeError("Check for deterministic X failed.")
+      291          elif not allclose_report(X1, X2, rtol=rtol, atol=atol):
+      292              raise RuntimeError("Check for deterministic X failed.")
+      293  
+      294          y1, y2 = ys
+      295          if not allclose_report(y1, y2, rtol=rtol, atol=atol):
+      296              raise RuntimeError("Check for deterministic y failed.")
+      297  
+      298          pred1, pred2 = predictions
+      299          if not allclose_report(pred1, pred2, rtol=rtol, atol=atol):
+      300              raise RuntimeError("Check for deterministic batch prediction failed.")
+      301  
+      302          loss1, loss2 = losses
+      303          grad1, grad2 = gradients
+      304          if has_loss_func:
+      305              if not allclose_report(loss1, loss2, rtol=rtol, atol=atol):
+      306                  raise RuntimeError("Check for deterministic batch loss failed.")
+      307              if any(
+      308                  not allclose_report(g1, g2, rtol=rtol, atol=atol)
+      309                  for g1, g2 in zip(grad1, grad2)
+      310              ):
+      311                  raise RuntimeError("Check for deterministic batch gradient failed.")
+      312  
+      313      @property
+      314      def device(self) -> device:
+      315          """Infer the device from model parameters.
+      316  
+      317          Returns:
+      318              Inferred device.
+      319          """
+      320          return _infer_device(self._params.values())
+      321  
+      322      @property
+      323      def dtype(self) -> dtype:
+      324          """Infer the data type from model parameters.
+      325  
+      326          Returns:
+      327              Inferred data type.
+      328          """
+      329          return _infer_dtype(self._params.values())
+      330  
+      331      def _loop_over_data(
+      332          self, desc: str | None = None
+      333      ) -> Iterable[tuple[Tensor | MutableMapping, Tensor]]:
+      334          """Yield batches of the data set, loaded to the correct device.
+      335  
+      336          Args:
+      337              desc: Description for the progress bar. Will be ignored if progressbar is
+      338                  disabled.
+      339  
+      340          Yields:
+      341              Mini-batches ``(X, y)``.
+      342          """
+      343          data_iter = self._data
+      344          dev = self.device
+      345  
+      346          if self._progressbar:
+      347              desc = (
+      348                  f"{self.__class__.__name__}"
+      349                  f"{'' if desc is None else f'.{desc}'}"
+      350                  f" (on {str(dev)})"
+      351              )
+      352              data_iter = tqdm(data_iter, desc=desc)
+      353  
+      354          for X, y in data_iter:
+      355              if isinstance(X, Tensor):
+      356                  X = X.to(dev)
+      357              y = y.to(dev)
+      358              yield (X, y)
+      359  
+      360      def _get_normalization_factor(self, X: MutableMapping | Tensor, y: Tensor) -> float:
+      361          """Return the correction factor for correct normalization over the data set.
+      362  
+      363          Args:
+      364              X: Input to the DNN.
+      365              y: Ground truth.
+      366  
+      367          Returns:
+      368              Normalization factor.
+      369          """
+      370          return {"sum": 1.0, "mean": self._batch_size_fn(X) / self._N_data}[
+      371              self._loss_func.reduction
+      372          ]
+      373  
+      374      def _data_prediction_loss_gradient(
+      375          self, desc: str = "batch_prediction_loss_gradient"
+      376      ) -> Iterator[
+      377          tuple[
+      378              tuple[Tensor | MutableMapping, Tensor],
+      379              Tensor,
+      380              Tensor | None,
+      381              list[Tensor] | None,
+      382          ]
+      383      ]:
+      384          """Yield (input, label), prediction, loss, and gradient for each batch.
+      385  
+      386          Args:
+      387              desc: Description for the progress bar (if the progress bar is enabled).
+      388                  Default: ``'batch_prediction_loss_gradient'``.
+      389  
+      390          Yields:
+      391              Tuple of ((input, label), prediction, loss, gradient) for each batch of
+      392              the data.
+      393          """
+      394  
+      395          def loss_fn(
+      396              params: dict[str, Tensor],
+      397              X: Tensor | MutableMapping,
+      398              y: Tensor,
+      399              normalization_factor: float,
+      400          ) -> tuple[Tensor, Tensor]:
+      401              """Compute normalized loss and prediction.
+      402  
+      403              Args:
+      404                  params: Model parameters.
+      405                  X: Input to the model.
+      406                  y: Ground truth.
+      407                  normalization_factor: Normalization factor for the loss.
+      408  
+      409              Returns:
+      410                  Tuple of (loss, prediction).
+      411              """
+      412              pred = self._model_func(params, X)
+      413              return self._loss_func(pred, y).mul_(normalization_factor), pred
+      414  
+      415          loss_and_grad_fn = grad_and_value(loss_fn, has_aux=True)
+      416  
+      417          for X, y in self._loop_over_data(desc=desc):
+      418              if self._loss_func is None:
+      419                  prediction = self._model_func(self._params, X).detach()
+      420                  yield (X, y), prediction, None, None
+      421              else:
+      422                  normalization_factor = self._get_normalization_factor(X, y)
+      423                  grad_dict, (loss, prediction) = loss_and_grad_fn(
+      424                      self._params, X, y, normalization_factor
+      425                  )
+      426                  grad_params = [grad_dict[k].detach() for k in self._params]
+      427                  yield (X, y), prediction.detach(), loss.detach(), grad_params
+      428  
+      429      def _gradient_and_loss(self) -> tuple[list[Tensor], Tensor]:
+      430          """Evaluate the gradient and loss on the data.
+      431  
+      432          Uses ``autograd.grad`` instead of ``torch.func.grad_and_value`` to avoid
+      433          the ~2x memory overhead of the functional API
+      434          (see `pytorch#134612 <https://github.com/pytorch/pytorch/issues/134612>`_).
+      435  
+      436          Returns:
+      437              Gradient and loss on the data set.
+      438  
+      439          Raises:
+       ... truncated at 400 lines ...

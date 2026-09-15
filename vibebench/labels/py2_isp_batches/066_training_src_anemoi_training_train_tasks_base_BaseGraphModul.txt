@@ -1,0 +1,328 @@
+row 66   ecmwf/anemoi-core#962
+============================================================================
+CONTRACT training.src.anemoi.training.train.tasks.base:BaseGraphModule   kind=abc abstract_methods=1.0 implementers=3.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file training/src/anemoi/training/train/tasks/base.py
+       56  class BaseGraphModule(pl.LightningModule, ABC):
+       57      """Abstract base class for Anemoi GNN forecasters using PyTorch Lightning.
+       58  
+       59      This class encapsulates the shared functionality for distributed training,
+       60      scaling, and evaluation of graph-based neural network models across multiple GPUs and nodes.
+       61      It provides hooks for defining losses, metrics, optimizers, and distributed sharding strategies.
+       62  
+       63      Key Features
+       64      ------------
+       65      - Supports model and data parallelism through model and reader process groups.
+       66      - Handles graph data via `torch_geometric.data.HeteroData` format.
+       67      - Supports sharded input batches and reconstruction via `allgather`.
+       68      - Integrates modular loss and metric functions with support for variable scaling.
+       69      - Enables deferred creation of variable scalers post-model instantiation.
+       70      - Fully compatible with PyTorch Lightning training and validation loops.
+       71  
+       72      Subclass Responsibilities
+       73      -------------------------
+       74      Child classes must implement the `_step` method, which defines the forward and loss computation
+       75      for training and validation steps.
+       76  
+       77      Parameters
+       78      ----------
+       79      config : BaseSchema
+       80          Configuration object defining all parameters.
+       81      graph_data : HeteroData
+       82          Graph-structured input data containing node and edge features, keyed by dataset name.
+       83      statistics : dict
+       84          Dictionary of training statistics (mean, std, etc.) used for normalization.
+       85      statistics_tendencies : dict
+       86          Statistics related to tendencies (if used).
+       87      data_indices : dict[str, IndexCollection]
+       88          Maps feature names to index ranges used for training and loss functions.
+       89      metadata : dict
+       90          Dictionary with metadata such as dataset provenance and variable descriptions.
+       91      supporting_arrays : dict
+       92          Numpy arrays (e.g., topography, masks) needed during inference and stored in checkpoints.
+       93  
+       94      Attributes
+       95      ----------
+       96      model : AnemoiModelInterface
+       97          Wrapper for the underlying GNN model and its pre/post-processing logic.
+       98      loss : BaseLoss
+       99          Training loss function, optionally supporting variable scaling and sharding.
+      100      metrics : dict[str, BaseLoss | Callable]
+      101          Dictionary of validation metrics (often loss-style) computed during evaluation.
+      102      scalers : dict
+      103          Variable-wise scaling functions (e.g., standardization).
+      104      val_metric_ranges : dict
+      105          Mapping of variable groups for which to calculate validation metrics.
+      106      output_mask : nn.Module
+      107          Masking module that filters outputs during inference.
+      108      n_step_input : int
+      109          Number of input timesteps provided to the model.
+      110      n_step_output : int
+      111          Number of output timesteps predicted by the model.
+      112      keep_batch_sharded : bool
+      113          Whether to keep input batches split across GPUs instead of gathering them.
+      114  
+      115      Distributed Training
+      116      --------------------
+      117      The module can be configured to work in multi-node, multi-GPU environments with support for:
+      118      - Custom communication groups for model and reader parallelism
+      119      - Sharded input and output tensors
+      120      - Support for `ZeroRedundancyOptimizer` and learning rate warmup
+      121  
+      122      Notes
+      123      -----
+      124      - This class should not be used directly. Subclass it and override `_step`.
+      125  
+      126      See Also
+      127      --------
+      128      - `AnemoiModelInterface`
+      129      - `BaseLoss`
+      130      - `IndexCollection`
+      131      - `CosineLRScheduler`
+      132      - `create_scalers`, `grad_scaler`
+      133  
+      134      """
+      135  
+      136      def __init__(
+      137          self,
+      138          *,
+      139          config: BaseSchema,
+      140          graph_data: HeteroData,
+      141          statistics: dict,
+      142          statistics_tendencies: dict,
+      143          data_indices: dict[str, IndexCollection],
+      144          metadata: dict,
+      145          supporting_arrays: dict,
+      146      ) -> None:
+      147          """Initialize graph neural network forecaster.
+      148  
+      149          Parameters
+      150          ----------
+      151          config : DictConfig
+      152              Job configuration
+      153          graph_data : HeteroData
+      154              Graph objects keyed by dataset name
+      155          statistics : dict
+      156              Statistics of the training data
+      157          data_indices : dict[str, IndexCollection]
+      158              Indices of the training data,
+      159          metadata : dict
+      160              Provenance information
+      161          supporting_arrays : dict
+      162              Supporting NumPy arrays to store in the checkpoint
+      163  
+      164          """
+      165          super().__init__()
+      166  
+      167          assert isinstance(graph_data, HeteroData), "graph_data must be a HeteroData object"
+      168          assert isinstance(data_indices, dict), "data_indices must be a dict keyed by dataset name"
+      169  
+      170          # Handle dictionary of graph_data
+      171          graph_data = graph_data.to(self.device)
+      172          self.dataset_names = list(data_indices.keys())
+      173  
+      174          # Create output_mask dictionary for each dataset
+      175          self.output_mask = {
+      176              name: instantiate(config.model.output_mask, nodes=graph_data[name]) for name in self.dataset_names
+      177          }
+      178  
+      179          # Handle supporting_arrays merge with all output masks
+      180          combined_supporting_arrays = supporting_arrays.copy()
+      181          for dataset_name, mask in self.output_mask.items():
+      182              combined_supporting_arrays[dataset_name].update(mask.supporting_arrays)
+      183  
+      184          if not hasattr(self.__class__, "task_type"):
+      185              msg = """Subclasses of BaseGraphModule must define a `task_type` class attribute,
+      186                  indicating the type of task (e.g., 'forecaster', 'time-interpolator')."""
+      187              raise AttributeError(msg)
+      188  
+      189          metadata["metadata_inference"]["task"] = self.task_type
+      190  
+      191          self.model = AnemoiModelInterface(
+      192              statistics=statistics,
+      193              statistics_tendencies=statistics_tendencies,
+      194              data_indices=data_indices,
+      195              metadata=metadata,
+      196              supporting_arrays=combined_supporting_arrays,
+      197              graph_data=graph_data,
+      198              config=config,
+      199          )
+      200          self.config = config
+      201  
+      202          self.data_indices = data_indices
+      203  
+      204          self.save_hyperparameters()
+      205  
+      206          self.statistics_tendencies = statistics_tendencies
+      207  
+      208          # Initialize components for multi-dataset
+      209          self.target_dataset_names = []  # list of dataset names used for loss computation
+      210          self.scalers = {}  # dict of dict of tensors
+      211          self.updating_scalars = {}  # dict of dict of objects
+      212          self.val_metric_ranges = {}  # dict of dict of lists
+      213          self._scaling_values_log = {}  # dict of dict[str, float]
+      214          self.loss = torch.nn.ModuleDict()
+      215          self.metrics = torch.nn.ModuleDict()
+      216  
+      217          dataset_variable_groups = get_multiple_datasets_config(self.config.training.variable_groups)
+      218          loss_configs = get_multiple_datasets_config(config.training.training_loss)
+      219          scalers_configs = get_multiple_datasets_config(config.training.scalers)
+      220          val_metrics_configs = get_multiple_datasets_config(config.training.validation_metrics)
+      221          metrics_to_log = get_multiple_datasets_config(config.training.metrics)
+      222          for dataset_name in self.dataset_names:
+      223              if dataset_name not in loss_configs or loss_configs[dataset_name] is None:
+      224                  LOGGER.warning("Dataset %s is skipped for loss & metric computation.", dataset_name)
+      225                  continue
+      226  
+      227              self.target_dataset_names.append(dataset_name)
+      228  
+      229              # Create dataset-specific metadata extractor
+      230              metadata_extractor = ExtractVariableGroupAndLevel(
+      231                  variable_groups=dataset_variable_groups[dataset_name],
+      232                  metadata_variables=metadata["dataset"][dataset_name].get("variables_metadata"),
+      233              )
+      234  
+      235              dataset_scalers, dataset_updating_scalars = create_scalers(
+      236                  scalers_configs[dataset_name],
+      237                  data_indices=data_indices[dataset_name],
+      238                  graph_data=graph_data,
+      239                  statistics=statistics[dataset_name],
+      240                  statistics_tendencies=(
+      241                      statistics_tendencies[dataset_name] if statistics_tendencies is not None else None
+      242                  ),
+      243                  metadata_extractor=metadata_extractor,
+      244                  nodes_name=dataset_name,
+      245                  output_mask=self.output_mask[dataset_name],
+      246              )
+      247              self.scalers[dataset_name] = dataset_scalers
+      248              self.updating_scalars[dataset_name] = dataset_updating_scalars
+      249  
+      250              self.val_metric_ranges[dataset_name] = get_metric_ranges(
+      251                  metadata_extractor,
+      252                  output_data_indices=data_indices[dataset_name].model.output,
+      253                  metrics_to_log=metrics_to_log[dataset_name],
+      254              )
+      255  
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER training.src.anemoi.training.train.tasks.diffusionforecaster:BaseDiffusionForecaster  stubs=0/1 ----------
+       32  class BaseDiffusionForecaster(BaseGraphModule):
+      (does not define: _step; inherited or absent)
+
+---------- IMPLEMENTER training.src.anemoi.training.train.tasks.diffusionforecaster:GraphDiffusionForecaster  stubs=0/1 ----------
+      196  class GraphDiffusionForecaster(BaseDiffusionForecaster):
+      199      def _step(
+      200          self,
+      201          batch: dict[str, torch.Tensor],
+      202          validation_mode: bool = False,
+      203      ) -> tuple[torch.Tensor, dict[str, torch.Tensor], list[dict[str, torch.Tensor]]]:
+      204          """Step for the forecaster.
+      205  
+      206          Will run pre_processors on batch, but not post_processors on predictions.
+      207  
+      208          Parameters
+      209          ----------
+      210          batch : dict[str, torch.Tensor]
+      211              Normalized batch to use for rollout (assumed to be already preprocessed).
+      212          validation_mode : bool, optional
+      213              Whether in validation mode, and to calculate validation metrics, by default False
+      214              If False, metrics will be empty
+      215  
+      216          Returns
+      217          -------
+      218          tuple[torch.Tensor, dict[str, torch.Tensor], list[dict[str, torch.Tensor]]]
+      219              Loss value, metrics, and predictions (per step)
+      220          """
+      221          x = self.get_input(batch)  # (bs, n_step_input, ens, latlon, nvar)
+      222          y = self.get_target(batch)  # (bs, n_step_output, ens, latlon, nvar)
+      223  
+      224          # get noise level and associated loss weights
+      225          shapes = {k: y_.shape for k, y_ in y.items()}
+      226          sigma, noise_weights = self._get_noise_level(
+      227              shape=shapes,
+      228              sigma_max=self.model.model.sigma_max,
+      229              sigma_min=self.model.model.sigma_min,
+      230              sigma_data=self.model.model.sigma_data,
+      231              rho=self.rho,
+      232              device=next(iter(batch.values())).device,
+      233          )
+      234  
+      235          y_noised = self._noise_target(y, sigma)
+      236          # prediction, fwd_with_preconditioning
+      237          y_pred = self(x, y_noised, sigma)  # shape is (bs, time, ens, latlon, nvar)
+      238          loss, metrics, y_pred = checkpoint(
+      239              self.compute_loss_metrics,
+      240              y_pred,
+      241              y,
+      242              validation_mode=validation_mode,
+      243              weights=noise_weights,
+      244              use_reentrant=False,
+      245          )
+      246  
+      247          return loss, metrics, [y_pred]
+
+---------- IMPLEMENTER training.src.anemoi.training.train.tasks.diffusionforecaster:GraphDiffusionTendForecaster  stubs=0/1 ----------
+      250  class GraphDiffusionTendForecaster(BaseDiffusionForecaster):
+      458      def _step(
+      459          self,
+      460          batch: dict[str, torch.Tensor],
+      461          validation_mode: bool = False,
+      462      ) -> tuple[torch.Tensor, dict[str, torch.Tensor], list[dict[str, torch.Tensor]]]:
+      463          """Step for the tendency-based diffusion forecaster.
+      464  
+      465          Will run pre_processors on batch, but not post_processors on predictions.
+      466  
+      467          Parameters
+      468          ----------
+      469          batch : dict[str, torch.Tensor]
+      470              Normalized batch to use for rollout (assumed to be already preprocessed).
+      471          validation_mode : bool, optional
+      472              Whether in validation mode, and to calculate validation metrics, by default False
+      473              If False, metrics will be empty
+      474  
+      475          Returns
+      476          -------
+      477          tuple[torch.Tensor, dict[str, torch.Tensor], list[dict[str, torch.Tensor]]]
+      478              Loss value, metrics, and predictions (per step)
+      479          """
+      480          # batch is already normalized in BaseGraphModule._normalize_batch
+      481          # x: data.input.full (normalized), y: data.output.full (normalized)
+      482          x = self.get_input(batch)  # (bs, n_step_input, ens, latlon, nvar)
+      483          y = self.get_target(batch)  # (bs, n_step_output, ens, latlon, nvar)
+      484  
+      485          pre_processors_tendencies = getattr(self.model, "pre_processors_tendencies", None)
+      486          if pre_processors_tendencies is None or len(pre_processors_tendencies) == 0:
+      487              msg = (
+      488                  "pre_processors_tendencies not found. This is required for tendency-based diffusion models. "
+      489                  "Ensure that statistics_tendencies is provided during model initialization."
+      490              )
+      491              raise AttributeError(msg)
+      492  
+      493          x_ref = self.model.model.apply_reference_state_truncation(
+      494              x,
+      495              self.grid_shard_shapes,
+      496              self.model_comm_group,
+      497          )
+      498          # x_ref is normalized model.input.prognostic (subset), aligned to output steps
+      499          x_ref = {dataset_name: (ref[:, -1] if ref.ndim == 5 else ref) for dataset_name, ref in x_ref.items()}
+      500  
+      501          tendency_target = self._compute_tendency_target(y, x_ref)
+      502  
+      503          # get noise level and associated loss weights
+      504          shapes = {k: target.shape for k, target in tendency_target.items()}
+      505          sigma, noise_weights = self._get_noise_level(
+      506              shape=shapes,
+      507              sigma_max=self.model.model.sigma_max,
+      508              sigma_min=self.model.model.sigma_min,
+      509              sigma_data=self.model.model.sigma_data,
+      510              rho=self.rho,
+      511              device=next(iter(batch.values())).device,
+      512          )
+      513  
+      514          tendency_target_noised = self._noise_target(tendency_target, sigma)
+      515  
+      516          # prediction, fwd_with_preconditioning
+      517          tendency_pred = self(x, tendency_target_noised, sigma)  # shape is (bs, time, ens, latlon, nvar)
+       ... truncated at 60 lines ...

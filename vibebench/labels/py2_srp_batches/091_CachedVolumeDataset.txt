@@ -1,0 +1,406 @@
+row 91   PytorchConnectomics/pytorch_connectomics#199
+============================================================================
+CLASS CachedVolumeDataset in connectomics/data/dataset/dataset_volume_cached.py   loc=518 methods=10 wmc=75 lcom=0.125
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      135  class CachedVolumeDataset(Dataset):
+      136      """
+      137      Cached volume dataset that loads volumes once and crops in memory.
+      138  
+      139      This dramatically speeds up training with iter_num > num_volumes by:
+      140      1. Loading all volumes into memory once during initialization
+      141      2. Performing random crops from cached volumes during iteration
+      142      3. Applying augmentations to crops (not full volumes)
+      143  
+      144      Args:
+      145          image_paths: List of image volume paths
+      146          label_paths: List of label volume paths
+      147          mask_paths: List of mask volume paths
+      148          patch_size: Size of random crops (z, y, x)
+      149          iter_num: Number of iterations per epoch
+      150          transforms: MONAI transforms (applied after cropping)
+      151          mode: 'train' or 'val'
+      152      """
+      153  
+      154      def __init__(
+      155          self,
+      156          image_paths: List[str],
+      157          label_paths: Optional[List[str]] = None,
+      158          mask_paths: Optional[List[str]] = None,
+      159          patch_size: Tuple[int, int, int] = (112, 112, 112),
+      160          iter_num: int = 500,
+      161          transforms: Optional[Compose] = None,
+      162          pre_cache_transforms: Optional[Any] = None,
+      163          mode: str = "train",
+      164          pad_size: Optional[Tuple[int, ...]] = None,
+      165          pad_mode: str = "reflect",
+      166          max_attempts: int = 10,
+      167          foreground_threshold: float = 0.05,
+      168          crop_to_nonzero_mask: bool = False,
+      169      ):
+      170          self.image_paths = image_paths
+      171          self.label_paths = label_paths if label_paths else [None] * len(image_paths)
+      172          self.mask_paths = mask_paths if mask_paths else [None] * len(image_paths)
+      173  
+      174          # Support both 2D and 3D patch sizes
+      175          if isinstance(patch_size, (list, tuple)):
+      176              ndim = len(patch_size)
+      177              if ndim not in [2, 3]:
+      178                  raise ValueError(f"patch_size must be 2D or 3D, got {ndim}D")
+      179              self.patch_size = ensure_tuple_rep(patch_size, ndim)
+      180          else:
+      181              # Single value - assume 3D for backward compatibility
+      182              self.patch_size = ensure_tuple_rep(patch_size, 3)
+      183  
+      184          self.iter_num = iter_num if iter_num > 0 else len(image_paths)
+      185          self.transforms = transforms
+      186          self.pre_cache_transforms = pre_cache_transforms
+      187          self.mode = mode
+      188          self.pad_size = pad_size
+      189          self.pad_mode = pad_mode
+      190  
+      191          # [FIX 1] Store base seed for epoch-based validation reseeding
+      192          # This allows validation to sample different patches each epoch while remaining deterministic
+      193          self.base_seed = 0  # Will be set by set_epoch() or defaults to 0
+      194          self.current_epoch = 0
+      195  
+      196          # [D2 DIAGNOSTIC] Initialize sampling statistics
+      197          self._d2_total_samples = 0
+      198          self._d2_total_attempts = 0
+      199          self._d2_rejected_patches = 0
+      200          self._d2_foreground_fracs = []
+      201          self._d2_last_report_step = 0
+      202          self.max_attempts = max_attempts
+      203          self.foreground_threshold = foreground_threshold
+      204          self.crop_to_nonzero_mask = crop_to_nonzero_mask
+      205  
+      206          # Load all volumes into memory
+      207          print(f"  Loading {len(image_paths)} volumes into memory...")
+      208          self.cached_images = []
+      209          self.cached_labels = []
+      210          self.cached_masks = []
+      211  
+      212          for i, (img_path, lbl_path, mask_path) in enumerate(
+      213              zip(image_paths, self.label_paths, self.mask_paths)
+      214          ):
+      215              # Load image
+      216              img = read_volume(img_path)
+      217              # Add channel dimension for both 2D and 3D
+      218              # 2D: (H, W) → (1, H, W)
+      219              # 3D: (D, H, W) → (1, D, H, W)
+      220              if img.ndim == 2:
+      221                  img = img[None, ...]  # Add channel for 2D
+      222              elif img.ndim == 3:
+      223                  img = img[None, ...]  # Add channel for 3D
+      224  
+      225              # Load label if available
+      226              lbl = None
+      227              if lbl_path:
+      228                  lbl = read_volume(lbl_path)
+      229                  # Add channel dimension for both 2D and 3D
+      230                  if lbl.ndim == 2:
+      231                      lbl = lbl[None, ...]  # Add channel for 2D
+      232                  elif lbl.ndim == 3:
+      233                      lbl = lbl[None, ...]  # Add channel for 3D
+      234  
+      235              # Load mask if available
+      236              mask = None
+      237              if mask_path:
+      238                  mask = read_volume(mask_path)
+      239                  if mask.ndim == 2:
+      240                      mask = mask[None, ...]
+      241                  elif mask.ndim == 3:
+      242                      mask = mask[None, ...]
+      243  
+      244              # Apply one-time preprocessing before caching (e.g., nnU-Net crop/resample/normalize).
+      245              if self.pre_cache_transforms is not None:
+      246                  sample = {"image": img}
+      247                  if lbl is not None:
+      248                      sample["label"] = lbl
+      249                  if mask is not None:
+      250                      sample["mask"] = mask
+      251                  sample = self.pre_cache_transforms(sample)
+      252                  img = sample["image"]
+      253                  lbl = sample.get("label")
+      254                  mask = sample.get("mask")
+      255  
+      256              # Apply padding if specified
+      257              if self.pad_size is not None:
+      258                  img = self._apply_padding(img)
+      259  
+      260              # Ensure volume is at least as large as patch_size in all dimensions
+      261              # This prevents crops from being smaller than patch_size
+      262              img = self._ensure_minimum_size(img)
+      263              self.cached_images.append(img)
+      264  
+      265              if lbl is not None:
+      266                  # Apply padding if specified (same padding as image)
+      267                  if self.pad_size is not None:
+      268                      lbl = self._apply_padding(
+      269                          lbl, mode="constant", constant_values=0
+      270                      )  # Use constant 0 for labels
+      271  
+      272                  # Ensure label is at least as large as patch_size
+      273                  lbl = self._ensure_minimum_size(lbl, mode="constant", constant_values=0)
+      274                  self.cached_labels.append(lbl)
+      275              else:
+      276                  self.cached_labels.append(None)
+      277  
+      278              if mask is not None:
+      279                  # Apply padding if specified (same padding as label)
+      280                  if self.pad_size is not None:
+      281                      mask = self._apply_padding(mask, mode="constant", constant_values=0)
+      282  
+      283                  # Ensure mask is at least as large as patch_size
+      284                  mask = self._ensure_minimum_size(mask, mode="constant", constant_values=0)
+      285                  self.cached_masks.append(mask)
+      286              else:
+      287                  self.cached_masks.append(None)
+      288  
+      289              print(f"    Volume {i + 1}/{len(image_paths)}: {img.shape}")
+      290  
+      291          print(f"  ✓ Loaded {len(self.cached_images)} volumes into memory")
+      292  
+      293          # Store volume sizes for random position generation
+      294          # Support both 2D and 3D: get last N dimensions matching patch_size
+      295          ndim = len(self.patch_size)
+      296          self.volume_sizes = [img.shape[-ndim:] for img in self.cached_images]  # (Z, Y, X) or (Y, X)
+      297  
+      298          # Precompute mask bounding boxes for crop_to_nonzero_mask sampling
+      299          self.mask_bboxes: List[Optional[List[Tuple[int, int]]]] = []
+      300          if self.crop_to_nonzero_mask:
+      301              for mask in self.cached_masks:
+      302                  self.mask_bboxes.append(self._compute_mask_bbox(mask))
+      303              print(
+      304                  f"  [crop_to_nonzero_mask] Mask bboxes computed for {len(self.mask_bboxes)} volumes"
+      305              )
+      306          else:
+      307              self.mask_bboxes = [None] * len(self.cached_images)
+      308  
+      309          # [D2 DIAGNOSTIC] Print foreground sampling configuration
+      310          if self.mode == "train":
+      311              if self.foreground_threshold > 0:
+      312                  print("  [D2] Foreground sampling ENABLED:")
+      313                  print(f"    - Minimum foreground threshold: {self.foreground_threshold * 100:.1f}%")
+      314                  print(f"    - Max retry attempts: {self.max_attempts}")
+      315                  print("    - Will report statistics every 100 batches")
+      316              else:
+      317                  print("  [D2] Foreground sampling DISABLED (threshold <= 0)")
+      318  
+      319      def _apply_padding(
+      320          self, volume: np.ndarray, mode: Optional[str] = None, constant_values: float = 0
+      321      ) -> np.ndarray:
+      322          """
+      323          Apply padding to a volume using np.pad.
+      324  
+      325          Args:
+      326              volume: Input volume with channel dimension (C, D, H, W) or (C, H, W)
+      327              mode: Padding mode ('reflect', 'constant', etc.). If None, uses self.pad_mode
+      328              constant_values: Value for constant padding
+      329  
+      330          Returns:
+      331              Padded volume
+      332          """
+      333          if self.pad_size is None:
+      334              return volume
+      335  
+      336          mode = mode if mode is not None else self.pad_mode
+      337  
+      338          # Build padding tuple for np.pad: ((before, after), ...)
+      339          # For channel dimension: no padding (0, 0)
+      340          # For spatial dimensions: pad according to pad_size
+      341          pad_width = [(0, 0)]  # No padding on channel dimension
+      342          for p in self.pad_size:
+      343              pad_width.append((p, p))
+      344  
+      345          # Apply padding using np.pad
+      346          if mode == "constant":
+      347              padded = np.pad(volume, pad_width, mode=mode, constant_values=constant_values)
+      348          else:
+      349              padded = np.pad(volume, pad_width, mode=mode)
+      350  
+      351          return padded
+      352  
+      353      def _ensure_minimum_size(
+      354          self, volume: np.ndarray, mode: Optional[str] = None, constant_values: float = 0
+      355      ) -> np.ndarray:
+      356          """
+      357          Ensure volume is at least as large as patch_size in all spatial dimensions.
+      358          Pads only if necessary.
+      359  
+      360          Args:
+      361              volume: Input volume with channel dimension (C, D, H, W) or (C, H, W)
+      362              mode: Padding mode ('reflect', 'constant', etc.). If None, uses self.pad_mode
+      363              constant_values: Value for constant padding
+      364  
+      365          Returns:
+      366              Volume padded to at least patch_size if necessary
+      367          """
+      368          ndim = len(self.patch_size)
+      369          has_channel = volume.ndim == ndim + 1
+      370  
+      371          # Get actual volume spatial dimensions
+      372          if has_channel:
+      373              vol_spatial_shape = volume.shape[1:]
+      374          else:
+      375              vol_spatial_shape = volume.shape
+      376  
+      377          # Check if padding is needed
+      378          needs_padding = any(vol_spatial_shape[i] < self.patch_size[i] for i in range(ndim))
+      379          if not needs_padding:
+      380              return volume
+      381  
+      382          # Calculate padding needed for each dimension
+      383          mode = mode if mode is not None else self.pad_mode
+      384          pad_width = [(0, 0)]  # No padding on channel dimension
+      385          for i in range(ndim):
+      386              pad_needed = max(0, self.patch_size[i] - vol_spatial_shape[i])
+      387              # Distribute padding evenly on both sides
+      388              pad_before = pad_needed // 2
+      389              pad_after = pad_needed - pad_before
+      390              pad_width.append((pad_before, pad_after))
+      391  
+      392          # Apply padding
+      393          if mode == "constant":
+      394              padded = np.pad(volume, pad_width, mode=mode, constant_values=constant_values)
+      395          else:
+      396              padded = np.pad(volume, pad_width, mode=mode)
+      397  
+      398          return padded
+      399  
+      400      def __len__(self) -> int:
+      401          return self.iter_num
+      402  
+      403      def set_epoch(self, epoch: int, base_seed: int = 0):
+      404          """
+      405          Set current epoch for epoch-based validation reseeding.
+      406  
+      407          This method enables validation to sample different patches each epoch
+      408          while maintaining determinism. For training, this has no effect since
+      409          training already uses random sampling.
+      410  
+      411          Args:
+      412              epoch: Current training epoch
+      413              base_seed: Base random seed (typically from cfg.system.seed)
+      414  
+      415          Usage:
+      416              Called by ValidationReseedingCallback at the start of each validation epoch:
+      417                  if hasattr(dataset, 'set_epoch'):
+      418                      dataset.set_epoch(trainer.current_epoch, base_seed)
+      419          """
+      420          if self.mode == "val":
+      421              # Reseed RNG for validation to get different patches each epoch
+      422              # Use base_seed + epoch to ensure reproducibility across runs
+      423              self.base_seed = base_seed
+      424              self.current_epoch = epoch
+      425              effective_seed = self.base_seed + epoch
+      426              random.seed(effective_seed)
+      427  
+      428              # IMPORTANT: Print to verify reseeding is happening
+      429              # This should appear in logs at the start of EACH validation epoch
+      430              print(
+      431                  f"[Validation] Set epoch={epoch}, base_seed={base_seed}, effective_seed={effective_seed}"
+      432              )
+      433              print(
+      434                  f"[Validation] Dataset: {type(self).__name__}@{id(self)}, mode={self.mode}, iter_num={self.iter_num}"
+      435              )
+      436  
+      437      def get_sampling_fingerprint(self, num_samples: int = 5) -> str:
+      438          """
+      439          Generate a deterministic fingerprint of validation sampling.
+      440  
+      441          This allows verification that validation patches change across epochs.
+      442          The fingerprint is based on the first N random samples that would be
+      443          generated with the current RNG state.
+      444  
+      445          Args:
+      446              num_samples: Number of random samples to include in fingerprint
+      447  
+      448          Returns:
+      449              String representing the sampling fingerprint
+      450          """
+      451          if self.mode != "val":
+      452              return "N/A (training mode)"
+      453  
+      454          # Save current RNG state
+      455          state = random.getstate()
+      456  
+      457          try:
+      458              # Generate deterministic samples
+      459              samples = []
+      460              for _ in range(num_samples):
+      461                  # Sample volume index
+      462                  vol_idx = random.randint(0, len(self.cached_images) - 1)
+      463                  # Sample patch position
+      464                  pos = self._get_random_crop_position(vol_idx)
+      465                  samples.append((vol_idx, pos))
+      466  
+      467              # Create fingerprint string
+      468              fingerprint = ", ".join([f"v{v}@{p}" for v, p in samples])
+      469              return fingerprint
+      470  
+      471          finally:
+      472              # Restore RNG state
+      473              random.setstate(state)
+      474  
+      475      def _compute_mask_bbox(
+      476          self, mask: Optional[np.ndarray]
+      477      ) -> Optional[List[Tuple[int, int]]]:
+      478          """Compute the axis-aligned bounding box of nonzero voxels in the mask.
+      479  
+      480          Args:
+      481              mask: Mask array with shape (C, D, H, W) or (C, H, W). May be None.
+      482  
+      483          Returns:
+      484              List of (start, end) pairs for each spatial dimension, or None if
+      485              the mask is None or entirely zero.
+      486          """
+      487          if mask is None:
+      488              return None
+      489          spatial = mask[0] > 0  # drop channel dim: (D, H, W) or (H, W)
+      490          if not spatial.any():
+      491              return None
+      492          ndim = spatial.ndim
+      493          bbox = []
+      494          for d in range(ndim):
+      495              axes = tuple(i for i in range(ndim) if i != d)
+      496              proj = spatial.any(axis=axes) if ndim > 1 else spatial
+      497              indices = np.where(proj)[0]
+      498              bbox.append((int(indices[0]), int(indices[-1]) + 1))
+      499          return bbox
+      500  
+      501      def _get_random_crop_position(self, vol_idx: int) -> Tuple[int, ...]:
+      502          """
+      503          Get a random crop position for training (like v1 VolumeDataset).
+      504  
+      505          When crop_to_nonzero_mask is True, restricts sampling so every crop
+      506          intersects the nonzero bounding box of the mask.
+      507  
+      508          Args:
+      509              vol_idx: Volume index
+      510  
+      511          Returns:
+      512              Random crop start position (z, y, x) for 3D or (y, x) for 2D
+      513          """
+      514          vol_size = self.volume_sizes[vol_idx]
+      515          patch_size = self.patch_size
+      516          mask_bbox = self.mask_bboxes[vol_idx] if self.crop_to_nonzero_mask else None
+      517  
+      518          positions = []
+      519          for i in range(len(patch_size)):
+      520              vol_max = max(0, vol_size[i] - patch_size[i])
+      521              if mask_bbox is not None:
+      522                  # Intersection condition: crop [pos, pos+patch) overlaps [bbox_start, bbox_end)
+      523                  # => pos < bbox_end  and  pos + patch > bbox_start
+      524                  # => pos >= bbox_start - patch + 1  and  pos <= bbox_end - 1
+      525                  min_start = max(0, mask_bbox[i][0] - patch_size[i] + 1)
+      526                  max_start = min(vol_max, mask_bbox[i][1] - 1)
+      527                  if min_start > max_start:  # bbox too small — fall back to full range
+      528                      min_start, max_start = 0, vol_max
+      529              else:
+      530                  min_start, max_start = 0, vol_max
+      531              positions.append(random.randint(min_start, max_start))
+      532          return tuple(positions)
+      533  
+      534      def _get_center_crop_position(self, vol_idx: int) -> Tuple[int, ...]:
+       ... truncated at 400 lines ...

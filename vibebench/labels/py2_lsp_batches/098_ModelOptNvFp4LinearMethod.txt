@@ -1,0 +1,112 @@
+row 98   vllm-project/vllm#38569
+============================================================================
+OVERRIDE  vllm.model_executor.layers.quantization.modelopt.ModelOptNvFp4LinearMethod.create_weights
+BASE      vllm.model_executor.layers.linear.LinearMethodBase.create_weights
+QUESTION: can an instance of the SUBCLASS be used anywhere the BASE
+          is expected, without breaking the caller?
+
+---------------- BASE CLASS HEADER (vllm/model_executor/layers/linear.py) ----------------
+      141  class LinearMethodBase(QuantizeMethodBase):
+---------------- BASE METHOD ----------------
+      144      @abstractmethod
+      145      def create_weights(
+      146          self,
+      147          layer: torch.nn.Module,
+      148          input_size_per_partition: int,
+      149          output_partition_sizes: list[int],
+      150          input_size: int,
+      151          output_size: int,
+      152          params_dtype: torch.dtype,
+      153          **extra_weight_attrs,
+      154      ):
+      155          """Create weights for a linear layer.
+      156             The weights will be set as attributes of the layer.
+      157  
+      158          Args:
+      159              layer: The layer that is using the LinearMethodBase factory.
+      160              input_size_per_partition: Size of the weight input dim on rank X.
+      161              output_partition_sizes: Sizes of the output dim of each logical
+      162                  weight on rank X. E.g., output_partition_sizes for QKVLinear
+      163                  is a list contains the width of Wq, Wk, Wv on rank X.
+      164              input_size: Size of the input dim of the weight across all ranks.
+      165              output_size: Size of the output dim of the weight across all ranks.
+      166              params_dtype: Datatype of the parameters.
+      167          """
+      168          raise NotImplementedError
+
+---------------- SUBCLASS HEADER (vllm/model_executor/layers/quantization/modelopt.py) ----------------
+     1060  class ModelOptNvFp4LinearMethod(LinearMethodBase):
+---------------- OVERRIDE ----------------
+     1076      def create_weights(
+     1077          self,
+     1078          layer: torch.nn.Module,
+     1079          input_size_per_partition: int,
+     1080          output_partition_sizes: list[int],
+     1081          input_size: int,
+     1082          output_size: int,
+     1083          params_dtype: torch.dtype,
+     1084          **extra_weight_attrs,
+     1085      ):
+     1086          del input_size, output_size
+     1087          if not self.quant_config.is_checkpoint_nvfp4_serialized:
+     1088              raise ValueError(
+     1089                  "NVFP4 quantization was selected, "
+     1090                  " dynamic quantization is not supported."
+     1091              )
+     1092          output_size_per_partition = sum(output_partition_sizes)
+     1093          weight_loader = extra_weight_attrs.get("weight_loader")
+     1094          layer.logical_widths = output_partition_sizes
+     1095          layer.input_size_per_partition = input_size_per_partition
+     1096          layer.output_size_per_partition = output_size_per_partition
+     1097  
+     1098          if input_size_per_partition % 16 != 0:
+     1099              raise ValueError(
+     1100                  "Unsupported model when in features size is not multiple of 16"
+     1101              )
+     1102          # The nvfp4 weight is still represented as
+     1103          weight_dtype = (
+     1104              torch.float8_e4m3fn
+     1105              if self.quant_config.is_checkpoint_nvfp4_serialized
+     1106              else params_dtype
+     1107          )
+     1108          # Weight
+     1109          weight = ModelWeightParameter(
+     1110              data=torch.empty(
+     1111                  # 2 fp4 items are packed in the input dimension
+     1112                  layer.output_size_per_partition,
+     1113                  layer.input_size_per_partition // 2,
+     1114                  dtype=torch.uint8,
+     1115              ),
+     1116              input_dim=1,
+     1117              output_dim=0,
+     1118              weight_loader=weight_loader,
+     1119          )
+     1120          layer.register_parameter("weight", weight)
+     1121  
+     1122          # Input Global Scale
+     1123          input_global_scale = PerTensorScaleParameter(
+     1124              data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+     1125              weight_loader=weight_loader,
+     1126          )
+     1127          layer.register_parameter("input_scale", input_global_scale)
+     1128  
+     1129          # Weight Global Scale
+     1130          weight_global_scale = PerTensorScaleParameter(
+     1131              data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+     1132              weight_loader=weight_loader,
+     1133          )
+     1134          layer.register_parameter("weight_scale_2", weight_global_scale)
+     1135  
+     1136          # Per Block Weight Scale
+     1137          weight_scale = ModelWeightParameter(
+     1138              data=torch.empty(
+     1139                  output_size_per_partition,
+     1140                  input_size_per_partition // self.quant_config.group_size,
+     1141                  dtype=weight_dtype,
+     1142              ),
+     1143              input_dim=1,
+     1144              output_dim=0,
+     1145              weight_loader=weight_loader,
+     1146          )
+     1147  
+     1148          layer.register_parameter("weight_scale", weight_scale)

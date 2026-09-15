@@ -1,0 +1,406 @@
+row 17   meta-pytorch/OpenEnv#476
+============================================================================
+CLASS FleetTaskEnv in src/envs/fleet_env/task_env.py   loc=801 methods=26 wmc=116 lcom=0.125
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       86  class FleetTaskEnv:
+       87      """Gymnasium-compatible environment for Fleet tasks.
+       88  
+       89      This class wraps FleetEnvClient to provide a task-oriented interface
+       90      suitable for RL training with SkyRL.
+       91  
+       92      Args:
+       93          task_config: Task configuration dict with keys:
+       94              - task_key: Unique task identifier
+       95              - prompt: Task instruction for the agent
+       96              - env_key: Environment key (e.g., "booking-com")
+       97              - env_version: Environment version (e.g., "v1.2.3")
+       98              - data_key: Optional data key
+       99              - data_version: Optional data version
+      100              - verifier_code: Python code for verification
+      101              - task_modality: "tool_use" or "computer_use"
+      102          api_key: Fleet API key (defaults to FLEET_API_KEY env var)
+      103          ttl_seconds: Instance TTL in seconds. If None, auto-selects based on
+      104              modality: 1800s (30 min) for computer_use, 900s (15 min) for tool_use.
+      105          max_steps: Maximum steps per episode (default: 50)
+      106          request_timeout_s: HTTP request timeout in seconds (default: 60.0)
+      107          partial_reward: If True, compute partial scores from verifier
+      108              error/success accumulators instead of binary 0/1 (default: False)
+      109  
+      110      Example:
+      111          >>> task_config = {
+      112          ...     "task_key": "search-flights-001",
+      113          ...     "prompt": "Search for flights from NYC to LA",
+      114          ...     "env_key": "booking-com",
+      115          ...     "env_version": "v1.2.3",
+      116          ...     "verifier_code": "async def verify(env): ...",
+      117          ...     "task_modality": "tool_use",
+      118          ... }
+      119          >>> env = FleetTaskEnv(task_config)
+      120          >>> obs = env.reset()
+      121          >>> obs, reward, done, info = env.step({"tool": "search", "params": {...}})
+      122      """
+      123  
+      124      def __init__(
+      125          self,
+      126          task_config: Dict[str, Any],
+      127          api_key: Optional[str] = None,
+      128          ttl_seconds: Optional[int] = None,
+      129          max_steps: int = 50,
+      130          request_timeout_s: float = 60.0,
+      131          reset_timeout_s: float = 10.0,
+      132          partial_reward: bool = False,
+      133      ):
+      134          self.task = task_config
+      135          self.api_key = api_key or os.environ.get("FLEET_API_KEY")
+      136          self.partial_reward = partial_reward
+      137          # Auto-select TTL based on modality if not explicitly provided
+      138          if ttl_seconds is not None:
+      139              self.ttl_seconds = ttl_seconds
+      140          elif self.modality == "computer_use":
+      141              self.ttl_seconds = (
+      142                  1800  # 30 min — CUA rollouts are slow (browser + inference)
+      143              )
+      144          else:
+      145              self.ttl_seconds = (
+      146                  900  # 15 min — tool_use rollouts need headroom for retries
+      147              )
+      148          self.max_steps = max_steps
+      149          self.request_timeout_s = request_timeout_s
+      150          self.reset_timeout_s = reset_timeout_s
+      151  
+      152          if not self.api_key:
+      153              raise ValueError(
+      154                  "Fleet API key required (pass api_key or set FLEET_API_KEY)"
+      155              )
+      156  
+      157          self._step_count = 0
+      158          self._done = False
+      159          self._rollout_completed_emitted = False
+      160          self._rollout_started = False
+      161          self._tools_cache: Optional[List[Dict]] = None
+      162          self._reward_computed = False
+      163          self.final_reward: Optional[float] = None
+      164          self._submitted_answer: Optional[str] = None
+      165  
+      166          # Feedback for hint generation (accumulated during rollout)
+      167          self._tool_errors: List[str] = []
+      168          self._verifier_stdout: Optional[str] = None
+      169          self._verifier_error: Optional[str] = None
+      170  
+      171          # Set telemetry context so init failures are tracked with full context
+      172          set_task_context(
+      173              env_key=self.env_key,
+      174              env_version=self.env_version,
+      175              task_key=self.task_key,
+      176              modality=self.modality,
+      177          )
+      178  
+      179          # Provisioning is deferred to _ensure_provisioned() (called from reset_async)
+      180          # to avoid blocking the event loop with sync Fleet.make() calls.
+      181          self._orch = None
+      182          self._tools = None
+      183  
+      184      @property
+      185      def task_key(self) -> str:
+      186          """Get the task key."""
+      187          return self.task.get("task_key", "unknown")
+      188  
+      189      @property
+      190      def prompt(self) -> str:
+      191          """Get the task prompt."""
+      192          return self.task.get("prompt", "")
+      193  
+      194      @property
+      195      def modality(self) -> str:
+      196          """Get the task modality."""
+      197          return self.task.get("task_modality", "tool_use")
+      198  
+      199      @property
+      200      def env_key(self) -> str:
+      201          """Get the environment key (e.g., 'github', 'amazon')."""
+      202          return self.task.get("env_key", "unknown")
+      203  
+      204      @property
+      205      def env_version(self) -> str:
+      206          """Get the environment version (e.g., 'v0.0.12')."""
+      207          return self.task.get("env_version", "unknown")
+      208  
+      209      def _build_env_spec(self) -> str:
+      210          """Build env_key:version spec for Fleet.make()."""
+      211          env_key = self.task.get("env_key")
+      212          env_version = self.task.get("env_version")
+      213  
+      214          if not env_key:
+      215              raise ValueError("Task config missing env_key")
+      216  
+      217          if env_version:
+      218              return f"{env_key}:{env_version}"
+      219          return env_key
+      220  
+      221      def _get_data_key(self) -> Optional[str]:
+      222          """Get data_key from task config."""
+      223          return self.task.get("data_key")
+      224  
+      225      def _get_data_version(self) -> Optional[str]:
+      226          """Get data_version from task config."""
+      227          return self.task.get("data_version")
+      228  
+      229      def _get_env_variables(self) -> Optional[Dict[str, Any]]:
+      230          """Get env_variables from task config.
+      231  
+      232          These variables parameterize the environment with task-specific values
+      233          like names, dates, scenario configurations, etc.
+      234          """
+      235          return self.task.get("env_variables")
+      236  
+      237      def reset(self, seed: Optional[int] = None) -> Dict[str, Any]:
+      238          """Reset the environment and return initial observation (sync wrapper).
+      239  
+      240          This is a sync wrapper around reset_async(). For async code, use reset_async() directly.
+      241  
+      242          Args:
+      243              seed: Optional random seed (passed to env reset)
+      244  
+      245          Returns:
+      246              Observation dict with keys:
+      247                  - prompt: The task instruction
+      248                  - observation: Raw observation from env reset
+      249                  - tools: List of available tools (if tool_use modality)
+      250                  - step: Current step number (0)
+      251          """
+      252          import asyncio
+      253  
+      254          return asyncio.run(self.reset_async(seed=seed))
+      255  
+      256      async def _ensure_provisioned(self):
+      257          """Provision the Fleet environment instance if not already done.
+      258  
+      259          Uses AsyncFleet.make() to avoid blocking the event loop. This allows
+      260          other async trajectories to progress while waiting for provisioning.
+      261          """
+      262          if self._orch is not None:
+      263              return
+      264  
+      265          env_spec = self._build_env_spec()
+      266          # computer_use: MCP-enabled container with browser infra (port 8081 aggregator)
+      267          # tool_use: standard container with per-env MCP server (port 3003)
+      268          image_type = "mcp" if self.modality == "computer_use" else "standard"
+      269          self._orch, self._tools = await FleetEnvClient.from_fleet_async(
+      270              api_key=self.api_key,
+      271              env_key=env_spec,
+      272              data_key=self._get_data_key(),
+      273              data_version=self._get_data_version(),
+      274              env_variables=self._get_env_variables(),
+      275              image_type=image_type,
+      276              ttl_seconds=self.ttl_seconds,
+      277              request_timeout_s=self.request_timeout_s,
+      278          )
+      279  
+      280      async def reset_async(self, seed: Optional[int] = None) -> Dict[str, Any]:
+      281          """Reset episode state and return initial observation.
+      282  
+      283          Provisions the Fleet environment on first call (async, non-blocking),
+      284          then resets episode state and returns the observation with tools.
+      285  
+      286          Args:
+      287              seed: Optional random seed (currently unused)
+      288  
+      289          Returns:
+      290              Observation dict with keys:
+      291                  - prompt: The task instruction
+      292                  - observation: Observation from env reset (or empty if reset fails)
+      293                  - tools: List of available tools (if tool_use modality)
+      294                  - step: Current step number (0)
+      295          """
+      296          import logging
+      297  
+      298          logger = logging.getLogger(__name__)
+      299  
+      300          # Count this rollout attempt immediately — even if provisioning fails,
+      301          # it's still a rollout attempt (e.g., fostgres health check failures).
+      302          fleet_info("fleet_rollout_started")
+      303          self._rollout_started = True
+      304          self._rollout_completed_emitted = False
+      305  
+      306          # Provision Fleet env (async, non-blocking) on first call
+      307          try:
+      308              await self._ensure_provisioned()
+      309          except Exception:
+      310              # Emit rollout_completed so init failures are tracked in dashboards
+      311              fleet_info(
+      312                  "fleet_rollout_completed",
+      313                  step_count=0,
+      314                  reward=0.0,
+      315                  verifier_success=False,
+      316                  failure_reason="init_error",
+      317              )
+      318              self._rollout_completed_emitted = True
+      319              raise
+      320  
+      321          # Reset episode state
+      322          self._step_count = 0
+      323          self._done = False
+      324          self._reward_computed = False
+      325          self.final_reward = None
+      326          self._submitted_answer = None
+      327          self._tool_errors = []
+      328          self._verifier_stdout = None
+      329          self._verifier_error = None
+      330  
+      331          # Reset the environment (use short timeout to avoid blocking on broken manager APIs)
+      332          # reset() failure is non-fatal — env is up, just the manager API timed out
+      333          reset_metadata = {}
+      334          if self._orch:
+      335              try:
+      336                  saved_timeout = self._orch._timeout
+      337                  self._orch._timeout = self.reset_timeout_s
+      338                  try:
+      339                      reset_result = await self._orch.reset_async()
+      340                      reset_metadata = (
+      341                          reset_result.observation.metadata if reset_result else {}
+      342                      )
+      343                  finally:
+      344                      self._orch._timeout = saved_timeout
+      345              except Exception as e:
+      346                  logger.warning(
+      347                      f"[env={self.env_key}] Fleet env reset failed (timeout={self.reset_timeout_s}s), continuing with empty observation: {e}"
+      348                  )
+      349                  fleet_warning(
+      350                      "fleet_env_reset_failed",
+      351                      step_count=self._step_count,
+      352                      timeout_s=self.reset_timeout_s,
+      353                      error_type=type(e).__name__,
+      354                      error_message=str(e)[:200],
+      355                  )
+      356  
+      357          # Fetch tools — fatal if MCP call fails (no tools = dead rollout)
+      358          try:
+      359              if self._tools:
+      360                  tools_result = await self._tools.list_tools()
+      361                  self._tools_cache = tools_result.tools
+      362              if not self._tools_cache:
+      363                  raise RuntimeError("list_tools returned no tools")
+      364          except Exception as e:
+      365              fleet_info(
+      366                  "fleet_rollout_completed",
+      367                  step_count=0,
+      368                  reward=0.0,
+      369                  verifier_success=False,
+      370                  failure_reason="tools_error",
+      371                  error_message=str(e)[:200],
+      372              )
+      373              self._rollout_completed_emitted = True
+      374              raise
+      375  
+      376          # Filter tools based on modality:
+      377          # - computer_use: keep ONLY the 'computer' tool
+      378          # - tool_use: EXCLUDE the 'computer' tool (should only use API tools)
+      379          if self.modality == "tool_use":
+      380              self._tools_cache = [
+      381                  t
+      382                  for t in self._tools_cache
+      383                  if t.get("name") != "computer"
+      384                  and t.get("function", {}).get("name") != "computer"
+      385              ]
+      386  
+      387          # For computer_use, filter to only the 'computer' tool
+      388          if self.modality == "computer_use":
+      389              computer_tools = [
+      390                  t
+      391                  for t in self._tools_cache
+      392                  if t.get("name") == "computer"
+      393                  or t.get("function", {}).get("name") == "computer"
+      394              ]
+      395              if not computer_tools:
+      396                  available = [
+      397                      t.get("name") or t.get("function", {}).get("name")
+      398                      for t in self._tools_cache
+      399                  ]
+      400                  fleet_info(
+      401                      "fleet_rollout_completed",
+      402                      step_count=0,
+      403                      reward=0.0,
+      404                      verifier_success=False,
+      405                      failure_reason="computer_tool_missing",
+      406                      available_tools=available,
+      407                  )
+      408                  self._rollout_completed_emitted = True
+      409                  raise RuntimeError(
+      410                      f"computer_use modality but no 'computer' tool found. "
+      411                      f"Available tools: {available}. Check MCP image configuration."
+      412                  )
+      413              self._tools_cache = computer_tools
+      414  
+      415          if not self._tools_cache:
+      416              fleet_info(
+      417                  "fleet_rollout_completed",
+      418                  step_count=0,
+      419                  reward=0.0,
+      420                  verifier_success=False,
+      421                  failure_reason="tools_error",
+      422                  error_message="No tools available after modality filtering",
+      423              )
+      424              self._rollout_completed_emitted = True
+      425              raise RuntimeError("No tools available after filtering")
+      426  
+      427          # Inject submit_final_answer synthetic tool for tool_use tasks whose
+      428          # prompt references it.  This mirrors the harness's ANSWER_SUBMISSION_TOOL
+      429          # so that models can submit answers during SkyRL training exactly as
+      430          # they would in a Fleet harness session.
+      431          if self.modality == "tool_use" and "submit_final_answer" in self.prompt:
+      432              self._tools_cache.append(SUBMIT_FINAL_ANSWER_TOOL)
+      433  
+      434          # Build observation with cached tools
+      435          obs = {
+      436              "prompt": self.prompt,
+      437              "observation": reset_metadata,
+      438              "step": 0,
+      439              "task_key": self.task_key,
+      440              "modality": self.modality,
+      441              "tools": self._tools_cache,
+      442          }
+      443  
+      444          # For computer_use, take initial screenshot so VL model can see the screen
+      445          # This is critical for VL models - without visual input they're blind
+      446          if self.modality == "computer_use" and self._tools:
+      447              try:
+      448                  screenshot_result = await self._tools.call_tool(
+      449                      "computer", {"action": "screenshot"}
+      450                  )
+      451                  obs["initial_screenshot"] = screenshot_result
+      452                  logger.info(f"Task {self.task_key}: captured initial screenshot")
+      453              except Exception as e:
+      454                  logger.warning(
+      455                      f"Task {self.task_key}: failed to capture initial screenshot: {e}"
+      456                  )
+      457                  fleet_exception(
+      458                      "fleet_screenshot_failed",
+      459                      step_count=self._step_count,
+      460                  )
+      461  
+      462          return obs
+      463  
+      464      def step(self, action: Dict[str, Any]) -> Tuple[Dict[str, Any], float, bool, Dict]:
+      465          """Execute a step in the environment (sync wrapper).
+      466  
+      467          For async tool calls, use step_async() instead.
+      468  
+      469          Args:
+      470              action: Action dict. For tool_use modality:
+      471                  - tool: Tool name to call
+      472                  - params: Tool parameters
+      473                  - done: Optional flag to signal episode completion
+      474  
+      475          Returns:
+      476              Tuple of (observation, reward, done, info)
+      477          """
+      478          import asyncio
+      479  
+      480          return asyncio.run(self.step_async(action))
+      481  
+      482      async def step_async(
+      483          self, action: Dict[str, Any]
+      484      ) -> Tuple[Dict[str, Any], float, bool, Dict]:
+      485          """Execute a step in the environment.
+       ... truncated at 400 lines ...

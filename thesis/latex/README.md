@@ -1,6 +1,13 @@
 # Thesis LaTeX project
 
-**Compile with XeLaTeX** (required for `polyglossia` + Arabic script):
+**Compile locally with MiKTeX and XeLaTeX** (XeLaTeX is required for `polyglossia` + Arabic
+script). The simplest way is `latexmk`, which ships with MiKTeX and runs under Perl:
+
+```
+latexmk -xelatex main.tex
+```
+
+or by hand:
 
 ```
 xelatex main.tex
@@ -9,10 +16,9 @@ xelatex main.tex
 xelatex main.tex
 ```
 
-On **Overleaf**: create a new project from this folder (or upload the `latex/` directory plus
-`../references.bib` one level up), then set **Menu → Compiler → XeLaTeX**. Overleaf ships the
-`Amiri` / `Scheherazade New` Arabic fonts and a full TeX Live, so no extra package installation
-should be needed.
+MiKTeX installs missing packages on first use. The Arabic abstract uses `Amiri` or
+`Scheherazade New` when installed and otherwise falls back to `Sakkal Majalla`, which ships with
+Windows.
 
 ## Layout
 

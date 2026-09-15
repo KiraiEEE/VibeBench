@@ -1,0 +1,216 @@
+row 44   pdfminer/pdfminer.six#1218
+============================================================================
+CLASS PDFLayoutAnalyzer in pdfminer/converter.py   loc=211 methods=10 wmc=37 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       61  class PDFLayoutAnalyzer(PDFTextDevice):
+       62      cur_item: LTLayoutContainer
+       63      ctm: Matrix
+       64  
+       65      def __init__(
+       66          self,
+       67          rsrcmgr: PDFResourceManager,
+       68          pageno: int = 1,
+       69          laparams: LAParams | None = None,
+       70      ) -> None:
+       71          PDFTextDevice.__init__(self, rsrcmgr)
+       72          self.pageno = pageno
+       73          self.laparams = laparams
+       74          self._stack: list[LTLayoutContainer] = []
+       75  
+       76      def begin_page(self, page: PDFPage, ctm: Matrix) -> None:
+       77          (x0, y0, x1, y1) = apply_matrix_rect(ctm, page.mediabox)
+       78          mediabox = (0, 0, abs(x0 - x1), abs(y0 - y1))
+       79          self.cur_item = LTPage(self.pageno, mediabox)
+       80  
+       81      def end_page(self, page: PDFPage) -> None:
+       82          assert not self._stack, str(len(self._stack))
+       83          assert isinstance(self.cur_item, LTPage), str(type(self.cur_item))
+       84          if self.laparams is not None:
+       85              self.cur_item.analyze(self.laparams)
+       86          self.pageno += 1
+       87          self.receive_layout(self.cur_item)
+       88  
+       89      def begin_figure(self, name: str, bbox: Rect, matrix: Matrix) -> None:
+       90          self._stack.append(self.cur_item)
+       91          self.cur_item = LTFigure(name, bbox, mult_matrix(matrix, self.ctm))
+       92  
+       93      def end_figure(self, _: str) -> None:
+       94          fig = self.cur_item
+       95          assert isinstance(self.cur_item, LTFigure), str(type(self.cur_item))
+       96          self.cur_item = self._stack.pop()
+       97          self.cur_item.add(fig)
+       98  
+       99      def render_image(self, name: str, stream: PDFStream) -> None:
+      100          assert isinstance(self.cur_item, LTFigure), str(type(self.cur_item))
+      101          item = LTImage(
+      102              name,
+      103              stream,
+      104              (self.cur_item.x0, self.cur_item.y0, self.cur_item.x1, self.cur_item.y1),
+      105          )
+      106          self.cur_item.add(item)
+      107  
+      108      def paint_path(
+      109          self,
+      110          gstate: PDFGraphicState,
+      111          stroke: bool,
+      112          fill: bool,
+      113          evenodd: bool,
+      114          path: Sequence[PathSegment],
+      115      ) -> None:
+      116          """Paint paths described in section 4.4 of the PDF reference manual"""
+      117          shape = "".join(x[0] for x in path)
+      118  
+      119          if shape[:1] != "m":
+      120              # Per PDF Reference Section 4.4.1, "path construction operators may
+      121              # be invoked in any sequence, but the first one invoked must be m
+      122              # or re to begin a new subpath." Since pdfminer.six already
+      123              # converts all `re` (rectangle) operators to their equivalent
+      124              # `mlllh` representation, paths ingested by `.paint_path(...)` that
+      125              # do not begin with the `m` operator are invalid.
+      126              pass
+      127  
+      128          elif shape.count("m") > 1:
+      129              # recurse if there are multiple m's in this shape
+      130              for m in re.finditer(r"m[^m]+", shape):
+      131                  subpath = path[m.start(0) : m.end(0)]
+      132                  self.paint_path(gstate, stroke, fill, evenodd, subpath)
+      133  
+      134          else:
+      135              # Although the 'h' command does not not literally provide a
+      136              # point-position, its position is (by definition) equal to the
+      137              # subpath's starting point.
+      138              #
+      139              # And, per Section 4.4's Table 4.9, all other path commands place
+      140              # their point-position in their final two arguments. (Any preceding
+      141              # arguments represent control points on Bézier curves.)
+      142              raw_pts = [
+      143                  cast(Point, p[-2:] if p[0] != "h" else path[0][-2:]) for p in path
+      144              ]
+      145              pts = [apply_matrix_pt(self.ctm, pt) for pt in raw_pts]
+      146  
+      147              operators = [str(operation[0]) for operation in path]
+      148              transformed_points = [
+      149                  [
+      150                      apply_matrix_pt(self.ctm, (float(operand1), float(operand2)))
+      151                      for operand1, operand2 in zip(
+      152                          operation[1::2], operation[2::2], strict=False
+      153                      )
+      154                  ]
+      155                  for operation in path
+      156              ]
+      157              transformed_path = [
+      158                  cast(PathSegment, (o, *p))
+      159                  for o, p in zip(operators, transformed_points, strict=False)
+      160              ]
+      161  
+      162              # Drop a redundant "l" on a path closed with "h"
+      163              if len(shape) > 3 and shape[-2:] == "lh" and pts[-2] == pts[0]:
+      164                  shape = shape[:-2] + "h"
+      165                  pts.pop()
+      166  
+      167              if shape in {"mlh", "ml"}:
+      168                  # single line segment
+      169                  #
+      170                  # Note: 'ml', in conditional above, is a frequent anomaly
+      171                  # that we want to support.
+      172                  line = LTLine(
+      173                      gstate.linewidth,
+      174                      pts[0],
+      175                      pts[1],
+      176                      stroke,
+      177                      fill,
+      178                      evenodd,
+      179                      gstate.scolor,
+      180                      gstate.ncolor,
+      181                      original_path=transformed_path,
+      182                      dashing_style=gstate.dash,
+      183                  )
+      184                  self.cur_item.add(line)
+      185  
+      186              elif shape in {"mlllh", "mllll"}:
+      187                  (x0, y0), (x1, y1), (x2, y2), (x3, y3), _ = pts
+      188  
+      189                  is_closed_loop = pts[0] == pts[4]
+      190                  has_square_coordinates = (
+      191                      x0 == x1 and y1 == y2 and x2 == x3 and y3 == y0
+      192                  ) or (y0 == y1 and x1 == x2 and y2 == y3 and x3 == x0)
+      193                  if is_closed_loop and has_square_coordinates:
+      194                      rect = LTRect(
+      195                          gstate.linewidth,
+      196                          (*pts[0], *pts[2]),
+      197                          stroke,
+      198                          fill,
+      199                          evenodd,
+      200                          gstate.scolor,
+      201                          gstate.ncolor,
+      202                          transformed_path,
+      203                          gstate.dash,
+      204                      )
+      205                      self.cur_item.add(rect)
+      206                  else:
+      207                      curve = LTCurve(
+      208                          gstate.linewidth,
+      209                          pts,
+      210                          stroke,
+      211                          fill,
+      212                          evenodd,
+      213                          gstate.scolor,
+      214                          gstate.ncolor,
+      215                          transformed_path,
+      216                          gstate.dash,
+      217                      )
+      218                      self.cur_item.add(curve)
+      219              else:
+      220                  curve = LTCurve(
+      221                      gstate.linewidth,
+      222                      pts,
+      223                      stroke,
+      224                      fill,
+      225                      evenodd,
+      226                      gstate.scolor,
+      227                      gstate.ncolor,
+      228                      transformed_path,
+      229                      gstate.dash,
+      230                  )
+      231                  self.cur_item.add(curve)
+      232  
+      233      def render_char(
+      234          self,
+      235          matrix: Matrix,
+      236          font: PDFFont,
+      237          fontsize: float,
+      238          scaling: float,
+      239          rise: float,
+      240          cid: int,
+      241          ncs: PDFColorSpace,
+      242          graphicstate: PDFGraphicState,
+      243      ) -> float:
+      244          try:
+      245              text = font.to_unichr(cid)
+      246              assert isinstance(text, str), str(type(text))
+      247          except PDFUnicodeNotDefined:
+      248              text = self.handle_undefined_char(font, cid)
+      249          textwidth = font.char_width(cid)
+      250          textdisp = font.char_disp(cid)
+      251          item = LTChar(
+      252              matrix,
+      253              font,
+      254              fontsize,
+      255              scaling,
+      256              rise,
+      257              text,
+      258              textwidth,
+      259              textdisp,
+      260              ncs,
+      261              graphicstate,
+      262          )
+      263          self.cur_item.add(item)
+      264          return item.adv
+      265  
+      266      def handle_undefined_char(self, font: PDFFont, cid: int) -> str:
+      267          log.debug(f"undefined: {font!r}, {cid!r}")
+      268          return f"(cid:{cid})"
+      269  
+      270      def receive_layout(self, ltpage: LTPage) -> None:
+      271          pass

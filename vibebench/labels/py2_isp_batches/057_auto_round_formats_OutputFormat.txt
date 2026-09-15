@@ -1,0 +1,629 @@
+row 57   intel/auto-round#1559
+============================================================================
+CONTRACT auto_round.formats:OutputFormat   kind=abc abstract_methods=2.0 implementers=7.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file auto_round/formats.py
+      237  class OutputFormat(ABC):
+      238      """ "Base class for different output formats.
+      239  
+      240      format: determines which method from export module to use for exporting.
+      241              For example, auto_round, gguf, llm_compressor etc.
+      242      backend: determines the specific export process within the format.
+      243              For example, auto_round:fp8_static, auto_round:auto_awq etc.
+      244      """
+      245  
+      246      support_schemes: list = []
+      247      _format_list: dict[str, OutputFormat] = {}
+      248      format_name = "base"
+      249  
+      250      def __init__(self, format: str, ar: BaseCompressor):
+      251          """Initializes the output format, validating scheme compatibility.
+      252  
+      253          Args:
+      254              format (str): The format name string (e.g. ``"auto_round"``).
+      255              ar (BaseCompressor): Compressor instance supplying the scheme to
+      256                  validate against ``support_schemes``.
+      257          """
+      258          self.output_format = format
+      259          self.backend = None
+      260  
+      261          if not self.is_fake() and not self.is_support_scheme(ar.scheme):
+      262              logger.error(
+      263                  f"Currently, the {self.format_name} format only supports {self.support_schemes}, "
+      264                  f"but got scheme {ar.scheme}, please change to fake or auto_round etc."
+      265              )
+      266              exit(-1)
+      267  
+      268      @classmethod
+      269      def register(cls, *names: str) -> Callable[[OutputFormat], OutputFormat]:
+      270          """Class decorator that registers an OutputFormat subclass under one or more names.
+      271  
+      272          Args:
+      273              *names (str): One or more format name strings to register.
+      274  
+      275          Returns:
+      276              Callable[[OutputFormat], OutputFormat]: Decorator function that adds the
+      277              class to ``_format_list`` under each name and returns it unchanged.
+      278  
+      279          Raises:
+      280              AssertionError: If no names are provided.
+      281          """
+      282          assert names
+      283  
+      284          def func(output_format: OutputFormat) -> OutputFormat:
+      285              """Register the decorated OutputFormat class under all given names."""
+      286              for name in names:
+      287                  cls._format_list[name] = output_format
+      288              return output_format
+      289  
+      290          return func
+      291  
+      292      @classmethod
+      293      def get_support_matrix(cls: OutputFormat) -> str:
+      294          """Builds a formatted string listing all registered formats and their supported schemes.
+      295  
+      296          Returns:
+      297              str: ANSI-colored multi-line string with one entry per registered format.
+      298          """
+      299          output_str = ""
+      300          for k, v in sorted(cls._format_list.items()):
+      301              if k == "fake":
+      302                  support_schemes = "All schemes"
+      303              else:
+      304                  if ":" in k and k.split(":")[1] in cls._format_list:
+      305                      support_schemes = cls._format_list[k.split(":")[1]].support_schemes
+      306                  else:
+      307                      support_schemes = v.support_schemes
+      308                  support_schemes = ", ".join(support_schemes).rstrip(",")
+      309              output_str += f"\x1b[31;1m{k}\x1b[0m support scheme:\n\t{support_schemes}\n"
+      310          return output_str
+      311  
+      312      def get_backend_name(self) -> str:
+      313          """Returns the fully-qualified backend name for this format.
+      314  
+      315          For simple formats (no backend) this is the ``output_format`` string.
+      316          For compound formats the backend names are joined with colons, e.g.
+      317          ``"auto_round:llm_compressor:fp8_static"``.
+      318  
+      319          Returns:
+      320              str: Backend name string.
+      321          """
+      322          if self.backend is None:
+      323              return self.output_format
+      324  
+      325          # auto_round:llm_compressor:fp8_static
+      326          if self.backend.backend is not None:
+      327              return f"{self.output_format}:{self.backend.get_backend_name()}"
+      328          # auto_round:fp8_static, llm_compressor:fp8_static, auto_round:auto_awq
+      329          else:
+      330              return self.backend.get_backend_name()
+      331  
+      332      @classmethod
+      333      def is_support_scheme(cls: OutputFormat, scheme: Union[str, QuantizationScheme]) -> bool:
+      334          """Checks whether a given scheme is supported by this format.
+      335  
+      336          Args:
+      337              scheme (str | QuantizationScheme): Scheme name or object to check.
+      338  
+      339          Returns:
+      340              bool: ``True`` if the scheme is compatible with this format.
+      341          """
+      342          if isinstance(scheme, str) and scheme.upper() in cls.support_schemes:
+      343              return True
+      344          if isinstance(scheme, QuantizationScheme):
+      345              return cls.check_scheme_args(scheme)
+      346          return False
+      347  
+      348      @classmethod
+      349      def check_scheme_args(cls: OutputFormat, scheme: QuantizationScheme) -> bool:
+      350          """Validates detailed scheme arguments for compatibility with this format.
+      351  
+      352          Override in subclasses to enforce format-specific restrictions on
+      353          ``bits``, ``data_type``, ``group_size``, etc. The base implementation
+      354          performs no validation and always returns ``True``.
+      355  
+      356          Args:
+      357              scheme (QuantizationScheme): The quantization scheme to validate.
+      358  
+      359          Returns:
+      360              bool: ``True`` if the scheme arguments are valid.
+      361  
+      362          Raises:
+      363              ValueError: If any scheme argument violates format constraints.
+      364          """
+      365          return True
+      366  
+      367      def check_and_reset_format(self, ar: BaseCompressor) -> str:
+      368          """Checks format compatibility and optionally resets to a fallback format.
+      369  
+      370          Inspects the compressor configuration (FP8 data types, activation
+      371          quantization settings) and returns a replacement format name when the
+      372          current format cannot support the configuration.
+      373  
+      374          Args:
+      375              ar (BaseCompressor): Compressor instance with quantization config.
+      376  
+      377          Returns:
+      378              str | None: Name of a replacement format (e.g. ``"fake"``) or
+      379              ``None`` if no reset is needed.
+      380          """
+      381          if self.backend is not None:
+      382              new_format = self.backend.check_and_reset_format(ar)
+      383              self.backend = OutputFormat._format_list[new_format](new_format, ar) if new_format else self.backend
+      384  
+      385          w_fp8 = ar.data_type.startswith("fp") and ar.bits == 8
+      386          act_fp8 = ar.act_data_type.startswith("fp") and ar.act_bits == 8
+      387          is_block_dynamic_fp8 = (
+      388              self.format_name in ["fp8", "auto_round:fp8"] and isinstance(ar.group_size, tuple) and ar.act_dynamic
+      389          )
+      390          if (w_fp8 or act_fp8) and not is_block_dynamic_fp8:
+      391              error_msg = (
+      392                  f"is only supported to export auto_round or llm_compressor format,"
+      393                  f" but got {self.format_name}, please check."
+      394              )
+      395              error_msg = ("act_data_type<fp8> " + error_msg) if act_fp8 else error_msg
+      396              error_msg = ("data_type<fp8> " + error_msg) if w_fp8 else error_msg
+      397              logger.error(error_msg)
+      398              sys.exit(-1)
+      399  
+      400          if ar.act_bits <= 8 and (not is_standard_fp(ar.act_data_type) or ar.act_dynamic) and not is_block_dynamic_fp8:
+      401              logger.warning(
+      402                  f"{self.format_name} format not support for current activation quantization configuration,"
+      403                  " reset to fake format and save."
+      404              )
+      405              return "fake"
+      406  
+      407          return None
+      408  
+      409      @abstractmethod
+      410      def pack_layer(self, *args, **kwargs):
+      411          """Packs quantization parameters into the layer in-place.
+      412  
+      413          Args:
+      414              *args: Format-specific positional arguments.
+      415              **kwargs: Format-specific keyword arguments.
+      416          """
+      417          pass
+      418  
+      419      @abstractmethod
+      420      def save_quantized(self, *args, **kwargs):
+      421          """Saves the quantized model to the given output directory.
+      422  
+      423          Args:
+      424              *args: Format-specific positional arguments.
+      425              **kwargs: Format-specific keyword arguments.
+      426          """
+      427          pass
+      428  
+      429      def immediate_pack(self, name: str, model: torch.nn.Module, device: torch.device, **kwargs):
+      430          """Packs a single named layer immediately if it is marked for quantization.
+      431  
+      432          Args:
+      433              name (str): Dot-separated layer name within ``model``.
+      434              model (torch.nn.Module): The model containing the layer.
+      435              device (torch.device): Device on which packing should be performed.
+      436              **kwargs: Additional keyword arguments forwarded to :meth:`pack_layer`.
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER auto_round.formats:FakeFormat  stubs=1/2 ----------
+      465  @OutputFormat.register("fake")
+      466  class FakeFormat(OutputFormat):
+      487      def pack_layer(self, *args, **kwargs):
+      488          """No-op: fake format does not pack layers."""
+      489          pass
+      491      def save_quantized(
+      492          self,
+      493          output_dir: str,
+      494          model: torch.nn.Module = None,
+      495          tokenizer: Callable = None,
+      496          layer_config: dict = None,
+      497          inplace: bool = True,
+      498          device: Union[str, torch.device] = "cpu",
+      499          serialization_dict: dict = None,
+      500          **kwargs,
+      501      ):
+      502          """Saves the model in standard HuggingFace format without weight packing.
+      503  
+      504          Args:
+      505              output_dir (str): Directory path where the model will be saved.
+      506              model (torch.nn.Module, optional): The model to save.
+      507              tokenizer (Callable, optional): Tokenizer to save alongside the model.
+      508              layer_config (dict, optional): Layer configuration (unused for fake format).
+      509              inplace (bool, optional): Whether to operate in-place. Defaults to ``True``.
+      510              device (str | torch.device, optional): Device for the model. Defaults to ``"cpu"``.
+      511              serialization_dict (dict, optional): Extra serialization metadata (unused).
+      512              **kwargs: Additional keyword arguments (e.g. ``processor``).
+      513  
+      514          Returns:
+      515              torch.nn.Module: The (possibly CPU-moved) model after saving.
+      516          """
+      517          if not unsupported_meta_device(model):
+      518              model = model.to("cpu")
+      519              model.save_pretrained(output_dir)
+      520          elif hasattr(model, "config") and model.config is not None:
+      521              model.config.save_pretrained(output_dir)
+      522  
+      523          if tokenizer is not None and hasattr(tokenizer, "save_pretrained"):
+      524              tokenizer.save_pretrained(output_dir)
+      525          processor = kwargs.get("processor", None)
+      526          if processor is not None:
+      527              processor.save_pretrained(output_dir)
+      528          try:
+      529              copy_python_files_from_model_cache(model, output_dir)
+      530          except Exception as e:
+      531              logger.warning("Skipping source model Python file copy due to error: %s", e)
+      532          return model
+
+---------- IMPLEMENTER auto_round.formats:LLMCompressorFormat  stubs=0/2 ----------
+      535  @OutputFormat.register("llm_compressor")
+      536  class LLMCompressorFormat(OutputFormat):
+      680      def pack_layer(self, layer_name, model, device=None, **kwargs):
+      681          """Packs quantization parameters into the layer using the llm_compressor backend.
+      682  
+      683          Args:
+      684              layer_name (str): Dot-separated layer name.
+      685              model (torch.nn.Module): The model containing the layer.
+      686              device (torch.device | None, optional): Device for packing.
+      687              **kwargs: Additional keyword arguments.
+      688          """
+      689          if self.backend is not None:
+      690              return self.backend.pack_layer(layer_name, model, device=device, **kwargs)
+      691          if re.search(f"{AutoRoundExportFormat.MX_FP.value}|{AutoRoundExportFormat.NV_FP.value}", self.output_format):
+      692              from auto_round.export.export_to_llmcompressor.export_to_fp import pack_layer
+      693  
+      694              return pack_layer(layer_name, model, device=device)
+      695          elif re.search(f"{AutoRoundExportFormat.FP8_STATIC.value}", self.output_format):
+      696              from auto_round.export.export_to_llmcompressor.export_to_static_fp import pack_layer
+      697  
+      698              return pack_layer(layer_name, model, self.get_backend_name(), device=device)
+      699          elif re.search(f"{AutoRoundExportFormat.INT8_W8A8.value}", self.output_format):
+      700              from auto_round.export.export_to_llmcompressor.export import pack_layer
+      701  
+      702              return pack_layer(layer_name, model, device=device)
+      703          elif re.search(f"{AutoRoundExportFormat.FP8_BLOCK.value}", self.output_format):
+      704              from auto_round.export.export_to_llmcompressor.export import pack_layer
+      705  
+      706              return pack_layer(layer_name, model, device=device)
+      707          ## passed as no other llm_compressor format is supported yet
+      708          logger.warning("No other llm_compressor packing format(except NVFP&MXFP) is supported yet, skip packing")
+      709          return
+      711      def save_quantized(
+      712          self,
+      713          output_dir: str,
+      714          model: torch.nn.Module = None,
+      715          tokenizer: Callable = None,
+      716          layer_config: dict = None,
+      717          inplace: bool = True,
+      718          device: Union[str, torch.device] = "cpu",
+      719          serialization_dict: dict = None,
+      720          **kwargs,
+      721      ) -> torch.nn.Module:
+      722          """Saves the model in llm_compressor / compressed-tensors format.
+      723  
+      724          Args:
+      725              output_dir (str): Destination directory.
+      726              model (torch.nn.Module, optional): Model to serialize.
+      727              tokenizer (Callable, optional): Tokenizer to save.
+      728              layer_config (dict, optional): Per-layer quantization configuration.
+      729              inplace (bool, optional): Operate in-place. Defaults to ``True``.
+      730              device (str | torch.device, optional): Device. Defaults to ``"cpu"``.
+      731              serialization_dict (dict, optional): Serialization metadata.
+      732              **kwargs: Extra keyword arguments forwarded to the export function.
+      733  
+      734          Returns:
+      735              torch.nn.Module: The serialized model.
+      736          """
+      737          backend = self.get_backend_name()
+      738          if re.search(f"{AutoRoundExportFormat.MX_FP.value}|{AutoRoundExportFormat.NV_FP.value}", backend):
+      739              from auto_round.export.export_to_llmcompressor.export_to_fp import save_quantized_as_fp
+      740  
+      741              export_func = save_quantized_as_fp
+      742          elif re.search(f"{AutoRoundExportFormat.FP8_STATIC.value}", backend):
+      743              from auto_round.export.export_to_llmcompressor.export_to_static_fp import save_quantized_as_static_fp
+      744  
+      745              export_func = save_quantized_as_static_fp
+      746          else:
+      747              from auto_round.export.export_to_llmcompressor.export import save_quantized_as_llmcompressor
+      748  
+      749              export_func = save_quantized_as_llmcompressor
+      750          return export_func(
+      751              output_dir=output_dir,
+      752              model=model,
+      753              tokenizer=tokenizer,
+      754              layer_config=layer_config,
+      755              inplace=inplace,
+      756              device=device,
+      757              backend=backend,
+      758              serialization_dict=serialization_dict,
+      759              **kwargs,
+      760          )
+
+---------- IMPLEMENTER auto_round.formats:AutoGPTQFormat  stubs=0/2 ----------
+      763  @OutputFormat.register("auto_gptq", "gptqmodel")
+      764  class AutoGPTQFormat(OutputFormat):
+      823      def pack_layer(self, layer_name, model, device=None, **kwargs):
+      824          """Packs quantization data into a layer using AutoGPTQ or AutoRound packing.
+      825  
+      826          Args:
+      827              layer_name (str): Dot-separated layer name.
+      828              model (torch.nn.Module): The model containing the layer.
+      829              device (torch.device | None, optional): Device for packing.
+      830              **kwargs: Additional keyword arguments.
+      831          """
+      832          if self.output_format.startswith("auto_round"):
+      833              from auto_round.export.export_to_autoround.export import pack_layer
+      834  
+      835              pack_layer(layer_name, model, backend=self.output_format, device=device)
+      836          else:
+      837              from auto_round.export.export_to_autogptq.export import pack_layer
+      838  
+      839              pack_layer(layer_name, model, backend=self.output_format, device=device)
+      841      def save_quantized(
+      842          self,
+      843          output_dir: str,
+      844          model: torch.nn.Module = None,
+      845          tokenizer: Callable = None,
+      846          layer_config: dict = None,
+      847          inplace: bool = True,
+      848          device: Union[str, torch.device] = "cpu",
+      849          serialization_dict: dict = None,
+      850          **kwargs,
+      851      ) -> torch.nn.Module:
+      852          """Saves the model in AutoGPTQ format.
+      853  
+      854          Args:
+      855              output_dir (str): Destination directory.
+      856              model (torch.nn.Module, optional): Model to serialize.
+      857              tokenizer (Callable, optional): Tokenizer to save.
+      858              layer_config (dict, optional): Per-layer quantization configuration.
+      859              inplace (bool, optional): Operate in-place. Defaults to ``True``.
+      860              device (str | torch.device, optional): Device. Defaults to ``"cpu"``.
+      861              serialization_dict (dict, optional): Serialization metadata.
+      862              **kwargs: Extra keyword arguments forwarded to the export function.
+      863  
+      864          Returns:
+      865              torch.nn.Module: The serialized model.
+      866          """
+      867          backend = self.get_backend_name()
+      868          if backend == "auto_round:auto_gptq" or backend == "auto_round:gptqmodel":
+      869              from auto_round.export.export_to_autoround.export import save_quantized_as_autoround
+      870  
+      871              export_func = save_quantized_as_autoround
+      872          else:
+      873              from auto_round.export.export_to_autogptq.export import save_quantized_as_autogptq
+      874  
+      875              export_func = save_quantized_as_autogptq
+      876          return export_func(
+      877              output_dir=output_dir,
+      878              model=model,
+      879              tokenizer=tokenizer,
+      880              layer_config=layer_config,
+      881              inplace=inplace,
+      882              device=device,
+      883              backend=backend,
+      884              serialization_dict=serialization_dict,
+      885              **kwargs,
+      886          )
+
+---------- IMPLEMENTER auto_round.formats:AutoAWQFormat  stubs=0/2 ----------
+      889  @OutputFormat.register("auto_awq")
+      890  class AutoAWQFormat(OutputFormat):
+      996      def pack_layer(self, layer_name, model, device=None, **kwargs):
+      997          """Packs quantization data into a layer using the AWQ kernel.
+      998  
+      999          Args:
+     1000              layer_name (str): Dot-separated layer name.
+     1001              model (torch.nn.Module): The model containing the layer.
+     1002              device (torch.device | None, optional): Device for packing.
+     1003              **kwargs: Additional keyword arguments.
+     1004          """
+     1005          from auto_round.export.export_to_awq.export import pack_layer
+     1006  
+     1007          pack_layer(layer_name, model, backend=self.output_format, device=device)
+     1009      def save_quantized(
+     1010          self,
+     1011          output_dir: str,
+     1012          model: torch.nn.Module = None,
+     1013          tokenizer: Callable = None,
+     1014          layer_config: dict = None,
+     1015          inplace: bool = True,
+     1016          device: Union[str, torch.device] = "cpu",
+     1017          serialization_dict: dict = None,
+     1018          **kwargs,
+     1019      ) -> torch.nn.Module:
+     1020          """Saves the model in AutoAWQ format.
+     1021  
+     1022          Args:
+     1023              output_dir (str): Destination directory.
+     1024              model (torch.nn.Module, optional): Model to serialize.
+     1025              tokenizer (Callable, optional): Tokenizer to save.
+     1026              layer_config (dict, optional): Per-layer quantization configuration.
+     1027              inplace (bool, optional): Operate in-place. Defaults to ``True``.
+     1028              device (str | torch.device, optional): Device. Defaults to ``"cpu"``.
+     1029              serialization_dict (dict, optional): Serialization metadata.
+     1030              **kwargs: Extra keyword arguments forwarded to the export function.
+     1031  
+     1032          Returns:
+     1033              torch.nn.Module: The serialized model.
+     1034          """
+     1035          backend = self.get_backend_name()
+     1036          if backend == "auto_round:auto_awq":
+     1037              from auto_round.export.export_to_autoround.export import save_quantized_as_autoround
+     1038  
+     1039              export_func = save_quantized_as_autoround
+     1040          else:
+     1041              from auto_round.export.export_to_awq.export import save_quantized_as_autoawq
+     1042  
+     1043              export_func = save_quantized_as_autoawq
+     1044  
+     1045          return export_func(
+     1046              output_dir=output_dir,
+     1047              model=model,
+     1048              tokenizer=tokenizer,
+     1049              layer_config=layer_config,
+     1050              inplace=inplace,
+     1051              backend=backend,
+     1052              device=device,
+     1053              serialization_dict=serialization_dict,
+     1054              **kwargs,
+     1055          )
+
+---------- IMPLEMENTER auto_round.formats:GGUFFormat  stubs=0/2 ----------
+     1058  @OutputFormat.register("gguf")
+     1059  class GGUFFormat(OutputFormat):
+     1166      def pack_layer(
+     1167          self,
+     1168          name,
+     1169          model,
+     1170          backend,
+     1171          output_dir,
+     1172          layer_config,
+     1173          tokenizer,
+     1174          processor=None,
+     1175          image_processor=None,
+     1176          model_type=ModelType.TEXT,
+     1177          device="cpu",
+     1178          quant_nontext_module=False,
+     1179      ):
+     1180          """Packs a single layer into the GGUF output file.
+     1181  
+     1182          Args:
+     1183              name (str): Dot-separated layer name.
+     1184              model (torch.nn.Module): The model.
+     1185              backend (str): Backend format string (e.g. ``"gguf:q4_k_m"``).
+     1186              output_dir (str): Output directory for the GGUF file.
+     1187              layer_config (dict): Per-layer quantization configuration.
+     1188              tokenizer: Tokenizer instance.
+     1189              processor (optional): Multimodal processor.
+     1190              image_processor (optional): Image processor.
+     1191              model_type (ModelType): Text or MMPROJ model type.
+     1192              device (str, optional): Device string. Defaults to ``"cpu"``.
+     1193              quant_nontext_module (bool, optional): Whether to quantize non-text
+     1194                  modules. Defaults to ``False``.
+     1195          """
+     1196          from auto_round.export.export_to_gguf.export import pack_gguf_layer
+     1197  
+     1198          pack_gguf_layer(
+     1199              name,
+     1200              model,
+     1201              backend,
+     1202              output_dir,
+     1203              layer_config,
+     1204              tokenizer,
+     1205              processor,
+     1206              image_processor,
+     1207              model_type,
+     1208              device,
+     1209              quant_nontext_module,
+     1210          )
+     1212      def save_quantized(
+     1213          self,
+     1214          output_dir: str,
+     1215          model: torch.nn.Module = None,
+     1216          tokenizer: Callable = None,
+     1217          layer_config: dict = None,
+     1218          inplace: bool = True,
+     1219          device: Union[str, torch.device] = "cpu",
+     1220          serialization_dict: dict = None,
+     1221          **kwargs,
+     1222      ) -> torch.nn.Module:
+     1223          """Saves the model in GGUF format.
+     1224  
+     1225          Args:
+     1226              output_dir (str): Destination directory.
+     1227              model (torch.nn.Module, optional): Model to serialize.
+     1228              tokenizer (Callable, optional): Tokenizer to save.
+     1229              layer_config (dict, optional): Per-layer quantization configuration.
+     1230              inplace (bool, optional): Operate in-place. Defaults to ``True``.
+     1231              device (str | torch.device, optional): Device. Defaults to ``"cpu"``.
+     1232              serialization_dict (dict, optional): Serialization metadata.
+     1233              **kwargs: Extra keyword arguments forwarded to the GGUF export function.
+     1234  
+     1235          Returns:
+     1236              torch.nn.Module: The serialized model.
+     1237          """
+     1238          from auto_round.export.export_to_gguf.export import save_quantized_as_gguf
+     1239  
+     1240          backend = self.get_backend_name()
+     1241          return save_quantized_as_gguf(
+     1242              output_dir=output_dir,
+     1243              model=model,
+     1244              backend=backend,
+     1245              layer_config=layer_config,
+     1246              mllm=self.mllm,
+     1247              device=device,
+     1248              serialization_dict=serialization_dict,
+     1249              **kwargs,
+     1250          )
+
+---------- IMPLEMENTER auto_round.formats:FP8Format  stubs=0/2 ----------
+     1431  @OutputFormat.register("fp8")
+     1432  class FP8Format(OutputFormat):
+     1477      def pack_layer(self, layer_name, model, device=None, **kwargs):
+     1478          """Packs a single layer using FP8 block-wise quantization.
+     1479  
+     1480          Args:
+     1481              layer_name (str): Dot-separated layer name.
+     1482              model (torch.nn.Module): The model containing the layer.
+     1483              device (torch.device | None, optional): Device for packing.
+     1484              **kwargs: Additional keyword arguments.
+     1485          """
+     1486          from auto_round.export.export_to_autoround.export_to_fp8 import pack_layer
+     1487  
+     1488          pack_layer(layer_name, model, self.output_format, device=device)
+     1490      def save_quantized(
+     1491          self,
+     1492          output_dir: str,
+     1493          model: torch.nn.Module = None,
+     1494          tokenizer: Callable = None,
+     1495          layer_config: dict = None,
+     1496          inplace: bool = True,
+     1497          device: Union[str, torch.device] = "cpu",
+     1498          serialization_dict: dict = None,
+     1499          **kwargs,
+     1500      ) -> torch.nn.Module:
+     1501          """Saves the model in FP8 block-wise format.
+     1502  
+     1503          Args:
+     1504              output_dir (str): Destination directory.
+     1505              model (torch.nn.Module, optional): Model to serialize.
+     1506              tokenizer (Callable, optional): Tokenizer to save.
+     1507              layer_config (dict, optional): Per-layer quantization configuration.
+     1508              inplace (bool, optional): Operate in-place. Defaults to ``True``.
+     1509              device (str | torch.device, optional): Device. Defaults to ``"cpu"``.
+     1510              serialization_dict (dict, optional): Serialization metadata.
+     1511              **kwargs: Extra keyword arguments forwarded to the export function.
+     1512  
+     1513          Returns:
+     1514              torch.nn.Module: The serialized model.
+     1515          """
+     1516          from auto_round.export.export_to_autoround.export_to_fp8 import save_quantized_as_autoround
+     1517  
+     1518          backend = self.get_backend_name()
+     1519  
+     1520          # weight_block_size & ignored_layers are required by fp8 format, skip them in auto_round:fp8 format
+     1521          if isinstance(serialization_dict["group_size"], tuple) and "auto_round" not in backend:
+     1522              serialization_dict["weight_block_size"] = serialization_dict["group_size"]
+     1523  
+     1524              ignored_layers = []
+     1525              for layer_name, cfg in layer_config.items():
+     1526                  if cfg["bits"] >= 16 and cfg["act_bits"] >= 16:
+     1527                      ignored_layers.append(layer_name)
+     1528              if len(ignored_layers) > 0:
+     1529                  serialization_dict["ignored_layers"] = ignored_layers
+     1530  
+     1531          return save_quantized_as_autoround(
+     1532              output_dir=output_dir,
+     1533              model=model,
+     1534              tokenizer=tokenizer,
+     1535              layer_config=layer_config,
+     1536              inplace=inplace,
+     1537              device=device,
+     1538              serialization_dict=serialization_dict,
+     1539              quant_method=backend,
+     1540              **kwargs,
+     1541          )
+
+(1 further implementers not shown)

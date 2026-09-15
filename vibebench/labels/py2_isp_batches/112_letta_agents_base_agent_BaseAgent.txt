@@ -1,0 +1,506 @@
+row 112   letta-ai/letta#3157
+============================================================================
+CONTRACT letta.agents.base_agent:BaseAgent   kind=abc abstract_methods=2.0 implementers=11.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file letta/agents/base_agent.py
+       28  class BaseAgent(ABC):
+       29      """
+       30      Abstract base class for AI agents, handling message management, tool execution,
+       31      and context tracking.
+       32      """
+       33  
+       34      def __init__(
+       35          self,
+       36          agent_id: str,
+       37          # TODO: Make required once client refactor hits
+       38          openai_client: Optional[openai.AsyncClient],
+       39          message_manager: MessageManager,
+       40          agent_manager: AgentManager,
+       41          actor: User,
+       42      ):
+       43          self.agent_id = agent_id
+       44          self.openai_client = openai_client
+       45          self.message_manager = message_manager
+       46          self.agent_manager = agent_manager
+       47          # TODO: Pass this in
+       48          self.passage_manager = PassageManager()
+       49          self.actor = actor
+       50          self.logger = get_logger(agent_id)
+       51  
+       52      @abstractmethod
+       53      async def step(
+       54          self, input_messages: List[MessageCreate], max_steps: int = DEFAULT_MAX_STEPS, run_id: Optional[str] = None
+       55      ) -> LettaResponse:
+       56          """
+       57          Main execution loop for the agent.
+       58          """
+       59          raise NotImplementedError
+       60  
+       61      @abstractmethod
+       62      async def step_stream(
+       63          self, input_messages: List[MessageCreate], max_steps: int = DEFAULT_MAX_STEPS
+       64      ) -> AsyncGenerator[Union[LettaMessage, LegacyLettaMessage, MessageStreamStatus], None]:
+       65          """
+       66          Main streaming execution loop for the agent.
+       67          """
+       68          raise NotImplementedError
+       69  
+       70      @staticmethod
+       71      def pre_process_input_message(input_messages: List[MessageCreate]) -> Any:
+       72          """
+       73          Pre-process function to run on the input_message.
+       74          """
+       75  
+       76          def get_content(message: MessageCreate) -> str:
+       77              if isinstance(message.content, str):
+       78                  return message.content
+       79              elif message.content and len(message.content) == 1 and isinstance(message.content[0], TextContent):
+       80                  return message.content[0].text
+       81              else:
+       82                  return ""
+       83  
+       84          return [{"role": input_message.role.value, "content": get_content(input_message)} for input_message in input_messages]
+       85  
+       86      async def _rebuild_memory_async(
+       87          self,
+       88          in_context_messages: List[Message],
+       89          agent_state: AgentState,
+       90          tool_rules_solver: Optional[ToolRulesSolver] = None,
+       91          num_messages: Optional[int] = None,  # storing these calculations is specific to the voice agent
+       92          num_archival_memories: Optional[int] = None,
+       93      ) -> List[Message]:
+       94          """
+       95          Async version of function above. For now before breaking up components, changes should be made in both places.
+       96          """
+       97          try:
+       98              # [DB Call] loading blocks (modifies: agent_state.memory.blocks)
+       99              agent_state = await self.agent_manager.refresh_memory_async(agent_state=agent_state, actor=self.actor)
+      100  
+      101              tool_constraint_block = None
+      102              if tool_rules_solver is not None:
+      103                  tool_constraint_block = tool_rules_solver.compile_tool_rule_prompts()
+      104  
+      105              # compile archive tags if there's an attached archive
+      106              from letta.services.archive_manager import ArchiveManager
+      107  
+      108              archive_manager = ArchiveManager()
+      109              archive = await archive_manager.get_default_archive_for_agent_async(
+      110                  agent_id=agent_state.id,
+      111                  actor=self.actor,
+      112              )
+      113  
+      114              if archive:
+      115                  archive_tags = await self.passage_manager.get_unique_tags_for_archive_async(
+      116                      archive_id=archive.id,
+      117                      actor=self.actor,
+      118                  )
+      119              else:
+      120                  archive_tags = None
+      121  
+      122              # TODO: This is a pretty brittle pattern established all over our code, need to get rid of this
+      123              curr_system_message = in_context_messages[0]
+      124              curr_system_message_text = curr_system_message.content[0].text
+      125  
+      126              # extract the dynamic section that includes memory blocks, tool rules, and directories
+      127              # this avoids timestamp comparison issues
+      128              def extract_dynamic_section(text):
+      129                  start_marker = "</base_instructions>"
+      130                  end_marker = "<memory_metadata>"
+      131  
+      132                  start_idx = text.find(start_marker)
+      133                  end_idx = text.find(end_marker)
+      134  
+      135                  if start_idx != -1 and end_idx != -1:
+      136                      return text[start_idx:end_idx]
+      137                  return text  # fallback to full text if markers not found
+      138  
+      139              curr_dynamic_section = extract_dynamic_section(curr_system_message_text)
+      140  
+      141              # generate just the memory string with current state for comparison
+      142              curr_memory_str = agent_state.memory.compile(
+      143                  tool_usage_rules=tool_constraint_block,
+      144                  sources=agent_state.sources,
+      145                  max_files_open=agent_state.max_files_open,
+      146                  llm_config=agent_state.llm_config,
+      147              )
+      148              new_dynamic_section = extract_dynamic_section(curr_memory_str)
+      149  
+      150              # compare just the dynamic sections (memory blocks, tool rules, directories)
+      151              if curr_dynamic_section == new_dynamic_section:
+      152                  logger.debug(
+      153                      f"Memory and sources haven't changed for agent id={agent_state.id} and actor=({self.actor.id}, {self.actor.name}), skipping system prompt rebuild"
+      154                  )
+      155                  return in_context_messages
+      156  
+      157              memory_edit_timestamp = get_utc_time()
+      158  
+      159              # size of messages and archival memories
+      160              if num_messages is None:
+      161                  num_messages = await self.message_manager.size_async(actor=self.actor, agent_id=agent_state.id)
+      162              if num_archival_memories is None:
+      163                  num_archival_memories = await self.passage_manager.agent_passage_size_async(actor=self.actor, agent_id=agent_state.id)
+      164  
+      165              new_system_message_str = PromptGenerator.get_system_message_from_compiled_memory(
+      166                  system_prompt=agent_state.system,
+      167                  memory_with_sources=curr_memory_str,
+      168                  in_context_memory_last_edit=memory_edit_timestamp,
+      169                  timezone=agent_state.timezone,
+      170                  previous_message_count=num_messages - len(in_context_messages),
+      171                  archival_memory_size=num_archival_memories,
+      172                  archive_tags=archive_tags,
+      173              )
+      174  
+      175              diff = united_diff(curr_system_message_text, new_system_message_str)
+      176              if len(diff) > 0:
+      177                  logger.debug(f"Rebuilding system with new memory...\nDiff:\n{diff}")
+      178  
+      179                  # [DB Call] Update Messages
+      180                  new_system_message = await self.message_manager.update_message_by_id_async(
+      181                      curr_system_message.id,
+      182                      message_update=MessageUpdate(content=new_system_message_str),
+      183                      actor=self.actor,
+      184                      project_id=agent_state.project_id,
+      185                  )
+      186                  return [new_system_message] + in_context_messages[1:]
+      187  
+      188              else:
+      189                  return in_context_messages
+      190          except:
+      191              logger.exception(f"Failed to rebuild memory for agent id={agent_state.id} and actor=({self.actor.id}, {self.actor.name})")
+      192              raise
+      193  
+      194      def get_finish_chunks_for_stream(self, usage: LettaUsageStatistics, stop_reason: Optional[LettaStopReason] = None):
+      195          if stop_reason is None:
+      196              stop_reason = LettaStopReason(stop_reason=StopReasonType.end_turn.value)
+      197          return [
+      198              stop_reason.model_dump_json(),
+      199              usage.model_dump_json(),
+      200              MessageStreamStatus.done.value,
+      201          ]
+
+---------- IMPLEMENTER letta.agents.ephemeral_agent:EphemeralAgent  stubs=1/2 ----------
+       16  class EphemeralAgent(BaseAgent):
+       39      async def step(self, input_messages: List[MessageCreate]) -> List[Message]:
+       40          """
+       41          Synchronous method that takes a user's input text and returns a summary from OpenAI.
+       42          Returns a list of ephemeral Message objects containing both the user text and the assistant summary.
+       43          """
+       44          agent_state = self.agent_manager.get_agent_by_id(agent_id=self.agent_id, actor=self.actor)
+       45  
+       46          openai_messages = self.pre_process_input_message(input_messages=input_messages)
+       47          request = self._build_openai_request(openai_messages, agent_state)
+       48  
+       49          chat_completion = await self.openai_client.chat.completions.create(**request.model_dump(exclude_unset=True))
+       50  
+       51          return [
+       52              Message(
+       53                  role=MessageRole.assistant,
+       54                  content=[TextContent(text=chat_completion.choices[0].message.content.strip())],
+       55              )
+       56          ]
+       68      async def step_stream(self, input_messages: List[MessageCreate]) -> AsyncGenerator[str, None]:
+       69          """
+       70          This agent is synchronous-only. If called in an async context, raise an error.
+       71          """
+       72          raise NotImplementedError("EphemeralAgent does not support async step.")
+
+---------- IMPLEMENTER letta.agents.ephemeral_summary_agent:EphemeralSummaryAgent  stubs=1/2 ----------
+       22  class EphemeralSummaryAgent(BaseAgent):
+       47      async def step(self, input_messages: List[MessageCreate], max_steps: int = DEFAULT_MAX_STEPS) -> List[Message]:
+       48          if len(input_messages) > 1:
+       49              raise ValueError("Can only invoke EphemeralSummaryAgent with a single summarization message.")
+       50  
+       51          # Check block existence
+       52          try:
+       53              block = await self.agent_manager.get_block_with_label_async(
+       54                  agent_id=self.agent_id, block_label=self.target_block_label, actor=self.actor
+       55              )
+       56          except NoResultFound:
+       57              block = await self.block_manager.create_or_update_block_async(
+       58                  block=Block(
+       59                      value="", label=self.target_block_label, description="Contains recursive summarizations of the conversation so far"
+       60                  ),
+       61                  actor=self.actor,
+       62              )
+       63              await self.agent_manager.attach_block_async(agent_id=self.agent_id, block_id=block.id, actor=self.actor)
+       64  
+       65          if block.value:
+       66              input_message = input_messages[0]
+       67              input_message.content[0].text += f"\n\n--- Previous Summary ---\n{block.value}\n"
+       68  
+       69          # Gets the LLMCLient based on the calling agent's LLM Config
+       70          agent_state = await self.agent_manager.get_agent_by_id_async(agent_id=self.agent_id, actor=self.actor)
+       71          llm_client = LLMClient.create(
+       72              provider_type=agent_state.llm_config.model_endpoint_type,
+       73              put_inner_thoughts_first=True,
+       74              actor=self.actor,
+       75          )
+       76  
+       77          system_message_create = MessageCreate(
+       78              role=MessageRole.system,
+       79              content=[TextContent(text=get_system_text("summary_system_prompt"))],
+       80          )
+       81          messages = await convert_message_creates_to_messages(
+       82              message_creates=[system_message_create] + input_messages,
+       83              agent_id=self.agent_id,
+       84              timezone=agent_state.timezone,
+       85              run_id=None,  # TODO: add this
+       86          )
+       87  
+       88          request_data = llm_client.build_request_data(agent_state.agent_type, messages, agent_state.llm_config, tools=[])
+       89          response_data = await llm_client.request_async(request_data, agent_state.llm_config)
+       90          response = await llm_client.convert_response_to_chat_completion(response_data, messages, agent_state.llm_config)
+       91          summary = response.choices[0].message.content.strip()
+       92  
+       93          await self.block_manager.update_block_async(block_id=block.id, block_update=BlockUpdate(value=summary), actor=self.actor)
+       94  
+       95          logger.debug("block:", block)
+       96          logger.debug("summary:", summary)
+       97  
+       98          return [
+       99              Message(
+      100                  role=MessageRole.assistant,
+      101                  content=[TextContent(text=summary)],
+      102              )
+      103          ]
+      105      async def step_stream(self, input_messages: List[MessageCreate], max_steps: int = DEFAULT_MAX_STEPS) -> AsyncGenerator[str, None]:
+      106          raise NotImplementedError("EphemeralAgent does not support async step.")
+
+---------- IMPLEMENTER letta.agents.letta_agent:LettaAgent  stubs=0/2 ----------
+       85  class LettaAgent(BaseAgent):
+      178      @trace_method
+      179      async def step(
+      180          self,
+      181          input_messages: list[MessageCreateBase],
+      182          max_steps: int = DEFAULT_MAX_STEPS,
+      183          run_id: str | None = None,
+      184          use_assistant_message: bool = True,
+      185          request_start_timestamp_ns: int | None = None,
+      186          include_return_message_types: list[MessageType] | None = None,
+      187          dry_run: bool = False,
+      188      ) -> Union[LettaResponse, dict]:
+      189          # TODO (cliandy): pass in run_id and use at send_message endpoints for all step functions
+      190          agent_state = await self.agent_manager.get_agent_by_id_async(
+      191              agent_id=self.agent_id,
+      192              include_relationships=["tools", "memory", "tool_exec_environment_variables", "sources"],
+      193              actor=self.actor,
+      194          )
+      195          result = await self._step(
+      196              agent_state=agent_state,
+      197              input_messages=input_messages,
+      198              max_steps=max_steps,
+      199              run_id=run_id,
+      200              request_start_timestamp_ns=request_start_timestamp_ns,
+      201              dry_run=dry_run,
+      202          )
+      203  
+      204          # If dry run, return the request payload directly
+      205          if dry_run:
+      206              return result
+      207  
+      208          _, new_in_context_messages, stop_reason, usage = result
+      209          return _create_letta_response(
+      210              new_in_context_messages=new_in_context_messages,
+      211              use_assistant_message=use_assistant_message,
+      212              stop_reason=stop_reason,
+      213              usage=usage,
+      214              include_return_message_types=include_return_message_types,
+      215          )
+      901      @trace_method
+      902      async def step_stream(
+      903          self,
+      904          input_messages: list[MessageCreateBase],
+      905          max_steps: int = DEFAULT_MAX_STEPS,
+      906          use_assistant_message: bool = True,
+      907          request_start_timestamp_ns: int | None = None,
+      908          include_return_message_types: list[MessageType] | None = None,
+      909      ) -> AsyncGenerator[str, None]:
+      910          """
+      911          Carries out an invocation of the agent loop in a streaming fashion that yields partial tokens.
+      912          Whenever we detect a tool call, we yield from _handle_ai_response as well. At each step, the agent
+      913              1. Rebuilds its memory
+      914              2. Generates a request for the LLM
+      915              3. Fetches a response from the LLM
+      916              4. Processes the response
+      917          """
+      918          agent_state = await self.agent_manager.get_agent_by_id_async(
+      919              agent_id=self.agent_id,
+      920              include_relationships=["tools", "memory", "tool_exec_environment_variables", "sources"],
+      921              actor=self.actor,
+      922          )
+      923          current_in_context_messages, new_in_context_messages = await _prepare_in_context_messages_no_persist_async(
+      924              input_messages, agent_state, self.message_manager, self.actor
+      925          )
+      926          initial_messages = new_in_context_messages
+      927          in_context_messages = current_in_context_messages
+      928  
+      929          tool_rules_solver = ToolRulesSolver(agent_state.tool_rules)
+      930          llm_client = LLMClient.create(
+      931              provider_type=agent_state.llm_config.model_endpoint_type,
+      932              put_inner_thoughts_first=True,
+      933              actor=self.actor,
+      934          )
+      935          stop_reason = None
+      936          job_update_metadata = None
+      937          usage = LettaUsageStatistics()
+      938          first_chunk, request_span = True, None
+      939          if request_start_timestamp_ns:
+      940              request_span = tracer.start_span("time_to_first_token", start_time=request_start_timestamp_ns)
+      941              request_span.set_attributes({f"llm_config.{k}": v for k, v in agent_state.llm_config.model_dump().items() if v is not None})
+      942  
+      943          for i in range(max_steps):
+      944              if in_context_messages[-1].role == "approval":
+      945                  approval_request_message = in_context_messages[-1]
+      946                  step_metrics = await self.step_manager.get_step_metrics_async(step_id=approval_request_message.step_id, actor=self.actor)
+      947                  persisted_messages, should_continue, stop_reason = await self._handle_ai_response(
+      948                      approval_request_message.tool_calls[0],
+      949                      [],  # TODO: update this
+      950                      agent_state,
+      951                      tool_rules_solver,
+      952                      usage,
+      953                      reasoning_content=approval_request_message.content,
+      954                      step_id=approval_request_message.step_id,
+      955                      initial_messages=new_in_context_messages,
+      956                      is_final_step=(i == max_steps - 1),
+      957                      step_metrics=step_metrics,
+      958                      run_id=self.current_run_id,
+      959                      is_approval=input_messages[0].approve,
+      960                      is_denial=input_messages[0].approve == False,
+       ... truncated at 60 lines ...
+
+---------- IMPLEMENTER letta.agents.letta_agent_batch:LettaAgentBatch  stubs=2/2 ----------
+      101  class LettaAgentBatch(BaseAgent):
+      620      async def step(
+      621          self, input_messages: List[MessageCreate], max_steps: int = DEFAULT_MAX_STEPS, run_id: str | None = None
+      622      ) -> LettaResponse:
+      623          raise NotImplementedError
+      625      async def step_stream(
+      626          self, input_messages: List[MessageCreate], max_steps: int = DEFAULT_MAX_STEPS
+      627      ) -> AsyncGenerator[Union[LettaMessage, LegacyLettaMessage, MessageStreamStatus], None]:
+      628          raise NotImplementedError
+
+---------- IMPLEMENTER letta.agents.voice_agent:VoiceAgent  stubs=1/2 ----------
+       50  class VoiceAgent(BaseAgent):
+      112      async def step(self, input_messages: List[MessageCreate], max_steps: int = DEFAULT_MAX_STEPS) -> LettaResponse:
+      113          raise NotImplementedError("VoiceAgent does not have a synchronous step implemented currently.")
+      115      async def step_stream(self, input_messages: List[MessageCreate], max_steps: int = DEFAULT_MAX_STEPS) -> AsyncGenerator[str, None]:
+      116          """
+      117          Main streaming loop that yields partial tokens.
+      118          Whenever we detect a tool call, we yield from _handle_ai_response as well.
+      119          """
+      120          if len(input_messages) != 1 or input_messages[0].role != MessageRole.user:
+      121              raise ValueError(f"Voice Agent was invoked with multiple input messages or message did not have role `user`: {input_messages}")
+      122  
+      123          user_query = input_messages[0].content[0].text
+      124  
+      125          agent_state = await self.agent_manager.get_agent_by_id_async(
+      126              agent_id=self.agent_id,
+      127              include_relationships=["tools", "memory", "tool_exec_environment_variables", "multi_agent_group"],
+      128              actor=self.actor,
+      129          )
+      130  
+      131          # TODO: Refactor this so it uses our in-house clients
+      132          # TODO: For now, piggyback off of OpenAI client for ease
+      133          if agent_state.llm_config.model_endpoint_type == "anthropic":
+      134              self.openai_client.api_key = model_settings.anthropic_api_key
+      135              self.openai_client.base_url = "https://api.anthropic.com/v1/"
+      136          elif agent_state.llm_config.model_endpoint_type != "openai":
+      137              raise ValueError("Letta voice agents are only compatible with OpenAI or Anthropic.")
+      138  
+      139          # Safety check
+      140          if agent_state.agent_type != AgentType.voice_convo_agent:
+      141              raise IncompatibleAgentType(expected_type=AgentType.voice_convo_agent, actual_type=agent_state.agent_type)
+      142  
+      143          summarizer = self.init_summarizer(agent_state=agent_state)
+      144  
+      145          in_context_messages = await self.message_manager.get_messages_by_ids_async(message_ids=agent_state.message_ids, actor=self.actor)
+      146          memory_edit_timestamp = get_utc_time()
+      147          in_context_messages[0].content[0].text = await PromptGenerator.compile_system_message_async(
+      148              system_prompt=agent_state.system,
+      149              in_context_memory=agent_state.memory,
+      150              in_context_memory_last_edit=memory_edit_timestamp,
+      151              timezone=agent_state.timezone,
+      152              previous_message_count=self.num_messages,
+      153              archival_memory_size=self.num_archival_memories,
+      154              sources=agent_state.sources,
+      155              max_files_open=agent_state.max_files_open,
+      156              llm_config=agent_state.llm_config,
+      157          )
+      158          letta_message_db_queue = await create_input_messages(
+      159              input_messages=input_messages, agent_id=agent_state.id, timezone=agent_state.timezone, run_id=None, actor=self.actor
+      160          )
+      161          in_memory_message_history = self.pre_process_input_message(input_messages)
+      162  
+      163          # TODO: Define max steps here
+      164          for _ in range(max_steps):
+      165              # Rebuild memory each loop
+      166              in_context_messages = await self._rebuild_memory_async(in_context_messages, agent_state)
+      167              openai_messages = convert_in_context_letta_messages_to_openai(in_context_messages, exclude_system_messages=True)
+      168              openai_messages.extend(in_memory_message_history)
+      169  
+      170              request = self._build_openai_request(openai_messages, agent_state)
+      171  
+      172              stream = await self.openai_client.chat.completions.create(**request.model_dump(exclude_unset=True))
+      173              streaming_interface = OpenAIChatCompletionsStreamingInterface(stream_pre_execution_message=True)
+      174  
+       ... truncated at 60 lines ...
+
+---------- IMPLEMENTER letta.agents.voice_sleeptime_agent:VoiceSleeptimeAgent  stubs=1/2 ----------
+       25  class VoiceSleeptimeAgent(LettaAgent):
+       65      async def step(
+       66          self,
+       67          input_messages: List[MessageCreate],
+       68          max_steps: int = DEFAULT_MAX_STEPS,
+       69          run_id: Optional[str] = None,
+       70          use_assistant_message: bool = True,
+       71          request_start_timestamp_ns: Optional[int] = None,
+       72          include_return_message_types: Optional[List[MessageType]] = None,
+       73      ) -> LettaResponse:
+       74          """
+       75          Process the user's input message, allowing the model to call memory-related tools
+       76          until it decides to stop and provide a final response.
+       77          """
+       78          agent_state = self.agent_manager.get_agent_by_id(self.agent_id, actor=self.actor)
+       79  
+       80          # Add tool rules to the agent_state specifically for this type of agent
+       81          agent_state.tool_rules = [
+       82              InitToolRule(tool_name="store_memories"),
+       83              ChildToolRule(tool_name="store_memories", children=["rethink_user_memory"]),
+       84              ContinueToolRule(tool_name="rethink_user_memory"),
+       85              TerminalToolRule(tool_name="finish_rethinking_memory"),
+       86          ]
+       87  
+       88          # Summarize
+       89          current_in_context_messages, new_in_context_messages, stop_reason, usage = await super()._step(
+       90              agent_state=agent_state, input_messages=input_messages, max_steps=max_steps
+       91          )
+       92          new_in_context_messages, updated = await self.summarizer.summarize(
+       93              in_context_messages=current_in_context_messages, new_letta_messages=new_in_context_messages
+       94          )
+       95          self.agent_manager.set_in_context_messages(
+       96              agent_id=self.agent_id, message_ids=[m.id for m in new_in_context_messages], actor=self.actor
+       97          )
+       98  
+       99          return _create_letta_response(
+      100              new_in_context_messages=new_in_context_messages,
+      101              use_assistant_message=use_assistant_message,
+      102              stop_reason=stop_reason,
+      103              usage=usage,
+      104              include_return_message_types=include_return_message_types,
+      105          )
+      177      async def step_stream(
+      178          self,
+      179          input_messages: List[MessageCreate],
+      180          max_steps: int = DEFAULT_MAX_STEPS,
+      181          use_assistant_message: bool = True,
+      182          request_start_timestamp_ns: Optional[int] = None,
+      183          include_return_message_types: Optional[List[MessageType]] = None,
+      184      ) -> AsyncGenerator[Union[LettaMessage, LegacyLettaMessage, MessageStreamStatus], None]:
+      185          """
+      186          This agent is synchronous-only. If called in an async context, raise an error.
+      187          """
+      188          raise NotImplementedError("VoiceSleeptimeAgent does not support async step.")
+
+(5 further implementers not shown)

@@ -1,0 +1,299 @@
+row 122   llamastack/llama-stack#3643
+============================================================================
+CLASS TelemetryAdapter in llama_stack/providers/inline/telemetry/meta_reference/telemetry.py   loc=294 methods=15 wmc=56 lcom=0.2307692307692307
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       71  class TelemetryAdapter(TelemetryDatasetMixin, Telemetry):
+       72      def __init__(self, config: TelemetryConfig, deps: dict[Api, Any]) -> None:
+       73          self.config = config
+       74          self.datasetio_api = deps.get(Api.datasetio)
+       75          self.meter = None
+       76  
+       77          resource = Resource.create(
+       78              {
+       79                  ResourceAttributes.SERVICE_NAME: self.config.service_name,
+       80              }
+       81          )
+       82  
+       83          global _TRACER_PROVIDER
+       84          # Initialize the correct span processor based on the provider state.
+       85          # This is needed since once the span processor is set, it cannot be unset.
+       86          # Recreating the telemetry adapter multiple times will result in duplicate span processors.
+       87          # Since the library client can be recreated multiple times in a notebook,
+       88          # the kernel will hold on to the span processor and cause duplicate spans to be written.
+       89          if _TRACER_PROVIDER is None:
+       90              provider = TracerProvider(resource=resource)
+       91              trace.set_tracer_provider(provider)
+       92              _TRACER_PROVIDER = provider
+       93  
+       94              # Use single OTLP endpoint for all telemetry signals
+       95              if TelemetrySink.OTEL_TRACE in self.config.sinks or TelemetrySink.OTEL_METRIC in self.config.sinks:
+       96                  if self.config.otel_exporter_otlp_endpoint is None:
+       97                      raise ValueError(
+       98                          "otel_exporter_otlp_endpoint is required when OTEL_TRACE or OTEL_METRIC is enabled"
+       99                      )
+      100  
+      101                  # Let OpenTelemetry SDK handle endpoint construction automatically
+      102                  # The SDK will read OTEL_EXPORTER_OTLP_ENDPOINT and construct appropriate URLs
+      103                  # https://opentelemetry.io/docs/languages/sdk-configuration/otlp-exporter
+      104                  if TelemetrySink.OTEL_TRACE in self.config.sinks:
+      105                      span_exporter = OTLPSpanExporter()
+      106                      span_processor = BatchSpanProcessor(span_exporter)
+      107                      trace.get_tracer_provider().add_span_processor(span_processor)
+      108  
+      109                  if TelemetrySink.OTEL_METRIC in self.config.sinks:
+      110                      metric_reader = PeriodicExportingMetricReader(OTLPMetricExporter())
+      111                      metric_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+      112                      metrics.set_meter_provider(metric_provider)
+      113  
+      114              if TelemetrySink.SQLITE in self.config.sinks:
+      115                  trace.get_tracer_provider().add_span_processor(SQLiteSpanProcessor(self.config.sqlite_db_path))
+      116              if TelemetrySink.CONSOLE in self.config.sinks:
+      117                  trace.get_tracer_provider().add_span_processor(ConsoleSpanProcessor(print_attributes=True))
+      118  
+      119          if TelemetrySink.OTEL_METRIC in self.config.sinks:
+      120              self.meter = metrics.get_meter(__name__)
+      121          if TelemetrySink.SQLITE in self.config.sinks:
+      122              self.trace_store = SQLiteTraceStore(self.config.sqlite_db_path)
+      123  
+      124          self._lock = _global_lock
+      125  
+      126      async def initialize(self) -> None:
+      127          pass
+      128  
+      129      async def shutdown(self) -> None:
+      130          trace.get_tracer_provider().force_flush()
+      131  
+      132      async def log_event(self, event: Event, ttl_seconds: int = 604800) -> None:
+      133          if isinstance(event, UnstructuredLogEvent):
+      134              self._log_unstructured(event, ttl_seconds)
+      135          elif isinstance(event, MetricEvent):
+      136              self._log_metric(event)
+      137          elif isinstance(event, StructuredLogEvent):
+      138              self._log_structured(event, ttl_seconds)
+      139          else:
+      140              raise ValueError(f"Unknown event type: {event}")
+      141  
+      142      async def query_metrics(
+      143          self,
+      144          metric_name: str,
+      145          start_time: int,
+      146          end_time: int | None = None,
+      147          granularity: str | None = None,
+      148          query_type: MetricQueryType = MetricQueryType.RANGE,
+      149          label_matchers: list[MetricLabelMatcher] | None = None,
+      150      ) -> QueryMetricsResponse:
+      151          """Query metrics from the telemetry store.
+      152  
+      153          Args:
+      154              metric_name: The name of the metric to query (e.g., "prompt_tokens")
+      155              start_time: Start time as Unix timestamp
+      156              end_time: End time as Unix timestamp (defaults to now if None)
+      157              granularity: Time granularity for aggregation
+      158              query_type: Type of query (RANGE or INSTANT)
+      159              label_matchers: Label filters to apply
+      160  
+      161          Returns:
+      162              QueryMetricsResponse with metric time series data
+      163          """
+      164          # Convert timestamps to datetime objects
+      165          start_dt = datetime.datetime.fromtimestamp(start_time, datetime.UTC)
+      166          end_dt = datetime.datetime.fromtimestamp(end_time, datetime.UTC) if end_time else None
+      167  
+      168          # Use SQLite trace store if available
+      169          if hasattr(self, "trace_store") and self.trace_store:
+      170              return await self.trace_store.query_metrics(
+      171                  metric_name=metric_name,
+      172                  start_time=start_dt,
+      173                  end_time=end_dt,
+      174                  granularity=granularity,
+      175                  query_type=query_type,
+      176                  label_matchers=label_matchers,
+      177              )
+      178          else:
+      179              raise ValueError(
+      180                  f"In order to query_metrics, you must have {TelemetrySink.SQLITE} set in your telemetry sinks"
+      181              )
+      182  
+      183      def _log_unstructured(self, event: UnstructuredLogEvent, ttl_seconds: int) -> None:
+      184          with self._lock:
+      185              # Use global storage instead of instance storage
+      186              span_id = int(event.span_id, 16)
+      187              span = _GLOBAL_STORAGE["active_spans"].get(span_id)
+      188  
+      189              if span:
+      190                  timestamp_ns = int(event.timestamp.timestamp() * 1e9)
+      191                  span.add_event(
+      192                      name=event.type.value,
+      193                      attributes={
+      194                          "message": event.message,
+      195                          "severity": event.severity.value,
+      196                          "__ttl__": ttl_seconds,
+      197                          **(event.attributes or {}),
+      198                      },
+      199                      timestamp=timestamp_ns,
+      200                  )
+      201              else:
+      202                  print(f"Warning: No active span found for span_id {span_id}. Dropping event: {event}")
+      203  
+      204      def _get_or_create_counter(self, name: str, unit: str) -> metrics.Counter:
+      205          assert self.meter is not None
+      206          if name not in _GLOBAL_STORAGE["counters"]:
+      207              _GLOBAL_STORAGE["counters"][name] = self.meter.create_counter(
+      208                  name=name,
+      209                  unit=unit,
+      210                  description=f"Counter for {name}",
+      211              )
+      212          return _GLOBAL_STORAGE["counters"][name]
+      213  
+      214      def _get_or_create_gauge(self, name: str, unit: str) -> metrics.ObservableGauge:
+      215          assert self.meter is not None
+      216          if name not in _GLOBAL_STORAGE["gauges"]:
+      217              _GLOBAL_STORAGE["gauges"][name] = self.meter.create_gauge(
+      218                  name=name,
+      219                  unit=unit,
+      220                  description=f"Gauge for {name}",
+      221              )
+      222          return _GLOBAL_STORAGE["gauges"][name]
+      223  
+      224      def _log_metric(self, event: MetricEvent) -> None:
+      225          # Add metric as an event to the current span
+      226          try:
+      227              with self._lock:
+      228                  # Only try to add to span if we have a valid span_id
+      229                  if event.span_id:
+      230                      try:
+      231                          span_id = int(event.span_id, 16)
+      232                          span = _GLOBAL_STORAGE["active_spans"].get(span_id)
+      233  
+      234                          if span:
+      235                              timestamp_ns = int(event.timestamp.timestamp() * 1e9)
+      236                              span.add_event(
+      237                                  name=f"metric.{event.metric}",
+      238                                  attributes={
+      239                                      "value": event.value,
+      240                                      "unit": event.unit,
+      241                                      **(event.attributes or {}),
+      242                                  },
+      243                                  timestamp=timestamp_ns,
+      244                              )
+      245                      except (ValueError, KeyError):
+      246                          # Invalid span_id or span not found, but we already logged to console above
+      247                          pass
+      248          except Exception:
+      249              # Lock acquisition failed
+      250              logger.debug("Failed to acquire lock to add metric to span")
+      251  
+      252          # Log to OpenTelemetry meter if available
+      253          if self.meter is None:
+      254              return
+      255          if isinstance(event.value, int):
+      256              counter = self._get_or_create_counter(event.metric, event.unit)
+      257              counter.add(event.value, attributes=event.attributes)
+      258          elif isinstance(event.value, float):
+      259              up_down_counter = self._get_or_create_up_down_counter(event.metric, event.unit)
+      260              up_down_counter.add(event.value, attributes=event.attributes)
+      261  
+      262      def _get_or_create_up_down_counter(self, name: str, unit: str) -> metrics.UpDownCounter:
+      263          assert self.meter is not None
+      264          if name not in _GLOBAL_STORAGE["up_down_counters"]:
+      265              _GLOBAL_STORAGE["up_down_counters"][name] = self.meter.create_up_down_counter(
+      266                  name=name,
+      267                  unit=unit,
+      268                  description=f"UpDownCounter for {name}",
+      269              )
+      270          return _GLOBAL_STORAGE["up_down_counters"][name]
+      271  
+      272      def _log_structured(self, event: StructuredLogEvent, ttl_seconds: int) -> None:
+      273          with self._lock:
+      274              span_id = int(event.span_id, 16)
+      275              tracer = trace.get_tracer(__name__)
+      276              if event.attributes is None:
+      277                  event.attributes = {}
+      278              event.attributes["__ttl__"] = ttl_seconds
+      279  
+      280              # Extract these W3C trace context attributes so they are not written to
+      281              # underlying storage, as we just need them to propagate the trace context.
+      282              traceparent = event.attributes.pop("traceparent", None)
+      283              tracestate = event.attributes.pop("tracestate", None)
+      284              if traceparent:
+      285                  # If we have a traceparent header value, we're not the root span.
+      286                  for root_attribute in ROOT_SPAN_MARKERS:
+      287                      event.attributes.pop(root_attribute, None)
+      288  
+      289              if isinstance(event.payload, SpanStartPayload):
+      290                  # Check if span already exists to prevent duplicates
+      291                  if span_id in _GLOBAL_STORAGE["active_spans"]:
+      292                      return
+      293  
+      294                  context = None
+      295                  if event.payload.parent_span_id:
+      296                      parent_span_id = int(event.payload.parent_span_id, 16)
+      297                      parent_span = _GLOBAL_STORAGE["active_spans"].get(parent_span_id)
+      298                      context = trace.set_span_in_context(parent_span)
+      299                  elif traceparent:
+      300                      carrier = {
+      301                          "traceparent": traceparent,
+      302                          "tracestate": tracestate,
+      303                      }
+      304                      context = TraceContextTextMapPropagator().extract(carrier=carrier)
+      305  
+      306                  span = tracer.start_span(
+      307                      name=event.payload.name,
+      308                      context=context,
+      309                      attributes=event.attributes or {},
+      310                  )
+      311                  _GLOBAL_STORAGE["active_spans"][span_id] = span
+      312  
+      313              elif isinstance(event.payload, SpanEndPayload):
+      314                  span = _GLOBAL_STORAGE["active_spans"].get(span_id)
+      315                  if span:
+      316                      if event.attributes:
+      317                          span.set_attributes(event.attributes)
+      318  
+      319                      status = (
+      320                          trace.Status(status_code=trace.StatusCode.OK)
+      321                          if event.payload.status == SpanStatus.OK
+      322                          else trace.Status(status_code=trace.StatusCode.ERROR)
+      323                      )
+      324                      span.set_status(status)
+      325                      span.end()
+      326                      _GLOBAL_STORAGE["active_spans"].pop(span_id, None)
+      327              else:
+      328                  raise ValueError(f"Unknown structured log event: {event}")
+      329  
+      330      async def query_traces(
+      331          self,
+      332          attribute_filters: list[QueryCondition] | None = None,
+      333          limit: int | None = 100,
+      334          offset: int | None = 0,
+      335          order_by: list[str] | None = None,
+      336      ) -> QueryTracesResponse:
+      337          return QueryTracesResponse(
+      338              data=await self.trace_store.query_traces(
+      339                  attribute_filters=attribute_filters,
+      340                  limit=limit,
+      341                  offset=offset,
+      342                  order_by=order_by,
+      343              )
+      344          )
+      345  
+      346      async def get_trace(self, trace_id: str) -> Trace:
+      347          return await self.trace_store.get_trace(trace_id)
+      348  
+      349      async def get_span(self, trace_id: str, span_id: str) -> Span:
+      350          return await self.trace_store.get_span(trace_id, span_id)
+      351  
+      352      async def get_span_tree(
+      353          self,
+      354          span_id: str,
+      355          attributes_to_return: list[str] | None = None,
+      356          max_depth: int | None = None,
+      357      ) -> QuerySpanTreeResponse:
+      358          return QuerySpanTreeResponse(
+      359              data=await self.trace_store.get_span_tree(
+      360                  span_id=span_id,
+      361                  attributes_to_return=attributes_to_return,
+      362                  max_depth=max_depth,
+      363              )
+      364          )

@@ -1,0 +1,446 @@
+row 87   strawberry-graphql/strawberry#4230
+============================================================================
+CONTRACT strawberry.http.async_base_view:AsyncBaseHTTPView   kind=abc abstract_methods=9.0 implementers=21.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file strawberry/http/async_base_view.py
+       73  class AsyncBaseHTTPView(
+       74      abc.ABC,
+       75      BaseView[Request],
+       76      Generic[
+       77          Request,
+       78          Response,
+       79          SubResponse,
+       80          WebSocketRequest,
+       81          WebSocketResponse,
+       82          Context,
+       83          RootValue,
+       84      ],
+       85  ):
+       86      schema: BaseSchema
+       87      graphql_ide: GraphQL_IDE | None
+       88      keep_alive = False
+       89      keep_alive_interval: float | None = None
+       90      connection_init_wait_timeout: timedelta = timedelta(minutes=1)
+       91      request_adapter_class: Callable[[Request], AsyncHTTPRequestAdapter]
+       92      websocket_adapter_class: Callable[
+       93          [
+       94              "AsyncBaseHTTPView[Any, Any, Any, Any, Any, Context, RootValue]",
+       95              WebSocketRequest,
+       96              WebSocketResponse,
+       97          ],
+       98          AsyncWebSocketAdapter,
+       99      ]
+      100      graphql_transport_ws_handler_class: type[
+      101          BaseGraphQLTransportWSHandler[Context, RootValue]
+      102      ] = BaseGraphQLTransportWSHandler[Context, RootValue]
+      103      graphql_ws_handler_class: type[BaseGraphQLWSHandler[Context, RootValue]] = (
+      104          BaseGraphQLWSHandler[Context, RootValue]
+      105      )
+      106  
+      107      @property
+      108      @abc.abstractmethod
+      109      def allow_queries_via_get(self) -> bool: ...
+      110  
+      111      @abc.abstractmethod
+      112      async def get_sub_response(self, request: Request) -> SubResponse: ...
+      113  
+      114      @abc.abstractmethod
+      115      async def get_context(
+      116          self,
+      117          request: Request | WebSocketRequest,
+      118          response: SubResponse | WebSocketResponse,
+      119      ) -> Context: ...
+      120  
+      121      @abc.abstractmethod
+      122      async def get_root_value(
+      123          self, request: Request | WebSocketRequest
+      124      ) -> RootValue | None: ...
+      125  
+      126      @abc.abstractmethod
+      127      def create_response(
+      128          self,
+      129          response_data: GraphQLHTTPResponse | list[GraphQLHTTPResponse],
+      130          sub_response: SubResponse,
+      131      ) -> Response: ...
+      132  
+      133      @abc.abstractmethod
+      134      async def render_graphql_ide(self, request: Request) -> Response: ...
+      135  
+      136      async def create_streaming_response(
+      137          self,
+      138          request: Request,
+      139          stream: Callable[[], AsyncGenerator[str, None]],
+      140          sub_response: SubResponse,
+      141          headers: dict[str, str],
+      142      ) -> Response:
+      143          raise ValueError("Multipart responses are not supported")
+      144  
+      145      @abc.abstractmethod
+      146      def is_websocket_request(
+      147          self, request: Request | WebSocketRequest
+      148      ) -> TypeGuard[WebSocketRequest]: ...
+      149  
+      150      @abc.abstractmethod
+      151      async def pick_websocket_subprotocol(
+      152          self, request: WebSocketRequest
+      153      ) -> str | None: ...
+      154  
+      155      @abc.abstractmethod
+      156      async def create_websocket_response(
+      157          self, request: WebSocketRequest, subprotocol: str | None
+      158      ) -> WebSocketResponse: ...
+      159  
+      160      async def execute_operation(
+      161          self,
+      162          request: Request,
+      163          context: Context,
+      164          root_value: RootValue | None,
+      165          sub_response: SubResponse,
+      166      ) -> ExecutionResult | list[ExecutionResult] | SubscriptionExecutionResult:
+      167          request_adapter = self.request_adapter_class(request)
+      168  
+      169          try:
+      170              request_data = await self.parse_http_body(request_adapter)
+      171          except json.decoder.JSONDecodeError as e:
+      172              raise HTTPException(400, "Unable to parse request body as JSON") from e
+      173              # DO this only when doing files
+      174          except KeyError as e:
+      175              raise HTTPException(400, "File(s) missing in form data") from e
+      176  
+      177          allowed_operation_types = OperationType.from_http(request_adapter.method)
+      178  
+      179          if not self.allow_queries_via_get and request_adapter.method == "GET":
+      180              allowed_operation_types = allowed_operation_types - {OperationType.QUERY}
+      181  
+      182          if isinstance(request_data, list):
+      183              # batch GraphQL requests
+      184              return await asyncio.gather(
+      185                  *[
+      186                      self.execute_single(
+      187                          request=request,
+      188                          request_adapter=request_adapter,
+      189                          sub_response=sub_response,
+      190                          context=context,
+      191                          root_value=root_value,
+      192                          request_data=data,
+      193                      )
+      194                      for data in request_data
+      195                  ]
+      196              )
+      197  
+      198          if request_data.protocol == "multipart-subscription":
+      199              return await self.schema.subscribe(
+      200                  request_data.query,  # type: ignore
+      201                  variable_values=request_data.variables,
+      202                  context_value=context,
+      203                  root_value=root_value,
+      204                  operation_name=request_data.operation_name,
+      205                  operation_extensions=request_data.extensions,
+      206              )
+      207  
+      208          return await self.execute_single(
+      209              request=request,
+      210              request_adapter=request_adapter,
+      211              sub_response=sub_response,
+      212              context=context,
+      213              root_value=root_value,
+      214              request_data=request_data,
+      215          )
+      216  
+      217      async def execute_single(
+      218          self,
+      219          request: Request,
+      220          request_adapter: AsyncHTTPRequestAdapter,
+      221          sub_response: SubResponse,
+      222          context: Context,
+      223          root_value: RootValue | None,
+      224          request_data: GraphQLRequestData,
+      225      ) -> ExecutionResult:
+      226          allowed_operation_types = OperationType.from_http(request_adapter.method)
+      227  
+      228          if not self.allow_queries_via_get and request_adapter.method == "GET":
+      229              allowed_operation_types = allowed_operation_types - {OperationType.QUERY}
+      230  
+      231          try:
+      232              result = await self.schema.execute(
+      233                  request_data.query,
+      234                  root_value=root_value,
+      235                  variable_values=request_data.variables,
+      236                  context_value=context,
+      237                  operation_name=request_data.operation_name,
+      238                  allowed_operation_types=allowed_operation_types,
+      239                  operation_extensions=request_data.extensions,
+      240              )
+      241          except CannotGetOperationTypeError as e:
+      242              raise HTTPException(400, e.as_http_error_reason()) from e
+      243          except InvalidOperationTypeError as e:
+      244              raise HTTPException(
+      245                  400, e.as_http_error_reason(request_adapter.method)
+      246              ) from e
+      247          except MissingQueryError as e:
+      248              raise HTTPException(400, "No GraphQL query found in the request") from e
+      249  
+      250          return result
+      251  
+      252      async def parse_multipart(self, request: AsyncHTTPRequestAdapter) -> dict[str, str]:
+      253          try:
+      254              form_data = await request.get_form_data()
+      255          except ValueError as e:
+      256              raise HTTPException(400, "Unable to parse the multipart body") from e
+      257  
+      258          operations = form_data.form.get("operations", "{}")
+      259          files_map = form_data.form.get("map", "{}")
+      260          files = form_data.files
+      261  
+      262          if isinstance(operations, (bytes, str)):
+      263              operations = self.parse_json(operations)
+      264  
+      265          if isinstance(files_map, (bytes, str)):
+      266              files_map = self.parse_json(files_map)
+      267  
+      268          try:
+      269              return replace_placeholders_with_files(operations, files_map, files)
+      270          except KeyError as e:
+      271              raise HTTPException(400, "File(s) missing in form data") from e
+      272  
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER strawberry.aiohttp.views:GraphQLView  stubs=0/9 ----------
+       74  class GraphQLView(
+      126      async def render_graphql_ide(self, request: web.Request) -> web.Response:
+      127          return web.Response(text=self.graphql_ide_html, content_type="text/html")
+      129      async def get_sub_response(self, request: web.Request) -> web.Response:
+      130          return web.Response()
+      132      def is_websocket_request(self, request: web.Request) -> TypeGuard[web.Request]:
+      133          ws = web.WebSocketResponse(protocols=self.subscription_protocols)
+      134          return ws.can_prepare(request).ok
+      136      async def pick_websocket_subprotocol(self, request: web.Request) -> str | None:
+      137          ws = web.WebSocketResponse(protocols=self.subscription_protocols)
+      138          return ws.can_prepare(request).protocol
+      140      async def create_websocket_response(
+      141          self, request: web.Request, subprotocol: str | None
+      142      ) -> web.WebSocketResponse:
+      143          protocols = [subprotocol] if subprotocol else []
+      144          ws = web.WebSocketResponse(protocols=protocols)
+      145          await ws.prepare(request)
+      146          return ws
+      157      async def get_root_value(self, request: web.Request) -> RootValue | None:
+      158          return None
+      160      async def get_context(
+      161          self, request: web.Request, response: web.Response | web.WebSocketResponse
+      162      ) -> Context:
+      163          return {"request": request, "response": response}  # type: ignore
+      165      def create_response(
+      166          self,
+      167          response_data: GraphQLHTTPResponse | list[GraphQLHTTPResponse],
+      168          sub_response: web.Response,
+      169      ) -> web.Response:
+      170          encoded_data = self.encode_json(response_data)
+      171          if isinstance(encoded_data, bytes):
+      172              encoded_data = encoded_data.decode()
+      173          sub_response.text = encoded_data
+      174          sub_response.content_type = "application/json"
+      175  
+      176          return sub_response
+      (does not define: allow_queries_via_get; inherited or absent)
+
+---------- IMPLEMENTER strawberry.asgi:GraphQL  stubs=0/9 ----------
+       90  class GraphQL(
+      154      async def get_root_value(self, request: Request | WebSocket) -> RootValue | None:
+      155          return None
+      157      async def get_context(
+      158          self, request: Request | WebSocket, response: Response | WebSocket
+      159      ) -> Context:
+      160          return {"request": request, "response": response}  # type: ignore
+      162      async def get_sub_response(
+      163          self,
+      164          request: Request | WebSocket,
+      165      ) -> Response:
+      166          sub_response = Response()
+      167          sub_response.status_code = None  # type: ignore
+      168          del sub_response.headers["content-length"]
+      169  
+      170          return sub_response
+      172      async def render_graphql_ide(self, request: Request) -> Response:
+      173          return HTMLResponse(self.graphql_ide_html)
+      175      def create_response(
+      176          self,
+      177          response_data: GraphQLHTTPResponse | list[GraphQLHTTPResponse],
+      178          sub_response: Response,
+      179      ) -> Response:
+      180          response = Response(
+      181              self.encode_json(response_data),
+      182              status_code=status.HTTP_200_OK,
+      183              media_type="application/json",
+      184          )
+      185  
+      186          response.headers.raw.extend(sub_response.headers.raw)
+      187  
+      188          if sub_response.background:
+      189              response.background = sub_response.background
+      190  
+      191          if sub_response.status_code:
+      192              response.status_code = sub_response.status_code
+      193  
+      194          return response
+      212      def is_websocket_request(
+      213          self, request: Request | WebSocket
+      214      ) -> TypeGuard[WebSocket]:
+      215          return request.scope["type"] == "websocket"
+      217      async def pick_websocket_subprotocol(self, request: WebSocket) -> str | None:
+      218          protocols = request["subprotocols"]
+      219          intersection = set(protocols) & set(self.protocols)
+      220          sorted_intersection = sorted(intersection, key=protocols.index)
+      221          return next(iter(sorted_intersection), None)
+      223      async def create_websocket_response(
+      224          self, request: WebSocket, subprotocol: str | None
+      225      ) -> WebSocket:
+      226          await request.accept(subprotocol=subprotocol)
+      227          return request
+      (does not define: allow_queries_via_get; inherited or absent)
+
+---------- IMPLEMENTER strawberry.channels.handlers.http_handler:GraphQLHTTPConsumer  stubs=1/9 ----------
+      255  class GraphQLHTTPConsumer(
+      291      async def get_root_value(self, request: ChannelsRequest) -> RootValue | None:
+      292          return None  # pragma: no cover
+      294      async def get_context(
+      295          self, request: ChannelsRequest, response: TemporalResponse
+      296      ) -> Context:
+      297          return {
+      298              "request": request,
+      299              "response": response,
+      300          }  # type: ignore
+      302      async def get_sub_response(self, request: ChannelsRequest) -> TemporalResponse:
+      303          return TemporalResponse()
+      323      async def render_graphql_ide(self, request: ChannelsRequest) -> ChannelsResponse:
+      324          return ChannelsResponse(
+      325              content=self.graphql_ide_html.encode(),
+      326              content_type="text/html; charset=utf-8",
+      327          )
+      329      def is_websocket_request(
+      330          self, request: ChannelsRequest
+      331      ) -> TypeGuard[ChannelsRequest]:
+      332          return False
+      334      async def pick_websocket_subprotocol(self, request: ChannelsRequest) -> str | None:
+      335          return None
+      337      async def create_websocket_response(
+      338          self, request: ChannelsRequest, subprotocol: str | None
+      339      ) -> TemporalResponse:
+      340          raise NotImplementedError
+      (does not define: allow_queries_via_get, create_response; inherited or absent)
+
+---------- IMPLEMENTER strawberry.channels.handlers.ws_handler:GraphQLWSConsumer  stubs=3/9 ----------
+       67  class GraphQLWSConsumer(
+      144      async def get_root_value(self, request: GraphQLWSConsumer) -> RootValue | None:
+      145          return None
+      147      async def get_context(
+      148          self, request: GraphQLWSConsumer, response: GraphQLWSConsumer
+      149      ) -> Context:
+      150          return {
+      151              "request": request,
+      152              "ws": request,
+      153          }  # type: ignore
+      155      @property
+      156      def allow_queries_via_get(self) -> bool:
+      157          return False
+      159      async def get_sub_response(self, request: GraphQLWSConsumer) -> GraphQLWSConsumer:
+      160          raise NotImplementedError
+      162      def create_response(
+      163          self,
+      164          response_data: GraphQLHTTPResponse | list[GraphQLHTTPResponse],
+      165          sub_response: GraphQLWSConsumer,
+      166      ) -> GraphQLWSConsumer:
+      167          raise NotImplementedError
+      169      async def render_graphql_ide(self, request: GraphQLWSConsumer) -> GraphQLWSConsumer:
+      170          raise NotImplementedError
+      172      def is_websocket_request(
+      173          self, request: GraphQLWSConsumer
+      174      ) -> TypeGuard[GraphQLWSConsumer]:
+      175          return True
+      177      async def pick_websocket_subprotocol(
+      178          self, request: GraphQLWSConsumer
+      179      ) -> str | None:
+      180          protocols = request.scope["subprotocols"]
+      181          intersection = set(protocols) & set(self.protocols)
+      182          sorted_intersection = sorted(intersection, key=protocols.index)
+      183          return next(iter(sorted_intersection), None)
+      185      async def create_websocket_response(
+      186          self, request: GraphQLWSConsumer, subprotocol: str | None
+      187      ) -> GraphQLWSConsumer:
+      188          await request.accept(subprotocol=subprotocol)
+      189          return request
+
+---------- IMPLEMENTER strawberry.django.views:AsyncGraphQLView  stubs=2/9 ----------
+      183  class AsyncGraphQLView(
+      212      async def get_root_value(self, request: HttpRequest) -> RootValue | None:
+      213          return None
+      215      async def get_context(
+      216          self, request: HttpRequest, response: HttpResponse
+      217      ) -> Context:
+      218          return StrawberryDjangoContext(request=request, response=response)  # type: ignore
+      220      async def get_sub_response(self, request: HttpRequest) -> TemporalHttpResponse:
+      221          return TemporalHttpResponse()
+      235      async def render_graphql_ide(self, request: HttpRequest) -> HttpResponse:
+      236          try:
+      237              content = render_to_string("graphql/graphiql.html", request=request)
+      238          except TemplateDoesNotExist:
+      239              content = self.graphql_ide_html
+      240  
+      241          return HttpResponse(content=content)
+      243      def is_websocket_request(self, request: HttpRequest) -> TypeGuard[HttpRequest]:
+      244          return False
+      246      async def pick_websocket_subprotocol(self, request: HttpRequest) -> str | None:
+      247          raise NotImplementedError
+      249      async def create_websocket_response(
+      250          self, request: HttpRequest, subprotocol: str | None
+      251      ) -> TemporalHttpResponse:
+      252          raise NotImplementedError
+      (does not define: allow_queries_via_get, create_response; inherited or absent)
+
+---------- IMPLEMENTER strawberry.fastapi.router:GraphQLRouter  stubs=0/9 ----------
+       55  class GraphQLRouter(
+      261      async def render_graphql_ide(self, request: Request) -> HTMLResponse:
+      262          return HTMLResponse(self.graphql_ide_html)
+      264      async def get_context(
+      265          self, request: Request | WebSocket, response: Response | WebSocket
+      266      ) -> Context:  # pragma: no cover
+      267          raise ValueError("`get_context` is not used by FastAPI GraphQL Router")
+      269      async def get_root_value(
+      270          self, request: Request | WebSocket
+      271      ) -> RootValue | None:  # pragma: no cover
+      272          raise ValueError("`get_root_value` is not used by FastAPI GraphQL Router")
+      274      async def get_sub_response(self, request: Request) -> Response:
+      275          return self.temporal_response
+      277      def create_response(
+      278          self,
+      279          response_data: GraphQLHTTPResponse | list[GraphQLHTTPResponse],
+      280          sub_response: Response,
+      281      ) -> Response:
+      282          response = Response(
+      283              self.encode_json(response_data),
+      284              media_type="application/json",
+      285              status_code=sub_response.status_code or status.HTTP_200_OK,
+      286          )
+      287  
+      288          response.headers.raw.extend(sub_response.headers.raw)
+      289  
+      290          return response
+      308      def is_websocket_request(
+      309          self, request: Request | WebSocket
+      310      ) -> TypeGuard[WebSocket]:
+      311          return request.scope["type"] == "websocket"
+      313      async def pick_websocket_subprotocol(self, request: WebSocket) -> str | None:
+      314          protocols = request["subprotocols"]
+      315          intersection = set(protocols) & set(self.protocols)
+      316          sorted_intersection = sorted(intersection, key=protocols.index)
+      317          return next(iter(sorted_intersection), None)
+      319      async def create_websocket_response(
+      320          self, request: WebSocket, subprotocol: str | None
+      321      ) -> WebSocket:
+      322          await request.accept(subprotocol=subprotocol)
+      323          return request
+      (does not define: allow_queries_via_get; inherited or absent)
+
+(15 further implementers not shown)

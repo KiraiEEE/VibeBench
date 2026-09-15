@@ -1,0 +1,125 @@
+row 136   OpenHands/benchmarks#595
+============================================================================
+OVERRIDE  benchmarks.swefficiency.run_infer.SWEfficiencyEvaluation.evaluate_instance
+BASE      benchmarks.utils.evaluation.Evaluation.evaluate_instance
+QUESTION: can an instance of the SUBCLASS be used anywhere the BASE
+          is expected, without breaking the caller?
+
+---------------- BASE CLASS HEADER (benchmarks/utils/evaluation.py) ----------------
+       98  class Evaluation(ABC, BaseModel):
+---------------- BASE METHOD ----------------
+      174      @abstractmethod
+      175      def evaluate_instance(
+      176          self, instance: EvalInstance, workspace: RemoteWorkspace
+      177      ) -> EvalOutput:
+      178          """Run evaluation for a single instance in the provided workspace."""
+      179          raise NotImplementedError
+
+---------------- SUBCLASS HEADER (benchmarks/swefficiency/run_infer.py) ----------------
+      128  class SWEfficiencyEvaluation(Evaluation):
+---------------- OVERRIDE ----------------
+      303      def evaluate_instance(
+      304          self, instance: EvalInstance, workspace: RemoteWorkspace
+      305      ) -> EvalOutput:
+      306          """
+      307          Create conversation, run agent, collect history and git patch.
+      308          """
+      309          tools = get_default_tools(enable_browser=False)
+      310          agent = Agent(
+      311              llm=self.metadata.llm,
+      312              tools=tools,
+      313              system_prompt_kwargs={"cli_mode": True},
+      314          )
+      315  
+      316          assert isinstance(workspace, RemoteWorkspace)
+      317  
+      318          # Set up workspace directory
+      319          workspace_dir_name = get_swefficiency_workspace_dir_name(instance.data)
+      320          repo_path = f"/workspace/{workspace_dir_name}/"
+      321          instance.data["repo_path"] = repo_path
+      322  
+      323          persist_callback = build_event_persistence_callback(
+      324              run_id=self.metadata.eval_output_dir,
+      325              instance_id=instance.id,
+      326              attempt=self.current_attempt,
+      327          )
+      328  
+      329          conversation = Conversation(
+      330              agent=agent,
+      331              workspace=workspace,
+      332              callbacks=[persist_callback],
+      333              max_iteration_per_run=self.metadata.max_iterations,
+      334              delete_on_close=True,
+      335          )
+      336  
+      337          # Copy testbed to workspace
+      338          logger.info("repo_path: %s", repo_path)
+      339          cp_testbed_repo = workspace.execute_command(
+      340              f"mkdir -p {repo_path} ; cp -r /testbed/. {repo_path}"
+      341          )
+      342          assert cp_testbed_repo.exit_code == 0, (
+      343              f"cp_testbed_repo failed: {cp_testbed_repo.stderr}"
+      344          )
+      345  
+      346          # git reset
+      347          git_reset = workspace.execute_command(f"cd {repo_path} ; git reset --hard")
+      348          assert git_reset.exit_code == 0, f"git reset failed: {git_reset.stderr}"
+      349  
+      350          # Remove git remotes
+      351          workspace.execute_command(
+      352              f"cd {repo_path} ; "
+      353              'for remote_name in $(git remote); do git remote remove "$remote_name"; done'
+      354          )
+      355  
+      356          # Get instruction and run conversation
+      357          instruction = get_instruction(
+      358              instance=instance.data,
+      359              metadata=self.metadata,
+      360              workspace_path=workspace.working_dir,
+      361          )
+      362          conversation.send_message(instruction)
+      363          run_conversation_with_fake_user_response(conversation)
+      364  
+      365          # git add
+      366          workspace.execute_command(f"cd {repo_path} ; git add -A")
+      367  
+      368          # Remove binary files from staging
+      369          workspace.execute_command(
+      370              f"cd {repo_path} ; "
+      371              'for file in $(git status --porcelain | grep -E "^(M| M|\\?\\?|A| A)" | cut -c4-); do '
+      372              'if [ -f "$file" ] && (file "$file" | grep -q "executable" || '
+      373              'git check-attr binary "$file" | grep -q "binary: set"); then '
+      374              'git rm -f "$file" 2>/dev/null || rm -f "$file"; '
+      375              "fi; done"
+      376          )
+      377  
+      378          # git commit
+      379          workspace.execute_command(
+      380              f"cd {repo_path} && "
+      381              f"git config --global user.email '{constants.GIT_USER_EMAIL}' && "
+      382              f"git config --global user.name '{constants.GIT_USER_NAME}' && "
+      383              f"git commit --no-verify -m '{constants.GIT_COMMIT_MESSAGE}'"
+      384          )
+      385  
+      386          # Get git patch
+      387          base_commit = instance.data["base_commit"]
+      388          git_patch_result = workspace.execute_command(
+      389              f"cd {repo_path} ; git --no-pager diff --no-color {base_commit} HEAD"
+      390          )
+      391          assert git_patch_result.exit_code == 0, (
+      392              f"git diff failed: {git_patch_result.stderr}"
+      393          )
+      394          git_patch = git_patch_result.stdout
+      395  
+      396          out = EvalOutput(
+      397              instance_id=instance.id,
+      398              attempt=self.current_attempt,
+      399              test_result={
+      400                  "git_patch": git_patch,
+      401              },
+      402              instruction=instruction,
+      403              error=None,
+      404              history=list(conversation.state.events),
+      405              metrics=conversation.conversation_stats.get_combined_metrics(),
+      406          )
+      407          return out

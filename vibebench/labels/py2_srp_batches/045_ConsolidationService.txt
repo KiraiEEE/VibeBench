@@ -1,0 +1,406 @@
+row 45   proffesor-for-testing/sentinel-api-testing#33
+============================================================================
+CLASS ConsolidationService in sentinel_backend/reasoningbank/services/consolidation_service.py   loc=888 methods=16 wmc=85 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       28  class ConsolidationService:
+       29      """
+       30      Service for memory consolidation and quality control.
+       31  
+       32      Responsibilities:
+       33      1. Deduplication: Identify and merge near-identical patterns
+       34      2. Contradiction Detection: Find conflicting patterns using semantic analysis
+       35      3. Pattern Aging: Reduce confidence of unused patterns over time
+       36      4. Confidence Updates: Reinforce successful patterns, weaken failed ones
+       37      5. Pattern Merging: Combine similar patterns to reduce redundancy
+       38      """
+       39  
+       40      # Configuration constants
+       41      DUPLICATE_THRESHOLD = 0.87  # Cosine similarity threshold for duplicates
+       42      CONTRADICTION_THRESHOLD = 0.60  # NLI score threshold for contradictions
+       43      AGING_HALF_LIFE_DAYS = 90  # Half-life for exponential decay
+       44      MIN_CONFIDENCE = 0.1  # Minimum confidence before pattern archival
+       45      MAX_USAGE_GAP_DAYS = 180  # Maximum days without usage before aggressive aging
+       46      MERGE_SIMILARITY_THRESHOLD = 0.75  # Threshold for merging similar patterns
+       47      LEARNING_RATE = 0.05  # Default learning rate for confidence updates
+       48  
+       49      def __init__(self, db_session: AsyncSession):
+       50          """
+       51          Initialize consolidation service.
+       52  
+       53          Args:
+       54              db_session: AsyncSession for database operations
+       55          """
+       56          self.db = db_session
+       57  
+       58      async def consolidate_patterns(
+       59          self,
+       60          tenant_id: Optional[str] = None,
+       61          batch_size: int = 100,
+       62          aggressive: bool = False,
+       63      ) -> Dict[str, Any]:
+       64          """
+       65          Run full consolidation pipeline on patterns.
+       66  
+       67          This is the main entry point that orchestrates all consolidation tasks:
+       68          1. Detect duplicates and contradictions
+       69          2. Age patterns based on usage
+       70          3. Update confidence scores
+       71          4. Merge similar patterns
+       72          5. Archive low-confidence patterns
+       73  
+       74          Args:
+       75              tenant_id: Filter patterns by tenant
+       76              batch_size: Number of patterns to process per batch
+       77              aggressive: If True, use more aggressive consolidation (merge more, age faster)
+       78  
+       79          Returns:
+       80              Dict with consolidation statistics and results
+       81          """
+       82          logger.info(f"Starting consolidation for tenant_id={tenant_id}, aggressive={aggressive}")
+       83  
+       84          stats = {
+       85              "start_time": datetime.utcnow().isoformat(),
+       86              "tenant_id": tenant_id,
+       87              "aggressive_mode": aggressive,
+       88              "patterns_processed": 0,
+       89              "duplicates_found": 0,
+       90              "contradictions_found": 0,
+       91              "patterns_merged": 0,
+       92              "patterns_aged": 0,
+       93              "patterns_archived": 0,
+       94              "errors": [],
+       95          }
+       96  
+       97          try:
+       98              # Step 1: Detect duplicates and contradictions
+       99              logger.info("Step 1: Detecting duplicates and contradictions")
+      100              duplicate_links = await self.detect_duplicates(tenant_id=tenant_id, batch_size=batch_size)
+      101              contradiction_links = await self.detect_contradictions(tenant_id=tenant_id, batch_size=batch_size)
+      102  
+      103              stats["duplicates_found"] = len(duplicate_links)
+      104              stats["contradictions_found"] = len(contradiction_links)
+      105  
+      106              # Step 2: Merge duplicate patterns
+      107              logger.info(f"Step 2: Merging {len(duplicate_links)} duplicate patterns")
+      108              for link in duplicate_links:
+      109                  try:
+      110                      merged = await self._merge_duplicate_patterns(
+      111                          link.source_pattern_id,
+      112                          link.target_pattern_id,
+      113                          similarity=link.similarity_score,
+      114                      )
+      115                      if merged:
+      116                          stats["patterns_merged"] += 1
+      117                  except Exception as e:
+      118                      logger.error(f"Error merging patterns {link.source_pattern_id} and {link.target_pattern_id}: {e}")
+      119                      stats["errors"].append(str(e))
+      120  
+      121              # Step 3: Age patterns based on usage
+      122              logger.info("Step 3: Aging patterns")
+      123              aging_config = {
+      124                  "half_life_days": self.AGING_HALF_LIFE_DAYS // 2 if aggressive else self.AGING_HALF_LIFE_DAYS,
+      125                  "min_confidence": self.MIN_CONFIDENCE,
+      126              }
+      127              aged_count = await self.age_patterns(tenant_id=tenant_id, **aging_config)
+      128              stats["patterns_aged"] = aged_count
+      129  
+      130              # Step 4: Update confidence based on recent usage (if applicable)
+      131              logger.info("Step 4: Updating confidence scores")
+      132              # This is typically done during pattern usage, but we can refresh here
+      133              await self._refresh_confidence_scores(tenant_id=tenant_id)
+      134  
+      135              # Step 5: Archive low-confidence patterns
+      136              logger.info("Step 5: Archiving low-confidence patterns")
+      137              archived_count = await self._archive_low_confidence_patterns(
+      138                  tenant_id=tenant_id,
+      139                  min_confidence=self.MIN_CONFIDENCE,
+      140              )
+      141              stats["patterns_archived"] = archived_count
+      142  
+      143              # Step 6: Get total patterns processed
+      144              query = select(func.count(PatternEmbedding.id))
+      145              if tenant_id:
+      146                  query = query.where(PatternEmbedding.tenant_id == tenant_id)
+      147              result = await self.db.execute(query)
+      148              stats["patterns_processed"] = result.scalar()
+      149  
+      150              stats["end_time"] = datetime.utcnow().isoformat()
+      151              stats["success"] = True
+      152  
+      153              logger.info(f"Consolidation complete: {stats}")
+      154              return stats
+      155  
+      156          except Exception as e:
+      157              logger.error(f"Consolidation failed: {e}", exc_info=True)
+      158              stats["success"] = False
+      159              stats["errors"].append(str(e))
+      160              stats["end_time"] = datetime.utcnow().isoformat()
+      161              return stats
+      162  
+      163      async def detect_duplicates(
+      164          self,
+      165          tenant_id: Optional[str] = None,
+      166          batch_size: int = 100,
+      167      ) -> List[PatternLink]:
+      168          """
+      169          Detect near-identical patterns using cosine similarity.
+      170  
+      171          Uses vector embeddings to find patterns with similarity >= DUPLICATE_THRESHOLD.
+      172          Creates PatternLink records with type=DUPLICATE.
+      173  
+      174          Args:
+      175              tenant_id: Filter patterns by tenant
+      176              batch_size: Number of patterns to process per batch
+      177  
+      178          Returns:
+      179              List of PatternLink objects representing duplicates
+      180          """
+      181          logger.info(f"Detecting duplicates with threshold={self.DUPLICATE_THRESHOLD}")
+      182  
+      183          # Fetch all patterns with embeddings
+      184          query = select(PatternEmbedding)
+      185          if tenant_id:
+      186              query = query.where(PatternEmbedding.tenant_id == tenant_id)
+      187  
+      188          result = await self.db.execute(query)
+      189          patterns = list(result.scalars().all())
+      190  
+      191          if len(patterns) < 2:
+      192              logger.info("Not enough patterns for duplicate detection")
+      193              return []
+      194  
+      195          duplicate_links = []
+      196          processed_pairs: Set[Tuple[str, str]] = set()
+      197  
+      198          # Compare patterns pairwise using embeddings
+      199          for i, pattern_a in enumerate(patterns):
+      200              for pattern_b in patterns[i + 1:]:
+      201                  # Skip if already processed
+      202                  pair = tuple(sorted([pattern_a.pattern_id, pattern_b.pattern_id]))
+      203                  if pair in processed_pairs:
+      204                      continue
+      205  
+      206                  processed_pairs.add(pair)
+      207  
+      208                  # Calculate cosine similarity
+      209                  similarity = self._cosine_similarity(
+      210                      np.array(pattern_a.embedding),
+      211                      np.array(pattern_b.embedding)
+      212                  )
+      213  
+      214                  if similarity >= self.DUPLICATE_THRESHOLD:
+      215                      logger.info(
+      216                          f"Duplicate found: {pattern_a.pattern_id} <-> {pattern_b.pattern_id} "
+      217                          f"(similarity={similarity:.3f})"
+      218                      )
+      219  
+      220                      # Create link record
+      221                      link = PatternLink(
+      222                          source_pattern_id=pattern_a.pattern_id,
+      223                          target_pattern_id=pattern_b.pattern_id,
+      224                          link_type=LinkType.DUPLICATE,
+      225                          similarity_score=similarity,
+      226                          is_resolved=0,
+      227                          tenant_id=tenant_id,
+      228                      )
+      229  
+      230                      self.db.add(link)
+      231                      duplicate_links.append(link)
+      232  
+      233          if duplicate_links:
+      234              await self.db.commit()
+      235              logger.info(f"Found {len(duplicate_links)} duplicate pairs")
+      236  
+      237          return duplicate_links
+      238  
+      239      async def detect_contradictions(
+      240          self,
+      241          tenant_id: Optional[str] = None,
+      242          batch_size: int = 100,
+      243      ) -> List[PatternLink]:
+      244          """
+      245          Detect contradicting patterns using semantic analysis.
+      246  
+      247          Identifies patterns that provide conflicting guidance by analyzing:
+      248          1. Semantic similarity (patterns about same topic)
+      249          2. Opposing recommendations (different actions for same situation)
+      250  
+      251          Args:
+      252              tenant_id: Filter patterns by tenant
+      253              batch_size: Number of patterns to process per batch
+      254  
+      255          Returns:
+      256              List of PatternLink objects representing contradictions
+      257          """
+      258          logger.info(f"Detecting contradictions with threshold={self.CONTRADICTION_THRESHOLD}")
+      259  
+      260          # Fetch all patterns
+      261          query = select(PatternEmbedding)
+      262          if tenant_id:
+      263              query = query.where(PatternEmbedding.tenant_id == tenant_id)
+      264  
+      265          result = await self.db.execute(query)
+      266          patterns = list(result.scalars().all())
+      267  
+      268          if len(patterns) < 2:
+      269              logger.info("Not enough patterns for contradiction detection")
+      270              return []
+      271  
+      272          contradiction_links = []
+      273          processed_pairs: Set[Tuple[str, str]] = set()
+      274  
+      275          # Compare patterns for contradictions
+      276          for i, pattern_a in enumerate(patterns):
+      277              for pattern_b in patterns[i + 1:]:
+      278                  # Skip if already processed
+      279                  pair = tuple(sorted([pattern_a.pattern_id, pattern_b.pattern_id]))
+      280                  if pair in processed_pairs:
+      281                      continue
+      282  
+      283                  processed_pairs.add(pair)
+      284  
+      285                  # Check for contradiction using semantic analysis
+      286                  is_contradiction, confidence = self._detect_semantic_contradiction(
+      287                      pattern_a.content,
+      288                      pattern_b.content,
+      289                      pattern_a.embedding,
+      290                      pattern_b.embedding,
+      291                  )
+      292  
+      293                  if is_contradiction and confidence >= self.CONTRADICTION_THRESHOLD:
+      294                      logger.warning(
+      295                          f"Contradiction found: {pattern_a.pattern_id} <-> {pattern_b.pattern_id} "
+      296                          f"(confidence={confidence:.3f})"
+      297                      )
+      298  
+      299                      # Create link record
+      300                      link = PatternLink(
+      301                          source_pattern_id=pattern_a.pattern_id,
+      302                          target_pattern_id=pattern_b.pattern_id,
+      303                          link_type=LinkType.CONTRADICTION,
+      304                          similarity_score=confidence,
+      305                          is_resolved=0,
+      306                          tenant_id=tenant_id,
+      307                      )
+      308  
+      309                      self.db.add(link)
+      310                      contradiction_links.append(link)
+      311  
+      312          if contradiction_links:
+      313              await self.db.commit()
+      314              logger.warning(f"Found {len(contradiction_links)} contradictions")
+      315  
+      316          return contradiction_links
+      317  
+      318      async def update_confidence(
+      319          self,
+      320          pattern_id: str,
+      321          success: bool,
+      322          learning_rate: Optional[float] = None,
+      323      ) -> PatternEmbedding:
+      324          """
+      325          Update pattern confidence based on usage outcome.
+      326  
+      327          Implements reinforcement learning-style confidence updates:
+      328          - Success: Increase confidence by learning_rate
+      329          - Failure: Decrease confidence by learning_rate
+      330  
+      331          Update Rule:
+      332          confidence ← clamp(confidence + η·success_delta, 0, 1)
+      333  
+      334          Args:
+      335              pattern_id: Pattern to update
+      336              success: Whether the pattern was used successfully
+      337              learning_rate: Learning rate (default: LEARNING_RATE)
+      338  
+      339          Returns:
+      340              Updated PatternEmbedding
+      341  
+      342          Raises:
+      343              ValueError: If pattern not found
+      344          """
+      345          lr = learning_rate or self.LEARNING_RATE
+      346  
+      347          # Fetch pattern
+      348          result = await self.db.execute(
+      349              select(PatternEmbedding).where(PatternEmbedding.pattern_id == pattern_id)
+      350          )
+      351          pattern = result.scalar_one_or_none()
+      352  
+      353          if not pattern:
+      354              raise ValueError(f"Pattern not found: {pattern_id}")
+      355  
+      356          # Update confidence using pattern's built-in method
+      357          old_confidence = pattern.confidence
+      358          pattern.update_confidence(success=success, learning_rate=lr)
+      359  
+      360          logger.info(
+      361              f"Updated confidence for {pattern_id}: "
+      362              f"{old_confidence:.3f} -> {pattern.confidence:.3f} "
+      363              f"(success={success}, lr={lr})"
+      364          )
+      365  
+      366          await self.db.commit()
+      367          await self.db.refresh(pattern)
+      368  
+      369          return pattern
+      370  
+      371      async def age_patterns(
+      372          self,
+      373          tenant_id: Optional[str] = None,
+      374          half_life_days: Optional[int] = None,
+      375          min_confidence: Optional[float] = None,
+      376      ) -> int:
+      377          """
+      378          Age patterns based on time since last use (exponential decay).
+      379  
+      380          Implements exponential decay formula:
+      381          confidence ← confidence × e^(-days_unused / half_life)
+      382  
+      383          Patterns that haven't been used recently have their confidence reduced.
+      384          This encourages the system to prefer fresh, actively-used patterns.
+      385  
+      386          Args:
+      387              tenant_id: Filter patterns by tenant
+      388              half_life_days: Half-life for decay (default: AGING_HALF_LIFE_DAYS)
+      389              min_confidence: Minimum confidence to maintain (default: MIN_CONFIDENCE)
+      390  
+      391          Returns:
+      392              Number of patterns aged
+      393          """
+      394          hl = half_life_days or self.AGING_HALF_LIFE_DAYS
+      395          min_conf = min_confidence or self.MIN_CONFIDENCE
+      396  
+      397          logger.info(f"Aging patterns with half_life={hl} days, min_confidence={min_conf}")
+      398  
+      399          # Fetch patterns that need aging
+      400          query = select(PatternEmbedding)
+      401          if tenant_id:
+      402              query = query.where(PatternEmbedding.tenant_id == tenant_id)
+      403  
+      404          result = await self.db.execute(query)
+      405          patterns = list(result.scalars().all())
+      406  
+      407          aged_count = 0
+      408          now = datetime.utcnow()
+      409  
+      410          for pattern in patterns:
+      411              # Calculate days since last use
+      412              last_used = pattern.last_used_at or pattern.created_at
+      413              days_unused = (now - last_used).days
+      414  
+      415              if days_unused == 0:
+      416                  continue  # Pattern was used today, no aging
+      417  
+      418              # Apply exponential decay
+      419              decay_factor = np.exp(-days_unused / hl)
+      420              old_confidence = pattern.confidence
+      421              new_confidence = max(min_conf, pattern.confidence * decay_factor)
+      422  
+      423              if new_confidence < old_confidence:
+      424                  pattern.confidence = new_confidence
+      425                  pattern.updated_at = now
+      426                  aged_count += 1
+      427  
+       ... truncated at 400 lines ...

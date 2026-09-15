@@ -1,0 +1,312 @@
+row 38   neurostuff/NiMARE#958
+============================================================================
+CLASS SDMPSI in nimare/meta/cbma/sdm.py   loc=307 methods=6 wmc=30 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      401  class SDMPSI(SDM):
+      402      """SDM with Permuted Subject Images (SDM-PSI) meta-analysis.
+      403  
+      404      This implementation extends the basic SDM algorithm with advanced features including
+      405      multiple imputation, subject-level image simulation, and Rubin's rules for combining
+      406      results across imputations. Supports hybrid coordinate/image input like the base SDM class.
+      407  
+      408      .. versionadded:: 0.3.1
+      409  
+      410      Parameters
+      411      ----------
+      412      kernel_transformer : :obj:`~nimare.meta.kernel.KernelTransformer`, optional
+      413          Kernel with which to convolve coordinates from dataset.
+      414          Default is SDMKernel with FWHM=20mm.
+      415      n_imputations : :obj:`int`, default=5
+      416          Number of imputations to perform for missing data.
+      417      n_subjects_sim : :obj:`int`, default=50
+      418          Number of simulated subjects per study for subject-level image simulation.
+      419      aggressive_mask : :obj:`bool`, default=True
+      420          Voxels with a value of zero or NaN in any of the input images will be removed.
+      421      memory : instance of :class:`joblib.Memory`, :obj:`str`, or :class:`pathlib.Path`
+      422          Used to cache the output of a function. By default, no caching is done.
+      423          If a :obj:`str` is given, it is the path to the caching directory.
+      424      memory_level : :obj:`int`, default=0
+      425          Rough estimator of the amount of memory used by caching.
+      426          Higher value means more memory for caching. Zero means no caching.
+      427      random_state : :obj:`int`, :class:`~numpy.random.RandomState`, or None, optional
+      428          Random state for reproducibility of simulations. Default is None.
+      429      **kwargs
+      430          Keyword arguments. Arguments for the kernel_transformer can be assigned here,
+      431          with the prefix ``kernel__`` in the variable name.
+      432          Another optional argument is ``mask``.
+      433  
+      434      Attributes
+      435      ----------
+      436      masker : :class:`~nilearn.input_data.NiftiMasker` or similar
+      437          Masker object.
+      438      inputs_ : :obj:`dict`
+      439          Inputs to the Estimator.
+      440      input_mode_ : :obj:`str`
+      441          One of 'coordinates', 'images', or 'hybrid' indicating what inputs were used.
+      442  
+      443      Notes
+      444      -----
+      445      This implementation follows the SDM-PSI algorithm described in
+      446      :footcite:t:`albajes2019metaanalytic`, which includes:
+      447  
+      448      1. Multiple imputation of missing data using iterative imputation
+      449      2. Subject-level image simulation with realistic correlations
+      450      3. Rubin's rules for combining statistics across imputations
+      451      4. Advanced permutation testing procedures
+      452  
+      453      The algorithm generates multiple imputed datasets, simulates subject-level images
+      454      for each, performs meta-analysis on each imputation, and combines results using
+      455      Rubin's rules to account for imputation uncertainty.
+      456  
+      457      Like the base SDM class, SDMPSI supports hybrid mode, accepting both coordinates
+      458      and images.
+      459  
+      460      References
+      461      ----------
+      462      .. footbibliography::
+      463  
+      464      See Also
+      465      --------
+      466      :class:`~nimare.meta.cbma.sdm.SDM`:
+      467          The base SDM estimator without advanced features.
+      468      :class:`~nimare.meta.kernel.SDMKernel`:
+      469          The kernel used by this estimator.
+      470      """
+      471  
+      472      # Constants for subject-level simulation
+      473      _BASE_NOISE_STD = 0.1  # Minimum noise standard deviation
+      474      _NOISE_SCALE_FACTOR = 0.2  # Noise scaling relative to effect size
+      475  
+      476      def __init__(
+      477          self,
+      478          kernel_transformer=SDMKernel,
+      479          n_imputations=5,
+      480          n_subjects_sim=50,
+      481          aggressive_mask=True,
+      482          memory=Memory(location=None, verbose=0),
+      483          memory_level=0,
+      484          random_state=None,
+      485          *,
+      486          mask=None,
+      487          **kwargs,
+      488      ):
+      489          super().__init__(
+      490              kernel_transformer=kernel_transformer,
+      491              aggressive_mask=aggressive_mask,
+      492              memory=memory,
+      493              memory_level=memory_level,
+      494              mask=mask,
+      495              **kwargs,
+      496          )
+      497          self.n_imputations = n_imputations
+      498          self.n_subjects_sim = n_subjects_sim
+      499          self.random_state = random_state
+      500          self._rng = np.random.RandomState(random_state)
+      501  
+      502      def _generate_description(self):
+      503          """Generate a description of the fitted Estimator."""
+      504          mode_desc = {
+      505              "coordinates": "coordinate-based reconstruction",
+      506              "images": "provided effect size maps",
+      507              "hybrid": "a hybrid combination of provided maps and coordinate-based reconstruction",
+      508          }
+      509  
+      510          description = (
+      511              "A Seed-based d Mapping with Permuted Subject Images (SDM-PSI) "
+      512              f"meta-analysis was performed with NiMARE {__version__} "
+      513              f"(RRID:SCR_017398; \\citealt{{Salo2023}}), using "
+      514              f"{mode_desc.get(self.input_mode_, 'unknown inputs')}. "
+      515          )
+      516  
+      517          if self.input_mode_ in ["coordinates", "hybrid"]:
+      518              description += (
+      519                  f"For coordinate-based reconstruction, an SDM kernel with "
+      520                  f"FWHM={self.kernel_transformer.fwhm}mm was used. "
+      521              )
+      522  
+      523          description += (
+      524              f"The analysis included {self.n_imputations} imputations with "
+      525              f"{self.n_subjects_sim} simulated subjects per study. "
+      526              "Results were combined across imputations using Rubin's rules "
+      527              "\\citep{rubin1987multiple}."
+      528          )
+      529          return description
+      530  
+      531      def _perform_multiple_imputation(self, ma_masked, n_studies):
+      532          """Perform multiple imputation on modeled activation maps."""
+      533          LGR.info(f"Performing {self.n_imputations} imputations...")
+      534  
+      535          imputed_datasets = []
+      536          for i_imp in range(self.n_imputations):
+      537              imputed_data = ma_masked.copy()
+      538              noise = self._rng.normal(0, 0.01, size=imputed_data.shape)
+      539              imputed_data = imputed_data + noise
+      540              imputed_datasets.append(imputed_data)
+      541  
+      542          return imputed_datasets
+      543  
+      544      def _simulate_subject_images(self, study_map, n_subjects):
+      545          """Simulate subject-level images from a study-level effect size map."""
+      546          n_voxels = study_map.shape[0]
+      547  
+      548          noise_std = np.maximum(self._BASE_NOISE_STD, np.abs(study_map) * self._NOISE_SCALE_FACTOR)
+      549  
+      550          subject_images = np.zeros((n_subjects, n_voxels))
+      551          for i_subj in range(n_subjects):
+      552              noise = self._rng.normal(0, noise_std)
+      553              subject_images[i_subj] = study_map + noise
+      554  
+      555          return subject_images
+      556  
+      557      def _apply_rubins_rules(self, imputation_results):
+      558          """Combine results across imputations using Rubin's rules."""
+      559          LGR.info("Applying Rubin's rules to combine imputation results...")
+      560  
+      561          n_imp = len(imputation_results)
+      562  
+      563          imputation_stats = np.array([res["stat"] for res in imputation_results])
+      564          imputation_variances = np.array([res["variance"] for res in imputation_results])
+      565  
+      566          pooled_stat = np.mean(imputation_stats, axis=0)
+      567          within_var = np.mean(imputation_variances, axis=0)
+      568          between_var = np.var(imputation_stats, axis=0, ddof=1)
+      569  
+      570          total_var = within_var + (1 + 1 / n_imp) * between_var
+      571  
+      572          epsilon = np.finfo(float).eps
+      573          dof = (n_imp - 1) * (1 + within_var / ((1 + 1 / n_imp) * between_var + epsilon)) ** 2
+      574  
+      575          se = np.sqrt(total_var)
+      576          se[se == 0] = np.finfo(float).eps
+      577          z_values = pooled_stat / se
+      578  
+      579          p_values = 2 * (1 - stats.norm.cdf(np.abs(z_values)))
+      580  
+      581          return {
+      582              "stat": pooled_stat,
+      583              "variance": total_var,
+      584              "se": se,
+      585              "z": z_values,
+      586              "p": p_values,
+      587              "dof": dof,
+      588              "within_var": within_var,
+      589              "between_var": between_var,
+      590          }
+      591  
+      592      def _fit(self, dataset):
+      593          """Perform SDM-PSI meta-analysis on dataset."""
+      594          # First collect all study maps using parent's logic
+      595          all_study_maps = []
+      596  
+      597          # Collect from images
+      598          if "image_data" in self.inputs_:
+      599              img_data = self.inputs_["image_data"]
+      600              if self.aggressive_mask and "aggressive_mask" in self.inputs_:
+      601                  mask = self.inputs_["aggressive_mask"]
+      602                  img_data = img_data[:, mask]
+      603  
+      604              for i in range(img_data.shape[0]):
+      605                  all_study_maps.append(img_data[i])
+      606  
+      607          # Generate from coordinates
+      608          if "coordinates" in self.inputs_ and self.input_mode_ in ["coordinates", "hybrid"]:
+      609              coords = self.inputs_["coordinates"]
+      610              ma_maps = self.kernel_transformer.transform(
+      611                  coords, masker=self.masker, return_type="array"
+      612              )
+      613  
+      614              if self.aggressive_mask and "aggressive_mask" in self.inputs_:
+      615                  mask = self.inputs_["aggressive_mask"]
+      616                  if isinstance(ma_maps, sparse.COO):
+      617                      ma_dense = ma_maps.todense()
+      618                      mask_data = self.masker.mask_img.get_fdata().astype(bool)
+      619                      n_coord_studies = ma_dense.shape[0]
+      620                      ma_dense_reshaped = ma_dense.reshape(n_coord_studies, -1)
+      621                      ma_masked = ma_dense_reshaped[:, mask_data.reshape(-1)]
+      622                      ma_masked = ma_masked[:, mask[mask_data.reshape(-1)]]
+      623                      for i in range(ma_masked.shape[0]):
+      624                          all_study_maps.append(ma_masked[i])
+      625                  else:
+      626                      for i in range(ma_maps.shape[0]):
+      627                          all_study_maps.append(ma_maps[i][mask] if mask is not None else ma_maps[i])
+      628              else:
+      629                  if isinstance(ma_maps, sparse.COO):
+      630                      ma_dense = ma_maps.todense()
+      631                      mask_data = self.masker.mask_img.get_fdata().astype(bool)
+      632                      n_coord_studies = ma_dense.shape[0]
+      633                      ma_dense_reshaped = ma_dense.reshape(n_coord_studies, -1)
+      634                      ma_masked = ma_dense_reshaped[:, mask_data.reshape(-1)]
+      635                      for i in range(ma_masked.shape[0]):
+      636                          all_study_maps.append(ma_masked[i])
+      637                  else:
+      638                      for i in range(ma_maps.shape[0]):
+      639                          all_study_maps.append(ma_maps[i])
+      640  
+      641          if len(all_study_maps) == 0:
+      642              raise ValueError("No valid studies found after preprocessing")
+      643  
+      644          all_maps = np.vstack(all_study_maps)
+      645          n_studies = all_maps.shape[0]
+      646  
+      647          # Step 1: Multiple imputation
+      648          imputed_datasets = self._perform_multiple_imputation(all_maps, n_studies)
+      649  
+      650          # Step 2-4: For each imputation, simulate subjects and perform meta-analysis
+      651          imputation_results = []
+      652  
+      653          for i_imp, imputed_data in enumerate(imputed_datasets):
+      654              LGR.info(f"Processing imputation {i_imp + 1}/{self.n_imputations}...")
+      655  
+      656              all_subject_images = []
+      657              for i_study in range(n_studies):
+      658                  study_map = imputed_data[i_study]
+      659                  subject_images = self._simulate_subject_images(study_map, self.n_subjects_sim)
+      660                  all_subject_images.append(subject_images)
+      661  
+      662              study_stats = []
+      663              study_vars = []
+      664  
+      665              for subject_images in all_subject_images:
+      666                  study_mean = np.mean(subject_images, axis=0)
+      667                  study_var = np.var(subject_images, axis=0, ddof=1) / subject_images.shape[0]
+      668                  study_stats.append(study_mean)
+      669                  study_vars.append(study_var)
+      670  
+      671              study_stats = np.array(study_stats)
+      672              study_vars = np.array(study_vars)
+      673  
+      674              # Random-effects meta-analysis (DerSimonian-Laird)
+      675              weights = 1.0 / (study_vars + 1e-10)
+      676              weighted_sum = np.sum(weights * study_stats, axis=0)
+      677              sum_weights = np.sum(weights, axis=0)
+      678              pooled_effect = weighted_sum / sum_weights
+      679              pooled_var = 1.0 / sum_weights
+      680  
+      681              imputation_results.append({"stat": pooled_effect, "variance": pooled_var})
+      682  
+      683          # Step 5: Apply Rubin's rules
+      684          combined_results = self._apply_rubins_rules(imputation_results)
+      685  
+      686          images = {
+      687              "stat": combined_results["stat"],
+      688              "z": combined_results["z"],
+      689              "p": combined_results["p"],
+      690              "dof": combined_results["dof"],
+      691              "se": combined_results["se"],
+      692              "within_var": combined_results["within_var"],
+      693              "between_var": combined_results["between_var"],
+      694          }
+      695  
+      696          tables = {
+      697              "imputation_info": pd.DataFrame(
+      698                  {
+      699                      "n_imputations": [self.n_imputations],
+      700                      "n_subjects_per_study": [self.n_subjects_sim],
+      701                  }
+      702              )
+      703          }
+      704  
+      705          description = self._generate_description()
+      706  
+      707          return images, tables, description

@@ -1,0 +1,406 @@
+row 29   Soju06/codex-lb#112
+============================================================================
+CLASS ProxyService in app/modules/proxy/service.py   loc=621 methods=16 wmc=137 lcom=0.0714285714285714
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       61  class ProxyService:
+       62      def __init__(self, repo_factory: ProxyRepoFactory) -> None:
+       63          self._repo_factory = repo_factory
+       64          self._encryptor = TokenEncryptor()
+       65          self._load_balancer = LoadBalancer(repo_factory)
+       66  
+       67      def stream_responses(
+       68          self,
+       69          payload: ResponsesRequest,
+       70          headers: Mapping[str, str],
+       71          *,
+       72          propagate_http_errors: bool = False,
+       73          api_key: ApiKeyData | None = None,
+       74          api_key_reservation: ApiKeyUsageReservationData | None = None,
+       75          suppress_text_done_events: bool = False,
+       76      ) -> AsyncIterator[str]:
+       77          _maybe_log_proxy_request_payload("stream", payload, headers)
+       78          _maybe_log_proxy_request_shape("stream", payload, headers)
+       79          filtered = filter_inbound_headers(headers)
+       80          return self._stream_with_retry(
+       81              payload,
+       82              filtered,
+       83              propagate_http_errors=propagate_http_errors,
+       84              api_key=api_key,
+       85              api_key_reservation=api_key_reservation,
+       86              suppress_text_done_events=suppress_text_done_events,
+       87          )
+       88  
+       89      async def compact_responses(
+       90          self,
+       91          payload: ResponsesCompactRequest,
+       92          headers: Mapping[str, str],
+       93          *,
+       94          api_key: ApiKeyData | None = None,
+       95          api_key_reservation: ApiKeyUsageReservationData | None = None,
+       96      ) -> OpenAIResponsePayload:
+       97          _maybe_log_proxy_request_payload("compact", payload, headers)
+       98          _maybe_log_proxy_request_shape("compact", payload, headers)
+       99          filtered = filter_inbound_headers(headers)
+      100          settings = await get_settings_cache().get()
+      101          prefer_earlier_reset = settings.prefer_earlier_reset_accounts
+      102          sticky_threads_enabled = settings.sticky_threads_enabled
+      103          routing_strategy = getattr(settings, "routing_strategy", "usage_weighted")
+      104          sticky_key = _sticky_key_from_compact_payload(payload) if sticky_threads_enabled else None
+      105          selection = await self._load_balancer.select_account(
+      106              sticky_key=sticky_key,
+      107              reallocate_sticky=sticky_key is not None,
+      108              prefer_earlier_reset_accounts=prefer_earlier_reset,
+      109              routing_strategy=routing_strategy,
+      110              model=payload.model,
+      111          )
+      112          account = selection.account
+      113          if not account:
+      114              raise ProxyResponseError(
+      115                  503,
+      116                  openai_error("no_accounts", selection.error_message or "No active accounts available"),
+      117              )
+      118          account = await self._ensure_fresh(account)
+      119          account_id = _header_account_id(account.chatgpt_account_id)
+      120  
+      121          async def _call_compact(target: Account) -> OpenAIResponsePayload:
+      122              access_token = self._encryptor.decrypt(target.access_token_encrypted)
+      123              return await core_compact_responses(payload, filtered, access_token, account_id)
+      124  
+      125          try:
+      126              response = await _call_compact(account)
+      127              await self._settle_compact_api_key_usage(
+      128                  api_key=api_key,
+      129                  api_key_reservation=api_key_reservation,
+      130                  response=response,
+      131              )
+      132              return response
+      133          except ProxyResponseError as exc:
+      134              if exc.status_code != 401:
+      135                  await self._settle_compact_api_key_usage(
+      136                      api_key=api_key,
+      137                      api_key_reservation=api_key_reservation,
+      138                      response=None,
+      139                  )
+      140                  await self._handle_proxy_error(account, exc)
+      141                  raise
+      142              try:
+      143                  account = await self._ensure_fresh(account, force=True)
+      144              except RefreshError as refresh_exc:
+      145                  if refresh_exc.is_permanent:
+      146                      await self._load_balancer.mark_permanent_failure(account, refresh_exc.code)
+      147                  await self._settle_compact_api_key_usage(
+      148                      api_key=api_key,
+      149                      api_key_reservation=api_key_reservation,
+      150                      response=None,
+      151                  )
+      152                  raise exc
+      153              try:
+      154                  response = await _call_compact(account)
+      155                  await self._settle_compact_api_key_usage(
+      156                      api_key=api_key,
+      157                      api_key_reservation=api_key_reservation,
+      158                      response=response,
+      159                  )
+      160                  return response
+      161              except ProxyResponseError as exc:
+      162                  await self._settle_compact_api_key_usage(
+      163                      api_key=api_key,
+      164                      api_key_reservation=api_key_reservation,
+      165                      response=None,
+      166                  )
+      167                  await self._handle_proxy_error(account, exc)
+      168                  raise
+      169  
+      170      async def _settle_compact_api_key_usage(
+      171          self,
+      172          *,
+      173          api_key: ApiKeyData | None,
+      174          api_key_reservation: ApiKeyUsageReservationData | None,
+      175          response: OpenAIResponsePayload | None,
+      176      ) -> None:
+      177          if api_key is None or api_key_reservation is None:
+      178              return
+      179  
+      180          reservation_id = api_key_reservation.reservation_id
+      181          usage = response.usage if response is not None else None
+      182          input_tokens = usage.input_tokens if usage else None
+      183          output_tokens = usage.output_tokens if usage else None
+      184          cached_input_tokens = usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else 0
+      185          model_name = api_key_reservation.model or (getattr(response, "model", None) or "")
+      186  
+      187          with anyio.CancelScope(shield=True):
+      188              try:
+      189                  async with self._repo_factory() as repos:
+      190                      api_keys_service = ApiKeysService(repos.api_keys)
+      191                      if response is not None and input_tokens is not None and output_tokens is not None:
+      192                          await api_keys_service.finalize_usage_reservation(
+      193                              reservation_id,
+      194                              model=model_name,
+      195                              input_tokens=input_tokens,
+      196                              output_tokens=output_tokens,
+      197                              cached_input_tokens=cached_input_tokens or 0,
+      198                          )
+      199                      else:
+      200                          await api_keys_service.release_usage_reservation(reservation_id)
+      201              except Exception:
+      202                  logger.warning(
+      203                      "Failed to settle compact API key reservation key_id=%s request_id=%s",
+      204                      api_key.id,
+      205                      get_request_id(),
+      206                      exc_info=True,
+      207                  )
+      208  
+      209      async def _settle_stream_api_key_usage(
+      210          self,
+      211          api_key: ApiKeyData | None,
+      212          api_key_reservation: ApiKeyUsageReservationData | None,
+      213          settlement: _StreamSettlement,
+      214          request_id: str,
+      215      ) -> bool:
+      216          """Settle stream reservation. Returns True if settled."""
+      217          if api_key is None or api_key_reservation is None:
+      218              return True
+      219  
+      220          reservation_id = api_key_reservation.reservation_id
+      221          model_name = api_key_reservation.model or settlement.model or ""
+      222  
+      223          settled: bool = False
+      224          with anyio.CancelScope(shield=True):
+      225              try:
+      226                  async with self._repo_factory() as repos:
+      227                      api_keys_service = ApiKeysService(repos.api_keys)
+      228                      if (
+      229                          settlement.status == "success"
+      230                          and settlement.input_tokens is not None
+      231                          and settlement.output_tokens is not None
+      232                      ):
+      233                          await api_keys_service.finalize_usage_reservation(
+      234                              reservation_id,
+      235                              model=model_name,
+      236                              input_tokens=settlement.input_tokens,
+      237                              output_tokens=settlement.output_tokens,
+      238                              cached_input_tokens=settlement.cached_input_tokens or 0,
+      239                          )
+      240                      else:
+      241                          await api_keys_service.release_usage_reservation(reservation_id)
+      242                  settled = True
+      243              except Exception:
+      244                  logger.warning(
+      245                      "Failed to settle stream API key reservation key_id=%s request_id=%s",
+      246                      api_key.id,
+      247                      request_id,
+      248                      exc_info=True,
+      249                  )
+      250                  settled = False
+      251  
+      252          return settled
+      253  
+      254      async def rate_limit_headers(self) -> dict[str, str]:
+      255          return await get_rate_limit_headers_cache().get(self._compute_rate_limit_headers)
+      256  
+      257      async def _compute_rate_limit_headers(self) -> dict[str, str]:
+      258          headers: dict[str, str] = {}
+      259          async with self._repo_factory() as repos:
+      260              accounts = await repos.accounts.list_accounts()
+      261              selected_accounts = _select_accounts_for_limits(accounts)
+      262              if not selected_accounts:
+      263                  return headers
+      264  
+      265              account_map = {account.id: account for account in selected_accounts}
+      266              primary_rows_raw = await self._latest_usage_rows(repos, account_map, "primary")
+      267              secondary_rows_raw = await self._latest_usage_rows(repos, account_map, "secondary")
+      268              primary_rows, secondary_rows = usage_core.normalize_weekly_only_rows(
+      269                  primary_rows_raw,
+      270                  secondary_rows_raw,
+      271              )
+      272  
+      273              primary_summary = _summarize_window(primary_rows, account_map, "primary")
+      274              if primary_summary is not None:
+      275                  headers.update(_rate_limit_headers("primary", primary_summary))
+      276  
+      277              secondary_summary = _summarize_window(secondary_rows, account_map, "secondary")
+      278              if secondary_summary is not None:
+      279                  headers.update(_rate_limit_headers("secondary", secondary_summary))
+      280  
+      281              headers.update(_credits_headers(await self._latest_usage_entries(repos, account_map)))
+      282          return headers
+      283  
+      284      async def get_rate_limit_payload(self) -> RateLimitStatusPayloadData:
+      285          async with self._repo_factory() as repos:
+      286              accounts = await repos.accounts.list_accounts()
+      287              await self._refresh_usage(repos, accounts)
+      288              selected_accounts = _select_accounts_for_limits(accounts)
+      289              if not selected_accounts:
+      290                  return RateLimitStatusPayloadData(plan_type="guest")
+      291  
+      292              account_map = {account.id: account for account in selected_accounts}
+      293              primary_rows_raw = await self._latest_usage_rows(repos, account_map, "primary")
+      294              secondary_rows_raw = await self._latest_usage_rows(repos, account_map, "secondary")
+      295              primary_rows, secondary_rows = usage_core.normalize_weekly_only_rows(
+      296                  primary_rows_raw,
+      297                  secondary_rows_raw,
+      298              )
+      299  
+      300              primary_summary = _summarize_window(primary_rows, account_map, "primary")
+      301              secondary_summary = _summarize_window(secondary_rows, account_map, "secondary")
+      302  
+      303              now_epoch = int(time.time())
+      304              primary_window = _window_snapshot(primary_summary, primary_rows, "primary", now_epoch)
+      305              secondary_window = _window_snapshot(secondary_summary, secondary_rows, "secondary", now_epoch)
+      306  
+      307              return RateLimitStatusPayloadData(
+      308                  plan_type=_plan_type_for_accounts(selected_accounts),
+      309                  rate_limit=_rate_limit_details(primary_window, secondary_window),
+      310                  credits=_credits_snapshot(await self._latest_usage_entries(repos, account_map)),
+      311              )
+      312  
+      313      async def _stream_with_retry(
+      314          self,
+      315          payload: ResponsesRequest,
+      316          headers: Mapping[str, str],
+      317          *,
+      318          propagate_http_errors: bool,
+      319          api_key: ApiKeyData | None,
+      320          api_key_reservation: ApiKeyUsageReservationData | None,
+      321          suppress_text_done_events: bool,
+      322      ) -> AsyncIterator[str]:
+      323          request_id = ensure_request_id()
+      324          settings = await get_settings_cache().get()
+      325          prefer_earlier_reset = settings.prefer_earlier_reset_accounts
+      326          sticky_threads_enabled = settings.sticky_threads_enabled
+      327          routing_strategy = getattr(settings, "routing_strategy", "usage_weighted")
+      328          sticky_key = _sticky_key_from_payload(payload) if sticky_threads_enabled else None
+      329          max_attempts = 3
+      330          settled = False
+      331          settlement = _StreamSettlement()
+      332          try:
+      333              for attempt in range(max_attempts):
+      334                  selection = await self._load_balancer.select_account(
+      335                      sticky_key=sticky_key,
+      336                      prefer_earlier_reset_accounts=prefer_earlier_reset,
+      337                      routing_strategy=routing_strategy,
+      338                      model=payload.model,
+      339                  )
+      340                  account = selection.account
+      341                  if not account:
+      342                      event = response_failed_event(
+      343                          "no_accounts",
+      344                          selection.error_message or "No active accounts available",
+      345                          response_id=request_id,
+      346                      )
+      347                      yield format_sse_event(event)
+      348                      return
+      349  
+      350                  account_id_value = account.id
+      351                  try:
+      352                      account = await self._ensure_fresh(account)
+      353                      settlement = _StreamSettlement()
+      354                      async for line in self._stream_once(
+      355                          account,
+      356                          payload,
+      357                          headers,
+      358                          request_id,
+      359                          attempt < max_attempts - 1,
+      360                          api_key=api_key,
+      361                          settlement=settlement,
+      362                          suppress_text_done_events=suppress_text_done_events,
+      363                      ):
+      364                          yield line
+      365                      settled = await self._settle_stream_api_key_usage(
+      366                          api_key,
+      367                          api_key_reservation,
+      368                          settlement,
+      369                          request_id,
+      370                      )
+      371                      return
+      372                  except _RetryableStreamError as exc:
+      373                      await self._handle_stream_error(account, exc.error, exc.code)
+      374                      continue
+      375                  except ProxyResponseError as exc:
+      376                      if exc.status_code == 401:
+      377                          try:
+      378                              account = await self._ensure_fresh(account, force=True)
+      379                          except RefreshError as refresh_exc:
+      380                              if refresh_exc.is_permanent:
+      381                                  await self._load_balancer.mark_permanent_failure(account, refresh_exc.code)
+      382                              continue
+      383                          settlement = _StreamSettlement()
+      384                          async for line in self._stream_once(
+      385                              account,
+      386                              payload,
+      387                              headers,
+      388                              request_id,
+      389                              False,
+      390                              api_key=api_key,
+      391                              settlement=settlement,
+      392                              suppress_text_done_events=suppress_text_done_events,
+      393                          ):
+      394                              yield line
+      395                          settled = await self._settle_stream_api_key_usage(
+      396                              api_key,
+      397                              api_key_reservation,
+      398                              settlement,
+      399                              request_id,
+      400                          )
+      401                          return
+      402                      error = _parse_openai_error(exc.payload)
+      403                      error_code = _normalize_error_code(error.code if error else None, error.type if error else None)
+      404                      error_message = error.message if error else None
+      405                      error_type = error.type if error else None
+      406                      error_param = error.param if error else None
+      407                      await self._handle_stream_error(
+      408                          account,
+      409                          _upstream_error_from_openai(error),
+      410                          error_code,
+      411                      )
+      412                      if propagate_http_errors:
+      413                          raise
+      414                      event = response_failed_event(
+      415                          error_code,
+      416                          error_message or "Upstream error",
+      417                          error_type=error_type or "server_error",
+      418                          response_id=request_id,
+      419                          error_param=error_param,
+      420                      )
+      421                      _apply_error_metadata(event["response"]["error"], error)
+      422                      yield format_sse_event(event)
+      423                      return
+      424                  except RefreshError as exc:
+      425                      if exc.is_permanent:
+      426                          await self._load_balancer.mark_permanent_failure(account, exc.code)
+      427                      continue
+      428                  except Exception:
+      429                      try:
+      430                          await self._load_balancer.record_error(account)
+      431                      except Exception:
+      432                          logger.warning(
+      433                              "Failed to record proxy error account_id=%s request_id=%s",
+      434                              account_id_value,
+      435                              request_id,
+      436                              exc_info=True,
+      437                          )
+      438                      if attempt == max_attempts - 1:
+      439                          event = response_failed_event(
+      440                              "upstream_error",
+      441                              "Proxy streaming failed",
+      442                              response_id=request_id,
+      443                          )
+      444                          yield format_sse_event(event)
+      445                          return
+      446              event = response_failed_event(
+      447                  "no_accounts",
+      448                  "No available accounts after retries",
+      449                  response_id=request_id,
+      450              )
+      451              yield format_sse_event(event)
+      452          finally:
+      453              if not settled and api_key is not None and api_key_reservation is not None:
+      454                  with anyio.CancelScope(shield=True):
+      455                      try:
+      456                          async with self._repo_factory() as repos:
+      457                              api_keys_service = ApiKeysService(repos.api_keys)
+      458                              await api_keys_service.release_usage_reservation(
+      459                                  api_key_reservation.reservation_id,
+      460                              )
+       ... truncated at 400 lines ...

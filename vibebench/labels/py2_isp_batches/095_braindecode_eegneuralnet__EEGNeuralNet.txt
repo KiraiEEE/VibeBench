@@ -1,0 +1,226 @@
+row 95   braindecode/braindecode#903
+============================================================================
+CONTRACT braindecode.eegneuralnet:_EEGNeuralNet   kind=abc abstract_methods=1.0 implementers=3.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file braindecode/eegneuralnet.py
+       42  class _EEGNeuralNet(NeuralNet, abc.ABC):
+       43      signal_args_set_ = False
+       44  
+       45      @property
+       46      def log(self):
+       47          return log.getChild(self.__class__.__name__)
+       48  
+       49      def initialize_module(self):
+       50          """Initializes the module.
+       51  
+       52          A Braindecode model name can also be passed as module argument.
+       53  
+       54          If the module is already initialized and no parameter was changed, it
+       55          will be left as is.
+       56          """
+       57          kwargs = self.get_params_for("module")
+       58          module = _get_model(self.module)
+       59          module = self.initialized_instance(module, kwargs)
+       60          # pylint: disable=attribute-defined-outside-init
+       61          self.module_ = module
+       62          return self
+       63  
+       64      def _yield_callbacks(self):
+       65          # Here we parse the callbacks supplied as strings,
+       66          # e.g. 'accuracy', to the callbacks skorch expects
+       67          for name, cb, named_by_user in super()._yield_callbacks():
+       68              if name == "str":
+       69                  train_cb, valid_cb = self._parse_str_callback(cb)
+       70                  yield train_cb
+       71                  if self.train_split is not None:
+       72                      yield valid_cb
+       73              else:
+       74                  yield name, cb, named_by_user
+       75  
+       76      def _parse_str_callback(self, cb_supplied_name):
+       77          scoring = get_scorer(cb_supplied_name)
+       78          scoring_name = scoring._score_func.__name__
+       79          assert scoring_name.endswith(("_score", "_error", "_deviance", "_loss"))
+       80          if scoring_name.endswith("_score") or cb_supplied_name.startswith("neg_"):
+       81              lower_is_better = False
+       82          else:
+       83              lower_is_better = True
+       84          train_name = f"train_{cb_supplied_name}"
+       85          valid_name = f"valid_{cb_supplied_name}"
+       86          if self.cropped:
+       87              train_scoring = CroppedTrialEpochScoring(
+       88                  cb_supplied_name, lower_is_better, on_train=True, name=train_name
+       89              )
+       90              valid_scoring = CroppedTrialEpochScoring(
+       91                  cb_supplied_name, lower_is_better, on_train=False, name=valid_name
+       92              )
+       93          else:
+       94              train_scoring = PostEpochTrainScoring(
+       95                  cb_supplied_name, lower_is_better, name=train_name
+       96              )
+       97              valid_scoring = EpochScoring(
+       98                  cb_supplied_name, lower_is_better, on_train=False, name=valid_name
+       99              )
+      100          named_by_user = True
+      101          train_valid_callbacks = [
+      102              (train_name, train_scoring, named_by_user),
+      103              (valid_name, valid_scoring, named_by_user),
+      104          ]
+      105          return train_valid_callbacks
+      106  
+      107      def on_batch_end(self, net, *batch, training=False, **kwargs):
+      108          # If training is false, assume that our loader has indices for this
+      109          # batch
+      110          if not training:
+      111              epoch_cbs = []
+      112              for name, cb in self.callbacks_:
+      113                  if (
+      114                      isinstance(
+      115                          cb, (CroppedTrialEpochScoring, CroppedTimeSeriesEpochScoring)
+      116                      )
+      117                      and (hasattr(cb, "window_inds_"))
+      118                      and (not cb.on_train)
+      119                  ):
+      120                      epoch_cbs.append(cb)
+      121              # for trialwise decoding stuffs it might also be we don't have
+      122              # cropped loader, so no indices there
+      123              if len(epoch_cbs) > 0:
+      124                  assert self._last_window_inds_ is not None
+      125                  for cb in epoch_cbs:
+      126                      cb.window_inds_.append(self._last_window_inds_)
+      127                  self._last_window_inds_ = None
+      128  
+      129      def predict_with_window_inds_and_ys(self, dataset):
+      130          self.module.eval()
+      131          preds = []
+      132          i_window_in_trials = []
+      133          i_window_stops = []
+      134          window_ys = []
+      135          for X, y, i in self.get_iterator(dataset, drop_index=False):
+      136              i_window_in_trials.append(i[0].cpu().numpy())
+      137              i_window_stops.append(i[2].cpu().numpy())
+      138              with torch.no_grad():
+      139                  preds.append(to_numpy(self.module.forward(X.to(self.device))))
+      140              window_ys.append(y.cpu().numpy())
+      141          preds = np.concatenate(preds)
+      142          i_window_in_trials = np.concatenate(i_window_in_trials)
+      143          i_window_stops = np.concatenate(i_window_stops)
+      144          window_ys = np.concatenate(window_ys)
+      145          return dict(
+      146              preds=preds,
+      147              i_window_in_trials=i_window_in_trials,
+      148              i_window_stops=i_window_stops,
+      149              window_ys=window_ys,
+      150          )
+      151  
+      152      # Changes the default target extractor to noop
+      153      @property
+      154      def _default_callbacks(self):
+      155          return [
+      156              ("epoch_timer", EpochTimer()),
+      157              (
+      158                  "train_loss",
+      159                  BatchScoring(
+      160                      train_loss_score,
+      161                      name="train_loss",
+      162                      on_train=True,
+      163                      target_extractor=noop,
+      164                  ),
+      165              ),
+      166              (
+      167                  "valid_loss",
+      168                  BatchScoring(
+      169                      valid_loss_score,
+      170                      name="valid_loss",
+      171                      target_extractor=noop,
+      172                  ),
+      173              ),
+      174              ("print_log", PrintLog()),
+      175          ]
+      176  
+      177      @property
+      178      @abc.abstractmethod
+      179      def mode(self) -> Literal["classification", "regression"]:
+      180          pass
+      181  
+      182      def _set_signal_args(self, X, y, classes):
+      183          is_init = isinstance(self.module, torch.nn.Module)
+      184          if is_init:
+      185              self.log.info(
+      186                  "The module passed is already initialized which is not recommended. "
+      187                  "Instead, you can pass the module class and its parameters separately.\n"
+      188                  "For more details, see "
+      189                  "https://skorch.readthedocs.io/en/stable/user/neuralnet.html#module \n"
+      190                  "Skipping setting signal-related parameters from data."
+      191              )
+      192              return
+      193          if classes is None:
+      194              classes = getattr(self, "classes", None)
+      195          signal_kwargs = infer_signal_properties(X, y, mode=self.mode, classes=classes)
+      196          if not signal_kwargs:
+      197              return
+      198  
+      199          # kick out missing kwargs:
+      200          module_kwargs = dict()
+      201          module = _get_model(self.module)
+      202          all_module_kwargs = inspect.signature(module.__init__).parameters.keys()
+      203          for k, v in signal_kwargs.items():
+      204              if v is None:
+      205                  continue
+      206              if k in all_module_kwargs:
+      207                  module_kwargs[k] = v
+      208              else:
+      209                  self.log.warning(f"Module {self.module!r} is missing parameter {k!r}.")
+      210  
+      211          # kick out inferred signal kwargs if user specifies kwargs:
+      212          user_specified_kwargs = self.get_params_for("module").items()
+      213          if len(user_specified_kwargs) > 0:
+      214              self.log.info(
+      215                  f"Overriding inferred parameters with user "
+      216                  f"specified parameters{user_specified_kwargs!r}."
+      217              )
+      218              for k, v in self.get_params_for("module").items():
+      219                  if k in module_kwargs:
+      220                      module_kwargs.pop(k)
+      221                      module_kwargs[k] = v
+      222  
+      223          # save kwargs to self:
+      224          self.log.info(
+      225              f"Passing additional parameters {module_kwargs!r} "
+      226              f"to module {self.module!r}."
+      227          )
+      228          module_kwargs = {f"module__{k}": v for k, v in module_kwargs.items()}
+      229          self.set_params(**module_kwargs)
+      230  
+      231      def get_dataset(self, X, y=None):
+      232          """Get a dataset that contains the input data and is passed to.
+      233  
+      234          the iterator.
+      235  
+      236          Override this if you want to initialize your dataset
+      237          differently.
+      238  
+      239          Parameters
+      240          ----------
+      241          X : input data, compatible with skorch.dataset.Dataset
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER braindecode.classifier:EEGClassifier  stubs=0/1 ----------
+       21  class EEGClassifier(_EEGNeuralNet, NeuralNetClassifier):
+      239      @property
+      240      def mode(self):
+      241          return "classification"
+
+---------- IMPLEMENTER braindecode.regressor:EEGRegressor  stubs=0/1 ----------
+       19  class EEGRegressor(_EEGNeuralNet, NeuralNetRegressor):
+      232      @property
+      233      def mode(self):
+      234          return "regression"
+
+---------- IMPLEMENTER test.unit_tests.test_eegneuralnet:ConcreteEEGNeuralNet  stubs=1/1 ----------
+      495  class ConcreteEEGNeuralNet(_EEGNeuralNet):
+      496      @property
+      497      def mode(self):
+      498          """"""

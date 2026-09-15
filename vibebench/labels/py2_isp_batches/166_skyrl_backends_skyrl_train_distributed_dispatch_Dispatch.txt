@@ -1,0 +1,148 @@
+row 166   NovaSky-AI/SkyRL#1401
+============================================================================
+CONTRACT skyrl.backends.skyrl_train.distributed.dispatch:Dispatch   kind=abc abstract_methods=4.0 implementers=3.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file skyrl/backends/skyrl_train/distributed/dispatch.py
+       61  class Dispatch(ABC):
+       62      """Base class for dispatch types
+       63  
+       64      Dispatch types are responsible for:
+       65      - dispatching method calls to actors handling data sharding if necessary
+       66      - collecting results from actors and concatenating results if necessary
+       67      - validating arguments for dispatch
+       68      """
+       69  
+       70      @classmethod
+       71      @abstractmethod
+       72      def dispatch(cls, actor_infos: List[ActorInfo], method: str, *args, **kwargs) -> List[ObjectRef]:
+       73          """Dispatches method calls to the actors with data sharding if necessary."""
+       74          pass
+       75  
+       76      @classmethod
+       77      @abstractmethod
+       78      async def async_collect(
+       79          cls, actor_infos: List[ActorInfo], object_refs: List[ObjectRef]
+       80      ) -> Optional[TrainingOutputBatch]:
+       81          """Collects results from the actors asynchronously in an asyncio-compatible way."""
+       82          pass
+       83  
+       84      @classmethod
+       85      @abstractmethod
+       86      def sync_collect(cls, actor_infos: List[ActorInfo], object_refs: List[ObjectRef]) -> Optional[TrainingOutputBatch]:
+       87          """Collects results from the actors synchronously and returns a `TrainingOutputBatch`."""
+       88          pass
+       89  
+       90      @classmethod
+       91      @abstractmethod
+       92      def validate_dispatch_args(cls, *args, **kwargs) -> Tuple[Tuple, Dict[str, Any]]:
+       93          """Validate and process arguments for dispatch.
+       94  
+       95          Returns:
+       96              Tuple of (args, kwargs) to be passed to dispatch
+       97          """
+       98          pass
+
+---------- IMPLEMENTER skyrl.backends.skyrl_train.distributed.dispatch:MeshDispatch  stubs=0/4 ----------
+      101  class MeshDispatch(Dispatch):
+      127      @classmethod
+      128      def dispatch(cls, actor_infos: List[ActorInfo], method: str, data: TrainingInputBatch, **kwargs) -> List[ObjectRef]:
+      129          assert len(actor_infos) > 0, "actor_infos must be a non-empty list"
+      130          object_refs = []
+      131          dp_size = actor_infos[0].rank.dp_size
+      132          assert len(data) % dp_size == 0, "data batch size must be divisible by dp_size, got {} and {}".format(
+      133              len(data), dp_size
+      134          )
+      135          chunk_size = len(data) // dp_size
+      136          data_chunks: List[TrainingInputBatch] = data.chunk(chunk_size)
+      137  
+      138          # Put each unique chunk in object store ONCE to avoid redundant serialization
+      139          # when the same chunk is sent to multiple workers (e.g., SP/TP replicas)
+      140          chunk_refs: List[ObjectRef] = [ray.put(chunk) for chunk in data_chunks]
+      141  
+      142          for actor_info in actor_infos:
+      143              # Pass ObjectRef instead of data - workers will fetch from object store
+      144              chunk_ref = chunk_refs[actor_info.rank.dp]
+      145              object_refs.append(getattr(actor_info.handle, method).remote(chunk_ref, **kwargs))
+      146          return object_refs
+      148      @classmethod
+      149      async def async_collect(
+      150          cls, actor_infos: List[ActorInfo], object_refs: List[ObjectRef]
+      151      ) -> Optional[TrainingOutputBatch]:
+      152          assert len(actor_infos) == len(object_refs), "`actor_infos` and `object_refs` must have the same length"
+      153          all_objects = await asyncio.gather(*object_refs)
+      154          if len(all_objects) and all_objects[0] is not None:
+      155              return concatenate_outputs_after_mesh_dispatch(actor_infos, all_objects)
+      156          return
+      158      @classmethod
+      159      def sync_collect(cls, actor_infos: List[ActorInfo], object_refs: List[ObjectRef]) -> Optional[TrainingOutputBatch]:
+      160          assert len(actor_infos) == len(object_refs), "`actor_infos` and `object_refs` must have the same length"
+      161          all_objects = ray.get(object_refs)
+      162          if len(all_objects) and all_objects[0] is not None:
+      163              return concatenate_outputs_after_mesh_dispatch(actor_infos, all_objects)
+      164          # all should be none
+      165          assert all(obj is None for obj in all_objects), "Got a mix of `None` and non-`None` objects"
+      166          return
+      212      @classmethod
+      213      def validate_dispatch_args(cls, *args, **kwargs) -> Tuple[Tuple, Dict[str, Any]]:
+      214          # Extract data from either positional arg or kwarg
+      215          if args:
+      216              data = args[0]
+      217              remaining_kwargs = kwargs
+      218          elif "data" in kwargs:
+      219              data = kwargs.pop("data")
+      220              remaining_kwargs = kwargs
+      221          else:
+      222              raise ValueError("MeshDispatch requires 'data' as first positional argument or keyword argument")
+      223  
+      224          if not isinstance(data, TrainingInputBatch):
+      225              raise ValueError(f"For MeshDispatch, `data` entry should be a `TrainingInputBatch`, got {type(data)}")
+      226          # Pass through data as positional arg, and any other kwargs (e.g., loss_fn, loss_fn_config)
+      227          return (data,), remaining_kwargs
+
+---------- IMPLEMENTER skyrl.backends.skyrl_train.distributed.dispatch:PassThroughDispatch  stubs=0/4 ----------
+      230  class PassThroughDispatch(Dispatch):
+      237      @classmethod
+      238      def dispatch(cls, actor_infos: List[ActorInfo], method: str, *args, **kwargs) -> List[ObjectRef]:
+      239          return [getattr(actor_info.handle, method).remote(*args, **kwargs) for actor_info in actor_infos]
+      241      @classmethod
+      242      async def async_collect(
+      243          cls, actor_infos: List[ActorInfo], object_refs: List[ObjectRef]
+      244      ) -> Optional[TrainingOutputBatch]:
+      245          all_objects = await asyncio.gather(*object_refs)
+      246          if len(all_objects) and all_objects[0] is not None:
+      247              return concatenate_outputs_after_mesh_dispatch(actor_infos, all_objects)
+      248          return
+      250      @classmethod
+      251      def sync_collect(cls, actor_infos: List[ActorInfo], object_refs: List[ObjectRef]) -> Optional[TrainingOutputBatch]:
+      252          data_batches = ray.get(object_refs)
+      253          if len(data_batches) > 0 and data_batches[0] is not None:
+      254              assert isinstance(
+      255                  data_batches[0], TrainingOutputBatch
+      256              ), "data_batches must be a list of `TrainingOutputBatch` objects"
+      257              return concatenate_outputs_after_mesh_dispatch(actor_infos, data_batches)
+      258          # all should be none
+      259          assert all(obj is None for obj in data_batches), "Got a mix of `None` and non-`None` objects"
+      260          return
+      262      @classmethod
+      263      def validate_dispatch_args(cls, *args, **kwargs) -> Tuple[Tuple, Dict[str, Any]]:
+      264          # no validation needed just pass everything
+      265          return args, kwargs
+
+---------- IMPLEMENTER tests.backends.skyrl_train.distributed.test_dispatch:CustomDispatch  stubs=3/4 ----------
+      149          class CustomDispatch(Dispatch):
+      150              @classmethod
+      151              def dispatch(cls, actor_infos: List[ActorInfo], method: str, *args, **kwargs) -> List[ObjectRef]:
+      152                  pass
+      154              @classmethod
+      155              def sync_collect(
+      156                  cls, actor_infos: List[ActorInfo], object_refs: List[ObjectRef], nonblocking: bool = False
+      157              ) -> Union[List[ObjectRef], TrainingInputBatch]:
+      158                  pass
+      160              @classmethod
+      161              def async_collect(
+      162                  cls, actor_infos: List[ActorInfo], object_refs: List[ObjectRef]
+      163              ) -> Optional[TrainingInputBatch]:
+      164                  pass
+      (does not define: validate_dispatch_args; inherited or absent)

@@ -1,0 +1,369 @@
+row 136   NousResearch/atropos#169
+============================================================================
+CONTRACT atroposlib.envs.base:BaseEnv   kind=abc abstract_methods=2.0 implementers=66.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file atroposlib/envs/base.py
+      167  class BaseEnv(ABC):
+      168  
+      169      name: Optional[str] = None
+      170      env_config_cls: BaseEnvConfig = BaseEnvConfig
+      171      server_cls: APIServer = APIServer
+      172  
+      173      def __init__(
+      174          self,
+      175          config: BaseEnvConfig,
+      176          server_configs: Union[ServerBaseline, List[APIServerConfig]],
+      177          slurm=False,
+      178          testing=False,
+      179      ):
+      180          self.items_sent_this_step = 0
+      181          self.eval_runner = None  # type: Optional[asyncio.Task]
+      182          self.workers_added_list = list()
+      183          self.succeeded_task_duration = list()
+      184          self.failed_task_duration = list()
+      185          self.task_duration = list()
+      186          self.mainloop_timings = list()
+      187          self.task_successful = list()
+      188          self.last_loop_time = None
+      189          self.last_completed_item = None
+      190          self.config = config
+      191          self.server = ServerManager(
+      192              server_configs, slurm=slurm, testing=testing, server_class=self.server_cls
+      193          )
+      194          self.workers = set()
+      195          self.eval_workers = set()
+      196          self.backlog = []
+      197          self.rollouts_for_wandb = []
+      198          self.running_items: dict[UUID, Item] = dict()
+      199          self.wandb_project = None
+      200          self.wandb_group = None
+      201          self.curr_step = 0
+      202          self.max_token_len = -1
+      203          self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
+      204          self.completion_lengths = []
+      205          self.max_num_workers = config.max_num_workers
+      206          if self.max_num_workers == -1:
+      207              self.max_num_workers = config.max_num_workers_per_node * len(
+      208                  self.server.servers
+      209              )
+      210          self.wandb_prepend = None
+      211          self.checkpoint_dir = ""
+      212          self.checkpoint_interval = -1
+      213          if self.config.data_path_to_save_groups is not None:
+      214  
+      215              Path(self.config.data_path_to_save_groups).parent.mkdir(
+      216                  parents=True, exist_ok=True
+      217              )
+      218              # Find a suitable filename by appending _1, _2, etc. if the file already exists
+      219              original_path = self.config.data_path_to_save_groups
+      220              counter = 1
+      221              path_changed = False
+      222              while os.path.exists(self.config.data_path_to_save_groups):
+      223                  path_obj = Path(original_path)
+      224                  self.config.data_path_to_save_groups = str(
+      225                      path_obj.with_stem(f"{path_obj.stem}_{counter}")
+      226                  )
+      227                  counter += 1
+      228                  path_changed = True
+      229              if path_changed:
+      230                  print(
+      231                      f"Changed data path to {self.config.data_path_to_save_groups} because {original_path} already exists."  # noqa: E501
+      232                  )
+      233  
+      234              self.jsonl_writer = jsonlines.open(
+      235                  self.config.data_path_to_save_groups, "w"
+      236              )  # type: jsonlines.Writer
+      237          else:
+      238              self.jsonl_writer = None
+      239  
+      240      @classmethod
+      241      def config_init(
+      242          cls,
+      243      ) -> Tuple[BaseEnvConfig, Union[ServerBaseline, List[APIServerConfig]]]:
+      244          """
+      245          Initialize the config
+      246          """
+      247          return cls.env_config_cls(), ServerBaseline()
+      248  
+      249      async def collect_trajectory(
+      250          self, item: Item
+      251      ) -> Tuple[Optional[Union[ScoredDataItem, Any]], List[Item]]:
+      252          raise NotImplementedError(
+      253              "Handle env single method must be implemented in subclass "
+      254          )
+      255  
+      256      async def collect_trajectories(self, item: Item) -> Tuple[
+      257          Union[
+      258              Optional[ScoredDataGroup], List[Optional[ScoredDataGroup]], List[Any | None]
+      259          ],
+      260          List[Item],
+      261      ]:
+      262          """
+      263  
+      264          :param item:
+      265          :return:
+      266          """
+      267          tasks = []
+      268          for _ in range(self.config.group_size):
+      269              tasks.append(self.collect_trajectory(item))
+      270          results = await asyncio.gather(*tasks)
+      271          if any(not isinstance(result[0], dict) for result in results):
+      272              logging.error("something wasn't a ScoredDataItem")
+      273              raise ValueError(
+      274                  "collect_trajectory must return a ScoredDataItem or None to use the default "
+      275                  "collect_trajectories method"
+      276              )
+      277          backlog = []
+      278          to_postprocess = ScoredDataGroup()
+      279          to_postprocess["tokens"] = []
+      280          to_postprocess["masks"] = []
+      281          to_postprocess["scores"] = []
+      282          to_postprocess["advantages"] = []
+      283          to_postprocess["ref_logprobs"] = []
+      284          to_postprocess["messages"] = []
+      285          to_postprocess["group_overrides"] = {}
+      286          to_postprocess["overrides"] = []
+      287          to_postprocess["images"] = []
+      288          print("Processing results")
+      289          for result in results:
+      290              to_postprocess["tokens"].append(result[0]["tokens"])
+      291              to_postprocess["masks"].append(result[0]["masks"])
+      292              to_postprocess["scores"].append(result[0]["scores"])
+      293              if result[0].get("advantages", None) is not None:
+      294                  to_postprocess["advantages"].append(result[0]["advantages"])
+      295              if result[0].get("ref_logprobs", None) is not None:
+      296                  to_postprocess["ref_logprobs"].append(result[0]["ref_logprobs"])
+      297              if result[0].get("messages", None) is not None:
+      298                  to_postprocess["messages"].append(result[0]["messages"])
+      299              if result[0].get("group_overrides", None) is not None:
+      300                  to_postprocess["group_overrides"].update(result[0]["group_overrides"])
+      301              if result[0].get("overrides", None) is not None:
+      302                  to_postprocess["overrides"].append(result[0]["overrides"])
+      303              if result[0].get("images", None) is not None:
+      304                  to_postprocess["images"].append(result[0]["images"])
+      305              backlog.extend(result[1])
+      306          return to_postprocess, backlog
+      307  
+      308      async def postprocess_histories(
+      309          self,
+      310          trajectories: Union[Optional[ScoredDataGroup], List[Optional[ScoredDataGroup]]],
+      311      ) -> Union[Optional[ScoredDataGroup], List[Optional[ScoredDataGroup]]]:
+      312          """
+      313          Postprocess the histories, this is called after the collect_trajectories method
+      314  
+      315          If you don't need to do anything to the trajectories, you may safely ignore this.
+      316  
+      317          :param trajectories:
+      318          :return:
+      319          """
+      320          return trajectories
+      321  
+      322      @abstractmethod
+      323      async def get_next_item(self) -> Item:
+      324          """
+      325          Get the next items to be rolled out
+      326          """
+      327          raise NotImplementedError(
+      328              "Get_next_items method must be implemented in subclass "
+      329          )
+      330  
+      331      @abstractmethod
+      332      async def evaluate(self, *args, **kwargs):
+      333          """
+      334          Evaluate the environment, this is called every steps_per_eval steps
+      335  
+      336          Included here is an example on how to use eval workers to run a task.
+      337  
+      338          You may however do whatever you want in this method.
+      339  
+      340          :param args:
+      341          :param kwargs:
+      342          :return: None.
+      343          """
+      344          for data in ["my", "eval", "data"]:
+      345              while len(self.eval_workers) >= self.config.max_eval_workers:
+      346                  await asyncio.sleep(0.1)
+      347              worker = asyncio.create_task(asyncio.sleep(0.1))
+      348              self.eval_workers.add(worker)
+      349              worker.add_done_callback(self.eval_workers.discard)
+      350          raise NotImplementedError("Evaluate method must be implemented in subclass ")
+      351  
+      352      def load_checkpoint(self):
+      353          # check if file exists...
+      354          ckpt_path = os.path.join(
+      355              self.checkpoint_dir,
+      356              "env_checkpoints",
+      357              self.wandb_prepend,
+      358              f"step-{self.curr_step}.json",
+      359          )
+      360          if os.path.exists(ckpt_path):
+      361              with open(ckpt_path, "r") as f:
+      362                  data = json.load(f)
+      363              # now load the data
+      364              for key in data:
+      365                  setattr(self, key, data[key])
+      366  
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER environments.code_execution_server.coding_server:CodingEnv  stubs=0/2 ----------
+       81  class CodingEnv(BaseEnv):
+      116      async def evaluate(self, *args, **kwargs):
+      117          """
+      118          Evaluate the environment, this is called every steps_per_eval steps
+      119  
+      120          Included here is an example on how to use eval workers to run a task.
+      121  
+      122          You may however do whatever you want in this method.
+      123  
+      124          :param args:
+      125          :param kwargs:
+      126          :return: None.
+      127          """
+      128          return
+      136      async def get_next_item(self) -> Item:
+      137          """
+      138          Get the next items to be rolled out
+      139          """
+      140          next_item = self.train[self.iter % len(self.train)]
+      141          self.iter += 1
+      142          prompt = tuple(
+      143              [frozenset({"role": "user", "content": next_item["description"]}.items())]
+      144          )
+      145          answer = (
+      146              tuple(next_item["private_tests"]["input"]),
+      147              tuple(next_item["private_tests"]["output"]),
+      148              tuple(next_item["generated_tests"]["input"]),
+      149              tuple(next_item["generated_tests"]["output"]),
+      150          )
+      151          return (prompt, answer)
+
+---------- IMPLEMENTER environments.community.accessibility_env.accessibility_env:AccessibilityEnv  stubs=0/2 ----------
+       32  class AccessibilityEnv(BaseEnv):
+      149      async def get_next_item(self) -> Optional[Item]:
+      150          if self.iter >= len(self.dataset):
+      151              if self.iter >= self.config.total_steps:
+      152                  return None
+      153  
+      154              print(f"[{self.name}] Reached end of dataset or total_steps.")
+      155              return None
+      156  
+      157          item_data = self.dataset[self.iter]
+      158          self.iter += 1
+      159  
+      160          return item_data
+      348      async def evaluate(
+      349          self,
+      350      ):
+      351          print(f"[{self.name}] Evaluate method called (placeholder).")
+      352          # Implement evaluation logic if you have a separate test set and metrics
+      353          pass
+
+---------- IMPLEMENTER environments.community.cat_behavior_env.cat_server:GSM8kEnv  stubs=0/2 ----------
+       84  class GSM8kEnv(BaseEnv):
+      219      async def evaluate(self, *args, **kwargs):
+      220          eval_tasks = []
+      221          for item in self.test:
+      222              eval_tasks.append(self.rollout_and_score_eval(item["scenario"]))
+      223          scores = await tqdm_asyncio.gather(*eval_tasks)
+      224          self.eval_metrics.append(("eval/percent_correct", sum(scores) / len(scores)))
+      461      async def get_next_item(self) -> CatRow:
+      462          next_item = self.train[self.iter % len(self.train)]
+      463          self.iter += 1
+      464          print(f"iteration: {self.iter}")
+      465          return next_item
+
+---------- IMPLEMENTER environments.community.cat_behavior_env.catbot_arena:GSM8kEnv  stubs=0/2 ----------
+       39  class GSM8kEnv(BaseEnv):
+      161      async def evaluate(self, *args, **kwargs):
+      162          eval_tasks = []
+      163          for item in self.test:
+      164              eval_tasks.append(
+      165                  self.rollout_and_score_eval(item["question"], item["gold_answer"])
+      166              )
+      167          scores = await tqdm_asyncio.gather(*eval_tasks)
+      168          self.eval_metrics.append(("eval/percent_correct", sum(scores) / len(scores)))
+      295      async def get_next_item(self) -> GSM8kRow:
+      296          next_item = self.train[self.iter % len(self.train)]
+      297          self.iter += 1
+      298          return next_item
+
+---------- IMPLEMENTER environments.community.conversational_style_dpo.conversational_style_dpo_env:ConversationalStyleDPOEnv  stubs=0/2 ----------
+       31  class ConversationalStyleDPOEnv(BaseEnv):
+      102      async def get_next_item(self) -> Item:
+      103          """
+      104          Returns the next item from the dataset.
+      105          For DPO, an "item" will be a tuple of (prompt, chosen_response, rejected_response).
+      106          The BaseEnv expects (prompt_tuple, gold_answer, optional_extra_data),
+      107          so we'll adapt our DPO item to this structure.
+      108          The prompt_tuple will be the actual prompt.
+      109          The gold_answer will be the chosen response.
+      110          The optional_extra_data will be the rejected response.
+      111          """
+      112          if not self.dataset or self.iter >= len(self.dataset):
+      113              await self.setup()  # Re-setup if dataset is exhausted or not loaded
+      114  
+      115          if not self.dataset:  # Still no dataset after setup
+      116              logger.error("Dataset is empty even after setup.")
+      117              # Return a fallback item or raise an error
+      118              # For now, let's create a dummy item to avoid crashing, but this should be handled
+      119              fallback_prompt = tuple(
+      120                  [frozenset({"role": "user", "content": "Fallback prompt"}.items())]
+      121              )
+      122              return (fallback_prompt, "Fallback chosen", "Fallback rejected")
+      123  
+      124          entry = self.dataset[self.iter % len(self.dataset)]
+      125          self.iter += 1
+      126  
+      127          # For DPO, the direct strings are often more useful for tokenization with tokenize_for_trainer_dpo
+      128  
+      129          # We will pass the raw strings to collect_trajectories and handle tokenization there.
+      130          # For Item, we can simplify or adjust based on how BaseEnv uses it.
+      131          # Let's pass the prompt string directly as the first element of the "prompt_tuple".
+      132          # The "gold_answer" will be the chosen response, and "extra_data" the rejected one.
+      133  
+      134          # Adapting to Item: Tuple[prompt_tuple, gold_answer_str, any_extra_data]
+      135          # prompt_tuple: Tuple[FrozenSet[Tuple[str, str]], ...]
+      136          # For DPO, the core elements are prompt, chosen, rejected. We'll pass them directly.
+      137          return (entry["prompt"], entry["chosen"], entry["rejected"])
+      289      async def evaluate(self, *args, **kwargs):
+      290          """
+      291          Evaluation for DPO might involve comparing the DPO-trained model's preferences
+      292          against a held-out set of preferred/rejected pairs or other metrics.
+      293          For this basic environment, we'll skip custom evaluation.
+      294          """
+      295          logger.info(
+      296              "Evaluation step called. No custom DPO evaluation implemented in this basic environment."
+      297          )
+      298          # You could load a separate test set of (prompt, chosen, rejected)
+      299          # and see if the model assigns higher logprobs to chosen than rejected.
+      300          return None
+
+---------- IMPLEMENTER environments.community.conversational_style_dpo.gsmk8k_conversational_style_dpo_env:GSM8KConversationalStyleDPOEnv  stubs=0/2 ----------
+       90  class GSM8KConversationalStyleDPOEnv(BaseEnv):
+      250      async def get_next_item(self) -> Item:
+      251          """
+      252          Returns the next prompt from the dataset.
+      253          Chosen and rejected responses will be generated dynamically.
+      254          """
+      255          if not self.prompt_dataset or self.iter >= len(self.prompt_dataset):
+      256              await self.setup()  # This will now potentially call the LLM to generate prompts
+      257  
+      258          if not self.prompt_dataset:  # Should be populated by setup, even with fallback
+      259              logger.error(
+      260                  f"Prompt dataset is STILL empty after setup in {self.name}. This is unexpected."
+      261              )
+      262              # Provide an absolute failsafe prompt
+      263              return ("Failsafe prompt: What is 1+1?", "", "")
+      264  
+      265          entry = self.prompt_dataset[self.iter % len(self.prompt_dataset)]
+      266          self.iter += 1
+      267          return (entry["prompt"], "", "")
+      406      async def evaluate(self, *args, **kwargs):
+      407          logger.info(
+      408              f"Evaluation step called for {self.name}. No custom DPO evaluation implemented."
+      409          )
+      410          return None
+
+(60 further implementers not shown)

@@ -194,13 +194,75 @@ check("ISP contracts flagged as fat", f"{int(_ifc['flagged'].fillna(False).astyp
 check("ISP implementer relationships with a forced stub",
       f"{int(_imp['forced_stub'].fillna(False).astype(bool).sum()):,}")
 
+# --------------------------------------------------- the Python replication
+# Added 2026-09-14 when the thesis became a two-language study. Every value is
+# recomputed from the Python V2 parquets and py2_ label CSVs, never typed in.
+print("\n-- the Python replication (Section 4.9) --")
+_ppr = pd.read_parquet(C.CORPUS_DIR / "py_pr_results.parquet")
+_pok = _ppr[_ppr.status == "ok"]
+check("Python curated pull requests", f"{len(_ppr):,}")
+check("Python analysable pull requests", f"{len(_pok):,}")
+check("Python analysable repositories", f"{_pok.full_name.nunique():,}")
+_pgold = pd.read_parquet(C.CORPUS_DIR / "gold_set.parquet")
+check("Python curated repositories", f"{_pgold.full_name.nunique():,}")
+
+_T = lambda s: s.astype(str).str.strip().str.lower().isin(["true", "1", "1.0"])  # noqa: E731
+import json as _json  # noqa: E402
+for p, col in PRED.items():
+    d = pd.read_csv(C.LABELS_DIR / f"py2_{p}_labeling_sample.csv")
+    pop = _json.loads((C.LABELS_DIR / f"py2_{p}_labeling_sample.population.json")
+                      .read_text(encoding="utf-8"))["population"]
+    f, lab = _T(d[col]), _T(d[f"llm_{p}_risk"])
+    tp, fn = int((f & lab).sum()), int((~f & lab).sum())
+    nf, nu = int(f.sum()), int((~f).sum())
+    est_tp, est_fn = tp * pop["True"] / max(nf, 1), fn * pop["False"] / max(nu, 1)
+    check(f"Python {p.upper()} precision", f"{tp / max(nf, 1):.3f}")
+    check(f"Python {p.upper()} weighted recall", f"{est_tp / max(est_tp + est_fn, 1e-9):.3f}")
+_isp_pop = _json.loads((C.LABELS_DIR / "py2_isp_labeling_sample.population.json")
+                       .read_text(encoding="utf-8"))["population"]["True"]
+check("Python ISP census size", f"all {_isp_pop} flagged contracts")
+
+_pl = pd.read_parquet(C.CORPUS_DIR / "lsp_results.parquet")
+_pl = _pl[_pl.pr_id.isin(_pok.pr_id)]
+_rb = _pl.signals.fillna("").str.contains("refused_bequest") & _pl.violation.fillna(False).astype(bool)
+_rb_present = _pl[_rb].drop_duplicates(["full_name", "module", "qualname", "base_id", "method"]).shape[0]
+check("Python refused-bequest relationships present", f"{_rb_present} refused-bequest")
+_rb_intro = int(_pok[_pok.lsp_risk.fillna(False).astype(bool)]
+                .lsp_risk_reasons.fillna("").str.contains("refused_bequest").sum())
+_words = {5: "five"}
+check("Python pull requests introducing a refused bequest",
+      f"{_words.get(_rb_intro, _rb_intro)} pull requests introduced one")
+
+_d = pd.read_csv(C.LABELS_DIR / "py2_lsp_labeling_sample.csv")
+_fl = _d[_T(_d.violation)]
+_tpr = _fl[_T(_fl.llm_lsp_risk)]
+_blocked = _tpr.signals.fillna("").str.contains("param_removed|param_required_added|param_type_narrowed")
+check("Python LSP true positives resting on javac-rejectable signals",
+      f"{int(_blocked.sum())} of the {len(_tpr)}")
+
+_man = pd.read_parquet(C.CORPUS_DIR / "clone_manifest.parquet")
+_per = _man.groupby("pr_id").extract_status.agg(
+    lambda s: "usable" if (s == "ok").any()
+    else ("loss" if set(s) & {"fetch_failed", "diff_failed", "file_missing"} else "oos"))
+_loss = int((_per == "loss").sum())
+check("Python retrieval loss", f"{_loss} Python pull requests ({100 * _loss / len(_per):.1f}")
+
+_mlog = Path("logs_archive/py2_model.txt").read_text(encoding="utf-8")
+_ocp_block = _mlog.split("OCP   n =")[1]
+_cc = re.search(r"agent\[T\.Claude_Code\]\s+(\S+)\s+\[\s*(\S+),\s*(\S+)\]", _ocp_block)
+check("Python OCP Claude Code odds ratio",
+      f"{float(_cc.group(1)):.2f} ({float(_cc.group(2)):.2f}--{float(_cc.group(3)):.2f})")
+
 # ------------------------------------------------------- forbidden text
 print("\n-- residue from the superseded study --")
 # Bare numbers are matched on a DIGIT BOUNDARY, so a V1 figure like 546 is not
 # reported when it appears inside a genuine V2 one such as 1{,}546.
+# The thesis became a two-language study on 2026-09-14, so "Python corpus",
+# "Python pull request" and "2,921" (now the Python V2 repository count, a
+# coincidence with a V1 figure) left this list. What remains is unique to the
+# superseded study and must never reappear.
 STALE = ["546", "867", "147 repositories", "27 repositories", "0.455", "0.679",
-         "13/13", "five agents", "30,984", "2,921", "6,618",
-         "Python pull request", "Python corpus", "TypeScript", "JavaScript"]
+         "13/13", "five agents", "30,984", "6,618", "TypeScript", "JavaScript"]
 
 found = [t for t in STALE if stale_present(t)]
 if found:

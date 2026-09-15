@@ -1,0 +1,2356 @@
+row 17   hummingbot/hummingbot#8140
+============================================================================
+CONTRACT hummingbot.connector.exchange_py_base:ExchangePyBase   kind=abc abstract_methods=29.0 implementers=36.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file hummingbot/connector/exchange_py_base.py
+       37  class ExchangePyBase(ExchangeBase, ABC):
+       38      _logger = None
+       39  
+       40      SHORT_POLL_INTERVAL = 5.0
+       41      LONG_POLL_INTERVAL = 120.0
+       42      TRADING_RULES_INTERVAL = 30 * MINUTE
+       43      TRADING_FEES_INTERVAL = TWELVE_HOURS
+       44      TICK_INTERVAL_LIMIT = 60.0
+       45  
+       46      def __init__(self,
+       47                   balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+       48                   rate_limits_share_pct: Decimal = Decimal("100")):
+       49          super().__init__(balance_asset_limit)
+       50  
+       51          self._last_poll_timestamp = 0
+       52          self._last_timestamp = 0
+       53          self._trading_rules = {}
+       54          self._trading_fees = {}
+       55  
+       56          self._status_polling_task: Optional[asyncio.Task] = None
+       57          self._user_stream_tracker_task: Optional[asyncio.Task] = None
+       58          self._user_stream_event_listener_task: Optional[asyncio.Task] = None
+       59          self._trading_rules_polling_task: Optional[asyncio.Task] = None
+       60          self._trading_fees_polling_task: Optional[asyncio.Task] = None
+       61          self._lost_orders_update_task: Optional[asyncio.Task] = None
+       62  
+       63          self._time_synchronizer = TimeSynchronizer()
+       64          self._throttler = AsyncThrottler(
+       65              rate_limits=self.rate_limits_rules,
+       66              limits_share_percentage=rate_limits_share_pct)
+       67          self._poll_notifier = asyncio.Event()
+       68  
+       69          # init Auth and Api factory
+       70          self._auth: AuthBase = self.authenticator
+       71          self._web_assistants_factory: WebAssistantsFactory = self._create_web_assistants_factory()
+       72  
+       73          # init OrderBook Data Source and Tracker
+       74          self._orderbook_ds: OrderBookTrackerDataSource = self._create_order_book_data_source()
+       75          self._set_order_book_tracker(OrderBookTracker(
+       76              data_source=self._orderbook_ds,
+       77              trading_pairs=self.trading_pairs,
+       78              domain=self.domain))
+       79  
+       80          # init UserStream Data Source and Tracker
+       81          self._user_stream_tracker = self._create_user_stream_tracker()
+       82  
+       83          self._order_tracker: ClientOrderTracker = self._create_order_tracker()
+       84  
+       85      @classmethod
+       86      def logger(cls) -> HummingbotLogger:
+       87          if cls._logger is None:
+       88              cls._logger = logging.getLogger(HummingbotLogger.logger_name_for_class(cls))
+       89          return cls._logger
+       90  
+       91      @property
+       92      @abstractmethod
+       93      def name(self) -> str:
+       94          raise NotImplementedError
+       95  
+       96      @property
+       97      @abstractmethod
+       98      def authenticator(self) -> AuthBase:
+       99          raise NotImplementedError
+      100  
+      101      @property
+      102      @abstractmethod
+      103      def rate_limits_rules(self) -> List[RateLimit]:
+      104          raise NotImplementedError
+      105  
+      106      @property
+      107      @abstractmethod
+      108      def domain(self) -> str:
+      109          raise NotImplementedError
+      110  
+      111      @property
+      112      @abstractmethod
+      113      def client_order_id_max_length(self) -> int:
+      114          raise NotImplementedError
+      115  
+      116      @property
+      117      @abstractmethod
+      118      def client_order_id_prefix(self) -> str:
+      119          raise NotImplementedError
+      120  
+      121      @property
+      122      @abstractmethod
+      123      def trading_rules_request_path(self) -> str:
+      124          raise NotImplementedError
+      125  
+      126      @property
+      127      @abstractmethod
+      128      def trading_pairs_request_path(self) -> str:
+      129          raise NotImplementedError
+      130  
+      131      @property
+      132      @abstractmethod
+      133      def check_network_request_path(self) -> str:
+      134          raise NotImplementedError
+      135  
+      136      @property
+      137      @abstractmethod
+      138      def trading_pairs(self) -> List[str]:
+      139          raise NotImplementedError
+      140  
+      141      @property
+      142      @abstractmethod
+      143      def is_cancel_request_in_exchange_synchronous(self) -> bool:
+      144          raise NotImplementedError
+      145  
+      146      @property
+      147      @abstractmethod
+      148      def is_trading_required(self) -> bool:
+      149          raise NotImplementedError
+      150  
+      151      @property
+      152      def order_books(self) -> Dict[str, OrderBook]:
+      153          return self.order_book_tracker.order_books
+      154  
+      155      @property
+      156      def in_flight_orders(self) -> Dict[str, InFlightOrder]:
+      157          return self._order_tracker.active_orders
+      158  
+      159      @property
+      160      def trading_rules(self) -> Dict[str, TradingRule]:
+      161          return self._trading_rules
+      162  
+      163      @property
+      164      def limit_orders(self) -> List[LimitOrder]:
+      165          return [in_flight_order.to_limit_order() for in_flight_order in self.in_flight_orders.values()]
+      166  
+      167      @property
+      168      def status_dict(self) -> Dict[str, bool]:
+      169          return {
+      170              "symbols_mapping_initialized": self.trading_pair_symbol_map_ready(),
+      171              "order_books_initialized": self.order_book_tracker.ready,
+      172              "account_balance": not self.is_trading_required or len(self._account_balances) > 0,
+      173              "trading_rule_initialized": len(self._trading_rules) > 0 if self.is_trading_required else True,
+      174              "user_stream_initialized": self._is_user_stream_initialized(),
+      175          }
+      176  
+      177      @property
+      178      def ready(self) -> bool:
+      179          """
+      180          Returns True if the connector is ready to operate (all connections established with the exchange). If it is
+      181          not ready it returns False.
+      182          """
+      183          return all(self.status_dict.values())
+      184  
+      185      @property
+      186      def name_cap(self) -> str:
+      187          return self.name.capitalize()
+      188  
+      189      @property
+      190      def tracking_states(self) -> Dict[str, any]:
+      191          """
+      192          Returns a dictionary associating current active orders client id to their JSON representation
+      193          """
+      194          return {key: value.to_json() for key, value in self._order_tracker.all_updatable_orders.items()}
+      195  
+      196      @abstractmethod
+      197      def supported_order_types(self) -> List[OrderType]:
+      198          raise NotImplementedError
+      199  
+      200      @abstractmethod
+      201      def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
+      202          raise NotImplementedError
+      203  
+      204      @abstractmethod
+      205      def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+      206          raise NotImplementedError
+      207  
+      208      @abstractmethod
+      209      def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+      210          raise NotImplementedError
+      211  
+      212      # === Price logic ===
+      213  
+      214      def get_order_price_quantum(self, trading_pair: str, price: Decimal) -> Decimal:
+      215          """
+      216          Used by quantize_order_price() in _create_order()
+      217          Returns a price step, a minimum price increment for a given trading pair.
+      218  
+      219          :param trading_pair: the trading pair to check for market conditions
+      220          :param price: the starting point price
+      221          """
+      222          trading_rule = self._trading_rules[trading_pair]
+      223          return Decimal(trading_rule.min_price_increment)
+      224  
+      225      def get_order_size_quantum(self, trading_pair: str, order_size: Decimal) -> Decimal:
+      226          """
+      227          Used by quantize_order_price() in _create_order()
+      228          Returns an order amount step, a minimum amount increment for a given trading pair.
+      229  
+      230          :param trading_pair: the trading pair to check for market conditions
+      231          :param order_size: the starting point order price
+      232          """
+      233          trading_rule = self._trading_rules[trading_pair]
+      234          return Decimal(trading_rule.min_base_amount_increment)
+      235  
+      236      def get_order_book(self, trading_pair: str) -> OrderBook:
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER hummingbot.connector.derivative.binance_perpetual.binance_perpetual_derivative:BinancePerpetualDerivative  stubs=1/29 ----------
+       38  class BinancePerpetualDerivative(PerpetualDerivativePyBase):
+       63      @property
+       64      def name(self) -> str:
+       65          return CONSTANTS.EXCHANGE_NAME
+       67      @property
+       68      def authenticator(self) -> BinancePerpetualAuth:
+       69          return BinancePerpetualAuth(self.binance_perpetual_api_key, self.binance_perpetual_secret_key,
+       70                                      self._time_synchronizer)
+       72      @property
+       73      def rate_limits_rules(self) -> List[RateLimit]:
+       74          return CONSTANTS.RATE_LIMITS
+       76      @property
+       77      def domain(self) -> str:
+       78          return self._domain
+       80      @property
+       81      def client_order_id_max_length(self) -> int:
+       82          return CONSTANTS.MAX_ORDER_ID_LEN
+       84      @property
+       85      def client_order_id_prefix(self) -> str:
+       86          return CONSTANTS.BROKER_ID
+       88      @property
+       89      def trading_rules_request_path(self) -> str:
+       90          return CONSTANTS.EXCHANGE_INFO_URL
+       92      @property
+       93      def trading_pairs_request_path(self) -> str:
+       94          return CONSTANTS.EXCHANGE_INFO_URL
+       96      @property
+       97      def check_network_request_path(self) -> str:
+       98          return CONSTANTS.PING_URL
+      100      @property
+      101      def trading_pairs(self):
+      102          return self._trading_pairs
+      104      @property
+      105      def is_cancel_request_in_exchange_synchronous(self) -> bool:
+      106          return True
+      108      @property
+      109      def is_trading_required(self) -> bool:
+      110          return self._trading_required
+      116      def supported_order_types(self) -> List[OrderType]:
+      117          """
+      118          :return a list of OrderType supported by this connector
+      119          """
+      120          return [OrderType.LIMIT, OrderType.MARKET, OrderType.LIMIT_MAKER]
+      136      def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
+      137          error_description = str(request_exception)
+      138          is_time_synchronizer_related = ("-1021" in error_description
+      139                                          and "Timestamp for this request" in error_description)
+      140          return is_time_synchronizer_related
+      142      def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+      143          return str(CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE) in str(
+      144              status_update_exception
+      145          ) and CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
+      147      def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+      148          return str(CONSTANTS.UNKNOWN_ORDER_ERROR_CODE) in str(
+      149              cancelation_exception
+      150          ) and CONSTANTS.UNKNOWN_ORDER_MESSAGE in str(cancelation_exception)
+      152      def _create_web_assistants_factory(self) -> WebAssistantsFactory:
+      153          return web_utils.build_api_factory(
+      154              throttler=self._throttler,
+      155              time_synchronizer=self._time_synchronizer,
+      156              domain=self._domain,
+      157              auth=self._auth)
+      159      def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
+      160          return BinancePerpetualAPIOrderBookDataSource(
+      161              trading_pairs=self._trading_pairs,
+      162              connector=self,
+      163              api_factory=self._web_assistants_factory,
+      164              domain=self.domain,
+      165          )
+      167      def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
+      168          return BinancePerpetualUserStreamDataSource(
+      169              auth=self._auth,
+      170              connector=self,
+      171              api_factory=self._web_assistants_factory,
+      172              domain=self.domain,
+      173          )
+      175      def _get_fee(self,
+      176                   base_currency: str,
+      177                   quote_currency: str,
+      178                   order_type: OrderType,
+      179                   order_side: TradeType,
+      180                   position_action: PositionAction,
+      181                   amount: Decimal,
+      182                   price: Decimal = s_decimal_NaN,
+      183                   is_maker: Optional[bool] = None) -> TradeFeeBase:
+      184          is_maker = is_maker or False
+      185          fee = build_trade_fee(
+      186              self.name,
+      187              is_maker,
+      188              base_currency=base_currency,
+      189              quote_currency=quote_currency,
+      190              order_type=order_type,
+      191              order_side=order_side,
+      192              amount=amount,
+      193              price=price,
+      194          )
+      195          return fee
+      197      async def _update_trading_fees(self):
+      198          """
+      199          Update fees information from the exchange
+      200          """
+      201          pass
+      211      async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
+      212          symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
+      213          api_params = {
+      214              "origClientOrderId": order_id,
+      215              "symbol": symbol,
+      216          }
+      217          cancel_result = await self._api_delete(
+      218              path_url=CONSTANTS.ORDER_URL,
+      219              params=api_params,
+      220              is_auth_required=True)
+      221          if cancel_result.get("code") == -2011 and "Unknown order sent." == cancel_result.get("msg", ""):
+      222              self.logger().debug(f"The order {order_id} does not exist on Binance Perpetuals. "
+      223                                  f"No cancelation needed.")
+      224              await self._order_tracker.process_order_not_found(order_id)
+      225              raise IOError(f"{cancel_result.get('code')} - {cancel_result['msg']}")
+      226          if cancel_result.get("status") == "CANCELED":
+      227              return True
+      228          return False
+      230      async def _place_order(
+      231              self,
+      232              order_id: str,
+      233              trading_pair: str,
+      234              amount: Decimal,
+      235              trade_type: TradeType,
+      236              order_type: OrderType,
+      237              price: Decimal,
+      238              position_action: PositionAction = PositionAction.NIL,
+      239              **kwargs,
+      240      ) -> Tuple[str, float]:
+      241  
+      242          amount_str = f"{amount:f}"
+      243          price_str = f"{price:f}"
+      244          symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+      245          api_params = {"symbol": symbol,
+      246                        "side": "BUY" if trade_type is TradeType.BUY else "SELL",
+      247                        "quantity": amount_str,
+      248                        "type": "MARKET" if order_type is OrderType.MARKET else "LIMIT",
+      249                        "newClientOrderId": order_id
+      250                        }
+      251          if order_type.is_limit_type():
+      252              api_params["price"] = price_str
+      253          if order_type == OrderType.LIMIT:
+      254              api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
+      255          if order_type == OrderType.LIMIT_MAKER:
+      256              api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTX
+      257          if self.position_mode == PositionMode.HEDGE:
+      258              if position_action == PositionAction.OPEN:
+      259                  api_params["positionSide"] = "LONG" if trade_type is TradeType.BUY else "SHORT"
+      260              else:
+      261                  api_params["positionSide"] = "SHORT" if trade_type is TradeType.BUY else "LONG"
+      262          try:
+      263              order_result = await self._api_post(
+      264                  path_url=CONSTANTS.ORDER_URL,
+      265                  data=api_params,
+      266                  is_auth_required=True)
+      267              o_id = str(order_result["orderId"])
+      268              transact_time = order_result["updateTime"] * 1e-3
+      269          except IOError as e:
+      270              error_description = str(e)
+      271              is_server_overloaded = ("status is 503" in error_description
+      272                                      and "Unknown error, please check your request or try again later." in error_description)
+      273              if is_server_overloaded:
+      274                  o_id = "UNKNOWN"
+      275                  transact_time = time.time()
+      276              else:
+      277                  raise
+      278          return o_id, transact_time
+      280      async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+      281          trade_updates = []
+      282          try:
+      283              exchange_order_id = await order.get_exchange_order_id()
+      284              trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
+      285              all_fills_response = await self._api_get(
+      286                  path_url=CONSTANTS.ACCOUNT_TRADE_LIST_URL,
+      287                  params={
+      288                      "symbol": trading_pair,
+      289                  },
+      290                  is_auth_required=True)
+      291  
+      292              for trade in all_fills_response:
+      293                  order_id = str(trade.get("orderId"))
+      294                  if order_id == exchange_order_id:
+      295                      position_side = trade["positionSide"]
+      296                      position_action = (PositionAction.OPEN
+      297                                         if (order.trade_type is TradeType.BUY and position_side == "LONG"
+      298                                             or order.trade_type is TradeType.SELL and position_side == "SHORT")
+      299                                         else PositionAction.CLOSE)
+      300                      fee = TradeFeeBase.new_perpetual_fee(
+      301                          fee_schema=self.trade_fee_schema(),
+      302                          position_action=position_action,
+      303                          percent_token=trade["commissionAsset"],
+      304                          flat_fees=[TokenAmount(amount=Decimal(trade["commission"]), token=trade["commissionAsset"])]
+      305                      )
+      306                      trade_update: TradeUpdate = TradeUpdate(
+      307                          trade_id=str(trade["id"]),
+      308                          client_order_id=order.client_order_id,
+      309                          exchange_order_id=trade["orderId"],
+      310                          trading_pair=order.trading_pair,
+      311                          fill_timestamp=trade["time"] * 1e-3,
+      312                          fill_price=Decimal(trade["price"]),
+      313                          fill_base_amount=Decimal(trade["qty"]),
+      314                          fill_quote_amount=Decimal(trade["quoteQty"]),
+      315                          fee=fee,
+      316                      )
+      317                      trade_updates.append(trade_update)
+      318  
+      319          except asyncio.TimeoutError:
+      320              raise IOError(f"Skipped order update with order fills for {order.client_order_id} "
+      321                            "- waiting for exchange order id.")
+      322  
+      323          return trade_updates
+      325      async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+      326          trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
+      327          order_update = await self._api_get(
+      328              path_url=CONSTANTS.ORDER_URL,
+      329              params={
+      330                  "symbol": trading_pair,
+      331                  "origClientOrderId": tracked_order.client_order_id
+      332              },
+      333              is_auth_required=True)
+      334          if "code" in order_update:
+      335              if self._is_request_exception_related_to_time_synchronizer(request_exception=order_update):
+      336                  _order_update = OrderUpdate(
+      337                      trading_pair=tracked_order.trading_pair,
+      338                      update_timestamp=self.current_timestamp,
+      339                      new_state=tracked_order.current_state,
+      340                      client_order_id=tracked_order.client_order_id,
+      341                  )
+      342                  return _order_update
+      343          _order_update: OrderUpdate = OrderUpdate(
+      344              trading_pair=tracked_order.trading_pair,
+      345  
+      346              update_timestamp=order_update["updateTime"] * 1e-3,
+      347              new_state=CONSTANTS.ORDER_STATE[order_update["status"]],
+      348              client_order_id=order_update["clientOrderId"],
+      349              exchange_order_id=order_update["orderId"],
+      350          )
+      351          return _order_update
+      367      async def _user_stream_event_listener(self):
+      368          """
+      369          Wait for new messages from _user_stream_tracker.user_stream queue and processes them according to their
+      370          message channels. The respective UserStreamDataSource queues these messages.
+      371          """
+      372          async for event_message in self._iter_user_event_queue():
+      373              try:
+      374                  await self._process_user_stream_event(event_message)
+      375              except asyncio.CancelledError:
+      376                  raise
+      377              except Exception as e:
+      378                  self.logger().error(f"Unexpected error in user stream listener loop: {e}", exc_info=True)
+      379                  await self._sleep(5.0)
+      489      async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
+      490          """
+      491          Queries the necessary API endpoint and initialize the TradingRule object for each trading pair being traded.
+      492  
+      493          Parameters
+      494          ----------
+      495          exchange_info_dict:
+      496              Trading rules dictionary response from the exchange
+      497          """
+      498          rules: list = exchange_info_dict.get("symbols", [])
+      499          return_val: list = []
+      500          for rule in rules:
+      501              try:
+      502                  if web_utils.is_exchange_information_valid(rule):
+      503                      trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=rule["symbol"])
+      504                      filters = rule["filters"]
+      505                      filt_dict = {fil["filterType"]: fil for fil in filters}
+      506  
+      507                      min_order_size = Decimal(filt_dict.get("LOT_SIZE").get("minQty"))
+      508                      step_size = Decimal(filt_dict.get("LOT_SIZE").get("stepSize"))
+      509                      tick_size = Decimal(filt_dict.get("PRICE_FILTER").get("tickSize"))
+      510                      min_notional = Decimal(filt_dict.get("MIN_NOTIONAL").get("notional"))
+      511                      collateral_token = rule["marginAsset"]
+      512  
+      513                      return_val.append(
+      514                          TradingRule(
+      515                              trading_pair,
+      516                              min_order_size=min_order_size,
+      517                              min_price_increment=Decimal(tick_size),
+      518                              min_base_amount_increment=Decimal(step_size),
+      519                              min_notional_size=Decimal(min_notional),
+      520                              buy_order_collateral_token=collateral_token,
+      521                              sell_order_collateral_token=collateral_token,
+      522                          )
+      523                      )
+      524              except Exception as e:
+      525                  self.logger().error(
+      526                      f"Error parsing the trading pair rule {rule}. Error: {e}. Skipping...", exc_info=True
+      527                  )
+      528          return return_val
+      530      def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
+      531          mapping = bidict()
+      532          for symbol_data in filter(web_utils.is_exchange_information_valid, exchange_info.get("symbols", [])):
+      533              exchange_symbol = symbol_data["pair"]
+      534              base = symbol_data["baseAsset"]
+      535              quote = symbol_data["quoteAsset"]
+      536              trading_pair = combine_to_hb_trading_pair(base, quote)
+      537              if trading_pair in mapping.inverse:
+      538                  self._resolve_trading_pair_symbols_duplicate(mapping, exchange_symbol, base, quote)
+      539              else:
+      540                  mapping[exchange_symbol] = trading_pair
+      541          self._set_trading_pair_symbol_map(mapping)
+      571      async def _update_balances(self):
+      572          """
+      573          Calls the REST API to update total and available balances.
+      574          """
+      575          local_asset_names = set(self._account_balances.keys())
+      576          remote_asset_names = set()
+      577  
+      578          account_info = await self._api_get(path_url=CONSTANTS.ACCOUNT_INFO_URL,
+      579                                             is_auth_required=True)
+      580          assets = account_info.get("assets")
+      581          for asset in assets:
+      582              asset_name = asset.get("asset")
+      583              available_balance = Decimal(asset.get("availableBalance"))
+      584              wallet_balance = Decimal(asset.get("walletBalance"))
+      585              self._account_available_balances[asset_name] = available_balance
+      586              self._account_balances[asset_name] = wallet_balance
+      587              remote_asset_names.add(asset_name)
+      588  
+      589          asset_names_to_remove = local_asset_names.difference(remote_asset_names)
+      590          for asset_name in asset_names_to_remove:
+      591              del self._account_available_balances[asset_name]
+      592              del self._account_balances[asset_name]
+
+---------- IMPLEMENTER hummingbot.connector.derivative.bitget_perpetual.bitget_perpetual_derivative:BitgetPerpetualDerivative  stubs=0/29 ----------
+       37  class BitgetPerpetualDerivative(PerpetualDerivativePyBase):
+       63      @property
+       64      def name(self) -> str:
+       65          return CONSTANTS.EXCHANGE_NAME
+       67      @property
+       68      def authenticator(self) -> BitgetPerpetualAuth:
+       69          return BitgetPerpetualAuth(
+       70              api_key=self.bitget_perpetual_api_key,
+       71              secret_key=self.bitget_perpetual_secret_key,
+       72              passphrase=self.bitget_perpetual_passphrase,
+       73              time_provider=self._time_synchronizer
+       74          )
+       76      @property
+       77      def rate_limits_rules(self) -> List[RateLimit]:
+       78          return CONSTANTS.RATE_LIMITS
+       80      @property
+       81      def domain(self) -> str:
+       82          return CONSTANTS.DEFAULT_DOMAIN
+       84      @property
+       85      def client_order_id_max_length(self) -> int:
+       86          return CONSTANTS.ORDER_ID_MAX_LEN
+       88      @property
+       89      def client_order_id_prefix(self) -> str:
+       90          return CONSTANTS.HBOT_ORDER_ID_PREFIX
+       92      @property
+       93      def trading_rules_request_path(self) -> str:
+       94          return CONSTANTS.PUBLIC_CONTRACTS_ENDPOINT
+       96      @property
+       97      def trading_pairs_request_path(self) -> str:
+       98          return CONSTANTS.PUBLIC_CONTRACTS_ENDPOINT
+      100      @property
+      101      def check_network_request_path(self) -> str:
+      102          return CONSTANTS.PUBLIC_TIME_ENDPOINT
+      104      @property
+      105      def trading_pairs(self) -> Optional[List[str]]:
+      106          return self._trading_pairs
+      108      @property
+      109      def is_cancel_request_in_exchange_synchronous(self) -> bool:
+      110          return False
+      112      @property
+      113      def is_trading_required(self) -> bool:
+      114          return self._trading_required
+      133      def supported_order_types(self) -> List[OrderType]:
+      134          return [OrderType.LIMIT, OrderType.MARKET]
+      139      def _is_request_exception_related_to_time_synchronizer(
+      140          self,
+      141          request_exception: Exception
+      142      ) -> bool:
+      143          error_description = str(request_exception)
+      144          ts_error_target_str = "Request timestamp expired"
+      145  
+      146          return ts_error_target_str in error_description
+      222      def _is_order_not_found_during_status_update_error(
+      223          self,
+      224          status_update_exception: Exception
+      225      ) -> bool:
+      226          # Error example:
+      227          # { "code": "00000", "msg": "success", "requestTime": 1710327684832, "data": [] }
+      228  
+      229          if isinstance(status_update_exception, IOError):
+      230              return any(
+      231                  value in str(status_update_exception)
+      232                  for value in CONSTANTS.RET_CODES_ORDER_NOT_EXISTS
+      233              )
+      234  
+      235          if isinstance(status_update_exception, ValueError):
+      236              return True
+      237  
+      238          return False
+      240      def _is_order_not_found_during_cancelation_error(
+      241          self,
+      242          cancelation_exception: Exception
+      243      ) -> bool:
+      244          if isinstance(cancelation_exception, IOError):
+      245              return any(
+      246                  value in str(cancelation_exception)
+      247                  for value in CONSTANTS.RET_CODES_ORDER_NOT_EXISTS
+      248              )
+      249  
+      250          return False
+      252      async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
+      253          symbol = await self.exchange_symbol_associated_to_pair(tracked_order.trading_pair)
+      254          product_type = await self.product_type_associated_to_trading_pair(
+      255              tracked_order.trading_pair
+      256          )
+      257          cancel_result = await self._api_post(
+      258              path_url=CONSTANTS.CANCEL_ORDER_ENDPOINT,
+      259              data={
+      260                  "symbol": symbol,
+      261                  "productType": product_type,
+      262                  "marginCoin": self.get_buy_collateral_token(tracked_order.trading_pair),
+      263                  "orderId": tracked_order.exchange_order_id
+      264              },
+      265              is_auth_required=True,
+      266          )
+      267          response_code = cancel_result["code"]
+      268  
+      269          if response_code != CONSTANTS.RET_CODE_OK:
+      270              raise IOError(self._formatted_error(response_code, cancel_result["msg"]))
+      271  
+      272          return True
+      274      async def _place_order(
+      275          self,
+      276          order_id: str,
+      277          trading_pair: str,
+      278          amount: Decimal,
+      279          trade_type: TradeType,
+      280          order_type: OrderType,
+      281          price: Decimal,
+      282          position_action: PositionAction = PositionAction.NIL,
+      283          **kwargs,
+      284      ) -> Tuple[str, float]:
+      285          product_type = await self.product_type_associated_to_trading_pair(trading_pair)
+      286          margin_modes = {
+      287              MarginMode.CROSS: "crossed",
+      288              MarginMode.ISOLATED: "isolated"
+      289          }
+      290          data = {
+      291              "marginCoin": self.get_buy_collateral_token(trading_pair),
+      292              "symbol": await self.exchange_symbol_associated_to_pair(trading_pair),
+      293              "productType": product_type,
+      294              "size": str(amount),
+      295              "force": CONSTANTS.DEFAULT_TIME_IN_FORCE,
+      296              "clientOid": order_id,
+      297              "side": trade_type.name.lower(),
+      298              "marginMode": margin_modes[self._margin_mode],
+      299              "orderType": "limit" if order_type.is_limit_type() else "market",
+      300          }
+      301          if order_type.is_limit_type():
+      302              data["price"] = str(price)
+      303  
+      304          if self.position_mode is PositionMode.HEDGE:
+      305              if position_action is PositionAction.CLOSE:
+      306                  data["side"] = "sell" if trade_type is TradeType.BUY else "buy"
+      307              data["tradeSide"] = position_action.name.lower()
+      308  
+      309          resp = await self._api_post(
+      310              path_url=CONSTANTS.PLACE_ORDER_ENDPOINT,
+      311              data=data,
+      312              is_auth_required=True,
+      313              headers={
+      314                  "X-CHANNEL-API-CODE": CONSTANTS.API_CODE,
+      315              }
+      316          )
+      317  
+      318          if resp["code"] != CONSTANTS.RET_CODE_OK:
+      319              raise IOError(self._formatted_error(
+      320                  resp["code"],
+      321                  f"Error submitting order {order_id}: {resp['msg']}"
+      322              ))
+      323  
+      324          return str(resp["data"]["orderId"]), self.current_timestamp
+      326      def _get_fee(
+      327          self,
+      328          base_currency: str,
+      329          quote_currency: str,
+      330          order_type: OrderType,
+      331          order_side: TradeType,
+      332          position_action: PositionAction,
+      333          amount: Decimal,
+      334          price: Decimal = s_decimal_NaN,
+      335          is_maker: Optional[bool] = None
+      336      ) -> TradeFeeBase:
+      337          is_maker = is_maker or (order_type is OrderType.LIMIT_MAKER)
+      338          trading_pair = combine_to_hb_trading_pair(base=base_currency, quote=quote_currency)
+      339          if trading_pair in self._trading_fees:
+      340              fee_schema: TradeFeeSchema = self._trading_fees[trading_pair]
+      341              fee_rate = (
+      342                  fee_schema.maker_percent_fee_decimal
+      343                  if is_maker
+      344                  else fee_schema.taker_percent_fee_decimal
+      345              )
+      346              fee = TradeFeeBase.new_spot_fee(
+      347                  fee_schema=fee_schema,
+      348                  trade_type=order_side,
+      349                  percent=fee_rate,
+      350              )
+      351          else:
+      352              fee = build_trade_fee(
+      353                  self.name,
+      354                  is_maker,
+      355                  base_currency=base_currency,
+      356                  quote_currency=quote_currency,
+      357                  order_type=order_type,
+      358                  order_side=order_side,
+      359                  amount=amount,
+      360                  price=price,
+      361              )
+      362          return fee
+      364      async def _update_trading_fees(self):
+      365          symbol_data = []
+      366  
+      367          for product_type in CONSTANTS.ALL_PRODUCT_TYPES:
+      368              exchange_info = await self._api_get(
+      369                  path_url=self.trading_rules_request_path,
+      370                  params={
+      371                      "productType": product_type
+      372                  }
+      373              )
+      374              symbol_data.extend(exchange_info["data"])
+      375  
+      376          for symbol_details in symbol_data:
+      377              if bitget_perpetual_utils.is_exchange_information_valid(exchange_info=symbol_details):
+      378                  trading_pair = await self.trading_pair_associated_to_exchange_symbol(
+      379                      symbol=symbol_details["symbol"]
+      380                  )
+      381                  self._trading_fees[trading_pair] = TradeFeeSchema(
+      382                      maker_percent_fee_decimal=Decimal(symbol_details["makerFeeRate"]),
+      383                      taker_percent_fee_decimal=Decimal(symbol_details["takerFeeRate"])
+      384                  )
+      386      def _create_web_assistants_factory(self) -> WebAssistantsFactory:
+      387          return web_utils.build_api_factory(
+      388              throttler=self._throttler,
+      389              time_synchronizer=self._time_synchronizer,
+      390              auth=self._auth,
+      391          )
+      393      def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
+      394          return BitgetPerpetualAPIOrderBookDataSource(
+      395              self.trading_pairs,
+      396              connector=self,
+      397              api_factory=self._web_assistants_factory,
+      398          )
+      400      def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
+      401          return BitgetPerpetualUserStreamDataSource(
+      402              auth=self._auth,
+      403              trading_pairs=self._trading_pairs,
+      404              connector=self,
+      405              api_factory=self._web_assistants_factory,
+      406          )
+      408      async def _update_balances(self):
+      409          """
+      410          Calls REST API to update total and available balances
+      411          """
+      412          balances = []
+      413          product_types: set[str] = {
+      414              await self.product_type_associated_to_trading_pair(trading_pair)
+      415              for trading_pair in self._trading_pairs
+      416          } or CONSTANTS.ALL_PRODUCT_TYPES
+      417  
+      418          for product_type in product_types:
+      419              accounts_info_response: Dict[str, Any] = await self._api_get(
+      420                  path_url=CONSTANTS.ACCOUNTS_INFO_ENDPOINT,
+      421                  params={
+      422                      "productType": product_type
+      423                  },
+      424                  is_auth_required=True,
+      425              )
+      426  
+      427              if accounts_info_response["code"] != CONSTANTS.RET_CODE_OK:
+      428                  raise IOError(
+      429                      self._formatted_error(
+      430                          accounts_info_response["code"],
+      431                          accounts_info_response["msg"]
+      432                      )
+      433                  )
+      434  
+      435              balances.extend(accounts_info_response["data"])
+      436  
+      437          self._account_available_balances.clear()
+      438          self._account_balances.clear()
+      439  
+      440          for balance_data in balances:
+      441              quote_asset_name = balance_data["marginCoin"]
+      442              queried_available = Decimal(balance_data["crossedMaxAvailable"])
+      443              queried_total = Decimal(balance_data["accountEquity"])
+      444              current_total = self._account_balances.get(quote_asset_name, Decimal(0))
+      445              current_available = self._account_available_balances.get(quote_asset_name, Decimal(0))
+      446  
+      447              total = current_total + queried_total
+      448              available = current_available + queried_available
+      449  
+      450              if total or available:
+      451                  self._account_available_balances[quote_asset_name] = available
+      452                  self._account_balances[quote_asset_name] = total
+      453  
+      454              if "assetList" in balance_data:
+      455                  for base_asset in balance_data["assetList"]:
+      456                      base_asset_name = base_asset["coin"]
+      457                      queried_available = Decimal(base_asset["available"])
+      458                      queried_total = Decimal(base_asset["balance"])
+      459                      current_total = self._account_balances.get(base_asset_name, Decimal(0))
+      460                      current_available = self._account_available_balances.get(
+      461                          base_asset_name,
+      462                          Decimal(0)
+      463                      )
+      464  
+      465                      total = current_total + queried_total
+      466                      available = current_available + queried_available
+      467  
+       ... truncated at 60 lines ...
+      529      async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+      530          trade_updates = []
+      531  
+      532          if order.exchange_order_id is not None:
+      533              try:
+      534                  all_fills_response = await self._request_order_fills(order=order)
+      535                  all_fills_data = all_fills_response["data"]["fillList"]
+      536  
+      537                  for fill_data in all_fills_data:
+      538                      trade_update = self._parse_trade_update(
+      539                          trade_msg=fill_data,
+      540                          tracked_order=order
+      541                      )
+      542                      trade_updates.append(trade_update)
+      543              except IOError as ex:
+      544                  if not self._is_request_exception_related_to_time_synchronizer(
+      545                      request_exception=ex
+      546                  ):
+      547                      raise
+      548  
+      549          return trade_updates
+      565      async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+      566          try:
+      567              order_status_data = await self._request_order_status_data(tracked_order=tracked_order)
+      568              updated_order_data = order_status_data["data"]
+      569  
+      570              if len(updated_order_data) == 0:
+      571                  raise ValueError(f"Can't parse order status data. Data: {updated_order_data}")
+      572  
+      573              client_order_id = str(updated_order_data["clientOid"])
+      574  
+      575              order_update: OrderUpdate = OrderUpdate(
+      576                  trading_pair=tracked_order.trading_pair,
+      577                  update_timestamp=self.current_timestamp,
+      578                  new_state=CONSTANTS.STATE_TYPES[updated_order_data["state"]],
+      579                  client_order_id=client_order_id,
+      580                  exchange_order_id=updated_order_data["orderId"],
+      581              )
+      582  
+      583              return order_update
+      584  
+      585          except IOError as ex:
+      586              if self._is_request_exception_related_to_time_synchronizer(request_exception=ex):
+      587                  order_update = OrderUpdate(
+      588                      client_order_id=tracked_order.client_order_id,
+      589                      trading_pair=tracked_order.trading_pair,
+      590                      update_timestamp=self.current_timestamp,
+      591                      new_state=tracked_order.current_state,
+      592                  )
+      593              else:
+      594                  raise
+      595  
+      596          return order_update
+      755      async def _user_stream_event_listener(self):
+      756          async for event_message in self._iter_user_event_queue():
+      757              try:
+      758                  channel = event_message["arg"]["channel"]
+      759                  data = event_message["data"]
+      760  
+      761                  if channel == CONSTANTS.WS_POSITIONS_ENDPOINT:
+      762                      await self._process_account_position_event(data)
+      763                  elif channel == CONSTANTS.WS_ORDERS_ENDPOINT:
+      764                      for order_msg in data:
+      765                          self._process_trade_event_message(order_msg)
+      766                          self._process_order_event_message(order_msg)
+      767                          self._process_balance_update_from_order_event(order_msg)
+      768                  elif channel == CONSTANTS.WS_ACCOUNT_ENDPOINT:
+      769                      for wallet_msg in data:
+      770                          self._process_wallet_event_message(wallet_msg)
+      771              except asyncio.CancelledError:
+      772                  raise
+      773              except Exception:
+      774                  self.logger().exception("Unexpected error in user stream listener loop.")
+     1010      def _initialize_trading_pair_symbols_from_exchange_info(
+     1011          self,
+     1012          exchange_info: List[Dict[str, Any]]
+     1013      ) -> None:
+     1014          mapping = bidict()
+     1015          for symbol_data in exchange_info:
+     1016              if bitget_perpetual_utils.is_exchange_information_valid(exchange_info=symbol_data):
+     1017                  try:
+     1018                      symbol = symbol_data["symbol"]
+     1019                      base = symbol_data["baseCoin"]
+     1020                      quote = symbol_data["quoteCoin"]
+     1021                      trading_pair = combine_to_hb_trading_pair(base, quote)
+     1022                      mapping[symbol] = trading_pair
+     1023                  except Exception as exception:
+     1024                      self.logger().error(
+     1025                          f"There was an error parsing a trading pair information ({exception}). Symbol: {symbol}. Trading pair: {trading_pair}"
+     1026                      )
+     1027          self._set_trading_pair_symbol_map(mapping)
+     1029      async def _format_trading_rules(
+     1030          self,
+     1031          exchange_info_dict: Dict[str, List[Dict[str, Any]]]
+     1032      ) -> List[TradingRule]:
+     1033          """
+     1034          Converts JSON API response into a local dictionary of trading rules.
+     1035  
+     1036          :param instrument_info_dict: The JSON API response.
+     1037  
+     1038          :returns: A dictionary of trading pair to its respective TradingRule.
+     1039          """
+     1040          trading_rules = []
+     1041          for rule in exchange_info_dict:
+     1042              if bitget_perpetual_utils.is_exchange_information_valid(exchange_info=rule):
+     1043                  try:
+     1044                      trading_pair = await self.trading_pair_associated_to_exchange_symbol(
+     1045                          symbol=rule["symbol"]
+     1046                      )
+     1047                      max_order_size = Decimal(rule["maxOrderQty"]) if rule["maxOrderQty"] else None
+     1048                      margin_coin = rule["supportMarginCoins"][0]
+     1049  
+     1050                      trading_rules.append(
+     1051                          TradingRule(
+     1052                              trading_pair=trading_pair,
+     1053                              min_order_value=Decimal(rule["minTradeUSDT"]),
+     1054                              max_order_size=max_order_size,
+     1055                              min_order_size=Decimal(rule["minTradeNum"]),
+     1056                              min_price_increment=Decimal(f"1e-{int(rule['pricePlace'])}"),
+     1057                              min_base_amount_increment=Decimal(rule["sizeMultiplier"]),
+     1058                              buy_order_collateral_token=margin_coin,
+     1059                              sell_order_collateral_token=margin_coin,
+     1060                          )
+     1061                      )
+     1062                  except Exception:
+     1063                      self.logger().exception(
+     1064                          f"Error parsing the trading pair rule: {rule}. Skipping."
+     1065                      )
+     1066  
+     1067          return trading_rules
+
+---------- IMPLEMENTER hummingbot.connector.derivative.bybit_perpetual.bybit_perpetual_derivative:BybitPerpetualDerivative  stubs=1/29 ----------
+       37  class BybitPerpetualDerivative(PerpetualDerivativePyBase):
+       62      @property
+       63      def name(self) -> str:
+       64          return CONSTANTS.EXCHANGE_NAME
+       66      @property
+       67      def authenticator(self) -> BybitPerpetualAuth:
+       68          return BybitPerpetualAuth(self.bybit_perpetual_api_key, self.bybit_perpetual_secret_key, self._time_synchronizer)
+       70      @property
+       71      def rate_limits_rules(self) -> List[RateLimit]:
+       72          return web_utils.build_rate_limits(self.trading_pairs)
+       74      @property
+       75      def domain(self) -> str:
+       76          return self._domain
+       78      @property
+       79      def client_order_id_max_length(self) -> int:
+       80          return CONSTANTS.MAX_ID_LEN
+       82      @property
+       83      def client_order_id_prefix(self) -> str:
+       84          return CONSTANTS.HBOT_BROKER_ID
+       86      @property
+       87      def trading_rules_request_path(self) -> str:
+       88          return CONSTANTS.QUERY_SYMBOL_ENDPOINT
+       90      @property
+       91      def trading_pairs_request_path(self) -> str:
+       92          return CONSTANTS.QUERY_SYMBOL_ENDPOINT
+      123      @property
+      124      def check_network_request_path(self) -> str:
+      125          return CONSTANTS.SERVER_TIME_PATH_URL
+      127      @property
+      128      def trading_pairs(self):
+      129          return self._trading_pairs
+      131      @property
+      132      def is_cancel_request_in_exchange_synchronous(self) -> bool:
+      133          return False
+      135      @property
+      136      def is_trading_required(self) -> bool:
+      137          return self._trading_required
+      143      def supported_order_types(self) -> List[OrderType]:
+      144          """
+      145          :return a list of OrderType supported by this connector
+      146          """
+      147          return [OrderType.LIMIT, OrderType.MARKET]
+      175      def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
+      176          error_description = str(request_exception)
+      177          ts_error_target_str = (f"{self._format_ret_code_for_print(ret_code=CONSTANTS.RET_CODE_INVALID_TIME)} - "
+      178                                 f"The request time exceeds the time window range")
+      179          is_time_synchronizer_related = ts_error_target_str in error_description
+      180          return is_time_synchronizer_related
+      182      def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+      183          return (
+      184              str(CONSTANTS.RET_CODE_ORDER_NOT_EXISTS) in str(status_update_exception) or
+      185              str(CONSTANTS.RET_CODE_ORDER_NOT_FOUND) in str(status_update_exception) or
+      186              CONSTANTS.RET_MSG_ORDER_NOT_EXISTS in str(status_update_exception) or
+      187              CONSTANTS.RET_MSG_ORDER_NOT_FOUND in str(status_update_exception))
+      189      def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+      190          return (
+      191              str(CONSTANTS.RET_CODE_ORDER_NOT_EXISTS) in str(cancelation_exception) or
+      192              str(CONSTANTS.RET_CODE_ORDER_NOT_FOUND) in str(cancelation_exception) or
+      193              CONSTANTS.RET_MSG_ORDER_NOT_EXISTS in str(cancelation_exception) or
+      194              CONSTANTS.RET_MSG_ORDER_NOT_FOUND in str(cancelation_exception))
+      196      async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
+      197          data = {
+      198              "category": "linear" if bybit_utils.is_linear_perpetual(tracked_order.trading_pair) else "inverse",
+      199              "symbol": await self.exchange_symbol_associated_to_pair(tracked_order.trading_pair)
+      200          }
+      201          if tracked_order.exchange_order_id:
+      202              data["orderId"] = tracked_order.exchange_order_id
+      203          else:
+      204              data["orderLinkId"] = tracked_order.client_order_id
+      205          cancel_result = await self._api_post(
+      206              path_url=CONSTANTS.CANCEL_ACTIVE_ORDER_PATH_URL,
+      207              data=data,
+      208              is_auth_required=True,
+      209              trading_pair=tracked_order.trading_pair,
+      210          )
+      211          self._validate_exchange_response(cancel_result)
+      212          return True
+      214      async def _place_order(
+      215          self,
+      216          order_id: str,
+      217          trading_pair: str,
+      218          amount: Decimal,
+      219          trade_type: TradeType,
+      220          order_type: OrderType,
+      221          price: Decimal,
+      222          position_action: PositionAction = PositionAction.NIL,
+      223          **kwargs,
+      224      ) -> Tuple[str, float]:
+      225          position_idx = self._get_position_idx(trade_type, position_action)
+      226          data = {
+      227              "category": "linear" if bybit_utils.is_linear_perpetual(trading_pair) else "inverse",
+      228              "side": "Buy" if trade_type == TradeType.BUY else "Sell",
+      229              "symbol": await self.exchange_symbol_associated_to_pair(trading_pair),
+      230              "qty": str(amount),
+      231              "timeInForce": CONSTANTS.DEFAULT_TIME_IN_FORCE,
+      232              "closeOnTrigger": position_action == PositionAction.CLOSE,
+      233              "orderLinkId": order_id,
+      234              "reduceOnly": position_action == PositionAction.CLOSE,
+      235              "positionIdx": position_idx,
+      236              "orderType": CONSTANTS.ORDER_TYPE_MAP[order_type],
+      237          }
+      238          if order_type.is_limit_type():
+      239              data["price"] = str(price)
+      240  
+      241          resp = await self._api_post(
+      242              path_url=CONSTANTS.PLACE_ACTIVE_ORDER_PATH_URL,
+      243              data=data,
+      244              is_auth_required=True,
+      245              trading_pair=trading_pair,
+      246              headers={"referer": CONSTANTS.HBOT_BROKER_ID},
+      247              **kwargs,
+      248          )
+      249  
+      250          self._validate_exchange_response(resp, before_text="Error submitting order {order_id}: ")
+      251  
+      252          return str(resp["result"]["orderId"]), self.current_timestamp
+      274      def _get_fee(self,
+      275                   base_currency: str,
+      276                   quote_currency: str,
+      277                   order_type: OrderType,
+      278                   order_side: TradeType,
+      279                   amount: Decimal,
+      280                   price: Decimal = s_decimal_NaN,
+      281                   is_maker: Optional[bool] = None,
+      282                   position_action: PositionAction = None) -> TradeFeeBase:
+      283          is_maker = is_maker or False
+      284          fee = build_trade_fee(
+      285              self.name,
+      286              is_maker,
+      287              base_currency=base_currency,
+      288              quote_currency=quote_currency,
+      289              order_type=order_type,
+      290              order_side=order_side,
+      291              amount=amount,
+      292              price=price,
+      293          )
+      294          return fee
+      296      async def _update_trading_fees(self):
+      297          pass
+      299      def _create_web_assistants_factory(self) -> WebAssistantsFactory:
+      300          return web_utils.build_api_factory(
+      301              throttler=self._throttler,
+      302              time_synchronizer=self._time_synchronizer,
+      303              auth=self._auth,
+      304          )
+      306      def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
+      307          return BybitPerpetualAPIOrderBookDataSource(
+      308              self.trading_pairs,
+      309              connector=self,
+      310              api_factory=self._web_assistants_factory,
+      311              domain=self._domain,
+      312          )
+      314      def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
+      315          return BybitPerpetualUserStreamDataSource(
+      316              auth=self._auth,
+      317              api_factory=self._web_assistants_factory,
+      318              domain=self._domain,
+      319          )
+      403      async def _update_balances(self):
+      404          """
+      405          Calls REST API to update total and available balances
+      406          """
+      407          unified_wallet_response = await self._api_get(path_url=CONSTANTS.GET_WALLET_BALANCE_PATH_URL,
+      408                                                        params={"accountType": "UNIFIED"},
+      409                                                        is_auth_required=True)
+      410          self._validate_exchange_response(unified_wallet_response)
+      411  
+      412          unified_wallet_balance = [d for d in unified_wallet_response["result"]["list"][0]["coin"] if
+      413                                    Decimal(d["equity"]) > 0]
+      414  
+      415          self._account_available_balances.clear()
+      416          self._account_balances.clear()
+      417  
+      418          for asset in unified_wallet_balance:
+      419              self._account_balances[asset["coin"]] = Decimal(asset["equity"])
+      420  
+      421          available_coins = self._account_balances.keys()
+      422  
+      423          for coin in available_coins:
+      424              available_balance = await self._fetch_available_balance(coin)
+      425              self._account_available_balances[coin] = available_balance
+      492      async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+      493          trade_updates = []
+      494  
+      495          if order.exchange_order_id is not None:
+      496              try:
+      497                  all_fills_response = await self._request_order_fills(order=order)
+      498                  fills_data = all_fills_response["result"].get("list", [])
+      499  
+      500                  if fills_data is not None:
+      501                      for fill_data in fills_data:
+      502                          trade_update = self._parse_trade_update(trade_msg=fill_data, tracked_order=order)
+      503                          trade_updates.append(trade_update)
+      504              except IOError as ex:
+      505                  if not self._is_request_exception_related_to_time_synchronizer(request_exception=ex):
+      506                      raise
+      507  
+      508          return trade_updates
+      525      async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+      526          try:
+      527              order_status_data = await self._request_order_status_data(tracked_order=tracked_order)
+      528              order_msg = order_status_data["result"]["list"][0]
+      529              client_order_id = str(order_msg["orderLinkId"])
+      530  
+      531              order_update: OrderUpdate = OrderUpdate(
+      532                  trading_pair=tracked_order.trading_pair,
+      533                  update_timestamp=self.current_timestamp,
+      534                  new_state=CONSTANTS.ORDER_STATE[order_msg["orderStatus"]],
+      535                  client_order_id=client_order_id,
+      536                  exchange_order_id=order_msg["orderId"],
+      537              )
+      538          except IOError as ex:
+      539              if self._is_request_exception_related_to_time_synchronizer(request_exception=ex):
+      540                  order_update = OrderUpdate(
+      541                      client_order_id=tracked_order.client_order_id,
+      542                      trading_pair=tracked_order.trading_pair,
+      543                      update_timestamp=self.current_timestamp,
+      544                      new_state=tracked_order.current_state,
+      545                  )
+      546              else:
+      547                  raise
+      548  
+      549          return order_update
+      571      async def _user_stream_event_listener(self):
+      572          """
+      573          Listens to message in _user_stream_tracker.user_stream queue.
+      574          """
+      575          async for event_message in self._iter_user_event_queue():
+      576              try:
+      577                  endpoint = web_utils.endpoint_from_message(event_message)
+      578                  payload = web_utils.payload_from_message(event_message)
+      579  
+      580                  if endpoint == CONSTANTS.WS_SUBSCRIPTION_POSITIONS_ENDPOINT_NAME:
+      581                      for position_msg in payload:
+      582                          await self._process_account_position_event(position_msg)
+      583                  elif endpoint == CONSTANTS.WS_SUBSCRIPTION_ORDERS_ENDPOINT_NAME:
+      584                      for order_msg in payload:
+      585                          self._process_order_event_message(order_msg)
+      586                  elif endpoint == CONSTANTS.WS_SUBSCRIPTION_EXECUTIONS_ENDPOINT_NAME:
+      587                      for trade_msg in payload:
+      588                          self._process_trade_event_message(trade_msg)
+      589                  elif endpoint is None:
+      590                      self.logger().error(f"Could not extract endpoint from {event_message}.")
+      591                      raise ValueError
+      592              except asyncio.CancelledError:
+      593                  raise
+      594              except Exception:
+      595                  self.logger().exception("Unexpected error in user stream listener loop.")
+      596                  await self._sleep(5.0)
+      698      async def _format_trading_rules(self, instrument_info_dict: Dict[str, Any]) -> List[TradingRule]:
+      699          """
+      700          Converts JSON API response into a local dictionary of trading rules.
+      701          :param instrument_info_dict: The JSON API response.
+      702          :returns: A dictionary of trading pair to its respective TradingRule.
+      703          """
+      704          trading_rules = {}
+      705          symbol_map = await self.trading_pair_symbol_map()
+      706          for instrument in instrument_info_dict:
+      707              try:
+      708                  exchange_symbol = instrument["symbol"]
+      709                  if exchange_symbol in symbol_map:
+      710                      trading_pair = combine_to_hb_trading_pair(instrument['baseCoin'], instrument['quoteCoin'])
+      711                      is_linear = bybit_utils.is_linear_perpetual(trading_pair)
+      712                      collateral_token = instrument["quoteCoin"] if is_linear else instrument["baseCoin"]
+      713                      min_notional_size = (Decimal(instrument["lotSizeFilter"]["minNotionalValue"])
+      714                                           if is_linear else s_decimal_0)
+      715                      trading_rules[trading_pair] = TradingRule(
+      716                          trading_pair=trading_pair,
+      717                          min_order_size=Decimal(instrument["lotSizeFilter"]["minOrderQty"]),
+      718                          min_notional_size=min_notional_size,
+      719                          max_order_size=Decimal(instrument["lotSizeFilter"]["maxOrderQty"]),
+      720                          min_price_increment=Decimal(instrument["priceFilter"]["tickSize"]),
+      721                          min_base_amount_increment=Decimal(instrument["lotSizeFilter"]["qtyStep"]),
+      722                          buy_order_collateral_token=collateral_token,
+      723                          sell_order_collateral_token=collateral_token,
+      724                      )
+      725              except Exception:
+      726                  self.logger().exception(f"Error parsing the trading pair rule: {instrument}. Skipping...")
+      727          return list(trading_rules.values())
+      729      def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
+      730          mapping = bidict()
+      731          for symbol_data in filter(bybit_utils.is_exchange_information_valid, exchange_info):
+      732              exchange_symbol = symbol_data["symbol"]
+      733              base = symbol_data["baseCoin"]
+      734              quote = symbol_data["quoteCoin"]
+      735              trading_pair = combine_to_hb_trading_pair(base, quote)
+      736              if trading_pair in mapping.inverse:
+      737                  self._resolve_trading_pair_symbols_duplicate(mapping, exchange_symbol, base, quote)
+      738              else:
+      739                  mapping[exchange_symbol] = trading_pair
+      740          self._set_trading_pair_symbol_map(mapping)
+
+---------- IMPLEMENTER hummingbot.connector.derivative.derive_perpetual.derive_perpetual_derivative:DerivePerpetualDerivative  stubs=1/29 ----------
+       37  class DerivePerpetualDerivative(PerpetualDerivativePyBase):
+       70      @property
+       71      def name(self) -> str:
+       72          # Note: domain here refers to the entire exchange name. i.e. derive_perpetual_ or derive_perpetual_testnet
+       73          return self._domain
+       79      @property
+       80      def authenticator(self) -> DerivePerpetualAuth:
+       81          return DerivePerpetualAuth(
+       82              self.derive_perpetual_api_key,
+       83              self.derive_perpetual_secret_key,
+       84              self._sub_id,
+       85              self._trading_required,
+       86              self._domain)
+       88      @property
+       89      def rate_limits_rules(self) -> List[RateLimit]:
+       90          return CONSTANTS.RATE_LIMITS
+       92      @property
+       93      def domain(self) -> str:
+       94          return self._domain
+       96      @property
+       97      def client_order_id_max_length(self) -> int:
+       98          return CONSTANTS.MAX_ORDER_ID_LEN
+      100      @property
+      101      def client_order_id_prefix(self) -> str:
+      102          return CONSTANTS.BROKER_ID
+      104      @property
+      105      def trading_rules_request_path(self) -> str:
+      106          return CONSTANTS.EXCHANGE_INFO_PATH_URL
+      108      @property
+      109      def trading_pairs_request_path(self) -> str:
+      110          return CONSTANTS.EXCHANGE_INFO_PATH_URL
+      116      @property
+      117      def check_network_request_path(self) -> str:
+      118          return CONSTANTS.PING_PATH_URL
+      120      @property
+      121      def trading_pairs(self):
+      122          return self._trading_pairs
+      124      @property
+      125      def is_cancel_request_in_exchange_synchronous(self) -> bool:
+      126          return True
+      128      @property
+      129      def is_trading_required(self) -> bool:
+      130          return self._trading_required
+      139      def supported_order_types(self) -> List[OrderType]:
+      140          """
+      141          :return a list of OrderType supported by this connector
+      142          """
+      143          return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
+      205      def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
+      206          return False
+      208      def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: List):
+      209          mapping = bidict()
+      210  
+      211          for _info in filter(web_utils.is_exchange_information_valid, exchange_info):
+      212              ex_name = _info["instrument_name"]
+      213  
+      214              base, _quote = ex_name.split("-")
+      215              _quote = "USDC"
+      216              trading_pair = combine_to_hb_trading_pair(base, _quote)
+      217              mapping[ex_name] = trading_pair
+      218          self._set_trading_pair_symbol_map(mapping)
+      228      def _create_web_assistants_factory(self) -> WebAssistantsFactory:
+      229          return web_utils.build_api_factory(
+      230              throttler=self._throttler,
+      231              time_synchronizer=self._time_synchronizer,
+      232              domain=self._domain,
+      233              auth=self._auth)
+      235      def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
+      236          return DerivePerpetualAPIOrderBookDataSource(
+      237              trading_pairs=self._trading_pairs,
+      238              connector=self,
+      239              api_factory=self._web_assistants_factory,
+      240              domain=self.domain,
+      241          )
+      243      def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
+      244          return DerivePerpetualAPIUserStreamDataSource(
+      245              auth=self._auth,
+      246              trading_pairs=self._trading_pairs,
+      247              connector=self,
+      248              api_factory=self._web_assistants_factory,
+      249              domain=self.domain,
+      250          )
+      256      def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+      257          return CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
+      259      def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+      260          return CONSTANTS.UNKNOWN_ORDER_MESSAGE in str(cancelation_exception)
+      269      def _get_fee(self,
+      270                   base_currency: str,
+      271                   quote_currency: str,
+      272                   order_type: OrderType,
+      273                   order_side: TradeType,
+      274                   amount: Decimal,
+      275                   price: Decimal = s_decimal_NaN,
+      276                   is_maker: Optional[bool] = None) -> TradeFeeBase:
+      277          is_maker = order_type is OrderType.LIMIT_MAKER
+      278          trade_base_fee = build_trade_fee(
+      279              exchange=self.name,
+      280              is_maker=is_maker,
+      281              order_side=order_side,
+      282              order_type=order_type,
+      283              amount=amount,
+      284              price=price,
+      285              base_currency=base_currency.upper(),
+      286              quote_currency=quote_currency.upper()
+      287          )
+      288          return trade_base_fee
+      351      async def _update_trading_fees(self):
+      352          """
+      353          Update fees information from the derivative exchange.
+      354          """
+      355          pass
+      357      async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
+      358          oid = await tracked_order.get_exchange_order_id()
+      359          symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
+      360          api_params = {
+      361              "instrument_name": symbol,
+      362              "order_id": oid,
+      363              "subaccount_id": int(self._sub_id)
+      364          }
+      365          cancel_result = await self._api_post(
+      366              path_url=CONSTANTS.CANCEL_ORDER_URL,
+      367              data=api_params,
+      368              is_auth_required=True)
+      369  
+      370          if "error" in cancel_result:
+      371              if 'Does not exist' in cancel_result['error']['message']:
+      372                  self.logger().debug(f"The order {order_id} does not exist on DerivePerpetual s. "
+      373                                      f"No cancelation needed.")
+      374                  await self._order_tracker.process_order_not_found(order_id)
+      375              raise IOError(f'{cancel_result["error"]["message"]}')
+      376          if "result" in cancel_result:
+      377              if cancel_result["result"]["order_status"] == "cancelled":
+      378                  return True
+      379          return False
+      459      async def _place_order(
+      460              self,
+      461              order_id: str,
+      462              trading_pair: str,
+      463              amount: Decimal,
+      464              trade_type: TradeType,
+      465              order_type: OrderType,
+      466              price: Decimal,
+      467              position_action: PositionAction = PositionAction.NIL,
+      468              **kwargs,
+      469      ) -> Tuple[str, float]:
+      470          """
+      471          Creates an order on the derivative exchange using the specified parameters.
+      472          """
+      473          symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+      474          if len(self._instrument_ticker) == 0:
+      475              await self._make_trading_pairs_request()
+      476          instrument = next((pair for pair in self._instrument_ticker if symbol == pair["instrument_name"]), None)
+      477          if order_type is OrderType.LIMIT and position_action == PositionAction.CLOSE:
+      478              param_order_type = "gtc"
+      479          elif order_type is OrderType.LIMIT_MAKER:
+      480              param_order_type = "gtc"
+      481          elif order_type is OrderType.MARKET:
+      482              param_order_type = "ioc"
+      483          else:
+      484              param_order_type = "gtc"
+      485          type_str = DerivePerpetualDerivative.derive_perpetual_order_type(order_type)
+      486  
+      487          price_type = "limit" if type_str == "limit_maker" or type_str == "limit" else "market"
+      488          new_price = float(f"{price:.4g}")
+      489          api_params = {
+      490              "asset_address": instrument["base_asset_address"],
+      491              "sub_id": instrument["base_asset_sub_id"],
+      492              "limit_price": str(new_price),
+      493              "type": "order",
+      494              "max_fee": str(1000),
+      495              "amount": str(amount),
+      496              "instrument_name": symbol,
+      497              "label": order_id,
+      498              "is_bid": True if trade_type is TradeType.BUY else False,
+      499              "direction": "buy" if trade_type is TradeType.BUY else "sell",
+      500              "order_type": price_type,
+      501              "reduce_only": False,
+      502              "referral_code": CONSTANTS.REFERRAL_CODE,
+      503              "mmp": False,
+      504              "time_in_force": param_order_type,
+      505              "recipient_id": self._sub_id,
+      506          }
+      507  
+      508          order_result = await self._api_post(
+      509              path_url = CONSTANTS.CREATE_ORDER_URL,
+      510              data=api_params,
+      511              is_auth_required=True)
+      512  
+      513          if "error" in order_result:
+      514              if "Self-crossing disallowed" in order_result["error"]["message"]:
+      515                  self.logger().warning(f"Error submitting order: {order_result['error']['data']}")
+      516              else:
+      517                  raise IOError(f"Error submitting order {order_id}: {order_result['error']['data']}")
+      518          else:
+       ... truncated at 60 lines ...
+      590      async def _user_stream_event_listener(self):
+      591          """
+      592          Listens to messages from _user_stream_tracker.user_stream queue.
+      593          Traders, Orders, and Balance updates from the WS.
+      594          """
+      595          user_channels = [
+      596              f"{self._sub_id}.{CONSTANTS.USER_ORDERS_ENDPOINT_NAME}",
+      597              f"{self._sub_id}.{CONSTANTS.USEREVENT_ENDPOINT_NAME}",
+      598              "positions",
+      599              "collaterals",
+      600          ]
+      601          async for event_message in self._iter_user_event_queue():
+      602              try:
+      603                  if isinstance(event_message, dict):
+      604                      if "channel" in event_message:
+      605                          channel: str = event_message.get("channel", None)
+      606                          results = event_message.get("data", None)
+      607                      else:
+      608                          if "collaterals" in event_message["result"]:
+      609                              channel = "collaterals"
+      610                              results = event_message.get("result", {})
+      611                          elif "positions" in event_message["result"]:
+      612                              channel = "positions"
+      613                              results = event_message.get("result", {})
+      614                          else:
+      615                              channel = "none"
+      616  
+      617                  elif event_message is asyncio.CancelledError:
+      618                      raise asyncio.CancelledError
+      619                  else:
+      620                      raise Exception(event_message)
+      621                  if channel not in user_channels:
+      622                      self.logger().error(
+      623                          f"Unexpected message in user stream: {event_message}.", exc_info=True)
+      624                      continue
+      625                  if channel == user_channels[0] and results is not None:
+      626                      for order_msg in results:
+      627                          self._process_order_message(order_msg)
+      628                  elif channel == user_channels[1] and results is not None:
+      629                      for trade_msg in results:
+      630                          await self._process_trade_message(trade_msg)
+      631                  elif channel == user_channels[2] and results is not None:
+      632                      await self._process_update_positions(results)
+      633                  elif channel == user_channels[3] and results is not None:
+      634                      for balance_msg in results["collaterals"]:
+      635                          self._process_update_balances(balance_msg)
+      636              except asyncio.CancelledError:
+      637                  raise
+      638              except Exception:
+      639                  self.logger().error(
+      640                      "Unexpected error in user stream listener loop.", exc_info=True)
+      641                  await self._sleep(5.0)
+      745      async def _format_trading_rules(self, exchange_info_dict: List) -> List[TradingRule]:
+      746          """
+      747          Queries the necessary API endpoint and initialize the TradingRule object for each trading pair being traded.
+      748  
+      749          Parameters
+      750          ----------
+      751          exchange_info_dict:
+      752              Trading rules dictionary response from the derivative
+      753  
+      754          {
+      755              "result": {
+      756                  "instruments": [
+      757                  {
+      758                      "instrument_type": "perp",
+      759                      "instrument_name": "OP-USDC",
+      760                      "scheduled_activation": 1728508925,
+      761                      "scheduled_deactivation": 9223372036854776000,
+      762                      "is_active": true,
+      763                      "tick_size": "0.01",
+      764                      "minimum_amount": "0.1",
+      765                      "maximum_amount": "1000",
+      766                      "amount_step": "0.01",
+      767                      "mark_price_fee_rate_cap": "0",
+      768                      "maker_fee_rate": "0.0015",
+      769                      "taker_fee_rate": "0.0015",
+      770                      "base_fee": "0.1",
+      771                      "base_currency": "OP",
+      772                      "quote_currency": "USD",
+      773                      "option_details": null,
+      774                      "perp_details": null,
+      775                      "erc20_details": {
+      776                      "decimals": 18,
+      777                      "underlying_erc20_address": "0x15CEcd5190A43C7798dD2058308781D0662e678E",
+      778                      "borrow_index": "1",
+      779                      "supply_index": "1"
+      780                      },
+      781                      "base_asset_address": "0xE201fCEfD4852f96810C069f66560dc25B2C7A55",
+      782                      "base_asset_sub_id": "0",
+      783                      "pro_rata_fraction": "0",
+      784                      "fifo_min_allocation": "0",
+      785                      "pro_rata_amount_step": "1"
+      786                  }
+      787                  ],
+      788                  "pagination": {
+      789                  "num_pages": 1,
+      790                  "count": 1
+      791                  }
+      792              },
+      793              "id": "0f9131b4-2502-4f8e-afa4-adfce67a6509"
+      794          }
+      795          """
+      796  
+      797          trading_pair_rules = exchange_info_dict
+      798          retval = []
+      799          for rule in filter(web_utils.is_exchange_information_valid, trading_pair_rules):
+      800              if rule["instrument_type"] != "perp":
+      801                  continue
+      802              try:
+      803                  trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=rule["instrument_name"])
+      804                  min_order_size = rule["minimum_amount"]
+       ... truncated at 60 lines ...
+      823      async def _update_balances(self):
+      824          """
+      825          Calls the REST API to update total and available balances.
+      826          """
+      827          local_asset_names = set(self._account_balances.keys())
+      828          remote_asset_names = set()
+      829  
+      830          account_info = await self._api_post(
+      831              path_url=CONSTANTS.ACCOUNTS_PATH_URL,
+      832              data={"subaccount_id": self._sub_id},
+      833              is_auth_required=True)
+      834          if "error" in account_info:
+      835              self.logger().error(f"Error fetching account balances: {account_info['error']['message']}")
+      836              raise
+      837          else:
+      838              balances = account_info["result"]["collaterals"]
+      839              for balance_entry in balances:
+      840                  asset_name = balance_entry["asset_name"]
+      841                  free_balance = Decimal(balance_entry["amount"])
+      842                  total_balance = Decimal(balance_entry["amount"])
+      843                  self._account_available_balances[asset_name] = free_balance
+      844                  self._account_balances[asset_name] = total_balance
+      845                  remote_asset_names.add(asset_name)
+      846  
+      847              asset_names_to_remove = local_asset_names.difference(remote_asset_names)
+      848              for asset_name in asset_names_to_remove:
+      849                  del self._account_available_balances[asset_name]
+      850                  del self._account_balances[asset_name]
+      852      async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+      853          oid = await tracked_order.get_exchange_order_id()
+      854          client_order_id = tracked_order.client_order_id
+      855          order_update = await self._api_post(
+      856              path_url=CONSTANTS.ORDER_STATUS_PAATH_URL,
+      857              data={
+      858                  "subaccount_id": self._sub_id,
+      859                  "order_id": oid
+      860              },
+      861              is_auth_required=True)
+      862          if "error" in order_update:
+      863              self.logger().debug(f"Error fetching order status for {client_order_id}: {order_update['error']['message']}")
+      864          if "result" in order_update:
+      865              current_state = order_update["result"]["order_status"]
+      866              _order_update: OrderUpdate = OrderUpdate(
+      867                  trading_pair=tracked_order.trading_pair,
+      868                  update_timestamp=order_update["result"]["last_update_timestamp"] * 1e-3,
+      869                  new_state=CONSTANTS.ORDER_STATE[current_state],
+      870                  client_order_id=order_update["result"]["label"] or client_order_id,
+      871                  exchange_order_id=str(order_update["result"]["order_id"]),
+      872              )
+      873              return _order_update
+      875      async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+      876          exchange_order_id = str(order.exchange_order_id)
+      877          if exchange_order_id is not None:
+      878              trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
+      879              all_fills_response = await self._api_get(
+      880                  path_url=CONSTANTS.MY_TRADES_PATH_URL,
+      881                  params={
+      882                      "instrument_name": trading_pair,
+      883                      "order_id": exchange_order_id,
+      884                      "subaccount_id": self._sub_id
+      885                  },
+      886                  is_auth_required=True,
+      887                  limit_id=CONSTANTS.MY_TRADES_PATH_URL)
+      888  
+      889              for trade in all_fills_response["result"]["trades"]:
+      890                  fee_asset = order.quote_asset
+      891                  if str(trade["order_id"]) == exchange_order_id:
+      892                      position_side = PositionSide.LONG if trade["direction"] == 'buy' else PositionSide.SHORT
+      893                      position_action = (PositionAction.OPEN
+      894                                         if (order.trade_type is TradeType.BUY and position_side == "LONG"
+      895                                             or order.trade_type is TradeType.SELL and position_side == "SHORT") else PositionAction.CLOSE)
+      896                      fee = TradeFeeBase.new_perpetual_fee(
+      897                          fee_schema=self.trade_fee_schema(),
+      898                          position_action=position_action,
+      899                          percent_token=fee_asset,
+      900                          flat_fees=[TokenAmount(amount=Decimal(trade["trade_fee"]), token=fee_asset)])
+      901                      trade_update = TradeUpdate(
+      902                          trade_id=str(trade["trade_id"]),
+      903                          client_order_id=order.client_order_id,
+      904                          exchange_order_id=exchange_order_id,
+      905                          trading_pair=trading_pair,
+      906                          fee=fee,
+      907                          fill_base_amount=Decimal(trade["trade_amount"]),
+      908                          fill_quote_amount=Decimal(trade["trade_amount"]) * Decimal(trade["trade_price"]),
+      909                          fill_price=Decimal(trade["trade_price"]),
+      910                          fill_timestamp=trade["timestamp"] * 1e-3,
+      911                      )
+      912                      self._order_tracker.process_trade_update(trade_update)
+
+---------- IMPLEMENTER hummingbot.connector.derivative.dydx_v4_perpetual.dydx_v4_perpetual_derivative:DydxV4PerpetualDerivative  stubs=1/29 ----------
+       35  class DydxV4PerpetualDerivative(PerpetualDerivativePyBase):
+       65      @property
+       66      def name(self) -> str:
+       67          return CONSTANTS.EXCHANGE_NAME
+       69      @property
+       70      def authenticator(self) -> AuthBase:
+       71          return None
+       73      @property
+       74      def rate_limits_rules(self) -> List[RateLimit]:
+       75          return CONSTANTS.RATE_LIMITS
+       77      @property
+       78      def domain(self) -> str:
+       79          return self._domain
+       81      @property
+       82      def client_order_id_max_length(self) -> int:
+       83          return CONSTANTS.MAX_ID_LEN
+       85      @property
+       86      def client_order_id_prefix(self) -> str:
+       87          return CONSTANTS.HBOT_BROKER_ID
+       89      @property
+       90      def trading_rules_request_path(self) -> str:
+       91          return CONSTANTS.PATH_MARKETS
+       93      @property
+       94      def trading_pairs_request_path(self) -> str:
+       95          return CONSTANTS.PATH_MARKETS
+       97      @property
+       98      def check_network_request_path(self) -> str:
+       99          return CONSTANTS.PATH_TIME
+      101      @property
+      102      def trading_pairs(self) -> List[str]:
+      103          return self._trading_pairs
+      105      @property
+      106      def is_cancel_request_in_exchange_synchronous(self) -> bool:
+      107          return True
+      109      @property
+      110      def is_trading_required(self) -> bool:
+      111          return self._trading_required
+      117      def supported_order_types(self) -> List[OrderType]:
+      118          return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
+      120      def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
+      121          return False
+      139      def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+      140          # TODO: implement this method correctly for the connector
+      141          # The default implementation was added when the functionality to detect not found orders was introduced in the
+      142          # ExchangePyBase class. Also fix the unit test test_lost_order_removed_if_not_found_during_order_status_update
+      143          # when replacing the dummy implementation
+      144          return False
+      146      def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+      147          # The default implementation was added when the functionality to detect not found orders was introduced in the
+      148          # ExchangePyBase class. Also fix the unit test test_cancel_order_not_found_in_the_exchange when replacing the
+      149          # dummy implementation
+      150          return False
+      157      async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
+      158          async with self._throttler.execute_task(limit_id=CONSTANTS.LIMIT_ID_ORDER_CANCEL):
+      159              if not self._margin_fractions:
+      160                  await self._update_trading_rules()
+      161              for i in range(3):
+      162                  resp = await self._tx_client.cancel_order(
+      163                      client_id=int(tracked_order.client_order_id),
+      164                      clob_pair_id=self._margin_fractions[tracked_order.trading_pair]["clob_pair_id"],
+      165                      order_flags=CONSTANTS.ORDER_FLAGS_LONG_TERM,
+      166                      good_til_block_time=int(time.time()) + CONSTANTS.ORDER_EXPIRATION
+      167                  )
+      168                  if CONSTANTS.ACCOUNT_SEQUENCE_MISMATCH_ERROR in resp['raw_log']:
+      169                      self.logger().warning(
+      170                          f"Failed to cancel order {tracked_order.client_order_id} (retry {i + 1}), {resp['raw_log']}")
+      171                      await asyncio.sleep(1)
+      172                      continue
+      173                  else:
+      174                      break
+      175          if resp["raw_log"] != "[]" and CONSTANTS.ERR_MSG_NO_ORDER_FOUND not in resp['raw_log']:
+      176              raise ValueError(f"Error sending the order cancel transaction ({resp['raw_log']})")
+      177          else:
+      178              return True
+      238      async def _place_order(
+      239              self,
+      240              order_id: str,
+      241              trading_pair: str,
+      242              amount: Decimal,
+      243              trade_type: TradeType,
+      244              order_type: OrderType,
+      245              price: Decimal,
+      246              position_action: PositionAction = PositionAction.NIL,
+      247              **kwargs,
+      248      ):
+      249          if not self._margin_fractions:
+      250              await self._update_trading_rules()
+      251          if order_type.is_limit_type():
+      252              _order_type = "LIMIT"
+      253              limit_id = CONSTANTS.LIMIT_LONG_TERM_ORDER_PLACE
+      254          else:
+      255              limit_id = CONSTANTS.MARKET_SHORT_TERM_ORDER_PLACE
+      256              _order_type = "MARKET"
+      257              if trade_type.name.lower() == 'buy':
+      258                  # The price needs to be relatively high before the transaction, whether the test will be cancelled
+      259                  price = Decimal("1.5") * self.get_price_for_volume(
+      260                      trading_pair,
+      261                      True,
+      262                      amount
+      263                  ).result_price
+      264              else:
+      265                  price = Decimal("0.75") * self.get_price_for_volume(
+      266                      trading_pair,
+      267                      False,
+      268                      amount
+      269                  ).result_price
+      270              price = self.quantize_order_price(trading_pair, price)
+      271          side = "BUY" if trade_type == TradeType.BUY else "SELL"
+      272          expiration = CONSTANTS.ORDER_EXPIRATION
+      273          reduce_only = False
+      274  
+      275          post_only = order_type is OrderType.LIMIT_MAKER
+      276          market = await self.exchange_symbol_associated_to_pair(trading_pair)
+      277          try:
+      278              async with self._throttler.execute_task(limit_id=limit_id):
+      279                  for i in range(3):
+      280                      resp = await self._tx_client.place_order(
+      281                          market=market,
+      282                          type=_order_type,
+      283                          side=side,
+      284                          price=price,
+      285                          size=amount,
+      286                          client_id=int(order_id),
+      287                          post_only=post_only,
+      288                          reduce_only=reduce_only,
+      289                          good_til_time_in_seconds=expiration,
+      290                      )
+      291                      if CONSTANTS.ACCOUNT_SEQUENCE_MISMATCH_ERROR in resp['raw_log']:
+      292                          self.logger().warning(f"Failed to submit order {order_id} (retry {i + 1}), {resp['raw_log']}")
+      293                          await asyncio.sleep(1)
+      294                          continue
+      295                      else:
+      296                          break
+      297              if resp["raw_log"] != "[]" or resp["txhash"] in [None, ""]:
+       ... truncated at 60 lines ...
+      347      def _get_fee(
+      348              self,
+      349              base_currency: str,
+      350              quote_currency: str,
+      351              order_type: OrderType,
+      352              order_side: TradeType,
+      353              position_action: PositionAction,
+      354              amount: Decimal,
+      355              price: Decimal = s_decimal_NaN,
+      356              is_maker: Optional[bool] = None,
+      357      ) -> TradeFeeBase:
+      358          is_maker = is_maker or False
+      359          fee = build_perpetual_trade_fee(
+      360              self.name,
+      361              is_maker,
+      362              position_action=position_action,
+      363              base_currency=base_currency,
+      364              quote_currency=quote_currency,
+      365              order_type=order_type,
+      366              order_side=order_side,
+      367              amount=amount,
+      368              price=price,
+      369          )
+      370          return fee
+      372      async def _update_trading_fees(self):
+      373          pass
+      375      async def _user_stream_event_listener(self):
+      376  
+      377          async for event_message in self._iter_user_event_queue():
+      378              try:
+      379                  event: Dict[str, Any] = event_message
+      380                  data: Dict[str, Any] = event["contents"]
+      381                  quote = "USD"
+      382                  if "subaccount" in data.keys() and len(data["subaccount"]) > 0:
+      383                      self._account_balances[quote] = Decimal(data["subaccount"]["equity"])
+      384                      self._account_available_balances[quote] = Decimal(data["subaccount"]["freeCollateral"])
+      385                      if "openPerpetualPositions" in data["subaccount"]:
+      386                          await self._process_open_positions(data["subaccount"]["openPerpetualPositions"])
+      387                  if "orders" in data.keys() and len(data["orders"]) > 0:
+      388                      for order in data["orders"]:
+      389                          client_order_id: str = order["clientId"]
+      390                          exchange_order_id: str = order["id"]
+      391                          tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
+      392                          trading_pair = await self.trading_pair_associated_to_exchange_symbol(order["ticker"])
+      393                          if tracked_order is not None:
+      394                              state = CONSTANTS.ORDER_STATE[order["status"]]
+      395                              new_order_update: OrderUpdate = OrderUpdate(
+      396                                  trading_pair=tracked_order.trading_pair,
+      397                                  update_timestamp=self.current_timestamp,
+      398                                  new_state=state,
+      399                                  client_order_id=tracked_order.client_order_id,
+      400                                  exchange_order_id=exchange_order_id,
+      401                              )
+      402                              self._order_tracker.process_order_update(new_order_update)
+      403                          # Processing all orders of the account, not just the client's
+      404                          if order["status"] in ["OPEN"]:
+      405                              initial_margin_requirement = (
+      406                                  Decimal(order["price"])
+      407                                  * Decimal(order["size"])
+      408                                  * self._margin_fractions[trading_pair]["initial"]
+      409                              )
+      410                              initial_margin_requirement = abs(initial_margin_requirement)
+      411                              self._allocated_collateral[order["id"]] = initial_margin_requirement
+      412                              # self._allocated_collateral_sum += initial_margin_requirement
+      413                              self._account_available_balances[quote] -= initial_margin_requirement
+      414                          if order["status"] in ["FILLED", "CANCELED"]:
+      415                              if order["id"] in self._allocated_collateral:
+      416                                  # Only deduct orders that were previously in the OPEN state
+      417                                  # Some orders are filled instantly and reach only the PENDING state
+      418                                  # self._allocated_collateral_sum -= self._allocated_collateral[order["id"]]
+      419                                  self._account_available_balances[quote] += self._allocated_collateral[order["id"]]
+      420                                  del self._allocated_collateral[order["id"]]
+      421                  if "fills" in data.keys() and len(data["fills"]) > 0:
+      422                      trade_updates = await self._process_ws_fills(data["fills"])
+      423                      for trade_update in trade_updates:
+      424                          self._order_tracker.process_trade_update(trade_update)
+      425  
+      426                  if "perpetualPositions" in data.keys() and len(data["perpetualPositions"]) > 0:
+      427                      # this is hit when a position is closed
+      428                      positions = data["perpetualPositions"]
+      429                      for position in positions:
+      430                          trading_pair = position["market"]
+      431                          if trading_pair not in self._trading_pairs:
+      432                              continue
+      433                          position_side = PositionSide[position["side"]]
+      434                          pos_key = self._perpetual_trading.position_key(trading_pair, position_side)
+       ... truncated at 60 lines ...
+      465      async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
+      466          trading_rules = []
+      467          markets_info = exchange_info_dict["markets"]
+      468          for market_name, market_info in markets_info.items():
+      469              if web_utils.is_exchange_information_valid(market_info):
+      470                  trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=market_name)
+      471                  market = markets_info[market_name]
+      472                  try:
+      473                      collateral_token = CONSTANTS.CURRENCY
+      474                      trading_rules += [
+      475                          TradingRule(
+      476                              trading_pair=trading_pair,
+      477                              min_price_increment=Decimal(market["tickSize"]),
+      478                              min_base_amount_increment=Decimal(market["stepSize"]),
+      479                              supports_limit_orders=True,
+      480                              supports_market_orders=True,
+      481                              buy_order_collateral_token=collateral_token,
+      482                              sell_order_collateral_token=collateral_token,
+      483                          )
+      484                      ]
+      485                      self._margin_fractions[trading_pair] = {
+      486                          "initial": Decimal(market["initialMarginFraction"]),
+      487                          "maintenance": Decimal(market["maintenanceMarginFraction"]),
+      488                          "clob_pair_id": market["clobPairId"],
+      489                          "atomicResolution": market["atomicResolution"],
+      490                          "stepBaseQuantums": market["stepBaseQuantums"],
+      491                          "quantumConversionExponent": market["quantumConversionExponent"],
+      492                          "subticksPerTick": market["subticksPerTick"],
+      493                      }
+      494                  except Exception:
+      495                      self.logger().exception("Error updating trading rules")
+      496          return trading_rules
+      498      async def _update_balances(self):
+      499          path = f"{CONSTANTS.PATH_SUBACCOUNT}/{self._dydx_v4_perpetual_chain_address}/subaccountNumber/{self.subaccount_id}"
+      500          response: Dict[str, Dict[str, Any]] = await self._api_get(
+      501              path_url=path, params={}, limit_id=CONSTANTS.PATH_SUBACCOUNT
+      502          )
+      503          quote = CONSTANTS.CURRENCY
+      504          self._account_available_balances.clear()
+      505          self._account_balances.clear()
+      506  
+      507          self._account_balances[quote] = Decimal(response["subaccount"]["equity"])
+      508          self._account_available_balances[quote] = Decimal(response["subaccount"]["freeCollateral"])
+      560      async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+      561          trade_updates = []
+      562  
+      563          if order.exchange_order_id is not None:
+      564              try:
+      565                  all_fills_response = await self._request_order_fills(order=order)
+      566                  fills_data = all_fills_response["fills"]
+      567                  trade_updates_tmp = self._process_rest_fills(fills_data)
+      568                  trade_updates += trade_updates_tmp
+      569  
+      570              except IOError as ex:
+      571                  if not self._is_request_exception_related_to_time_synchronizer(request_exception=ex):
+      572                      raise
+      573          return trade_updates
+      637      async def _request_order_status(self, tracked_order: InFlightOrder, exchange_order_id=None) -> OrderUpdate:
+      638          try:
+      639              orders_rsp = await self._api_get(
+      640                  path_url=CONSTANTS.PATH_ORDERS,
+      641                  limit_id=CONSTANTS.PATH_ORDERS,
+      642                  params={
+      643                      'address': self._dydx_v4_perpetual_chain_address,
+      644                      'subaccountNumber': self.subaccount_id,
+      645                      'goodTilBlockBeforeOrAt': CONSTANTS.TX_MAX_HEIGHT,
+      646                      'limit': CONSTANTS.LAST_FILLS_MAX,
+      647                  }
+      648              )
+      649              if exchange_order_id:
+      650                  updated_order_data = next(
+      651                      (order for order in orders_rsp if
+      652                       order["id"] == exchange_order_id), None
+      653                  )
+      654                  if updated_order_data is None:
+      655                      return None
+      656                  tracked_order = self._order_tracker.all_updatable_orders.get(str(updated_order_data["clientId"]))
+      657              else:
+      658                  updated_order_data = next(
+      659                      (order for order in orders_rsp if
+      660                       int(order["clientId"]) == int(tracked_order.client_order_id)), None
+      661                  )
+      662  
+      663              if updated_order_data is None:
+      664                  # If the order is not found in the response, return an OrderUpdate with the same status as before
+      665                  return OrderUpdate(
+      666                      client_order_id=tracked_order.client_order_id,
+      667                      exchange_order_id=tracked_order.exchange_order_id,
+      668                      trading_pair=tracked_order.trading_pair,
+      669                      update_timestamp=self._time_synchronizer.time(),
+      670                      new_state=tracked_order.current_state,
+      671                  )
+      672              client_order_id = str(updated_order_data["clientId"])
+      673  
+      674              order_update: OrderUpdate = OrderUpdate(
+      675                  trading_pair=tracked_order.trading_pair,
+      676                  update_timestamp=self.current_timestamp,
+      677                  new_state=CONSTANTS.ORDER_STATE[updated_order_data["status"]],
+      678                  client_order_id=client_order_id,
+      679                  exchange_order_id=updated_order_data["id"],
+      680              )
+      681          except IOError as ex:
+      682              if self._is_request_exception_related_to_time_synchronizer(request_exception=ex):
+      683                  order_update = OrderUpdate(
+      684                      client_order_id=tracked_order.client_order_id,
+      685                      trading_pair=tracked_order.trading_pair,
+      686                      update_timestamp=self.current_timestamp,
+      687                      new_state=tracked_order.current_state,
+      688                  )
+      689              else:
+      690                  raise
+      691          return order_update
+      693      def _create_web_assistants_factory(self) -> WebAssistantsFactory:
+      694          return web_utils.build_api_factory(
+      695              throttler=self._throttler,
+      696          )
+      705      def _create_order_book_data_source(self) -> DydxV4PerpetualAPIOrderBookDataSource:
+      706          return DydxV4PerpetualAPIOrderBookDataSource(
+      707              self.trading_pairs,
+      708              connector=self,
+      709              api_factory=self._web_assistants_factory,
+      710              domain=self._domain,
+      711          )
+      713      def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
+      714          return DydxV4PerpetualUserStreamDataSource(api_factory=self._web_assistants_factory,
+      715                                                     connector=self)
+      717      def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
+      718          markets = exchange_info["markets"]
+      719  
+      720          mapping = bidict()
+      721          for key, val in markets.items():
+      722              if web_utils.is_exchange_information_valid(val):
+      723                  exchange_symbol = val["ticker"]
+      724                  base = exchange_symbol.split("-")[0]
+      725                  quote = CONSTANTS.CURRENCY
+      726                  trading_pair = combine_to_hb_trading_pair(base, quote)
+      727                  if trading_pair in mapping.inverse:
+      728                      self._resolve_trading_pair_symbols_duplicate(mapping, exchange_symbol, base, quote)
+      729                  else:
+      730                      mapping[exchange_symbol] = trading_pair
+      731  
+      732          self._set_trading_pair_symbol_map(mapping)
+
+---------- IMPLEMENTER hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_derivative:GateIoPerpetualDerivative  stubs=1/29 ----------
+       35  class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
+       74      @property
+       75      def authenticator(self):
+       76          return GateIoPerpetualAuth(
+       77              api_key=self._gate_io_perpetual_api_key,
+       78              secret_key=self._gate_io_perpetual_secret_key)
+       80      @property
+       81      def name(self) -> str:
+       82          return "gate_io_perpetual"
+       84      @property
+       85      def rate_limits_rules(self):
+       86          return CONSTANTS.RATE_LIMITS
+       88      @property
+       89      def domain(self):
+       90          return self._domain
+       92      @property
+       93      def client_order_id_max_length(self):
+       94          return CONSTANTS.MAX_ID_LEN
+       96      @property
+       97      def client_order_id_prefix(self):
+       98          return CONSTANTS.HBOT_ORDER_ID
+      100      @property
+      101      def trading_rules_request_path(self):
+      102          return CONSTANTS.EXCHANGE_INFO_URL
+      104      @property
+      105      def trading_pairs_request_path(self):
+      106          return CONSTANTS.EXCHANGE_INFO_URL
+      108      @property
+      109      def check_network_request_path(self):
+      110          return CONSTANTS.NETWORK_CHECK_PATH_URL
+      112      @property
+      113      def trading_pairs(self):
+      114          return self._trading_pairs
+      116      @property
+      117      def is_cancel_request_in_exchange_synchronous(self) -> bool:
+      118          return True
+      120      @property
+      121      def is_trading_required(self) -> bool:
+      122          return self._trading_required
+      140      def supported_order_types(self) -> List[OrderType]:
+      141          """
+      142          :return a list of OrderType supported by this connector.
+      143          Note that Market order type is no longer required and will not be used.
+      144          """
+      145          return [OrderType.LIMIT, OrderType.MARKET, OrderType.LIMIT_MAKER]
+      167      def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
+      168          # API documentation does not clarify the error message for timestamp related problems
+      169          return False
+      171      def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+      172          # TODO: implement this method correctly for the connector
+      173          # The default implementation was added when the functionality to detect not found orders was introduced in the
+      174          # ExchangePyBase class. Also fix the unit test test_lost_order_removed_if_not_found_during_order_status_update
+      175          # when replacing the dummy implementation
+      176          return False
+      178      def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+      179          # TODO: implement this method correctly for the connector
+      180          # The default implementation was added when the functionality to detect not found orders was introduced in the
+      181          # ExchangePyBase class. Also fix the unit test test_cancel_order_not_found_in_the_exchange when replacing the
+      182          # dummy implementation
+      183          return False
+      185      def _create_web_assistants_factory(self) -> WebAssistantsFactory:
+      186          return web_utils.build_api_factory(
+      187              throttler=self._throttler,
+      188              auth=self._auth)
+      190      def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
+      191          return GateIoPerpetualAPIOrderBookDataSource(
+      192              trading_pairs=self._trading_pairs,
+      193              connector=self,
+      194              api_factory=self._web_assistants_factory,
+      195              domain=self.domain,
+      196          )
+      198      def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
+      199          return GateIoPerpetualAPIUserStreamDataSource(
+      200              auth=self._auth,
+      201              user_id=self._gate_io_perpetual_user_id,
+      202              trading_pairs=self._trading_pairs,
+      203              connector=self,
+      204              api_factory=self._web_assistants_factory,
+      205              domain=self.domain,
+      206          )
+      215      async def _format_trading_rules(self, raw_trading_pair_info) -> List[TradingRule]:
+      216          """
+      217          Converts json API response into a dictionary of trading rules.
+      218          :param symbols_info: The json API response
+      219          :return A dictionary of trading rules.
+      220          Response Example:
+      221          [
+      222              {
+      223                  "name": "BTC_USDT",
+      224                  "type": "direct",
+      225                  "quanto_multiplier": "0.0001",
+      226                  "ref_discount_rate": "0",
+      227                  "order_price_deviate": "0.5",
+      228                  "maintenance_rate": "0.005",
+      229                  "mark_type": "index",
+      230                  "last_price": "38026",
+      231                  "mark_price": "37985.6",
+      232                  "index_price": "37954.92",
+      233                  "funding_rate_indicative": "0.000219",
+      234                  "mark_price_round": "0.01",
+      235                  "funding_offset": 0,
+      236                  "in_delisting": false,
+      237                  "risk_limit_base": "1000000",
+      238                  "interest_rate": "0.0003",
+      239                  "order_price_round": "0.1",
+      240                  "order_size_min": 1,
+      241                  "ref_rebate_rate": "0.2",
+      242                  "funding_interval": 28800,
+      243                  "risk_limit_step": "1000000",
+      244                  "leverage_min": "1",
+      245                  "leverage_max": "100",
+      246                  "risk_limit_max": "8000000",
+      247                  "maker_fee_rate": "-0.00025",
+      248                  "taker_fee_rate": "0.00075",
+      249                  "funding_rate": "0.002053",
+      250                  "order_size_max": 1000000,
+      251                  "funding_next_apply": 1610035200,
+      252                  "short_users": 977,
+      253                  "config_change_time": 1609899548,
+      254                  "trade_size": 28530850594,
+      255                  "position_size": 5223816,
+      256                  "long_users": 455,
+      257                  "funding_impact_value": "60000",
+      258                  "orders_limit": 50,
+      259                  "trade_id": 10851092,
+      260                  "orderbook_id": 2129638396
+      261                }
+      262          ]
+      263          """
+      264          result = {}
+      265  
+      266          for rule in raw_trading_pair_info:
+      267              try:
+      268                  if not web_utils.is_exchange_information_valid(rule):
+      269                      continue
+      270  
+      271                  trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=rule["name"])
+      272  
+      273                  min_amount_inc = Decimal(f"{rule['quanto_multiplier']}")
+      274                  min_price_inc = Decimal(f"{rule['order_price_round']}")
+       ... truncated at 60 lines ...
+      288      async def _place_order(self,
+      289                             order_id: str,
+      290                             trading_pair: str,
+      291                             amount: Decimal,
+      292                             trade_type: TradeType,
+      293                             order_type: OrderType,
+      294                             price: Decimal,
+      295                             **kwargs) -> Tuple[str, float]:
+      296          symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+      297          size = self._format_amount_to_size(trading_pair, amount)
+      298          data = {
+      299              "text": order_id,
+      300              "contract": symbol,
+      301              "size": float(-size) if trade_type.name.lower() == 'sell' else float(size),
+      302          }
+      303          if order_type.is_limit_type():
+      304              data.update({
+      305                  "price": f"{price:f}",
+      306                  "tif": "gtc",
+      307              })
+      308              if order_type is OrderType.LIMIT_MAKER:
+      309                  data.update({"tif": "poc"})
+      310          else:
+      311              data.update({
+      312                  "price": "0",
+      313                  "tif": "ioc",
+      314              })
+      315  
+      316          # RESTRequest does not support json, and if we pass a dict
+      317          # the underlying aiohttp will encode it to params
+      318          data = data
+      319          endpoint = CONSTANTS.ORDER_CREATE_PATH_URL
+      320          order_result = await self._api_post(
+      321              path_url=endpoint,
+      322              data=data,
+      323              is_auth_required=True,
+      324              limit_id=endpoint,
+      325          )
+      326          if order_result.get('finish_as') in {"cancelled", "expired", "failed", "ioc"}:
+      327              raise IOError({"label": "ORDER_REJECTED", "message": "Order rejected."})
+      328          exchange_order_id = str(order_result["id"])
+      329          return exchange_order_id, self.current_timestamp
+      331      async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
+      332          """
+      333          This implementation-specific method is called by _cancel
+      334          returns True if successful
+      335          """
+      336          canceled = False
+      337          exchange_order_id = await tracked_order.get_exchange_order_id()
+      338          resp = await self._api_delete(
+      339              path_url=CONSTANTS.ORDER_DELETE_PATH_URL.format(id=exchange_order_id),
+      340              is_auth_required=True,
+      341              limit_id=CONSTANTS.ORDER_DELETE_LIMIT_ID,
+      342          )
+      343          canceled = resp.get("finish_as") == "cancelled"
+      344          return canceled
+      346      async def _update_balances(self):
+      347          """
+      348          Calls REST API to update total and available balances.
+      349          """
+      350          account_info = ""
+      351          try:
+      352              account_info = await self._api_get(
+      353                  path_url=CONSTANTS.USER_BALANCES_PATH_URL,
+      354                  is_auth_required=True,
+      355                  limit_id=CONSTANTS.USER_BALANCES_PATH_URL
+      356              )
+      357              self._process_balance_message(account_info)
+      358          except Exception as e:
+      359              self.logger().network(
+      360                  f"Unexpected error while fetching balance update - {str(e)}", exc_info=True,
+      361                  app_warning_msg=(f"Could not fetch balance update from {self.name_cap}"))
+      362              raise e
+      363          return account_info
+      397      async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+      398          trade_updates = []
+      399  
+      400          try:
+      401              exchange_order_id = await order.get_exchange_order_id()
+      402              trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
+      403              all_fills_response = await self._api_get(
+      404                  path_url=CONSTANTS.MY_TRADES_PATH_URL,
+      405                  params={
+      406                      "contract": trading_pair,
+      407                      "order": exchange_order_id
+      408                  },
+      409                  is_auth_required=True,
+      410                  limit_id=CONSTANTS.MY_TRADES_PATH_URL)
+      411  
+      412              for trade_fill in all_fills_response:
+      413                  trade_update = self._create_trade_update_with_order_fill_data(
+      414                      order_fill=trade_fill,
+      415                      order=order)
+      416                  trade_updates.append(trade_update)
+      417  
+      418          except asyncio.TimeoutError:
+      419              raise IOError(f"Skipped order update with order fills for {order.client_order_id} "
+      420                            "- waiting for exchange order id.")
+      421  
+      422          return trade_updates
+      455      async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+      456          try:
+      457              exchange_order_id = await tracked_order.get_exchange_order_id()
+      458              updated_order_data = await self._api_get(
+      459                  path_url=CONSTANTS.ORDER_STATUS_PATH_URL.format(id=exchange_order_id),
+      460                  is_auth_required=True,
+      461                  limit_id=CONSTANTS.ORDER_STATUS_LIMIT_ID)
+      462  
+      463              order_update = self._create_order_update_with_order_status_data(
+      464                  order_status=updated_order_data,
+      465                  order=tracked_order)
+      466          except asyncio.TimeoutError:
+      467              raise IOError(f"Skipped order status update for {tracked_order.client_order_id}"
+      468                            f" - waiting for exchange order id.")
+      469  
+      470          return order_update
+      509      def _get_fee(self,
+      510                   base_currency: str,
+      511                   quote_currency: str,
+      512                   order_type: OrderType,
+      513                   order_side: TradeType,
+      514                   amount: Decimal,
+      515                   price: Decimal = s_decimal_NaN,
+      516                   is_maker: Optional[bool] = None) -> TradeFeeBase:
+      517          is_maker = is_maker or False
+      518          fee = build_trade_fee(
+      519              self.name,
+      520              is_maker,
+      521              base_currency=base_currency,
+      522              quote_currency=quote_currency,
+      523              order_type=order_type,
+      524              order_side=order_side,
+      525              amount=amount,
+      526              price=price,
+      527          )
+      528          return fee
+      530      async def _update_trading_fees(self):
+      531          """
+      532          Update fees information from the exchange
+      533          """
+      534          pass
+      536      async def _user_stream_event_listener(self):
+      537          """
+      538          Listens to messages from _user_stream_tracker.user_stream queue.
+      539          Traders, Orders, and Balance updates from the WS.
+      540          """
+      541          user_channels = [
+      542              CONSTANTS.USER_TRADES_ENDPOINT_NAME,
+      543              CONSTANTS.USER_ORDERS_ENDPOINT_NAME,
+      544              CONSTANTS.USER_BALANCE_ENDPOINT_NAME,
+      545              CONSTANTS.USER_POSITIONS_ENDPOINT_NAME,
+      546          ]
+      547          async for event_message in self._iter_user_event_queue():
+      548              try:
+      549                  if isinstance(event_message, dict):
+      550                      channel: str = event_message.get("channel", None)
+      551                      results: List[Dict[str, Any]] = event_message.get("result", None)
+      552                  elif event_message is asyncio.CancelledError:
+      553                      raise asyncio.CancelledError
+      554                  else:
+      555                      raise Exception(event_message)
+      556                  if channel not in user_channels:
+      557                      self.logger().error(
+      558                          f"Unexpected message in user stream: {event_message}.", exc_info=True)
+      559                      continue
+      560  
+      561                  if channel == CONSTANTS.USER_TRADES_ENDPOINT_NAME:
+      562                      for trade_msg in results:
+      563                          self._process_trade_message(trade_msg)
+      564                  elif channel == CONSTANTS.USER_ORDERS_ENDPOINT_NAME:
+      565                      for order_msg in results:
+      566                          self._process_order_message(order_msg)
+      567                  elif channel == CONSTANTS.USER_POSITIONS_ENDPOINT_NAME:
+      568                      for position_msg in results:
+      569                          await self._process_account_position_message(position_msg)
+      570                  elif channel == CONSTANTS.USER_BALANCE_ENDPOINT_NAME:
+      571                      self._process_balance_message_ws(results)
+      572              except asyncio.CancelledError:
+      573                  raise
+      574              except Exception:
+      575                  self.logger().error(
+      576                      "Unexpected error in user stream listener loop.", exc_info=True)
+      577                  await self._sleep(5.0)
+      640      def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
+      641          mapping = bidict()
+      642          for symbol_data in filter(web_utils.is_exchange_information_valid, exchange_info):
+      643              exchange_symbol = symbol_data["name"]
+      644              base = symbol_data["name"].split('_')[0]
+      645              quote = symbol_data["name"].split('_')[1]
+      646              trading_pair = combine_to_hb_trading_pair(base, quote)
+      647              if trading_pair in mapping.inverse:
+      648                  self._resolve_trading_pair_symbols_duplicate(mapping, exchange_symbol, base, quote)
+      649              else:
+      650                  mapping[exchange_symbol] = trading_pair
+      651          self._set_trading_pair_symbol_map(mapping)
+
+(30 further implementers not shown)

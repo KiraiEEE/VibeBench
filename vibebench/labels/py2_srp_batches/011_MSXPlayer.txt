@@ -1,0 +1,267 @@
+row 11   music-assistant/server#3146
+============================================================================
+CLASS MSXPlayer in music_assistant/providers/msx_bridge/player.py   loc=262 methods=14 wmc=69 lcom=0.1666666666666666
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       17  class MSXPlayer(Player):
+       18      """Represents a Smart TV running MSX as a Music Assistant player."""
+       19  
+       20      current_stream_url: str | None = None
+       21      output_format: str = "mp3"
+       22      _skip_ws_notify: bool = False
+       23      _propagating: bool = False
+       24      _playing_from_queue: bool = False
+       25      _playlist_offset: int = 0
+       26      _playlist_size: int = 0
+       27  
+       28      def __init__(
+       29          self,
+       30          provider: MSXBridgeProvider,
+       31          player_id: str,
+       32          name: str = "MSX TV",
+       33          output_format: str = "mp3",
+       34          *,
+       35          grouping_enabled: bool = True,
+       36      ) -> None:
+       37          """Initialize the MSX Player."""
+       38          super().__init__(provider, player_id)
+       39          self._attr_name = name
+       40          self._attr_type = PlayerType.PLAYER
+       41          self._attr_supported_features = {
+       42              PlayerFeature.PAUSE,
+       43              PlayerFeature.VOLUME_SET,
+       44          }
+       45          if grouping_enabled:
+       46              self._attr_supported_features.add(PlayerFeature.SET_MEMBERS)
+       47              self._attr_can_group_with = {provider.instance_id}
+       48          self._attr_device_info = DeviceInfo(
+       49              model="Smart TV (MSX)",
+       50              manufacturer="MSX Bridge",
+       51          )
+       52          self._attr_available = True
+       53          self._attr_powered = True
+       54          self._attr_volume_level = 100
+       55          self.output_format = output_format
+       56  
+       57      @property
+       58      def needs_poll(self) -> bool:
+       59          """Return if the player needs to be polled for state updates."""
+       60          return True
+       61  
+       62      @property
+       63      def poll_interval(self) -> int:
+       64          """Return poll interval in seconds."""
+       65          return 5 if self.playback_state == PlaybackState.PLAYING else 30
+       66  
+       67      async def play_media(self, media: PlayerMedia) -> None:
+       68          """Handle PLAY MEDIA command — store stream URL for the TV to fetch."""
+       69          self.logger.info("play_media on %s: uri=%s", self.display_name, media.uri)
+       70          self.current_stream_url = media.uri
+       71          self._attr_current_media = media
+       72          self._attr_playback_state = PlaybackState.PLAYING
+       73          self._attr_elapsed_time = 0
+       74          self._attr_elapsed_time_last_updated = time.time()
+       75          self.update_state()
+       76  
+       77          title, artist, image_url, duration = self._resolve_media_metadata(media)
+       78          provider = cast("MSXBridgeProvider", self.provider)
+       79  
+       80          if not self._skip_ws_notify:
+       81              if self._playing_from_queue and media.source_id:
+       82                  # MA-initiated track change while MSX already has the playlist.
+       83                  # Translate MA queue index → MSX rotated playlist index.
+       84                  queue = self.mass.player_queues.get(media.source_id)
+       85                  ma_index = getattr(queue, "current_index", 0) if queue else 0
+       86                  if self._playlist_size > 0:
+       87                      msx_index = (ma_index - self._playlist_offset) % self._playlist_size
+       88                  else:
+       89                      msx_index = ma_index
+       90                  provider.notify_goto_index(self.player_id, msx_index)
+       91              elif media.source_id and media.queue_item_id:
+       92                  # First queue-backed play → send full MSX native playlist
+       93                  queue = self.mass.player_queues.get(media.source_id)
+       94                  start_index = getattr(queue, "current_index", 0) if queue else 0
+       95                  # Store rotation offset/size for goto_index translation
+       96                  try:
+       97                      queue_items = self.mass.player_queues.items(media.source_id)
+       98                      self._playlist_size = len(list(queue_items))
+       99                  except Exception:
+      100                      self._playlist_size = 0
+      101                  self._playlist_offset = start_index
+      102                  provider.notify_play_playlist(self.player_id, start_index)
+      103                  self._playing_from_queue = True
+      104              else:
+      105                  # Direct stream / non-queue → existing broadcast_play behavior
+      106                  next_action = f"request:interaction:/api/next/{self.player_id}"
+      107                  prev_action = f"request:interaction:/api/previous/{self.player_id}"
+      108  
+      109                  provider.notify_play_started(
+      110                      self.player_id,
+      111                      title=title,
+      112                      artist=artist,
+      113                      image_url=image_url,
+      114                      duration=duration,
+      115                      next_action=next_action,
+      116                      prev_action=prev_action,
+      117                  )
+      118  
+      119          await self._propagate_to_group_members("play_media", media=media)
+      120  
+      121      def _resolve_media_metadata(
+      122          self, media: PlayerMedia
+      123      ) -> tuple[str | None, str | None, str | None, int | None]:
+      124          """Resolve real metadata from queue item (flow_mode sends generic metadata)."""
+      125          title = media.title
+      126          artist = media.artist
+      127          image_url = media.image_url
+      128          duration = media.duration
+      129          if media.source_id and media.queue_item_id:
+      130              queue_item = self.mass.player_queues.get_item(media.source_id, media.queue_item_id)
+      131              if queue_item:
+      132                  if queue_item.media_item:
+      133                      title = getattr(queue_item.media_item, "name", None) or title
+      134                      artist = getattr(queue_item.media_item, "artist_str", None) or artist
+      135                      duration = getattr(queue_item.media_item, "duration", None) or duration
+      136                  if queue_item.image:
+      137                      image_url = self.mass.metadata.get_image_url(
+      138                          queue_item.image, size=500, prefer_stream_server=True
+      139                      )
+      140                  if duration is None and queue_item.duration:
+      141                      duration = queue_item.duration
+      142                  if title is None and queue_item.name:
+      143                      title = queue_item.name
+      144          return title, artist, image_url, duration
+      145  
+      146      def _get_group_member_ids(self) -> list[str]:
+      147          """Get IDs of group members (excluding self).
+      148  
+      149          Only returns members when this player is the sync leader.
+      150          MA's SyncGroupPlayer forwards play_media to the sync leader,
+      151          whose group_members already contains all SyncGroup members.
+      152          """
+      153          if self.synced_to is not None:
+      154              return []
+      155          return [x for x in self.group_members if x != self.player_id]
+      156  
+      157      async def _propagate_to_group_members(self, command: str, **kwargs: Any) -> None:
+      158          """Propagate command to group members when we are the leader."""
+      159          # Skip if grouping is disabled at provider level
+      160          provider = cast("MSXBridgeProvider", self.provider)
+      161          if not provider.grouping_enabled:
+      162              return
+      163          # Prevent infinite recursion if member.play_media triggers propagation back
+      164          if self._propagating:
+      165              return
+      166          self._propagating = True
+      167          try:
+      168              for member_id in self._get_group_member_ids():
+      169                  member = self.mass.players.get(member_id)
+      170                  if not member or not isinstance(member, MSXPlayer) or not member.available:
+      171                      continue
+      172                  try:
+      173                      if command == "play_media":
+      174                          media = kwargs.get("media")
+      175                          if media:
+      176                              # Call member.play_media directly — mass.players.play_media
+      177                              # would redirect synced/grouped players back to the leader
+      178                              await member.play_media(media)
+      179                      elif command == "stop":
+      180                          await member.stop()
+      181                      elif command == "pause":
+      182                          await member.pause()
+      183                      elif command == "play":
+      184                          await member.play()
+      185                  except Exception:
+      186                      self.logger.warning(
+      187                          "Failed to propagate %s to member %s",
+      188                          command,
+      189                          member_id,
+      190                          exc_info=True,
+      191                      )
+      192          finally:
+      193              self._propagating = False
+      194  
+      195      async def set_members(
+      196          self,
+      197          player_ids_to_add: list[str] | None = None,
+      198          player_ids_to_remove: list[str] | None = None,
+      199      ) -> None:
+      200          """Handle SET_MEMBERS — update group membership."""
+      201          for pid in player_ids_to_remove or []:
+      202              if pid in self._attr_group_members:
+      203                  self._attr_group_members.remove(pid)
+      204          for pid in player_ids_to_add or []:
+      205              if pid != self.player_id and pid not in self._attr_group_members:
+      206                  other = self.mass.players.get(pid)
+      207                  if other and isinstance(other, MSXPlayer):
+      208                      self._attr_group_members.append(pid)
+      209          self.update_state()
+      210  
+      211      async def play(self) -> None:
+      212          """Handle PLAY (resume) command."""
+      213          self.logger.info("play (resume) on %s", self.display_name)
+      214          if self._attr_playback_state == PlaybackState.PAUSED:
+      215              await self._resume_from_pause()
+      216              return
+      217          self._attr_playback_state = PlaybackState.PLAYING
+      218          self._attr_elapsed_time_last_updated = time.time()
+      219          self.update_state()
+      220          await self._propagate_to_group_members("play")
+      221  
+      222      async def _resume_from_pause(self) -> None:
+      223          """Resume playback after pause — queue re-sends current track to MSX."""
+      224          try:
+      225              await self.mass.player_queues.resume(self.player_id)
+      226          except Exception:
+      227              self.logger.warning(
+      228                  "resume from pause failed, falling back to play state only",
+      229                  exc_info=True,
+      230              )
+      231              self._attr_playback_state = PlaybackState.PLAYING
+      232              self._attr_elapsed_time_last_updated = time.time()
+      233              self.update_state()
+      234  
+      235      async def pause(self) -> None:
+      236          """Handle PAUSE command — stop playback on MSX but keep queue/position for resume."""
+      237          self.logger.info("pause on %s", self.display_name)
+      238          # Snapshot the elapsed time before pausing
+      239          if self._attr_elapsed_time is not None and self._attr_elapsed_time_last_updated is not None:
+      240              self._attr_elapsed_time += time.time() - self._attr_elapsed_time_last_updated
+      241          self._attr_playback_state = PlaybackState.PAUSED
+      242          self._attr_elapsed_time_last_updated = time.time()
+      243          self.update_state()
+      244          cast("MSXBridgeProvider", self.provider).notify_play_stopped(self.player_id)
+      245          await self._propagate_to_group_members("pause")
+      246  
+      247      async def stop(self) -> None:
+      248          """Handle STOP command."""
+      249          self.logger.info("stop on %s", self.display_name)
+      250          self._attr_playback_state = PlaybackState.IDLE
+      251          self._attr_current_media = None
+      252          self._attr_elapsed_time = None
+      253          self._attr_elapsed_time_last_updated = None
+      254          self.current_stream_url = None
+      255          self._playing_from_queue = False
+      256          self._playlist_offset = 0
+      257          self._playlist_size = 0
+      258          self.update_state()
+      259          provider = cast("MSXBridgeProvider", self.provider)
+      260          provider.notify_play_stopped(self.player_id)
+      261          await self._propagate_to_group_members("stop")
+      262  
+      263      async def volume_set(self, volume_level: int) -> None:
+      264          """Handle VOLUME_SET command."""
+      265          self._attr_volume_level = volume_level
+      266          self.update_state()
+      267  
+      268      async def poll(self) -> None:
+      269          """Poll player for state updates."""
+      270          if (
+      271              self._attr_playback_state == PlaybackState.PLAYING
+      272              and self._attr_elapsed_time is not None
+      273              and self._attr_elapsed_time_last_updated is not None
+      274          ):
+      275              now = time.time()
+      276              self._attr_elapsed_time += now - self._attr_elapsed_time_last_updated
+      277              self._attr_elapsed_time_last_updated = now
+      278              self.update_state()

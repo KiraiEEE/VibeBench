@@ -1,0 +1,598 @@
+row 103   Deep-Learning-Profiling-Tools/triton-viz#105
+============================================================================
+CONTRACT triton_viz.core.client:Client   kind=abc abstract_methods=10.0 implementers=7.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file triton_viz/core/client.py
+       21  class Client(ABC):
+       22      NAME: ClassVar[str]
+       23  
+       24      def __init__(self):
+       25          # Whether this client needs ASM information from kernel warmup
+       26          self.collect_asm: bool = False
+       27          # Storage for ASM information if collected
+       28          self.asm_info: Optional[dict] = None
+       29  
+       30      @abstractmethod
+       31      def pre_run_callback(self, fn: Callable) -> bool:
+       32          """
+       33          Returns True if the function should continue running, False if it should be skipped.
+       34          """
+       35          ...
+       36  
+       37      @abstractmethod
+       38      def post_run_callback(self, fn: Callable) -> bool:
+       39          """
+       40          Returns True if the function should continue running, False if it should be skipped.
+       41          """
+       42          ...
+       43  
+       44      @abstractmethod
+       45      def arg_callback(self, name, arg, arg_cvt):
+       46          ...
+       47  
+       48      @abstractmethod
+       49      def grid_callback(self, grid: tuple[int, ...]):
+       50          ...
+       51  
+       52      @abstractmethod
+       53      def grid_idx_callback(self, grid_idx: tuple[int, ...]):
+       54          ...
+       55  
+       56      @abstractmethod
+       57      def register_op_callback(self, op_type: type[Op]) -> OpCallbacks:
+       58          ...
+       59  
+       60      @abstractmethod
+       61      def register_for_loop_callback(self) -> ForLoopCallbacks:
+       62          ...
+       63  
+       64      @abstractmethod
+       65      def finalize(self) -> list:
+       66          ...
+       67  
+       68      @abstractmethod
+       69      def pre_warmup_callback(self, jit_fn: Callable, *args, **kwargs) -> bool:
+       70          """
+       71          Returns True if the warmup should proceed, False to skip warmup.
+       72          """
+       73          ...
+       74  
+       75      @abstractmethod
+       76      def post_warmup_callback(self, jit_fn: Callable, ret: Any) -> None:
+       77          ...
+
+---------- IMPLEMENTER tests.test_sanitizer:LoadIndexChecker  stubs=1/10 ----------
+      130  class LoadIndexChecker(SanitizerSymbolicExecution):
+      143      def register_op_callback(self, op_type):
+      144          op_callbacks = super().register_op_callback(op_type)
+      145          if op_type not in (Load, RawLoad) or op_callbacks.op_overrider is None:
+      146              return op_callbacks
+      147  
+      148          orig_overrider = op_callbacks.op_overrider
+      149  
+      150          def new_load_overrider(ptr, *a, **k):
+      151              # exec original overrider
+      152              load_expr = orig_overrider(ptr, *a, **k)
+      153  
+      154              # Important: We only record pointers accessing fp32!
+      155              # This is because fp32 is usually the outermost dtype of a "load of a load" chain.
+      156              # This is the case in all unittests.
+      157              p = load_expr.ptr
+      158              if (
+      159                  hasattr(p, "dtype_tt")
+      160                  and isinstance(p.dtype_tt, tl.pointer_type)
+      161                  and p.dtype_tt.element_ty is tl.float32
+      162              ):  # filtering fp32 pointers
+      163                  offs = _sum_offsets_from_addptr(p)
+      164                  if offs is not None:
+      165                      self._offset_lists.append(offs.tolist())
+      166              return load_expr
+      167  
+      168          # Return OpCallbacks with the new overrider, preserving other callbacks
+      169          from triton_viz.core.callbacks import OpCallbacks
+      170  
+      171          return OpCallbacks(
+      172              before_callback=op_callbacks.before_callback,
+      173              after_callback=op_callbacks.after_callback,
+      174              op_overrider=new_load_overrider,
+      175          )
+      (does not define: arg_callback, finalize, grid_callback, grid_idx_callback, post_run_callback, post_warmup_callback, pre_run_callback, pre_warmup_callback, register_for_loop_callback; inherited or absent)
+
+---------- IMPLEMENTER triton_viz.clients.profiler.profiler:Profiler  stubs=1/10 ----------
+       18  class Profiler(Client):
+       68      def pre_run_callback(self, fn: Callable) -> bool:
+       69          # If block sampling is enabled, check if current block is selected
+       70          if self.block_sampling and self.sampled_blocks is not None:
+       71              return self.current_grid_idx in self.sampled_blocks
+       72          return True
+       74      def post_run_callback(self, fn: Callable) -> bool:
+       75          return True
+       77      def pre_warmup_callback(self, jit_fn, *args, **kwargs) -> bool:
+       78          # TODO: optionally proceed the warmup. For now, always proceed.
+       79          return True
+       81      def post_warmup_callback(self, jit_fn, ret) -> None:
+       82          if not ret:
+       83              return
+       84  
+       85          if (
+       86              not self.disable_buffer_load_check
+       87              and hasattr(ret, "asm")
+       88              and "amdgcn" in ret.asm
+       89          ):
+       90              self.has_buffer_load = "buffer_load" in ret.asm["amdgcn"]
+       91              if self.has_buffer_load:
+       92                  print("Detected buffer_load instruction in kernel ASM!")
+       94      def arg_callback(self, name, arg, arg_cvt):
+       95          pass
+       97      def grid_idx_callback(self, grid_idx: tuple[int, ...]):
+       98          # Store the current grid index
+       99          self.current_grid_idx = grid_idx
+      101      def grid_callback(self, grid: tuple[int, ...]):
+      102          # If block sampling is enabled, determine which blocks to sample
+      103          if self.block_sampling:
+      104              # Generate all possible indices
+      105              all_indices = []
+      106              for x in range(grid[0] if len(grid) > 0 else 1):
+      107                  for y in range(grid[1] if len(grid) > 1 else 1):
+      108                      for z in range(grid[2] if len(grid) > 2 else 1):
+      109                          all_indices.append((x, y, z))
+      110  
+      111              # Sample k blocks randomly
+      112              total_blocks = len(all_indices)
+      113              k = min(self.k if self.k is not None else 1, total_blocks)
+      114  
+      115              # Randomly select k indices
+      116              perm = np.random.permutation(total_blocks)[:k]
+      117              sampled_indices = [all_indices[i] for i in perm]
+      118              self.sampled_blocks = set(sampled_indices)
+      119          else:
+      120              # No sampling - all blocks will be executed
+      121              self.sampled_blocks = None
+      164      def register_op_callback(self, op_type: type[Op]) -> OpCallbacks:
+      165          def _get_mask_stats(mask: TensorHandle) -> tuple[int, int]:
+      166              """Get mask statistics: total count and false count.
+      167  
+      168              Args:
+      169                  mask: TensorHandle containing boolean mask data
+      170  
+      171              Returns:
+      172                  Tuple of (total_count, false_count)
+      173              """
+      174              total_count = mask.data.size
+      175              false_count = np.count_nonzero(np.logical_not(mask.data))
+      176              return total_count, false_count
+      177  
+      178          def pre_load_callback(
+      179              ptr, mask, other, cache_modifier, eviction_policy, is_volatile
+      180          ):
+      181              self._report_load_store_bytes("load", ptr, mask)
+      182              if not self.disable_load_mask_percentage_check:
+      183                  total_count, false_count = _get_mask_stats(mask)
+      184                  self.load_mask_total_count += total_count
+      185                  self.load_mask_false_count += false_count
+      186  
+      187          def load_overrider(
+      188              ptr, mask, other, cache_modifier, eviction_policy, is_volatile
+      189          ):
+      190              # Skip actual load, return zeros
+      191              dtype_tt = ptr.get_element_ty()
+      192              dtype_np = _get_np_dtype(dtype_tt)
+      193              return TensorHandle(np.zeros_like(ptr.data, dtype=dtype_np), dtype_tt)
+      194  
+      195          def pre_store_callback(ptr, value, mask, cache_modifier, eviction_policy):
+      196              self._report_load_store_bytes("store", ptr, mask)
+      197              if not self.disable_load_mask_percentage_check:
+      198                  total_count, false_count = _get_mask_stats(mask)
+      199                  self.store_mask_total_count += total_count
+      200                  self.store_mask_false_count += false_count
+      201  
+      202          def store_overrider(ptr, value, mask, cache_modifier, eviction_policy):
+      203              # Skip actual store
+      204              pass
+      205  
+      206          def dot_overrider(a, b, d, input_precision, max_num_imprecise_acc):
+      207              # Skip actual dot operation, return zeros with same shape as d
+      208              # This replaces np.matmul(a_data, b_data, dtype=d.data.dtype) + d.data
+      209              return TensorHandle(np.zeros_like(d.data), d.dtype.scalar)
+      210  
+      211          def pre_addptr_callback(ptr, offset):
+      212              dtype_tt = ptr.get_element_ty()
+      213              element_bitwidth = dtype_tt.primitive_bitwidth
+      214              element_bytewidth = max(1, element_bitwidth // 8)
+      215  
+      216              # Get offset data
+      217              offset_data = offset.data if isinstance(offset, TensorHandle) else offset
+      218  
+      219              # Calculate byte offset
+      220              byte_offset = offset_data * element_bytewidth
+      221  
+      222              # Check if byte offsets are within 32-bit range
+      223              if not self.disable_buffer_load_check:
+       ... truncated at 60 lines ...
+      250      def register_for_loop_callback(self):
+      251          def loop_hook_range_type(lineno: int, range_type: str) -> None:
+      252              cur = self.loop_info.get(lineno, LoopInfo())
+      253              self.loop_info[lineno] = replace(cur, range_type=range_type)
+      254  
+      255          def loop_hook_before(lineno, iterable):
+      256              if self.disable_for_loop_unroll_check:
+      257                  return
+      258  
+      259              if not isinstance(iterable, range):
+      260                  return
+      261  
+      262              # Only record each unique loop (by line number) once
+      263              # Different blocks will execute the same loop, so we deduplicate by lineno
+      264              if self.loop_info[lineno].length is not None:
+      265                  return
+      266  
+      267              # Record loop information: line number and total steps
+      268              length = len(iterable)
+      269              # Update length in LoopInfo
+      270              cur = self.loop_info.get(lineno, LoopInfo())
+      271              self.loop_info[lineno] = replace(cur, length=length)
+      272  
+      273          def loop_hook_after(lineno: int) -> None:
+      274              # No action needed after loop for profiler
+      275              pass
+      276  
+      277          return ForLoopCallbacks(
+      278              range_type_callback=loop_hook_range_type,
+      279              before_loop_callback=loop_hook_before,
+      280              after_loop_callback=loop_hook_after,
+      281          )
+      283      def finalize(self) -> list:
+      284          print("=" * 60, "Profiler Issues Summary", "=" * 60)
+      285          if not self.disable_for_loop_unroll_check:
+      286              print("\n" + "=" * 60)
+      287              print(
+      288                  "-" * 10
+      289                  + " "
+      290                  + "Profiler: For-Loop Unrolling Statistics"
+      291                  + " "
+      292                  + "-" * 9
+      293              )
+      294              print("=" * 60)
+      295              if self.loop_info:
+      296                  print(f"\nTotal for-loops detected: {len(self.loop_info)}\n")
+      297  
+      298                  for idx, (lineno, loop_info) in enumerate(self.loop_info.items(), 1):
+      299                      print(f"Loop #{idx}:")
+      300                      print(f"  Line number:    {lineno}")
+      301                      print(f"  Range type:     {loop_info.range_type}")
+      302                      print(f"  Total steps:    {loop_info.length}")
+      303  
+      304                  print("=" * 60)
+      305              else:
+      306                  print("\nNo for-loops detected.\n")
+      307                  print("=" * 60)
+      308  
+      309          if not self.disable_load_mask_percentage_check:
+      310              print("\n" + "=" * 60)
+      311              print("-" * 10 + " " + "Profiler: Mask Ratio Statistics" + " " + "-" * 17)
+      312              print("=" * 60)
+      313  
+      314              # Load statistics
+      315              if self.load_mask_total_count > 0:
+      316                  load_masked_percentage = (
+      317                      self.load_mask_false_count / self.load_mask_total_count
+      318                  ) * 100
+      319                  print("\nLoad Operations:")
+      320                  print(f"  Total mask elements:     {self.load_mask_total_count}")
+      321                  print(f"  False elements:          {self.load_mask_false_count}")
+      322                  print(f"  Masked percentage:       {load_masked_percentage:.2f}%")
+      323              else:
+      324                  print("\nLoad Operations:")
+      325                  print("  No load operations detected")
+      326  
+      327              # Store statistics
+      328              if self.store_mask_total_count > 0:
+      329                  store_masked_percentage = (
+      330                      self.store_mask_false_count / self.store_mask_total_count
+      331                  ) * 100
+      332                  print("\nStore Operations:")
+      333                  print(f"  Total mask elements:     {self.store_mask_total_count}")
+      334                  print(f"  False elements:          {self.store_mask_false_count}")
+      335                  print(f"  Masked percentage:       {store_masked_percentage:.2f}%")
+      336              else:
+      337                  print("\nStore Operations:")
+      338                  print("  No store operations detected")
+      339  
+      340              print("=" * 60 + "\n")
+      341  
+      342          if not self.disable_buffer_load_check:
+       ... truncated at 60 lines ...
+
+---------- IMPLEMENTER triton_viz.clients.sanitizer.sanitizer:Sanitizer  stubs=7/10 ----------
+      446  class Sanitizer(Client):
+      466      def pre_run_callback(self, fn: Callable) -> bool:
+      467          return True
+      469      def post_run_callback(self, fn: Callable) -> bool:
+      470          return True
+      472      def pre_warmup_callback(self, jit_fn, *args, **kwargs) -> bool:
+      473          return False
+      475      def post_warmup_callback(self, jit_fn, ret) -> None:
+      476          pass
+      478      def arg_callback(self, *args, **kwargs):  # type: ignore[override]
+      479          raise NotImplementedError
+      481      def finalize(self, *args, **kwargs):  # type: ignore[override]
+      482          raise NotImplementedError
+      484      def grid_callback(self, *args, **kwargs):  # type: ignore[override]
+      485          raise NotImplementedError
+      487      def grid_idx_callback(self, *args, **kwargs):  # type: ignore[override]
+      488          raise NotImplementedError
+      490      def register_op_callback(self, *args, **kwargs):  # type: ignore[override]
+      491          raise NotImplementedError
+      493      def register_for_loop_callback(self, *args, **kwargs):  # type: ignore[override]
+      494          raise NotImplementedError
+
+---------- IMPLEMENTER triton_viz.clients.sanitizer.sanitizer:SanitizerBruteForce  stubs=1/10 ----------
+      501  class SanitizerBruteForce(Sanitizer):
+      529      def pre_run_callback(self, fn: Callable) -> bool:
+      530          return True
+      532      def post_run_callback(self, fn: Callable) -> bool:
+      533          if self.grid_idx == self.last_grid:
+      534              self.tensors.clear()
+      535          return True
+      537      def arg_callback(self, name, arg, arg_cvt):
+      538          if hasattr(arg, "data_ptr"):
+      539              assert check_storage_contiguous(
+      540                  arg
+      541              ), "The address sanitizer only supports contiguouly stored tensors for now"
+      542              self.tensors.append(arg)
+      544      def grid_idx_callback(self, grid_idx: tuple[int, ...]) -> None:
+      545          self.grid_idx = grid_idx
+      547      def grid_callback(self, grid: tuple[int, ...]) -> None:
+      548          self.last_grid = _get_last_grid(grid)
+      549          self.tensors = sorted(self.tensors, key=lambda x: x.data_ptr())
+      551      def register_op_callback(self, op_type: type[Op]) -> OpCallbacks:
+      552          def pre_load_callback(
+      553              ptr, mask, other, cache_modifier, eviction_policy, is_volatile
+      554          ):
+      555              first_loc = np.unravel_index(np.argmax(mask, axis=None), mask.data.shape)
+      556              first_ptr = ptr.data[first_loc]
+      557              tensor = _get_tensor(self.tensors, first_ptr)
+      558              oob = check_out_of_bounds_access(ptr.data, mask.data, tensor)
+      559              self._report(op_type, oob)
+      560              ptr.data = tensor.data_ptr() + oob["corrected_offsets"]
+      561  
+      562          def pre_store_callback(ptr, value, mask, cache_modifier, eviction_policy):
+      563              first_loc = np.unravel_index(np.argmax(mask, axis=None), mask.data.shape)
+      564              first_ptr = ptr.data[first_loc]
+      565              tensor = _get_tensor(self.tensors, first_ptr)
+      566              oob = check_out_of_bounds_access(ptr.data, mask.data, tensor)
+      567              self._report(
+      568                  op_type, check_out_of_bounds_access(ptr.data, mask.data, tensor)
+      569              )
+      570              ptr.data = tensor.data_ptr() + oob["corrected_offsets"]
+      571  
+      572          if op_type is Load:
+      573              return OpCallbacks(before_callback=pre_load_callback)
+      574          elif op_type is Store:
+      575              return OpCallbacks(before_callback=pre_store_callback)
+      576  
+      577          return OpCallbacks()
+      579      def register_for_loop_callback(self):
+      580          return ForLoopCallbacks()
+      582      def finalize(self) -> list:
+      583          return self.records
+      (does not define: post_warmup_callback, pre_warmup_callback; inherited or absent)
+
+---------- IMPLEMENTER triton_viz.clients.sanitizer.sanitizer:SanitizerSymbolicExecution  stubs=1/10 ----------
+     1523  class SanitizerSymbolicExecution(Sanitizer):
+     1677      def pre_run_callback(self, fn: Callable) -> bool:
+     1678          # Kernel Cache: Only use cache if enabled
+     1679          if cfg.enable_kernel_cache and self.cache_grid:
+     1680              # First time we launch this program, compute the hash
+     1681              fn_cache = _FnSymbolicCache(fn, self.cache_grid, tuple(self.cache_args))
+     1682              self._clear_cache()
+     1683              if fn_cache not in _fn_symbolic_cache_set:
+     1684                  _fn_symbolic_cache_set.add(fn_cache)
+     1685                  # Must continue to run the program at least once
+     1686                  # We don't clear up tensors at this point
+     1687                  return True
+     1688              else:
+     1689                  # Skip re-analysis for identical kernel launch
+     1690                  return False
+     1691          elif self.cache_grid:
+     1692              # Kernel cache disabled, always clear cache and run
+     1693              self._clear_cache()
+     1694  
+     1695          # 2nd time we launch this program, depends on whether we need a full grid
+     1696          if self.need_full_grid is None:
+     1697              return True
+     1698          return self.need_full_grid
+     1700      def post_run_callback(self, fn: Callable) -> bool:
+     1701          if self.need_full_grid is None:
+     1702              self.need_full_grid = False
+     1703          if self.grid_idx == self.last_grid or not self.need_full_grid:
+     1704              self._clear_cache()
+     1705              self.tensors.clear()
+     1706              self.tensor_addrs.clear()
+     1707          ret = self.need_full_grid
+     1708          self.need_full_grid = None  # reset for the next run
+     1709          return ret
+     1711      def arg_callback(self, name, arg, arg_cvt):
+     1712          if not hasattr(arg, "data_ptr"):
+     1713              if name not in ["num_warps", "num_stages", "maxnreg", "num_ctas"]:
+     1714                  self.cache_args.append(arg)
+     1715              return
+     1716          if arg.is_contiguous() or check_storage_contiguous(arg):
+     1717              start = arg.data_ptr()
+     1718              end = arg.data_ptr() + (arg.numel() - 1) * arg.element_size()
+     1719              tensor_physical_addresses = [(start, end)]
+     1720          elif check_inner_stride_equal_to_one(arg):
+     1721              tensor_physical_addresses = get_physical_addr_from_tensor_slice(arg)
+     1722          else:
+     1723              raise ValueError(
+     1724                  "The address sanitizer only supports contiguouly stored tensors for now!"
+     1725              )
+     1726          # To uniquely identify the metadata of a tensor
+     1727          self.cache_args.append((arg.shape, arg.stride(), arg.dtype))
+     1728          self.tensors.append(arg)
+     1729          self.tensor_addrs.extend(tensor_physical_addresses)
+     1731      def grid_callback(self, grid: tuple[int, ...]) -> None:
+     1732          self.cache_grid = grid
+     1733          self.last_grid = _get_last_grid(grid)
+     1734          self.grid = tuple(int(g) for g in grid)
+     1735          addr = Int("addr")
+     1736          self._addr_ok = Or(*[And(addr >= s, addr <= e) for s, e in self.tensor_addrs])
+     1737          self._pid_ok = And(
+     1738              SymbolicExpr.PID0 < self.grid[0],
+     1739              SymbolicExpr.PID1 < self.grid[1],
+     1740              SymbolicExpr.PID2 < self.grid[2],
+     1741              SymbolicExpr.PID0 >= 0,
+     1742              SymbolicExpr.PID1 >= 0,
+     1743              SymbolicExpr.PID2 >= 0,
+     1744          )
+     1745          self._solver = Solver()
+     1746          self._solver.add(Not(self._addr_ok))
+     1747          self._solver.add(self._pid_ok)
+     1748          self._addr_sym = addr
+     1750      def grid_idx_callback(self, grid_idx: tuple[int, ...]) -> None:
+     1751          self.grid_idx = grid_idx
+     1753      def register_op_callback(self, op_type: type[Op]) -> OpCallbacks:
+     1754          def op_program_id_overrider(axis):
+     1755              assert self.grid, "Grid not initialized!"
+     1756              return SymbolicExpr("pid", self.grid, axis)
+     1757  
+     1758          def op_raw_load_overrider(ptr, cache_modifier, eviction_policy, is_volatile):
+     1759              return op_load_overrider(
+     1760                  ptr, None, None, cache_modifier, eviction_policy, is_volatile
+     1761              )
+     1762  
+     1763          def op_load_overrider(
+     1764              ptr, mask, other, cache_modifier, eviction_policy, is_volatile
+     1765          ):
+     1766              # deal with indirect loads
+     1767              if isinstance(ptr, SymbolicExpr) and ptr.has_op("load"):
+     1768                  self.need_full_grid = True
+     1769                  ptr = _replace_load_subtree(ptr)
+     1770  
+     1771              # make sure ptr dtype is valid
+     1772              if isinstance(ptr, TensorHandle) and not isinstance(
+     1773                  ptr.dtype, tl.pointer_type
+     1774              ):
+     1775                  raise ValueError(f"Unsupported ptr dtype: {ptr.dtype}")
+     1776              ptr_sym = SymbolicExpr.from_value(ptr)
+     1777  
+     1778              if mask is None:
+     1779                  ret = SymbolicExpr("load", ptr_sym)
+     1780              elif other is None:
+     1781                  ret = SymbolicExpr("load", ptr_sym, mask)
+     1782              else:
+     1783                  ret = SymbolicExpr("load", ptr_sym, mask, other)
+     1784  
+     1785              # check memory access using z3 (defer in loops or check immediately)
+     1786              self._handle_access_check(ret)
+     1787              return ret
+     1788  
+     1789          def op_raw_store_overrider(ptr, value, cache_modifier, eviction_policy):
+     1790              return op_store_overrider(ptr, value, None, cache_modifier, eviction_policy)
+     1791  
+     1792          def op_store_overrider(ptr, value, mask, cache_modifier, eviction_policy):
+     1793              # deal with indirect loads
+     1794              if isinstance(ptr, SymbolicExpr) and ptr.has_op("load"):
+     1795                  self.need_full_grid = True
+     1796                  ptr = _replace_load_subtree(ptr)
+     1797  
+     1798              # make sure ptr is a SymbolicExpr
+     1799              if isinstance(ptr, TensorHandle) and not isinstance(
+     1800                  ptr.dtype, tl.pointer_type
+     1801              ):
+     1802                  raise ValueError(f"Unsupported ptr dtype: {ptr.dtype}")
+     1803              ptr_sym = SymbolicExpr.from_value(ptr)
+     1804  
+     1805              value = SymbolicExpr.from_value(value)
+     1806              if mask is None:
+     1807                  ret = SymbolicExpr("store", ptr_sym, value)
+     1808              else:
+     1809                  ret = SymbolicExpr("store", ptr_sym, value, mask)
+     1810  
+     1811              # check memory access using z3 (defer in loops or check immediately)
+     1812              self._handle_access_check(ret)
+       ... truncated at 60 lines ...
+     2071      def register_for_loop_callback(self):
+     2072          def loop_hook_before(lineno, iterable):
+     2073              if not isinstance(iterable, range):
+     2074                  if cfg.verbose:
+     2075                      print("not a for-loop, skipping for-loop iterator association.")
+     2076                  return
+     2077              length = len(iterable)
+     2078              idx_z3 = Int(f"loop_i_{lineno}")
+     2079              self.loop_stack.append(LoopContext(lineno, length, idx_z3))
+     2080              if cfg.verbose:
+     2081                  print(f"[Sanitizer] ▶ enter loop@{lineno}, len={length}")
+     2082  
+     2083          def loop_hook_iter_overrider(lineno, idx):
+     2084              # collect iterator values
+     2085              if self.loop_stack and self.loop_stack[-1].lineno == lineno:
+     2086                  self.loop_stack[-1].values.append(idx)
+     2087  
+     2088              # Make a tagged SymbolicExpr
+     2089              sym = SymbolicExpr("const", idx, tl.int32)
+     2090              sym._loop_ctx = self.loop_stack[-1]
+     2091  
+     2092              return tl.core.tensor(sym, tl.int32)
+     2093  
+     2094          def loop_hook_iter_listener(lineno, idx):
+     2095              if cfg.verbose:
+     2096                  print(f"[Sanitizer] ▶ loop@{lineno} idx={idx}")
+     2097  
+     2098          def loop_hook_after(lineno: int) -> None:
+     2099              ctx = self.loop_stack.pop()
+     2100              # add constraints for loop_i
+     2101              iterator_constraints: list[BoolRef] = []
+     2102              if ctx.values:
+     2103                  iterator_constraints.append(
+     2104                      Or(*[ctx.idx_z3 == v for v in set(ctx.values)])
+     2105                  )
+     2106  
+     2107              # execute pending checks
+     2108              for check_tuple in ctx.pending_checks:
+     2109                  # Handle both old format (2-tuple) and new format (3-tuple)
+     2110                  if len(check_tuple) == 2:
+     2111                      addr_expr, expr_constraints = check_tuple
+     2112                      symbolic_expr = None
+     2113                  else:
+     2114                      addr_expr, expr_constraints, symbolic_expr = check_tuple
+     2115  
+     2116                  if cfg.verbose:
+     2117                      print(
+     2118                          "[Sanitizer] ▶ checking:",
+     2119                          addr_expr,
+     2120                          f" with iterator constraints: {iterator_constraints} ",
+     2121                          f" and expression-related constraints: {expr_constraints} ",
+     2122                      )
+     2123  
+     2124                  if symbolic_expr is not None:
+     2125                      self._check_range_satisfiable_with_expr(
+     2126                          addr_expr,
+     2127                          expr_constraints + iterator_constraints,
+     2128                          symbolic_expr,
+     2129                      )
+     2130                  else:
+       ... truncated at 60 lines ...
+     2148      def finalize(self) -> list:
+     2149          return []
+      (does not define: post_warmup_callback, pre_warmup_callback; inherited or absent)
+
+---------- IMPLEMENTER triton_viz.clients.sanitizer.sanitizer:NullSanitizer  stubs=1/10 ----------
+     2152  class NullSanitizer(Sanitizer):
+     2167      def arg_callback(self, *args, **kwargs):
+     2168          self._disabled("arg_callback")
+     2170      def finalize(self, *args, **kwargs):
+     2171          self._disabled("finalize")
+     2173      def grid_callback(self, *args, **kwargs):
+     2174          self._disabled("grid_callback")
+     2176      def grid_idx_callback(self, *args, **kwargs):
+     2177          self._disabled("grid_idx_callback")
+     2179      def register_op_callback(self, *args, **kwargs):
+     2180          self._disabled("register_op_callback")
+     2182      def register_for_loop_callback(self, *args, **kwargs):
+     2183          self._disabled("register_for_loop_callback")
+      (does not define: post_run_callback, post_warmup_callback, pre_run_callback, pre_warmup_callback; inherited or absent)
+
+(1 further implementers not shown)

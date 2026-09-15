@@ -1,0 +1,343 @@
+row 163   livekit/agents#5135
+============================================================================
+CLASS HammingTransport in livekit-plugins/livekit-plugins-hamming/livekit/plugins/hamming/_transport.py   loc=338 methods=12 wmc=51 lcom=0.3
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       34  class HammingTransport:
+       35      def __init__(
+       36          self,
+       37          *,
+       38          base_url: str,
+       39          api_key: str,
+       40          policy: ConnectionPolicy,
+       41      ) -> None:
+       42          self._base_url = base_url.rstrip("/")
+       43          self._api_key = api_key
+       44          self._policy = policy
+       45          self._session: aiohttp.ClientSession | None = None
+       46  
+       47      def _auth_headers(self) -> dict[str, str]:
+       48          return {
+       49              "Authorization": f"Bearer {self._api_key}",
+       50              "X-Workspace-Key": self._api_key,
+       51              "X-API-Key": self._api_key,
+       52          }
+       53  
+       54      async def aclose(self) -> None:
+       55          if self._session is not None:
+       56              await self._session.close()
+       57              self._session = None
+       58  
+       59      async def build_inline_recording_capture(
+       60          self,
+       61          *,
+       62          recording_path: str | Path,
+       63      ) -> dict[str, Any] | None:
+       64          path = Path(recording_path)
+       65          exists = await asyncio.to_thread(lambda: path.exists() and path.is_file())
+       66          if not exists:
+       67              return None
+       68  
+       69          try:
+       70              stat = await asyncio.to_thread(path.stat)
+       71          except OSError:
+       72              return None
+       73          if stat.st_size <= 0:
+       74              return None
+       75          if stat.st_size > _MAX_INLINE_RECORDING_BYTES:
+       76              return None
+       77  
+       78          content_type = _guess_audio_content_type(path)
+       79          file_name = path.name or "recording.ogg"
+       80          try:
+       81              audio_bytes = await asyncio.to_thread(path.read_bytes)
+       82          except OSError:
+       83              return None
+       84          return {
+       85              "file_name": file_name,
+       86              "content_type": content_type,
+       87              "content_base64": b64encode(audio_bytes).decode("ascii"),
+       88          }
+       89  
+       90      async def send_capture(self, envelope: dict[str, Any]) -> None:
+       91          session = await self._ensure_session()
+       92          url = f"{self._base_url}/api/rest/v2/livekit-monitoring"
+       93          timeout = aiohttp.ClientTimeout(total=self._policy.timeout_seconds)
+       94  
+       95          backoff = self._policy.retry_backoff_seconds
+       96          for attempt in range(self._policy.max_retries + 1):
+       97              try:
+       98                  async with session.post(
+       99                      url,
+      100                      json=envelope,
+      101                      timeout=timeout,
+      102                      headers={
+      103                          **self._auth_headers(),
+      104                          "Content-Type": "application/json",
+      105                      },
+      106                  ) as resp:
+      107                      body = (await resp.text())[:300]
+      108                      if 200 <= resp.status < 300:
+      109                          logger.info(
+      110                              "hamming monitoring request accepted",
+      111                              extra={
+      112                                  "endpoint": url,
+      113                                  "status": resp.status,
+      114                                  "attempt": attempt + 1,
+      115                              },
+      116                          )
+      117                          return
+      118  
+      119                      if resp.status == 429 or resp.status >= 500:
+      120                          raise _RetryableResponseError(
+      121                              f"retryable response status={resp.status} body={body}"
+      122                          )
+      123  
+      124                      raise ValueError(
+      125                          f"hamming monitoring request rejected status={resp.status} body={body}"
+      126                      )
+      127              except (aiohttp.ClientError, asyncio.TimeoutError, _RetryableResponseError):
+      128                  if attempt >= self._policy.max_retries:
+      129                      raise
+      130                  await asyncio.sleep(backoff)
+      131                  backoff *= 2
+      132  
+      133      async def fetch_test_case_run_recording_url(
+      134          self,
+      135          *,
+      136          test_case_run_id: str,
+      137      ) -> str | None:
+      138          session = await self._ensure_session()
+      139          url = f"{self._base_url}/api/rest/test-case-runs/{quote(test_case_run_id, safe='')}/details"
+      140          timeout = aiohttp.ClientTimeout(total=self._policy.timeout_seconds)
+      141  
+      142          backoff = self._policy.retry_backoff_seconds
+      143          for attempt in range(self._policy.max_retries + 1):
+      144              try:
+      145                  async with session.get(
+      146                      url,
+      147                      timeout=timeout,
+      148                      headers=self._auth_headers(),
+      149                  ) as resp:
+      150                      if resp.status == 404:
+      151                          return None
+      152  
+      153                      if resp.status == 429 or resp.status >= 500:
+      154                          body = (await resp.text())[:300]
+      155                          raise _RetryableResponseError(
+      156                              f"retryable response status={resp.status} body={body}"
+      157                          )
+      158  
+      159                      if resp.status >= 400:
+      160                          return None
+      161  
+      162                      payload = await resp.json(content_type=None)
+      163                      if not isinstance(payload, dict):
+      164                          return None
+      165  
+      166                      recording_url = payload.get("recordingUrl")
+      167                      if isinstance(recording_url, str) and recording_url.strip():
+      168                          return recording_url.strip()
+      169  
+      170                      return None
+      171              except (aiohttp.ClientError, asyncio.TimeoutError, _RetryableResponseError):
+      172                  if attempt >= self._policy.max_retries:
+      173                      raise
+      174                  await asyncio.sleep(backoff)
+      175                  backoff *= 2
+      176  
+      177          return None
+      178  
+      179      async def start_plugin_managed_room_composite_egress(
+      180          self,
+      181          *,
+      182          room_name: str,
+      183          filepath: str,
+      184      ) -> str:
+      185          _assert_plugin_managed_room_composite_environment()
+      186          logger.info(
+      187              "starting plugin-managed room composite egress",
+      188              extra={
+      189                  "room_name": room_name,
+      190                  "filepath": filepath,
+      191                  "bucket": os.getenv("AWS_RECORDINGS_BUCKET", "").strip() or None,
+      192                  "region": os.getenv("AWS_REGION", "").strip() or None,
+      193              },
+      194          )
+      195          async with livekit_api.LiveKitAPI() as lkapi:
+      196              output = livekit_api.EncodedFileOutput(
+      197                  filepath=filepath,
+      198                  s3=_build_s3_upload_config(),
+      199                  file_type=_resolve_encoded_file_type(filepath),
+      200              )
+      201              request = livekit_api.RoomCompositeEgressRequest(
+      202                  room_name=room_name,
+      203                  audio_only=True,
+      204                  audio_mixing=livekit_api.AudioMixing.DUAL_CHANNEL_AGENT,
+      205                  file_outputs=[output],
+      206              )
+      207  
+      208              if filepath.lower().endswith(".ogg"):
+      209                  request.advanced.CopyFrom(
+      210                      livekit_api.EncodingOptions(
+      211                          audio_codec=livekit_api.AudioCodec.OPUS,
+      212                          audio_frequency=_ROOM_COMPOSITE_OPUS_SAMPLE_RATE_HZ,
+      213                      )
+      214                  )
+      215  
+      216              response = await lkapi.egress.start_room_composite_egress(request)
+      217              egress_id = (response.egress_id or "").strip()
+      218              if not egress_id:
+      219                  raise RuntimeError(f"LiveKit returned an empty egress_id for room={room_name}")
+      220              logger.info(
+      221                  "started plugin-managed room composite egress",
+      222                  extra={
+      223                      "room_name": room_name,
+      224                      "filepath": filepath,
+      225                      "egress_id": egress_id,
+      226                  },
+      227              )
+      228              return egress_id
+      229  
+      230      async def stop_plugin_managed_room_composite_egress_and_wait_for_url(
+      231          self,
+      232          *,
+      233          egress_id: str,
+      234          filepath: str,
+      235          max_attempts: int,
+      236          poll_interval_seconds: float,
+      237      ) -> str | None:
+      238          async with livekit_api.LiveKitAPI() as lkapi:
+      239              self._log_plugin_managed_egress_finalization(
+      240                  egress_id=egress_id,
+      241                  filepath=filepath,
+      242                  max_attempts=max_attempts,
+      243                  poll_interval_seconds=poll_interval_seconds,
+      244              )
+      245              await self._request_plugin_managed_egress_stop(
+      246                  lkapi=lkapi,
+      247                  egress_id=egress_id,
+      248                  filepath=filepath,
+      249              )
+      250              last_status_name: str | None = None
+      251              for attempt in range(1, max_attempts + 1):
+      252                  (
+      253                      resolved_url,
+      254                      last_status_name,
+      255                      should_continue,
+      256                  ) = await self._poll_plugin_managed_egress(
+      257                      lkapi=lkapi,
+      258                      egress_id=egress_id,
+      259                      filepath=filepath,
+      260                      attempt=attempt,
+      261                      max_attempts=max_attempts,
+      262                      last_status_name=last_status_name,
+      263                  )
+      264                  if resolved_url is not None or not should_continue:
+      265                      return resolved_url
+      266                  if attempt < max_attempts:
+      267                      await asyncio.sleep(poll_interval_seconds)
+      268  
+      269          logger.warning(
+      270              "plugin-managed room composite egress polling exhausted without recording URL",
+      271              extra={"egress_id": egress_id, "filepath": filepath, "attempts": max_attempts},
+      272          )
+      273          return None
+      274  
+      275      def _log_plugin_managed_egress_finalization(
+      276          self,
+      277          *,
+      278          egress_id: str,
+      279          filepath: str,
+      280          max_attempts: int,
+      281          poll_interval_seconds: float,
+      282      ) -> None:
+      283          logger.info(
+      284              "finalizing plugin-managed room composite egress",
+      285              extra={
+      286                  "egress_id": egress_id,
+      287                  "filepath": filepath,
+      288                  "max_attempts": max_attempts,
+      289                  "poll_interval_seconds": poll_interval_seconds,
+      290              },
+      291          )
+      292  
+      293      async def _request_plugin_managed_egress_stop(
+      294          self,
+      295          *,
+      296          lkapi: livekit_api.LiveKitAPI,
+      297          egress_id: str,
+      298          filepath: str,
+      299      ) -> None:
+      300          try:
+      301              await lkapi.egress.stop_egress(livekit_api.StopEgressRequest(egress_id=egress_id))
+      302              logger.info(
+      303                  "requested plugin-managed room composite egress stop",
+      304                  extra={"egress_id": egress_id, "filepath": filepath},
+      305              )
+      306          except Exception:
+      307              logger.info(
+      308                  "plugin-managed room composite egress stop request was not accepted; polling final state",
+      309                  extra={"egress_id": egress_id, "filepath": filepath},
+      310              )
+      311  
+      312      async def _poll_plugin_managed_egress(
+      313          self,
+      314          *,
+      315          lkapi: livekit_api.LiveKitAPI,
+      316          egress_id: str,
+      317          filepath: str,
+      318          attempt: int,
+      319          max_attempts: int,
+      320          last_status_name: str | None,
+      321      ) -> tuple[str | None, str | None, bool]:
+      322          response = await lkapi.egress.list_egress(
+      323              livekit_api.ListEgressRequest(egress_id=egress_id)
+      324          )
+      325          egress_info = next(iter(response.items), None)
+      326          if egress_info is None:
+      327              result = _handle_missing_plugin_managed_egress(
+      328                  egress_id=egress_id,
+      329                  filepath=filepath,
+      330                  attempt=attempt,
+      331                  max_attempts=max_attempts,
+      332              )
+      333              return result, last_status_name, result is None
+      334  
+      335          resolved_location = _extract_egress_location(egress_info)
+      336          if resolved_location:
+      337              logger.info(
+      338                  "resolved plugin-managed room composite egress location",
+      339                  extra={
+      340                      "egress_id": egress_id,
+      341                      "filepath": filepath,
+      342                      "attempt": attempt,
+      343                      "resolved_location": resolved_location,
+      344                  },
+      345              )
+      346              return resolved_location, last_status_name, False
+      347  
+      348          status_name = _resolve_egress_status_name(getattr(egress_info, "status", None))
+      349          if status_name != last_status_name:
+      350              logger.info(
+      351                  "plugin-managed room composite egress status update",
+      352                  extra={
+      353                      "egress_id": egress_id,
+      354                      "filepath": filepath,
+      355                      "attempt": attempt,
+      356                      "status": status_name,
+      357                  },
+      358              )
+      359  
+      360          resolved_url, should_continue = _resolve_plugin_managed_egress_terminal_result(
+      361              egress_id=egress_id,
+      362              filepath=filepath,
+      363              attempt=attempt,
+      364              status_name=status_name,
+      365          )
+      366          return resolved_url, status_name, should_continue
+      367  
+      368      async def _ensure_session(self) -> aiohttp.ClientSession:
+      369          if self._session is None or self._session.closed:
+      370              self._session = aiohttp.ClientSession()
+      371          return self._session

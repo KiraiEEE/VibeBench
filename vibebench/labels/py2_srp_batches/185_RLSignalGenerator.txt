@@ -1,0 +1,299 @@
+row 185   lee101/stock-prediction#79
+============================================================================
+CLASS RLSignalGenerator in rl-trading-agent-binance/rl_signal.py   loc=294 methods=12 wmc=60 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      373  class RLSignalGenerator:
+      374      def __init__(
+      375          self,
+      376          checkpoint_path: str | Path,
+      377          forecast_cache_root: str | Path = "binanceneural/forecast_cache",
+      378          device: str = "auto",
+      379          symbols: tuple[str, ...] | None = None,
+      380      ):
+      381          self._device_preference = device
+      382          self.device = _resolve_device(device)
+      383          self.forecast_cache_root = Path(forecast_cache_root)
+      384  
+      385          ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+      386          state_dict = ckpt["model"]
+      387  
+      388          obs_size = _infer_obs_size(state_dict)
+      389          num_actions = _infer_num_actions(state_dict)
+      390          hidden = _infer_hidden_size(state_dict)
+      391          use_obs_norm = _has_obs_norm(state_dict)
+      392  
+      393          self.features_per_sym = int(ckpt.get("features_per_sym", FEATURES_PER_SYM))
+      394          self.max_steps = int(ckpt.get("max_steps", DEFAULT_MAX_STEPS))
+      395          self.num_symbols = _infer_num_symbols(obs_size, self.features_per_sym)
+      396          self.obs_size = obs_size
+      397          self.num_actions = num_actions
+      398          self._episode_step = 0
+      399  
+      400          if symbols is not None:
+      401              self.symbols = symbols
+      402          else:
+      403              self.symbols = _infer_symbols(obs_size)
+      404  
+      405          if len(self.symbols) != self.num_symbols:
+      406              raise ValueError(
+      407                  f"Symbol count mismatch: obs_size={obs_size} implies "
+      408                  f"{self.num_symbols} symbols but got {len(self.symbols)}"
+      409              )
+      410  
+      411          alloc_bins = ckpt.get("action_allocation_bins", 1)
+      412          level_bins = ckpt.get("action_level_bins", 1)
+      413          self.action_allocation_bins = max(1, int(alloc_bins))
+      414          self.action_level_bins = max(1, int(level_bins))
+      415          self.per_symbol_actions = self.action_allocation_bins * self.action_level_bins
+      416          self.disable_shorts = ckpt.get("disable_shorts", False)
+      417  
+      418          self.action_names = _build_action_names(self.symbols)
+      419  
+      420          self.policy = TradingPolicy(obs_size, num_actions, hidden=hidden, use_obs_norm=use_obs_norm)
+      421          self.policy.load_state_dict(state_dict)
+      422          try:
+      423              self.policy = self.policy.to(self.device)
+      424          except Exception as exc:
+      425              if _should_fallback_to_cpu(self._device_preference, self.device, exc):
+      426                  logger.warning(
+      427                      f"Auto-selected CUDA unavailable for RLSignalGenerator, falling back to CPU: {exc}"
+      428                  )
+      429                  self.device = torch.device("cpu")
+      430                  self.policy = self.policy.to(self.device)
+      431              else:
+      432                  raise
+      433          self.policy.eval()
+      434  
+      435          logger.info(
+      436              f"RL policy loaded: obs_size={obs_size}, num_actions={num_actions}, "
+      437              f"hidden={hidden}, symbols={self.num_symbols}, "
+      438              f"obs_norm={use_obs_norm}, "
+      439              f"update={ckpt.get('update')}, steps={ckpt.get('global_step')}"
+      440          )
+      441  
+      442      def _fetch_klines(self, binance_pair: str, limit: int = 96) -> pd.DataFrame:
+      443          from src.binan import binance_wrapper as bw
+      444  
+      445          # todo optimize to only get latest hour and have already got/cached this in trainingdata/ in daily case or trainingdatahourly/ in this case
+      446          klines = bw.get_client().get_klines(symbol=binance_pair, interval="1h", limit=limit)
+      447          rows = []
+      448          for k in klines:
+      449              rows.append(
+      450                  {
+      451                      "timestamp": pd.Timestamp(k[0], unit="ms", tz="UTC").floor("h"),
+      452                      "open": float(k[1]),
+      453                      "high": float(k[2]),
+      454                      "low": float(k[3]),
+      455                      "close": float(k[4]),
+      456                      "volume": float(k[5]),
+      457                  }
+      458              )
+      459          df = pd.DataFrame(rows).set_index("timestamp").sort_index()
+      460          df = df[~df.index.duplicated(keep="last")]
+      461          return df
+      462  
+      463      def _build_market_features(self, klines_map: dict[str, pd.DataFrame]) -> np.ndarray:
+      464          features = np.zeros((self.num_symbols, self.features_per_sym), dtype=np.float32)
+      465          for i, sym in enumerate(self.symbols):
+      466              klines = klines_map.get(sym)
+      467              if klines is None or klines.empty:
+      468                  continue
+      469              fc_h1 = _load_forecast_parquet(self.forecast_cache_root, 1, sym)
+      470              fc_h24 = _load_forecast_parquet(self.forecast_cache_root, 24, sym)
+      471              feat_arr = compute_symbol_features(klines, fc_h1, fc_h24)
+      472              if len(feat_arr) > 0:
+      473                  features[i] = feat_arr[-1]
+      474          return features
+      475  
+      476      def _build_obs(
+      477          self,
+      478          market_features: np.ndarray,
+      479          portfolio: PortfolioSnapshot,
+      480      ) -> np.ndarray:
+      481          S = self.num_symbols
+      482          F = self.features_per_sym
+      483          obs = np.zeros(self.obs_size, dtype=np.float32)
+      484          obs[: S * F] = market_features.flatten()
+      485  
+      486          base = S * F
+      487          obs[base + 0] = portfolio.cash_usd / INITIAL_CASH
+      488          pos_val = portfolio.position_value_usd
+      489          if portfolio.is_short:
+      490              pos_val = -pos_val
+      491          obs[base + 1] = pos_val / INITIAL_CASH
+      492          obs[base + 2] = portfolio.unrealized_pnl_usd / INITIAL_CASH
+      493          max_steps = self.max_steps if self.max_steps > 0 else DEFAULT_MAX_STEPS
+      494          obs[base + 3] = portfolio.hold_hours / float(max_steps)
+      495          obs[base + 4] = self._episode_step / float(max_steps)
+      496  
+      497          if portfolio.position_symbol and portfolio.position_symbol in self.symbols:
+      498              sym_idx = self.symbols.index(portfolio.position_symbol)
+      499              obs[base + 5 + sym_idx] = -1.0 if portfolio.is_short else 1.0
+      500  
+      501          return obs
+      502  
+      503      def _decode_action(self, action: int) -> tuple[str | None, str]:
+      504          """Decode flat action index to (target_symbol, direction).
+      505  
+      506          Action layout: 0=flat, 1..S*psa=long, S*psa+1..2*S*psa=short
+      507          where psa = per_symbol_actions (alloc_bins * level_bins).
+      508          """
+      509          if action == 0:
+      510              return None, "flat"
+      511          S = self.num_symbols
+      512          psa = self.per_symbol_actions
+      513          side_block = S * psa
+      514          if action <= side_block:
+      515              idx = action - 1
+      516              sym_idx = idx // psa
+      517              return self.symbols[sym_idx], "long"
+      518          elif action <= 2 * side_block:
+      519              idx = action - 1 - side_block
+      520              sym_idx = idx // psa
+      521              return self.symbols[sym_idx], "short"
+      522          return None, "flat"
+      523  
+      524      def _action_to_symbol(self, action: int) -> str | None:
+      525          """Return the symbol for a given action index, or None for FLAT."""
+      526          sym, _ = self._decode_action(action)
+      527          return sym
+      528  
+      529      def _mask_logits(self, logits: np.ndarray, tradable_symbols: list[str]) -> np.ndarray:
+      530          """Mask logits for non-tradable symbols to -inf. Action 0 (FLAT) is never masked."""
+      531          masked = logits.copy()
+      532          tradable_set = set(tradable_symbols)
+      533          for i in range(1, len(masked)):
+      534              sym = self._action_to_symbol(i)
+      535              if sym is not None and sym not in tradable_set:
+      536                  masked[i] = -np.inf
+      537          return masked
+      538  
+      539      def _mask_shorts(self, logits: np.ndarray) -> np.ndarray:
+      540          """Mask all SHORT actions to -inf for spot-only trading."""
+      541          masked = logits.copy()
+      542          S = self.num_symbols
+      543          psa = self.per_symbol_actions
+      544          short_start = 1 + S * psa
+      545          masked[short_start:] = -np.inf
+      546          return masked
+      547  
+      548      @staticmethod
+      549      def _softmax(logits: np.ndarray) -> np.ndarray:
+      550          finite = np.isfinite(logits)
+      551          if not finite.any():
+      552              probs = np.zeros_like(logits, dtype=np.float64)
+      553              if len(probs) > 0:
+      554                  probs[0] = 1.0
+      555              return probs
+      556          shifted = np.full_like(logits, -np.inf, dtype=np.float64)
+      557          shifted[finite] = logits[finite] - np.max(logits[finite])
+      558          exp = np.exp(shifted)
+      559          exp[~finite] = 0.0
+      560          total = exp.sum()
+      561          if not np.isfinite(total) or total <= 0.0:
+      562              probs = np.zeros_like(logits, dtype=np.float64)
+      563              if len(probs) > 0:
+      564                  probs[0] = 1.0
+      565              return probs
+      566          return exp / total  # type: ignore[no-any-return]
+      567  
+      568      def _decode_action_metadata(self, action: int, direction: str) -> tuple[float, float]:
+      569          if action <= 0 or direction == "flat":
+      570              return 0.0, 0.0
+      571          side_block = self.num_symbols * self.per_symbol_actions
+      572          local_idx = action - 1
+      573          if direction == "short":
+      574              local_idx -= side_block
+      575          if local_idx < 0:
+      576              return 0.0, 0.0
+      577          rem = local_idx % max(1, self.per_symbol_actions)
+      578          alloc_idx = rem // max(1, self.action_level_bins)
+      579          level_idx = rem % max(1, self.action_level_bins)
+      580          allocation_pct = float(alloc_idx + 1) / float(max(1, self.action_allocation_bins))
+      581          if self.action_level_bins <= 1:
+      582              return min(1.0, allocation_pct), 0.0
+      583          frac = float(level_idx) / float(max(1, self.action_level_bins - 1))
+      584          return min(1.0, allocation_pct), 2.0 * frac - 1.0
+      585  
+      586      def reset_episode(self) -> None:
+      587          """Reset episode step counter (call when position is fully closed)."""
+      588          self._episode_step = 0
+      589  
+      590      def get_signal(
+      591          self,
+      592          portfolio: PortfolioSnapshot,
+      593          klines_map: dict[str, pd.DataFrame] | None = None,
+      594          binance_pairs: dict[str, str] | None = None,
+      595          tradable_symbols: list[str] | None = None,
+      596          spot_only: bool = True,
+      597      ) -> RLSignal:
+      598          if klines_map is None:
+      599              if binance_pairs is None:
+      600                  binance_pairs = {
+      601                      sym: SYMBOL_TO_BINANCE_PAIR[sym] for sym in self.symbols if sym in SYMBOL_TO_BINANCE_PAIR
+      602                  }
+      603              klines_map = {}
+      604              for sym, pair in binance_pairs.items():
+      605                  try:
+      606                      klines_map[sym] = self._fetch_klines(pair, limit=96)
+      607                  except Exception as e:
+      608                      logger.warning(f"Failed to fetch klines for {sym} ({pair}): {e}")
+      609  
+      610          market_features = self._build_market_features(klines_map)
+      611          obs = self._build_obs(market_features, portfolio)
+      612  
+      613          obs_t = torch.from_numpy(obs).unsqueeze(0).to(self.device)
+      614          with torch.no_grad():
+      615              logits, value = self.policy(obs_t)
+      616  
+      617          logits_np = logits[0].cpu().numpy()
+      618          if tradable_symbols is not None:
+      619              logits_np = self._mask_logits(logits_np, tradable_symbols)
+      620          if spot_only:
+      621              logits_np = self._mask_shorts(logits_np)
+      622          probs = self._softmax(logits_np)
+      623          action = int(logits_np.argmax())
+      624          value_f = float(value[0].cpu())
+      625  
+      626          target_symbol, direction = self._decode_action(action)
+      627          chosen_prob = float(probs[action]) if 0 <= action < len(probs) else 0.0
+      628          flat_prob = float(probs[0]) if len(probs) > 0 else 1.0
+      629          chosen_logit = float(logits_np[action]) if 0 <= action < len(logits_np) else float("-inf")
+      630          flat_logit = float(logits_np[0]) if len(logits_np) > 0 else 0.0
+      631          if direction == "flat" or target_symbol is None:
+      632              confidence = flat_prob
+      633              logit_gap = 0.0
+      634              allocation_pct = 0.0
+      635              level_offset_bps = 0.0
+      636          else:
+      637              confidence = chosen_prob / max(chosen_prob + flat_prob, 1e-8)
+      638              logit_gap = chosen_logit - flat_logit if np.isfinite(chosen_logit) and np.isfinite(flat_logit) else 0.0
+      639              allocation_pct, level_offset_bps = self._decode_action_metadata(action, direction)
+      640  
+      641          action_name = "FLAT"
+      642          if target_symbol is not None:
+      643              short_name = target_symbol.replace("USD", "")
+      644              prefix = "SHORT" if direction == "short" else "LONG"
+      645              action_name = f"{prefix}_{short_name}"
+      646  
+      647          self._episode_step += 1
+      648  
+      649          sig = RLSignal(
+      650              action=action,
+      651              action_name=action_name,
+      652              target_symbol=target_symbol,
+      653              direction=direction,
+      654              confidence=float(confidence),
+      655              logit_gap=float(logit_gap),
+      656              allocation_pct=float(allocation_pct),
+      657              level_offset_bps=float(level_offset_bps),
+      658              logits=logits_np.tolist(),
+      659              value=value_f,
+      660          )
+      661          logger.info(
+      662              f"RL signal: {sig.action_name} conf={sig.confidence:.2%} "
+      663              f"gap={sig.logit_gap:+.3f} alloc={sig.allocation_pct:.2f} "
+      664              f"(value={sig.value:.3f}, ep_step={self._episode_step}/{self.max_steps})"
+      665          )
+      666          return sig

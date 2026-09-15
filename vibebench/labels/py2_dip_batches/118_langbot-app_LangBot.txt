@@ -1,0 +1,282 @@
+row 118   langbot-app/LangBot#1986
+============================================================================
+PR langbot-app/LangBot#1986   cycles touched before=1.0 after=1.0
+QUESTION: does this PR make a module depend on a CONCRETE module in a
+          way that closes an import cycle, or otherwise invert the
+          dependency direction?
+
+NEWLY CYCLIC PAIRS involving a module this PR changed (58):
+    langbot.pkg.api.http.controller.group  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.api.http.controller.main  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.api.http.service.apikey  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.api.http.service.bot  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.api.http.service.external_kb  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.api.http.service.knowledge  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.api.http.service.mcp  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.api.http.service.model  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.api.http.service.monitoring  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.api.http.service.pipeline  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.api.http.service.provider  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.api.http.service.space  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.api.http.service.user  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.api.http.service.webhook  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.command.cmdmgr  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.command.operator  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.core.app  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.core.taskmgr  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.discover.engine  <->  langbot.pkg.pipeline.aggregator
+    langbot.pkg.persistence.database  <->  langbot.pkg.pipeline.aggregator
+    ... and 38 more
+pre-existing cyclic pairs (NOT this PR): 1653
+
+NEW IMPORT EDGES (absent from the before tree; target marked abstract or CONCRETE):
+  langbot.pkg.core.app -> langbot.pkg.pipeline.aggregator   [CONCRETE]
+  langbot.pkg.core.stages.build_app -> langbot.pkg.pipeline.aggregator   [CONCRETE]
+  langbot.pkg.persistence.migrations.dbm019_monitoring_message_role -> langbot.pkg.persistence.migration   [abstract]
+  langbot.pkg.pipeline.aggregator -> langbot.pkg.core.app   [CONCRETE]
+
+---------- CHANGED MODULE langbot.pkg.pipeline.aggregator (src/langbot/pkg/pipeline/aggregator.py) ----------
+        1  """Message Aggregator Module
+        2  
+        3  This module provides message aggregation/debounce functionality.
+        4  When users send multiple messages consecutively, the aggregator will wait
+        5  for a configurable delay period and merge them into a single message
+        6  before processing.
+        7  """
+        8  
+        9  from __future__ import annotations
+       10  
+       11  import asyncio
+       12  import time
+       13  import typing
+       14  from dataclasses import dataclass, field
+       15  
+       16  import langbot_plugin.api.entities.builtin.platform.message as platform_message
+       17  import langbot_plugin.api.entities.builtin.platform.events as platform_events
+       18  import langbot_plugin.api.entities.builtin.provider.session as provider_session
+       19  import langbot_plugin.api.definition.abstract.platform.adapter as abstract_platform_adapter
+       20  
+       21  if typing.TYPE_CHECKING:
+       22      from ..core import app
+       23  
+       24  # Maximum number of messages to buffer before forcing a flush
+       25  MAX_BUFFER_MESSAGES = 10
+       26  
+       27  
+       28  @dataclass
+       29  class PendingMessage:
+       30      """A pending message waiting to be aggregated"""
+       31  
+       32      bot_uuid: str
+       33      launcher_type: provider_session.LauncherTypes
+       34      launcher_id: typing.Union[int, str]
+       35      sender_id: typing.Union[int, str]
+       36      message_event: platform_events.MessageEvent
+       37      message_chain: platform_message.MessageChain
+       38      adapter: abstract_platform_adapter.AbstractMessagePlatformAdapter
+       39      pipeline_uuid: typing.Optional[str]
+       40      timestamp: float = field(default_factory=time.time)
+       41  
+       42  
+       43  @dataclass
+       44  class SessionBuffer:
+       45      """Buffer for a single session's pending messages"""
+       46  
+       47      session_id: str
+       48      messages: list[PendingMessage] = field(default_factory=list)
+       49      timer_task: typing.Optional[asyncio.Task] = None
+       50      last_message_time: float = field(default_factory=time.time)
+       51  
+       52  
+       53  class MessageAggregator:
+       54      """Message aggregator that buffers and merges consecutive messages
+       55  
+       56      This class implements a debounce mechanism for incoming messages.
+       57      When a message arrives, it starts a timer. If more messages arrive
+       58      before the timer expires, they are buffered. When the timer expires,
+       59      all buffered messages are merged and sent to the query pool.
+       60      """
+       61  
+       62      ap: app.Application
+       63  
+       64      buffers: dict[str, SessionBuffer]
+       65      """Session ID -> SessionBuffer mapping"""
+       66  
+       67      lock: asyncio.Lock
+       68      """Lock for thread-safe buffer operations"""
+       69  
+       70      def __init__(self, ap: app.Application):
+       71          self.ap = ap
+       72          self.buffers = {}
+       73          self.lock = asyncio.Lock()
+       74  
+       75      def _get_session_id(
+       76          self,
+       77          bot_uuid: str,
+       78          launcher_type: provider_session.LauncherTypes,
+       79          launcher_id: typing.Union[int, str],
+       80      ) -> str:
+       81          """Generate a unique session ID"""
+       82          return f'{bot_uuid}:{launcher_type.value}:{launcher_id}'
+       83  
+       84      async def _get_aggregation_config(self, pipeline_uuid: typing.Optional[str]) -> tuple[bool, float]:
+       85          """Get aggregation configuration for a pipeline
+       86  
+       87          Returns:
+       88              tuple: (enabled, delay_seconds)
+       89          """
+       90          default_enabled = False
+       91          default_delay = 1.5
+       92  
+       93          if pipeline_uuid is None:
+       94              return default_enabled, default_delay
+       95  
+       96          # Get pipeline from pipeline manager
+       97          pipeline = await self.ap.pipeline_mgr.get_pipeline_by_uuid(pipeline_uuid)
+       98          if pipeline is None:
+       99              return default_enabled, default_delay
+      100  
+      101          config = pipeline.pipeline_entity.config or {}
+      102          trigger_config = config.get('trigger', {})
+      103          aggregation_config = trigger_config.get('message-aggregation', {})
+      104  
+      105          enabled = aggregation_config.get('enabled', default_enabled)
+      106  
+      107          delay_raw = aggregation_config.get('delay', default_delay)
+      108          try:
+      109              delay = float(delay_raw)
+      110          except (TypeError, ValueError):
+      111              delay = default_delay
+      112  
+      113          # Clamp delay to valid range
+      114          delay = max(1.0, min(10.0, delay))
+      115  
+      116          return enabled, delay
+      117  
+      118      async def add_message(
+      119          self,
+      120          bot_uuid: str,
+       ... truncated at 120 lines ...
+
+---------- CHANGED MODULE langbot.pkg.pipeline.aggregator (src/langbot/pkg/pipeline/aggregator.py) ----------
+        1  """Message Aggregator Module
+        2  
+        3  This module provides message aggregation/debounce functionality.
+        4  When users send multiple messages consecutively, the aggregator will wait
+        5  for a configurable delay period and merge them into a single message
+        6  before processing.
+        7  """
+        8  
+        9  from __future__ import annotations
+       10  
+       11  import asyncio
+       12  import time
+       13  import typing
+       14  from dataclasses import dataclass, field
+       15  
+       16  import langbot_plugin.api.entities.builtin.platform.message as platform_message
+       17  import langbot_plugin.api.entities.builtin.platform.events as platform_events
+       18  import langbot_plugin.api.entities.builtin.provider.session as provider_session
+       19  import langbot_plugin.api.definition.abstract.platform.adapter as abstract_platform_adapter
+       20  
+       21  if typing.TYPE_CHECKING:
+       22      from ..core import app
+       23  
+       24  # Maximum number of messages to buffer before forcing a flush
+       25  MAX_BUFFER_MESSAGES = 10
+       26  
+       27  
+       28  @dataclass
+       29  class PendingMessage:
+       30      """A pending message waiting to be aggregated"""
+       31  
+       32      bot_uuid: str
+       33      launcher_type: provider_session.LauncherTypes
+       34      launcher_id: typing.Union[int, str]
+       35      sender_id: typing.Union[int, str]
+       36      message_event: platform_events.MessageEvent
+       37      message_chain: platform_message.MessageChain
+       38      adapter: abstract_platform_adapter.AbstractMessagePlatformAdapter
+       39      pipeline_uuid: typing.Optional[str]
+       40      timestamp: float = field(default_factory=time.time)
+       41  
+       42  
+       43  @dataclass
+       44  class SessionBuffer:
+       45      """Buffer for a single session's pending messages"""
+       46  
+       47      session_id: str
+       48      messages: list[PendingMessage] = field(default_factory=list)
+       49      timer_task: typing.Optional[asyncio.Task] = None
+       50      last_message_time: float = field(default_factory=time.time)
+       51  
+       52  
+       53  class MessageAggregator:
+       54      """Message aggregator that buffers and merges consecutive messages
+       55  
+       56      This class implements a debounce mechanism for incoming messages.
+       57      When a message arrives, it starts a timer. If more messages arrive
+       58      before the timer expires, they are buffered. When the timer expires,
+       59      all buffered messages are merged and sent to the query pool.
+       60      """
+       61  
+       62      ap: app.Application
+       63  
+       64      buffers: dict[str, SessionBuffer]
+       65      """Session ID -> SessionBuffer mapping"""
+       66  
+       67      lock: asyncio.Lock
+       68      """Lock for thread-safe buffer operations"""
+       69  
+       70      def __init__(self, ap: app.Application):
+       71          self.ap = ap
+       72          self.buffers = {}
+       73          self.lock = asyncio.Lock()
+       74  
+       75      def _get_session_id(
+       76          self,
+       77          bot_uuid: str,
+       78          launcher_type: provider_session.LauncherTypes,
+       79          launcher_id: typing.Union[int, str],
+       80      ) -> str:
+       81          """Generate a unique session ID"""
+       82          return f'{bot_uuid}:{launcher_type.value}:{launcher_id}'
+       83  
+       84      async def _get_aggregation_config(self, pipeline_uuid: typing.Optional[str]) -> tuple[bool, float]:
+       85          """Get aggregation configuration for a pipeline
+       86  
+       87          Returns:
+       88              tuple: (enabled, delay_seconds)
+       89          """
+       90          default_enabled = False
+       91          default_delay = 1.5
+       92  
+       93          if pipeline_uuid is None:
+       94              return default_enabled, default_delay
+       95  
+       96          # Get pipeline from pipeline manager
+       97          pipeline = await self.ap.pipeline_mgr.get_pipeline_by_uuid(pipeline_uuid)
+       98          if pipeline is None:
+       99              return default_enabled, default_delay
+      100  
+      101          config = pipeline.pipeline_entity.config or {}
+      102          trigger_config = config.get('trigger', {})
+      103          aggregation_config = trigger_config.get('message-aggregation', {})
+      104  
+      105          enabled = aggregation_config.get('enabled', default_enabled)
+      106  
+      107          delay_raw = aggregation_config.get('delay', default_delay)
+      108          try:
+      109              delay = float(delay_raw)
+      110          except (TypeError, ValueError):
+      111              delay = default_delay
+      112  
+      113          # Clamp delay to valid range
+      114          delay = max(1.0, min(10.0, delay))
+      115  
+      116          return enabled, delay
+      117  
+      118      async def add_message(
+      119          self,
+      120          bot_uuid: str,
+       ... truncated at 120 lines ...

@@ -1,0 +1,280 @@
+row 3   8ddieHu0314/Skill-Lab#11
+============================================================================
+PR 8ddieHu0314/Skill-Lab#11   cycles touched before=1.0 after=1.0
+QUESTION: does this PR make a module depend on a CONCRETE module in a
+          way that closes an import cycle, or otherwise invert the
+          dependency direction?
+
+NEWLY CYCLIC PAIRS involving a module this PR changed (10):
+    skill_lab.cli  <->  skill_lab.commands.optimize
+    skill_lab.commands  <->  skill_lab.commands.optimize
+    skill_lab.commands.evaluate  <->  skill_lab.commands.optimize
+    skill_lab.commands.generate  <->  skill_lab.commands.optimize
+    skill_lab.commands.info  <->  skill_lab.commands.optimize
+    skill_lab.commands.optimize  <->  skill_lab.commands.scan
+    skill_lab.commands.optimize  <->  skill_lab.commands.setup
+    skill_lab.commands.optimize  <->  skill_lab.commands.stats
+    skill_lab.commands.optimize  <->  skill_lab.commands.telemetry
+    skill_lab.commands.optimize  <->  skill_lab.commands.trigger
+pre-existing cyclic pairs (NOT this PR): 45
+
+NEW IMPORT EDGES (absent from the before tree; target marked abstract or CONCRETE):
+  skill_lab.commands -> skill_lab.commands.optimize   [CONCRETE]
+  skill_lab.commands.optimize -> skill_lab.cli   [CONCRETE]
+  skill_lab.commands.optimize -> skill_lab.core.telemetry   [CONCRETE]
+  skill_lab.commands.optimize -> skill_lab.optimizer.optimizer   [CONCRETE]
+  skill_lab.optimizer.optimizer -> skill_lab.core.exceptions   [CONCRETE]
+  skill_lab.optimizer.optimizer -> skill_lab.core.llm   [CONCRETE]
+  skill_lab.optimizer.optimizer -> skill_lab.core.models   [CONCRETE]
+  skill_lab.optimizer.optimizer -> skill_lab.evaluators.static_evaluator   [CONCRETE]
+  skill_lab.triggers.generator -> skill_lab.core.llm   [CONCRETE]
+  tests.test_optimizer -> skill_lab.cli   [CONCRETE]
+  tests.test_optimizer -> skill_lab.commands.optimize   [CONCRETE]
+  tests.test_optimizer -> skill_lab.core.exceptions   [CONCRETE]
+  tests.test_optimizer -> skill_lab.optimizer.optimizer   [CONCRETE]
+
+---------- CHANGED MODULE skill_lab.cli (src/skill_lab/cli.py) ----------
+        1  """CLI interface for skill-lab."""
+        2  
+        3  import contextlib
+        4  import functools
+        5  import sys
+        6  import time
+        7  from collections.abc import Callable, Iterator
+        8  from enum import Enum
+        9  from pathlib import Path
+       10  from typing import Annotated, Any
+       11  
+       12  import click.exceptions
+       13  import typer
+       14  from rich import box
+       15  from rich.console import Console
+       16  from rich.panel import Panel
+       17  from rich.table import Table
+       18  from rich.text import Text
+       19  
+       20  from skill_lab import __version__
+       21  from skill_lab.core.constants import SKLAB_HOME, SKLAB_INITIALIZED
+       22  from skill_lab.core.telemetry import (
+       23      _pop_pending_error,
+       24      _pop_telemetry_extras,
+       25      _store_pending_error,
+       26      check_for_update,
+       27      init_telemetry,
+       28      push_telemetry_extra,
+       29      record_error,
+       30      record_event,
+       31  )
+       32  
+       33  app = typer.Typer(
+       34      name="sklab",
+       35      help="Agent Skills Evaluation Framework",
+       36      add_completion=False,
+       37      context_settings={"help_option_names": ["-h", "--help"]},
+       38  )
+       39  console = Console()
+       40  
+       41  
+       42  def version_callback(value: bool) -> None:
+       43      """Print version and exit."""
+       44      if value:
+       45          console.print(f"sklab {__version__}")
+       46          raise typer.Exit()
+       47  
+       48  
+       49  def _find_repo_root(start: Path) -> Path | None:
+       50      """Walk up from start looking for a .git directory."""
+       51      current = start.resolve()
+       52      while True:
+       53          if (current / ".git").exists():
+       54              return current
+       55          parent = current.parent
+       56          if parent == current:
+       57              return None
+       58          current = parent
+       59  
+       60  
+       61  def _discover_skills(root: Path) -> list[Path]:
+       62      """Recursively find all skill directories (containing SKILL.md) under root.
+       63  
+       64      Skips hidden directories (dot-prefixed) to avoid .git, .claude, etc.
+       65      """
+       66      skills: list[Path] = []
+       67      for path in sorted(root.rglob("SKILL.md")):
+       68          # Skip hidden dirs relative to root (e.g. .git, .sklab subdirs),
+       69          # but allow root itself to be a hidden directory.
+       70          relative = path.relative_to(root)
+       71          if any(part.startswith(".") for part in relative.parts):
+       72              continue
+       73          skills.append(path.parent)
+       74      return skills
+       75  
+       76  
+       77  def _resolve_skill_path(skill_path: Path | None) -> Path:
+       78      """Resolve and validate a skill directory path.
+       79  
+       80      Args:
+       81          skill_path: User-provided path, or None for current directory.
+       82  
+       83      Returns:
+       84          Resolved absolute path.
+       85  
+       86      Raises:
+       87          typer.Exit: If path doesn't exist, isn't a directory, or has no SKILL.md.
+       88      """
+       89      resolved = Path.cwd() if skill_path is None else skill_path.resolve()
+       90      if not resolved.exists():
+       91          console.print(f"[red]Error: Path does not exist: {resolved}[/red]")
+       92          raise typer.Exit(code=1)
+       93      if not resolved.is_dir():
+       94          console.print(f"[red]Error: Path is not a directory: {resolved}[/red]")
+       95          raise typer.Exit(code=1)
+       96      if not (resolved / "SKILL.md").exists():
+       97          console.print(f"[red]Error: No SKILL.md found in {resolved}[/red]")
+       98          console.print("[dim]This directory does not appear to be a skill folder.[/dim]")
+       99          raise typer.Exit(code=1)
+      100      return resolved
+      101  
+      102  
+      103  @contextlib.contextmanager
+      104  def _cli_error_handler() -> Iterator[None]:
+      105      """Catch exceptions and convert to styled CLI error + exit code 1."""
+      106      try:
+      107          yield
+      108      except Exception as e:
+      109          console.print(f"[red]Error: {e}[/red]")
+      110          raise typer.Exit(code=1) from None
+      111  
+      112  
+      113  def _record_telemetry(command: str, start: float, exit_code: int) -> None:
+      114      duration_ms = (time.perf_counter() - start) * 1000
+      115      extras = _pop_telemetry_extras()
+      116      command_event_id: int | None = None
+      117      with contextlib.suppress(Exception):
+      118          command_event_id = record_event(command, duration_ms, exit_code, **extras)
+      119      pending_err = _pop_pending_error()
+      120      if pending_err is not None:
+       ... truncated at 120 lines ...
+
+---------- CHANGED MODULE skill_lab.commands.optimize (src/skill_lab/commands/optimize.py) ----------
+        1  """Optimize a SKILL.md using LLM-powered analysis."""
+        2  
+        3  import difflib
+        4  import os
+        5  import re
+        6  from pathlib import Path
+        7  from typing import Annotated
+        8  
+        9  import typer
+       10  from rich.panel import Panel
+       11  from rich.text import Text
+       12  
+       13  from skill_lab.cli import (
+       14      _cli_error_handler,
+       15      _resolve_skill_path,
+       16      _with_telemetry,
+       17      app,
+       18      console,
+       19  )
+       20  from skill_lab.core.telemetry import push_telemetry_extra
+       21  from skill_lab.optimizer.optimizer import SkillOptimizer
+       22  
+       23  _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@.*$")
+       24  
+       25  
+       26  def _build_diff_text(raw_diff: str) -> Text:
+       27      """Build a Rich Text from a unified diff with human-readable formatting.
+       28  
+       29      - Strips redundant file headers (--- / +++)
+       30      - Skips @@ hunk markers (line numbers shown inline instead)
+       31      - Prepends the file line number to each removed/added line
+       32      - Colors removed lines red, added lines green
+       33      - Each line is appended separately so word-wrap never bleeds between lines
+       34      """
+       35      text = Text()
+       36      old_line = 0
+       37      new_line = 0
+       38      first_hunk = True
+       39      for line in raw_diff.splitlines():
+       40          if line.startswith("--- ") or line.startswith("+++ "):
+       41              continue
+       42          m = _HUNK_RE.match(line)
+       43          if m:
+       44              old_line = int(m.group(1))
+       45              new_line = int(m.group(2))
+       46              if not first_hunk:
+       47                  text.append("\n")
+       48              first_hunk = False
+       49          elif line.startswith("-"):
+       50              text.append(f"{old_line:4d} ", style="dim red")
+       51              text.append(line + "\n", style="red")
+       52              old_line += 1
+       53          elif line.startswith("+"):
+       54              text.append(f"{new_line:4d} ", style="dim green")
+       55              text.append(line + "\n", style="green")
+       56              new_line += 1
+       57          else:
+       58              text.append(f"     {line}\n")
+       59              old_line += 1
+       60              new_line += 1
+       61      return text
+       62  
+       63  
+       64  @app.command("optimize")
+       65  @_with_telemetry("optimize")
+       66  def optimize(
+       67      skill_path: Annotated[
+       68          Path | None,
+       69          typer.Argument(
+       70              help="Path to the skill directory (defaults to current directory)",
+       71          ),
+       72      ] = None,
+       73      model: Annotated[
+       74          str | None,
+       75          typer.Option(
+       76              "--model",
+       77              "-m",
+       78              help="Anthropic model ID (default: claude-haiku-4-5-20251001)",
+       79          ),
+       80      ] = None,
+       81      auto: Annotated[
+       82          bool,
+       83          typer.Option(
+       84              "--auto",
+       85              help="Apply changes without confirmation prompt",
+       86          ),
+       87      ] = False,
+       88  ) -> None:
+       89      """Optimize a SKILL.md using LLM-powered analysis.
+       90  
+       91      Evaluates the skill, sends failures to an LLM, and proposes
+       92      improvements. Shows a diff and score delta before applying.
+       93  
+       94      Requires ANTHROPIC_API_KEY environment variable.
+       95      """
+       96      skill_path = _resolve_skill_path(skill_path)
+       97      push_telemetry_extra(skill_name=skill_path.name)
+       98  
+       99      # Check API key
+      100      api_key = os.environ.get("ANTHROPIC_API_KEY")
+      101      if not api_key:
+      102          console.print(
+      103              "[red]Error: ANTHROPIC_API_KEY environment variable is not set.[/red]\n"
+      104              "[dim]Set it with:[/dim] export ANTHROPIC_API_KEY=sk-..."
+      105          )
+      106          raise typer.Exit(code=1)
+      107  
+      108      # Resolve model: --model flag > SKLAB_MODEL env var > default
+      109      resolved_model = model or os.environ.get("SKLAB_MODEL") or None
+      110  
+      111      with _cli_error_handler():
+      112          kwargs: dict[str, str] = {}
+      113          if resolved_model:
+      114              kwargs["model"] = resolved_model
+      115  
+      116          optimizer = SkillOptimizer(api_key=api_key, **kwargs)
+      117  
+      118          with console.status("[cyan]Evaluating and optimizing...[/cyan]", spinner="dots"):
+      119              result = optimizer.optimize(skill_path)
+      120  
+       ... truncated at 120 lines ...

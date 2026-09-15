@@ -1,0 +1,406 @@
+row 193   nearai/nearai#1181
+============================================================================
+CLASS Environment in nearai/agents/environment.py   loc=1609 methods=38 wmc=169 lcom=0.0277777777777777
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      119  class Environment(object):
+      120      def __init__(  # noqa: D107
+      121          self,
+      122          agents: List[Agent],
+      123          client: InferenceClient,
+      124          hub_client: OpenAI,
+      125          thread_id: str,
+      126          run_id: str,
+      127          env_vars: Optional[Dict[str, Any]] = None,
+      128          tool_resources: Optional[Dict[str, Any]] = None,
+      129          print_system_log: bool = False,
+      130          agent_runner_user: Optional[str] = None,
+      131          fastnear_api_key: Optional[str] = None,
+      132          approvals=None,
+      133          upload_entry_fn=None,
+      134      ) -> None:
+      135          # Warning: never expose `client` or `_hub_client` to agent's environment
+      136  
+      137          self._initialized = False
+      138  
+      139          self.base_url = client._config.base_url
+      140  
+      141          # user_auth is used to authenticate the user in the ts_runner. It will be removed after that in
+      142          # `nearai/agents/agent.py`
+      143          auth = client._auth
+      144          self.user_auth = auth
+      145  
+      146          # Initialize secure openai clients
+      147          openai_client_params = {
+      148              "api_key": auth,
+      149              "base_url": client._config.base_url,
+      150              "default_headers": {"Authorization": f"Bearer {auth}"},
+      151          }
+      152          self.openai = SecureOpenAI(**openai_client_params)
+      153          self.async_openai = SecureAsyncOpenAI(**openai_client_params)
+      154  
+      155          # Placeholder for solver
+      156          self.client: Optional[InferenceClient] = None
+      157  
+      158          self._agents = agents
+      159          self._pending_ext_agent = False
+      160          self.env_vars: Dict[str, Any] = env_vars if env_vars else {}
+      161          self._last_used_model = ""
+      162          self.tool_resources: Dict[str, Any] = tool_resources if tool_resources else {}
+      163          self.print_system_log = print_system_log
+      164          self.agent_runner_user = agent_runner_user
+      165          self._approvals = approvals if approvals else default_approvals
+      166          self._thread_id = thread_id
+      167          self._run_id = run_id
+      168          self._debug_mode = is_debug_mode(self.env_vars)
+      169          self._async_api_calls = self.env_vars.get("ASYNC_API_CALLS", "true").lower() in ("true", "1", "yes", "on")
+      170  
+      171          # Initialize message cache
+      172          self._messages_cache: Optional[List[Message]] = None
+      173          self._messages_cache_initialized = False
+      174  
+      175          # Initialize analytics collection if enabled
+      176          self.logs_collection_mode = is_logs_collection_mode(self.env_vars)
+      177          env_init_metrics = EnvInitMetrics()
+      178          print(f"logs_collection_mode: {self.logs_collection_mode}")
+      179          self.analytics_collector: Optional[AnalyticsCollector] = None
+      180          if self.logs_collection_mode:
+      181              self.analytics_collector = AnalyticsCollector(
+      182                  agent=agents[0],
+      183                  debug_mode=self._debug_mode,
+      184                  upload_entry_fn=upload_entry_fn,
+      185                  env_init_metrics=env_init_metrics,
+      186              )
+      187              # Wrap clients with analytics
+      188              client = create_analytics_wrapper(client, "inference_client", self.analytics_collector)
+      189              hub_client = create_analytics_wrapper(hub_client, "hub_client", self.analytics_collector)
+      190              self.openai = create_analytics_wrapper(self.openai, "openai_client", self.analytics_collector)
+      191              self.async_openai = create_analytics_wrapper(
+      192                  self.async_openai, "async_openai_client", self.analytics_collector
+      193              )
+      194  
+      195          # Expose the NEAR account_id of a user that signs this request to run an agent.
+      196          self.signer_account_id: str = client._config.auth.account_id if client._config.auth else ""
+      197  
+      198          if fastnear_api_key:
+      199              default_mainnet_rpc = f"https://{fastnear_api_key}@rpc.mainnet.fastnear.com"
+      200          else:
+      201              default_mainnet_rpc = "https://rpc.mainnet.near.org"
+      202  
+      203          class NearAccount(Account):
+      204              user_rpc_addr: Union[str, None]
+      205  
+      206              async def view(
+      207                  self,
+      208                  contract_id: str,
+      209                  method_name: str,
+      210                  args: dict,
+      211                  block_id: Optional[int] = None,
+      212                  threshold: Optional[int] = None,
+      213                  max_retries: int = 3,
+      214              ):
+      215                  """Wrapper for the view method of the Account class, adding multiple retry attempts.
+      216  
+      217                  Parameters
+      218                  ----------
+      219                  contract_id : str
+      220                      The ID of the contract to call.
+      221                  method_name : str
+      222                      The name of the method to invoke on the contract.
+      223                  args : dict
+      224                      The arguments to pass to the contract method.
+      225                  block_id : Optional[int]
+      226                      The block ID to query at.
+      227                  threshold : Optional[int]
+      228                      The threshold for the view function.
+      229                  max_retries : int
+      230                      The maximum number of retry attempts.
+      231  
+      232                  Returns
+      233                  -------
+      234                  The result of the contract method call.
+      235  
+      236                  Raises
+      237                  ------
+      238                  Exception
+      239                      If all retry attempts fail, the exception is propagated.
+      240  
+      241                  """
+      242                  acc = Account(self.account_id, self.private_key, self.user_rpc_addr or default_mainnet_rpc)
+      243                  await acc.startup()
+      244                  max_retries = min(max_retries, 10)
+      245  
+      246                  for attempt in range(1, max_retries + 1):
+      247                      try:
+      248                          # Attempt to read the contract view method
+      249                          return await acc.view_function(contract_id, method_name, args, block_id, threshold)
+      250                      except Exception as e:
+      251                          # Log the error message for the current attempt
+      252                          print(
+      253                              f"Attempt {attempt}/{max_retries} to view method '{method_name}' on contract "
+      254                              f"'{contract_id}' failed with error: {e}"
+      255                          )
+      256  
+      257                          # If it's the last attempt, re-raise the exception
+      258                          if attempt == max_retries:
+      259                              raise
+      260  
+      261              async def call(
+      262                  self,
+      263                  contract_id: str,
+      264                  method_name: str,
+      265                  args: dict,
+      266                  gas: int = DEFAULT_ATTACHED_GAS,
+      267                  amount: int = 0,
+      268                  nowait: bool = False,
+      269                  included: bool = False,
+      270                  max_retries: int = 1,
+      271              ):
+      272                  """Wrapper for the call method of the Account class, adding multiple retry attempts.
+      273  
+      274                  Parameters
+      275                  ----------
+      276                  contract_id : str
+      277                      The ID of the contract to call.
+      278                  method_name : str
+      279                      The name of the method to invoke on the contract.
+      280                  args : dict
+      281                      The arguments to pass to the contract method.
+      282                  gas : int
+      283                      The amount of gas to attach to the call.
+      284                  amount : int
+      285                      The amount of tokens to attach to the call.
+      286                  nowait : bool
+      287                      If nowait is True, return transaction hash, else wait execution.
+      288                  included : bool
+      289                      If included is True, return transaction hash, else wait execution
+      290                  max_retries : int
+      291                      The maximum number of retry attempts.
+      292  
+      293                  Returns
+      294                  -------
+      295                  The result of the contract method call.
+      296  
+      297                  Raises
+      298                  ------
+      299                  Exception
+      300                      If all retry attempts fail, the exception is propagated.
+      301  
+      302                  """
+      303                  acc = Account(self.account_id, self.private_key, self.user_rpc_addr or default_mainnet_rpc)
+      304                  await acc.startup()
+      305                  max_retries = min(max_retries, 10)
+      306  
+      307                  for attempt in range(1, max_retries + 1):
+      308                      try:
+      309                          # Attempt to call the contract method
+      310                          return await acc.function_call(contract_id, method_name, args, gas, amount, nowait, included)
+      311                      except Exception as e:
+      312                          # Log the error message for the current attempt
+      313                          print(
+      314                              f"Attempt {attempt}/{max_retries} to call method '{method_name}' on contract "
+      315                              f"'{contract_id}' failed with error: {e}"
+      316                          )
+      317  
+      318                          # If it's the last attempt, re-raise the exception
+      319                          if attempt == max_retries:
+      320                              raise
+      321  
+      322              async def get_balance(self, account_id: Optional[str] = None) -> int:
+      323                  """Retrieves the balance of the specified NEAR account.
+      324  
+      325                  Parameters
+      326                  ----------
+      327                  account_id : Optional[str]
+      328                      The ID of the account to retrieve the balance for. If not provided, the balance of the current
+      329                      account is retrieved.
+      330  
+      331                  Returns
+      332                  -------
+      333                  int
+      334                      The balance of the specified account in yoctoNEAR.
+      335  
+      336                  Raises
+      337                  ------
+      338                  Exception
+      339                      If there is an error retrieving the balance.
+      340  
+      341                  """
+      342                  acc = Account(self.account_id, self.private_key, self.user_rpc_addr or default_mainnet_rpc)
+      343                  await acc.startup()
+      344                  return await acc.get_balance(account_id)
+      345  
+      346              def __init__(
+      347                  self,
+      348                  account_id: Optional[str] = None,
+      349                  private_key: Optional[Union[List[Union[str, bytes]], str, bytes]] = None,
+      350                  rpc_addr: Optional[str] = None,
+      351              ):
+      352                  self.user_rpc_addr = rpc_addr
+      353                  self.account_id = account_id
+      354                  self.private_key = private_key
+      355                  super().__init__(account_id, private_key, rpc_addr)
+      356  
+      357          self.set_near = NearAccount
+      358  
+      359          self._tools = ToolRegistry()
+      360  
+      361          # Protected client methods
+      362          def query_vector_store(vector_store_id: str, query: str, full_files: bool = False):
+      363              """Queries a vector store.
+      364  
+      365              vector_store_id: The id of the vector store to query.
+      366              query: The query to search for.
+      367              """
+      368              return client.query_vector_store(vector_store_id, query, full_files)
+      369  
+      370          self.query_vector_store = query_vector_store
+      371  
+      372          def upload_file(
+      373              file_content: str,
+      374              purpose: Literal["assistants", "batch", "fine-tune", "vision"] = "assistants",
+      375              encoding: Optional[str] = "utf-8",
+      376              file_name: Optional[str] = "file.txt",
+      377              file_type: Optional[str] = "text/plain",
+      378          ):
+      379              """Uploads a file to the registry."""
+      380              return client.upload_file(
+      381                  file_content, purpose, encoding=encoding, file_name=file_name, file_type=file_type
+      382              )
+      383  
+      384          self.upload_file = upload_file
+      385  
+      386          def remove_file(file_id: str):
+      387              """Removes a file from the registry."""
+      388              return client.remove_file(file_id)
+      389  
+      390          self.remove_file = remove_file
+      391  
+      392          def create_vector_store_from_source(
+      393              name: str,
+      394              source: Union[GitHubSource, GitLabSource],
+      395              source_auth: Optional[str] = None,
+      396              chunking_strategy: Optional[ChunkingStrategy] = None,
+      397              expires_after: Optional[ExpiresAfter] = None,
+      398              metadata: Optional[Dict[str, str]] = None,
+      399          ) -> VectorStore:
+      400              """Creates a vector store from the given source.
+      401  
+      402              Args:
+      403              ----
+      404                  name: The name of the vector store.
+      405                  source: The source from which to create the vector store.
+      406                  source_auth: The source authentication token.
+      407                  chunking_strategy: The chunking strategy to use.
+      408                  expires_after: The expiration policy.
+      409                  metadata: Additional metadata.
+      410  
+      411              Returns:
+      412              -------
+      413                  VectorStore: The created vector store.
+      414  
+      415              """
+      416              return client.create_vector_store_from_source(
+      417                  name=name,
+      418                  source=source,
+      419                  source_auth=source_auth,
+      420                  chunking_strategy=chunking_strategy,
+      421                  expires_after=expires_after,
+      422                  metadata=metadata,
+      423              )
+      424  
+      425          self.create_vector_store_from_source = create_vector_store_from_source
+      426  
+      427          def add_file_to_vector_store(vector_store_id: str, file_id: str):
+      428              """Adds a file to the vector store."""
+      429              return client.add_file_to_vector_store(vector_store_id, file_id)
+      430  
+      431          self.add_file_to_vector_store = add_file_to_vector_store
+      432  
+      433          # positional arguments are not allowed because arguments list will be updated
+      434          def find_agents(
+      435              *,
+      436              owner_id: Optional[str] = None,
+      437              with_capabilities: Optional[bool] = False,
+      438              latest_versions_only: Optional[bool] = True,
+      439              limit: Optional[int] = None,
+      440              offset: Optional[int] = None,
+      441          ):
+      442              """Find agents based on various parameters."""
+      443              return client.find_agents(owner_id, with_capabilities, latest_versions_only, limit, offset)
+      444  
+      445          self.find_agents = find_agents
+      446  
+      447          def create_vector_store(
+      448              name: str,
+      449              file_ids: list,
+      450              expires_after: Union[ExpiresAfter, NotGiven] = NOT_GIVEN,
+      451              chunking_strategy: Union[
+      452                  AutoFileChunkingStrategyParam, StaticFileChunkingStrategyObjectParam, NotGiven
+      453              ] = NOT_GIVEN,
+      454              metadata: Optional[Dict[str, str]] = None,
+      455          ) -> VectorStore:
+      456              """Creates a vector store.
+      457  
+      458              Args:
+      459              ----
+      460                  name: The name of the vector store.
+      461                  file_ids: List of file ids to create the vector store.
+      462                  chunking_strategy: The chunking strategy to use.
+      463                  expires_after: The expiration policy.
+      464                  metadata: Additional metadata.
+      465  
+      466              Returns:
+      467              -------
+      468                  VectorStore: The created vector store.
+      469  
+      470              """
+      471              return client.create_vector_store(
+      472                  name=name,
+      473                  file_ids=file_ids,
+      474                  chunking_strategy=chunking_strategy,
+      475                  expires_after=expires_after,
+      476                  metadata=metadata,
+      477              )
+      478  
+      479          self.create_vector_store = create_vector_store
+      480  
+      481          def get_vector_store(vector_store_id: str) -> VectorStore:
+      482              """Gets a vector store by id."""
+      483              return client.get_vector_store(vector_store_id)
+      484  
+      485          self.get_vector_store = get_vector_store
+      486  
+      487          def get_vector_store_files(vector_store_id: str) -> Optional[List[VectorStoreFile]]:
+      488              """Gets a list of vector store files."""
+      489              return client.get_vector_store_files(vector_store_id)
+      490  
+      491          self.get_vector_store_files = get_vector_store_files
+      492  
+      493          # Save cache of requested models for inference to avoid extra server calls
+      494          self.cached_models_for_inference: Dict[str, str] = {}
+      495  
+      496          def get_model_for_inference(model: str = "") -> str:
+      497              """Returns 'provider::model_full_path'."""
+      498              if self.cached_models_for_inference.get(model, None) is None:
+      499                  provider = self.get_primary_agent().model_provider if self._agents else ""
+      500                  if model == "":
+      501                      model = self.get_primary_agent().model if self._agents else ""
+      502                  if model == "":
+      503                      return DEFAULT_PROVIDER_MODEL
+      504  
+      505                  _, model_for_inference = client.provider_models.match_provider_model(model, provider)
+      506  
+      507                  self.cached_models_for_inference[model] = model_for_inference
+      508  
+      509              return self.cached_models_for_inference[model]
+      510  
+      511          self.get_model_for_inference = get_model_for_inference
+      512  
+      513          def _run_inference_completions(
+      514              messages: Union[Iterable[ChatCompletionMessageParam], str],
+      515              model: Union[Iterable[ChatCompletionMessageParam], str],
+      516              stream: bool,
+      517              **kwargs: Any,
+      518          ) -> Union[ModelResponse, CustomStreamWrapper]:
+       ... truncated at 400 lines ...

@@ -1,0 +1,312 @@
+row 41   TheR1D/shell_gpt#747
+============================================================================
+CLASS Handler in sgpt/handlers/handler.py   loc=307 methods=9 wmc=57 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       38  class Handler:
+       39      cache = Cache(int(cfg.get("CACHE_LENGTH")), Path(cfg.get("CACHE_PATH")))
+       40  
+       41      def __init__(self, role: SystemRole, markdown: bool) -> None:
+       42          self.role = role
+       43  
+       44          api_base_url = cfg.get("API_BASE_URL")
+       45          self.base_url = None if api_base_url == "default" else api_base_url
+       46          self.timeout = int(cfg.get("REQUEST_TIMEOUT"))
+       47  
+       48          self.markdown = "APPLY MARKDOWN" in self.role.role and markdown
+       49          self.code_theme, self.color = cfg.get("CODE_THEME"), cfg.get("DEFAULT_COLOR")
+       50  
+       51      @property
+       52      def printer(self) -> Printer:
+       53          return (
+       54              MarkdownPrinter(self.code_theme)
+       55              if self.markdown
+       56              else TextPrinter(self.color)
+       57          )
+       58  
+       59      def make_messages(self, prompt: str) -> List[Dict[str, str]]:
+       60          raise NotImplementedError
+       61  
+       62      def _messages_to_responses_api_format(
+       63          self, messages: List[Dict[str, Any]]
+       64      ) -> tuple[str, List[Dict[str, Any]]]:
+       65          """
+       66          Convert Chat Completions API messages format to Responses API format.
+       67          Returns (instructions, input_messages) tuple.
+       68          """
+       69          instructions = ""
+       70          input_messages = []
+       71  
+       72          for msg in messages:
+       73              role = msg.get("role")
+       74              content = msg.get("content")
+       75  
+       76              if role == "system":
+       77                  # System messages become instructions in Responses API
+       78                  instructions = content
+       79              elif role == "user":
+       80                  # User messages map to "user" type
+       81                  input_messages.append({"type": "user", "content": content})
+       82              elif role == "assistant":
+       83                  # Assistant messages map to "assistant" type
+       84                  tool_calls = msg.get("tool_calls")
+       85                  if tool_calls:
+       86                      # Assistant message with tool calls
+       87                      input_messages.append(
+       88                          {"type": "assistant", "tool_calls": tool_calls}
+       89                      )
+       90                  else:
+       91                      # Regular assistant message
+       92                      input_messages.append({"type": "assistant", "content": content})
+       93              elif role == "tool":
+       94                  # Tool result messages map to "tool_result" type
+       95                  input_messages.append(
+       96                      {
+       97                          "type": "tool_result",
+       98                          "tool_call_id": msg.get("tool_call_id"),
+       99                          "content": content,
+      100                      }
+      101                  )
+      102  
+      103          return instructions, input_messages
+      104  
+      105      def handle_function_call(
+      106          self,
+      107          messages: List[dict[str, Any]],
+      108          tool_call_id: str,
+      109          name: str,
+      110          arguments: str,
+      111      ) -> Generator[str, None, None]:
+      112          # Add assistant message with tool call
+      113          messages.append(
+      114              {
+      115                  "role": "assistant",
+      116                  "content": None,
+      117                  "tool_calls": [
+      118                      {
+      119                          "id": tool_call_id,
+      120                          "type": "function",
+      121                          "function": {"name": name, "arguments": arguments},
+      122                      }
+      123                  ],
+      124              }
+      125          )
+      126  
+      127          if messages and messages[-1]["role"] == "assistant":
+      128              yield "\n"
+      129  
+      130          dict_args = json.loads(arguments)
+      131          joined_args = ", ".join(f'{k}="{v}"' for k, v in dict_args.items())
+      132          yield f"> @FunctionCall `{name}({joined_args})` \n\n"
+      133  
+      134          result = get_function(name)(**dict_args)
+      135          if cfg.get("SHOW_FUNCTIONS_OUTPUT") == "true":
+      136              yield f"```text\n{result}\n```\n"
+      137  
+      138          # Add tool response message
+      139          messages.append(
+      140              {"role": "tool", "content": result, "tool_call_id": tool_call_id}
+      141          )
+      142  
+      143      @cache
+      144      def get_completion(
+      145          self,
+      146          model: str,
+      147          temperature: float,
+      148          top_p: float,
+      149          messages: List[Dict[str, Any]],
+      150          functions: Optional[List[Dict[str, str]]],
+      151      ) -> Generator[str, None, None]:
+      152          tool_call_id = name = arguments = ""
+      153          is_shell_role = self.role.name == DefaultRoles.SHELL.value
+      154          is_code_role = self.role.name == DefaultRoles.CODE.value
+      155          is_dsc_shell_role = self.role.name == DefaultRoles.DESCRIBE_SHELL.value
+      156          if is_shell_role or is_code_role or is_dsc_shell_role:
+      157              functions = None
+      158  
+      159          if use_responses_api:
+      160              # New Responses API path
+      161              yield from self._get_completion_responses_api(
+      162                  model, temperature, top_p, messages, functions
+      163              )
+      164          else:
+      165              # LiteLLM path (legacy Chat Completions API)
+      166              yield from self._get_completion_chat_api(
+      167                  model, temperature, top_p, messages, functions
+      168              )
+      169  
+      170      def _get_completion_responses_api(
+      171          self,
+      172          model: str,
+      173          temperature: float,
+      174          top_p: float,
+      175          messages: List[Dict[str, Any]],
+      176          functions: Optional[List[Dict[str, str]]],
+      177      ) -> Generator[str, None, None]:
+      178          """Handle completion using the new Responses API."""
+      179          tool_call_id = name = arguments = ""
+      180          
+      181          # Convert messages to Responses API format
+      182          instructions, input_items = self._messages_to_responses_api_format(messages)
+      183          
+      184          # Build request parameters
+      185          request_params: Dict[str, Any] = {
+      186              "model": model,
+      187              "temperature": temperature,
+      188              "top_p": top_p,
+      189              "input": input_items if input_items else "",
+      190          }
+      191          
+      192          # Add instructions if present
+      193          if instructions:
+      194              request_params["instructions"] = instructions
+      195          
+      196          # Add tool/function parameters if present
+      197          if functions:
+      198              request_params["tool_choice"] = "auto"
+      199              request_params["tools"] = functions
+      200              request_params["parallel_tool_calls"] = False
+      201          
+      202          # Call the Responses API stream method
+      203          try:
+      204              response_stream = completion(**request_params, **additional_kwargs)
+      205              
+      206              # Iterate through the stream events
+      207              for event in response_stream:
+      208                  event_type = event.type
+      209                  
+      210                  # Handle text delta events (main content)
+      211                  if event_type == "response.output_text.delta":
+      212                      yield event.delta
+      213                  
+      214                  # Handle function call argument deltas
+      215                  elif event_type == "response.function_call_arguments.delta":
+      216                      arguments += event.delta
+      217                      # Store the item_id as tool_call_id
+      218                      tool_call_id = event.item_id
+      219                  
+      220                  # Handle function call arguments done (get function name)
+      221                  elif event_type == "response.function_call_arguments.done":
+      222                      # We need to get the function name from the output item
+      223                      pass
+      224                  
+      225                  # Handle output item added (includes function name)
+      226                  elif event_type == "response.output_item.added":
+      227                      if hasattr(event, 'item') and event.item.get('type') == 'function_call':
+      228                          name = event.item.get('name', '')
+      229                          tool_call_id = event.item.get('id', '')
+      230                  
+      231                  # Handle output item done
+      232                  elif event_type == "response.output_item.done":
+      233                      # Check if this was a function call that completed
+      234                      if hasattr(event, 'item'):
+      235                          item = event.item
+      236                          if item.get('type') == 'function_call' and arguments:
+      237                              # Execute the function call
+      238                              yield from self.handle_function_call(
+      239                                  messages, tool_call_id, name, arguments
+      240                              )
+      241                              
+      242                              # Recursive call for next completion
+      243                              yield from self.get_completion(
+      244                                  model=model,
+      245                                  temperature=temperature,
+      246                                  top_p=top_p,
+      247                                  messages=messages,
+      248                                  functions=functions,
+      249                                  caching=False,
+      250                              )
+      251                              return
+      252                  
+      253          except KeyboardInterrupt:
+      254              if hasattr(response_stream, 'close'):
+      255                  response_stream.close()
+      256  
+      257      def _get_completion_chat_api(
+      258          self,
+      259          model: str,
+      260          temperature: float,
+      261          top_p: float,
+      262          messages: List[Dict[str, Any]],
+      263          functions: Optional[List[Dict[str, str]]],
+      264      ) -> Generator[str, None, None]:
+      265          """Handle completion using the legacy Chat Completions API (for LiteLLM)."""
+      266          tool_call_id = name = arguments = ""
+      267          
+      268          if functions:
+      269              additional_kwargs["tool_choice"] = "auto"
+      270              additional_kwargs["tools"] = functions
+      271              additional_kwargs["parallel_tool_calls"] = False
+      272  
+      273          response = completion(
+      274              model=model,
+      275              temperature=temperature,
+      276              top_p=top_p,
+      277              messages=messages,
+      278              stream=True,
+      279              **additional_kwargs,
+      280          )
+      281  
+      282          try:
+      283              for chunk in response:
+      284                  if not chunk.choices:
+      285                      continue
+      286                  delta = chunk.choices[0].delta
+      287  
+      288                  # LiteLLM uses dict instead of Pydantic object like OpenAI does.
+      289                  tool_calls = (
+      290                      delta.get("tool_calls") if use_litellm else delta.tool_calls
+      291                  )
+      292                  if tool_calls:
+      293                      for tool_call in tool_calls:
+      294                          if use_litellm:
+      295                              # TODO: test.
+      296                              tool_call_id = tool_call.get("id") or tool_call_id
+      297                              name = tool_call.get("function", {}).get("name") or name
+      298                              arguments += tool_call.get("function", {}).get(
+      299                                  "arguments", ""
+      300                              )
+      301                          else:
+      302                              tool_call_id = tool_call.id or tool_call_id
+      303                              name = tool_call.function.name or name
+      304                              arguments += tool_call.function.arguments or ""
+      305                  if chunk.choices[0].finish_reason == "tool_calls":
+      306                      yield from self.handle_function_call(
+      307                          messages, tool_call_id, name, arguments
+      308                      )
+      309                      yield from self.get_completion(
+      310                          model=model,
+      311                          temperature=temperature,
+      312                          top_p=top_p,
+      313                          messages=messages,
+      314                          functions=functions,
+      315                          caching=False,
+      316                      )
+      317                      return
+      318  
+      319                  yield delta.content or ""
+      320          except KeyboardInterrupt:
+      321              response.close()
+      322  
+      323      def handle(
+      324          self,
+      325          prompt: str,
+      326          model: str,
+      327          temperature: float,
+      328          top_p: float,
+      329          caching: bool,
+      330          functions: Optional[List[Dict[str, str]]] = None,
+      331          **kwargs: Any,
+      332      ) -> str:
+      333          disable_stream = cfg.get("DISABLE_STREAMING") == "true"
+      334          messages = self.make_messages(prompt.strip())
+      335          generator = self.get_completion(
+      336              model=model,
+      337              temperature=temperature,
+      338              top_p=top_p,
+      339              messages=messages,
+      340              functions=functions,
+      341              caching=caching,
+      342              **kwargs,
+      343          )
+      344          return self.printer(generator, not disable_stream)

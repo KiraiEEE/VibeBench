@@ -1,0 +1,304 @@
+row 198   littlebearapps/untether#258
+============================================================================
+PR littlebearapps/untether#258   cycles touched before=1.0 after=1.0
+QUESTION: does this PR make a module depend on a CONCRETE module in a
+          way that closes an import cycle, or otherwise invert the
+          dependency direction?
+
+NEWLY CYCLIC PAIRS involving a module this PR changed (41):
+    untether.runner_bridge  <->  untether.runners.claude
+    untether.runner_bridge  <->  untether.telegram.commands.claude_control
+    untether.runners.claude  <->  untether.telegram.bridge
+    untether.runners.claude  <->  untether.telegram.commands
+    untether.runners.claude  <->  untether.telegram.commands.agent
+    untether.runners.claude  <->  untether.telegram.commands.cancel
+    untether.runners.claude  <->  untether.telegram.commands.claude_control
+    untether.runners.claude  <->  untether.telegram.commands.dispatch
+    untether.runners.claude  <->  untether.telegram.commands.executor
+    untether.runners.claude  <->  untether.telegram.commands.file_transfer
+    untether.runners.claude  <->  untether.telegram.commands.handlers
+    untether.runners.claude  <->  untether.telegram.commands.media
+    untether.runners.claude  <->  untether.telegram.commands.menu
+    untether.runners.claude  <->  untether.telegram.commands.model
+    untether.runners.claude  <->  untether.telegram.commands.overrides
+    untether.runners.claude  <->  untether.telegram.commands.reasoning
+    untether.runners.claude  <->  untether.telegram.commands.reply
+    untether.runners.claude  <->  untether.telegram.commands.topics
+    untether.runners.claude  <->  untether.telegram.commands.trigger
+    untether.runners.claude  <->  untether.telegram.context
+    ... and 21 more
+pre-existing cyclic pairs (NOT this PR): 190
+
+NEW IMPORT EDGES (absent from the before tree; target marked abstract or CONCRETE):
+  tests.test_command_engine_gates -> untether.telegram.commands._resolve_engine   [CONCRETE]
+  tests.test_command_engine_gates -> untether.telegram.commands.planmode   [CONCRETE]
+  tests.test_command_engine_gates -> untether.telegram.commands.usage   [CONCRETE]
+  tests.test_stateless_mode -> tests.telegram_fakes   [CONCRETE]
+  tests.test_stateless_mode -> untether.markdown   [CONCRETE]
+  tests.test_stateless_mode -> untether.model   [CONCRETE]
+  tests.test_stateless_mode -> untether.runner_bridge   [CONCRETE]
+  tests.test_stateless_mode -> untether.runners.mock   [CONCRETE]
+  tests.test_stateless_mode -> untether.telegram.bridge   [CONCRETE]
+  tests.test_stateless_mode -> untether.telegram.chat_sessions   [CONCRETE]
+  tests.test_stateless_mode -> untether.telegram.commands.executor   [CONCRETE]
+  tests.test_stateless_mode -> untether.telegram.loop   [CONCRETE]
+  tests.test_stateless_mode -> untether.telegram.types   [CONCRETE]
+  tests.test_stateless_mode -> untether.transport_runtime   [CONCRETE]
+  tests.test_telegram_topics_command -> untether.runner_bridge   [CONCRETE]
+  tests.test_telegram_topics_command -> untether.transport   [CONCRETE]
+  untether.runners.claude -> untether.telegram.commands.claude_control   [CONCRETE]
+  untether.telegram.commands._resolve_engine -> untether.commands   [abstract]
+  untether.telegram.commands._resolve_engine -> untether.telegram.chat_prefs   [CONCRETE]
+  untether.telegram.commands.claude_control -> untether.transport   [CONCRETE]
+  untether.telegram.commands.planmode -> untether.telegram.commands._resolve_engine   [CONCRETE]
+  untether.telegram.commands.topics -> untether.logging   [CONCRETE]
+  untether.telegram.commands.topics -> untether.runner_bridge   [CONCRETE]
+  untether.telegram.commands.usage -> untether.telegram.commands._resolve_engine   [CONCRETE]
+  untether.telegram.commands.usage -> untether.telegram.engine_overrides   [CONCRETE]
+  untether.telegram.loop -> untether.telegram.commands.topics   [CONCRETE]
+
+---------- CHANGED MODULE untether.runner_bridge (src/untether/runner_bridge.py) ----------
+        1  from __future__ import annotations
+        2  
+        3  import contextlib
+        4  import time
+        5  from collections.abc import Awaitable, Callable
+        6  from dataclasses import dataclass, field
+        7  from pathlib import Path
+        8  from typing import Any
+        9  
+       10  import anyio
+       11  
+       12  from .context import RunContext
+       13  from .error_hints import get_error_hint as _get_error_hint
+       14  from .logging import bind_run_context, get_logger
+       15  from .markdown import format_meta_line, render_event_cli
+       16  from .model import ActionEvent, CompletedEvent, ResumeToken, StartedEvent, UntetherEvent
+       17  from .presenter import Presenter
+       18  from .progress import ProgressTracker
+       19  from .runner import Runner
+       20  from .transport import (
+       21      ChannelId,
+       22      MessageId,
+       23      MessageRef,
+       24      RenderedMessage,
+       25      SendOptions,
+       26      ThreadId,
+       27      Transport,
+       28  )
+       29  
+       30  logger = get_logger(__name__)
+       31  
+       32  # ---------------------------------------------------------------------------
+       33  # Ephemeral message registry
+       34  # ---------------------------------------------------------------------------
+       35  # Callback handlers (e.g. approve/deny) can register messages here so that
+       36  # ProgressEdits.delete_ephemeral() cleans them up when the run finishes.
+       37  # Keyed by (channel_id, progress_message_id).
+       38  
+       39  _EPHEMERAL_MSGS: dict[tuple[ChannelId, MessageId], list[MessageRef]] = {}
+       40  
+       41  
+       42  def register_ephemeral_message(
+       43      channel_id: ChannelId,
+       44      anchor_message_id: MessageId,
+       45      ref: MessageRef,
+       46  ) -> None:
+       47      """Register a message for deletion when the anchored run finishes."""
+       48      key = (channel_id, anchor_message_id)
+       49      _EPHEMERAL_MSGS.setdefault(key, []).append(ref)
+       50  
+       51  
+       52  # Outline message cleanup registry.
+       53  # Maps session_id → (transport, list of outline refs).
+       54  # Populated by ProgressEdits._send_outline(), consumed by
+       55  # delete_outline_messages() which the callback handler calls.
+       56  
+       57  _OUTLINE_REGISTRY: dict[str, tuple[Any, list[MessageRef]]] = {}
+       58  
+       59  
+       60  def register_outline_cleanup(
+       61      session_id: str,
+       62      transport: Any,
+       63      refs: list[MessageRef],
+       64  ) -> None:
+       65      """Register outline refs for a session so the callback handler can delete them."""
+       66      _OUTLINE_REGISTRY[session_id] = (transport, refs)
+       67  
+       68  
+       69  async def delete_outline_messages(session_id: str) -> None:
+       70      """Delete outline messages for a session.  Called from callback handler.
+       71  
+       72      Also clears the shared refs list so ProgressEdits detects the cleanup
+       73      and removes the stale keyboard on its next render cycle.
+       74      """
+       75      entry = _OUTLINE_REGISTRY.pop(session_id, None)
+       76      if entry is None:
+       77          return
+       78      transport, refs = entry
+       79      for ref in refs:
+       80          try:
+       81              await transport.delete(ref=ref)
+       82          except Exception:  # noqa: BLE001
+       83              logger.warning("outline_cleanup.delete_failed", exc_info=True)
+       84      refs.clear()
+       85  
+       86  
+       87  # ---------------------------------------------------------------------------
+       88  # Progress message persistence (orphan cleanup across restarts)
+       89  # ---------------------------------------------------------------------------
+       90  
+       91  _PROGRESS_PERSISTENCE_PATH: Path | None = None
+       92  
+       93  
+       94  def set_progress_persistence_path(path: Path | None) -> None:
+       95      """Set the path for progress message persistence (called from loop.py)."""
+       96      global _PROGRESS_PERSISTENCE_PATH
+       97      _PROGRESS_PERSISTENCE_PATH = path
+       98  
+       99  
+      100  # Usage alert thresholds (percentage of 5h window)
+      101  _USAGE_WARN_PCT = 70
+      102  _USAGE_CRITICAL_PCT = 90
+      103  
+      104  
+      105  def _load_footer_settings():
+      106      """Load footer settings from config, returning defaults if unavailable."""
+      107      try:
+      108          from .settings import FooterSettings, load_settings_if_exists
+      109  
+      110          result = load_settings_if_exists()
+      111          if result is None:
+      112              return FooterSettings()
+      113          settings, _ = result
+      114          return settings.footer
+      115      except Exception:  # noqa: BLE001
+      116          logger.warning("footer_settings.load_failed", exc_info=True)
+      117          from .settings import FooterSettings
+      118  
+      119          return FooterSettings()
+      120  
+       ... truncated at 120 lines ...
+
+---------- CHANGED MODULE untether.runners.claude (src/untether/runners/claude.py) ----------
+        1  """
+        2  Updated ClaudeRunner with PTY support for control channel.
+        3  
+        4  This replaces the existing claude.py with PTY-based stdin handling
+        5  to prevent deadlock when keeping stdin open for control responses.
+        6  """
+        7  
+        8  from __future__ import annotations
+        9  
+       10  import contextlib
+       11  import json
+       12  import os
+       13  import pty
+       14  import re
+       15  import shutil
+       16  import subprocess as subprocess_module
+       17  import time
+       18  import tty
+       19  from collections.abc import AsyncIterator
+       20  from dataclasses import dataclass, field
+       21  from pathlib import Path
+       22  from typing import Any
+       23  
+       24  import anyio
+       25  import msgspec
+       26  
+       27  from ..backends import EngineBackend, EngineConfig
+       28  from ..events import EventFactory
+       29  from ..logging import get_logger
+       30  from ..model import (
+       31      Action,
+       32      ActionKind,
+       33      CompletedEvent,
+       34      EngineId,
+       35      ResumeToken,
+       36      StartedEvent,
+       37      UntetherEvent,
+       38  )
+       39  from ..runner import (
+       40      JsonlStreamState,
+       41      JsonlSubprocessRunner,
+       42      ResumeTokenMixin,
+       43      Runner,
+       44      _rc_label,
+       45      _session_label,
+       46      _stderr_excerpt,
+       47  )
+       48  from ..schemas import claude as claude_schema
+       49  from ..utils.paths import get_run_base_dir
+       50  from ..utils.streams import drain_stderr
+       51  from ..utils.subprocess import manage_subprocess
+       52  from .run_options import get_run_options
+       53  from .tool_actions import tool_input_path, tool_kind_and_title
+       54  
+       55  logger = get_logger(__name__)
+       56  
+       57  ENGINE: EngineId = "claude"
+       58  DEFAULT_ALLOWED_TOOLS = ["Bash", "Read", "Edit", "Write"]
+       59  
+       60  _RESUME_RE = re.compile(
+       61      r"(?im)^\s*`?claude\s+(?:--resume|-r)\s+(?P<token>[^`\s]+)`?\s*$"
+       62  )
+       63  
+       64  # Phase 2: Global registry for active ClaudeRunner instances
+       65  # Keyed by session_id, stores (runner_instance, timestamp)
+       66  _ACTIVE_RUNNERS: dict[str, tuple[ClaudeRunner, float]] = {}
+       67  
+       68  # Phase 2: Global registry mapping session_id -> process stdin
+       69  # Stored separately from _ACTIVE_RUNNERS to support concurrent sessions
+       70  # on the same runner instance (runner._proc_stdin would be overwritten).
+       71  _SESSION_STDIN: dict[str, Any] = {}
+       72  
+       73  # Phase 2: Global registry mapping request_id -> session_id
+       74  # This allows callbacks to find the right runner instance
+       75  _REQUEST_TO_SESSION: dict[str, str] = {}
+       76  
+       77  # Phase 2: Global registry mapping request_id -> original tool input
+       78  # Claude Code CLI requires updatedInput in can_use_tool responses
+       79  _REQUEST_TO_INPUT: dict[str, dict[str, Any]] = {}
+       80  
+       81  # Phase 2: Global registry mapping request_id -> tool_name
+       82  # Used by claude_control.py to send tool-specific deny messages
+       83  _REQUEST_TO_TOOL_NAME: dict[str, str] = {}
+       84  
+       85  # Recently handled request_ids (prevents duplicate callback warnings)
+       86  _HANDLED_REQUESTS: set[str] = set()
+       87  
+       88  # Discuss cooldown: session_id -> (timestamp, deny_count)
+       89  # When user clicks "Pause & Outline Plan", this tracks when the denial was sent
+       90  # so rapid ExitPlanMode retries can be auto-denied with escalating messages.
+       91  _DISCUSS_COOLDOWN: dict[str, tuple[float, int]] = {}
+       92  
+       93  # Discuss approval: session_ids where user approved the plan via post-outline buttons.
+       94  # When Claude Code next calls ExitPlanMode, it will be auto-approved.
+       95  _DISCUSS_APPROVED: set[str] = set()
+       96  
+       97  # Sessions where "Pause & Outline Plan" was clicked and we're waiting for outline text.
+       98  # StreamTextBlock handler checks this to emit visible note events in the progress message.
+       99  _OUTLINE_PENDING: set[str] = set()
+      100  
+      101  # Minimum characters for an outline to be considered "substantial".
+      102  _OUTLINE_MIN_CHARS = 200
+      103  
+      104  # A1: Pending AskUserQuestion requests: request_id -> (channel_id, question text)
+      105  # When Claude Code asks a question, the user can reply via Telegram text.
+      106  # Scoped by channel_id to prevent cross-chat message stealing (#144).
+      107  _PENDING_ASK_REQUESTS: dict[str, tuple[int, str]] = {}
+      108  
+      109  
+      110  @dataclass(slots=True)
+      111  class AskQuestionState:
+      112      """Tracks multi-question AskUserQuestion flow state."""
+      113  
+      114      request_id: str
+      115      channel_id: int
+      116      questions: list[dict[str, Any]]
+      117      current_index: int = 0
+      118      answers: dict[str, str] = field(default_factory=dict)
+      119      awaiting_text: bool = False  # True when "Other" was clicked
+      120  
+       ... truncated at 120 lines ...

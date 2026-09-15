@@ -1,0 +1,343 @@
+row 34   Intelligent-Internet/ii-agent#90
+============================================================================
+CONTRACT ii_agent.tools.base:LLMTool   kind=abc abstract_methods=1.0 implementers=25.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file src/ii_agent/tools/base.py
+       32  class LLMTool(ABC):
+       33      """A tool that fits into the standard LLM tool-calling paradigm.
+       34  
+       35      An LLM tool can be called by supplying the parameters specified in its
+       36      input_schema, and returns a string that is then shown to the model.
+       37      """
+       38  
+       39      name: str
+       40      description: str
+       41      input_schema: ToolInputSchema
+       42  
+       43      @property
+       44      def should_stop(self) -> bool:
+       45          """Whether the tool wants to stop the current agentic run."""
+       46          return False
+       47  
+       48      # Final is here to indicate that subclasses should override run_impl(), not
+       49      # run(). There may be a reason in the future to override run() itself, and
+       50      # if such a reason comes up, this @final decorator can be removed.
+       51      @final
+       52      def run(
+       53          self,
+       54          tool_input: dict[str, Any],
+       55          message_history: Optional[MessageHistory] = None,
+       56      ) -> str | list[dict[str, Any]]:
+       57          """Run the tool.
+       58  
+       59          Args:
+       60              tool_input: The input to the tool.
+       61              message_history: The dialog messages so far, if available. The tool
+       62                  is allowed to modify this object, so the caller should make a copy
+       63                  if that's not desired. The dialog messages should not contain
+       64                  pending tool calls. They should end where it's the user's turn.
+       65          """
+       66          if message_history:
+       67              assert message_history.is_next_turn_user()
+       68  
+       69          try:
+       70              self._validate_tool_input(tool_input)
+       71              result = self.run_impl(tool_input, message_history)
+       72              tool_output = result.tool_output
+       73          except jsonschema.ValidationError as exc:
+       74              tool_output = "Invalid tool input: " + exc.message
+       75          except BadRequestError as exc:
+       76              raise RuntimeError("Bad request: " + exc.message)
+       77  
+       78          return tool_output
+       79  
+       80      def get_tool_start_message(self, tool_input: ToolInputSchema) -> str:
+       81          """Return a user-friendly message to be shown to the model when the tool is called."""
+       82          return f"Calling tool '{self.name}'"
+       83  
+       84      @abstractmethod
+       85      def run_impl(
+       86          self,
+       87          tool_input: dict[str, Any],
+       88          message_history: Optional[MessageHistory] = None,
+       89      ) -> ToolImplOutput:
+       90          """Subclasses should implement this.
+       91  
+       92          Returns:
+       93              A ToolImplOutput containing the output string, description, and any auxiliary data.
+       94          """
+       95          raise NotImplementedError()
+       96  
+       97      def get_tool_param(self) -> ToolParam:
+       98          return ToolParam(
+       99              name=self.name,
+      100              description=self.description,
+      101              input_schema=self.input_schema,
+      102          )
+      103  
+      104      def _validate_tool_input(self, tool_input: dict[str, Any]):
+      105          """Validates the tool input.
+      106  
+      107          Raises:
+      108              jsonschema.ValidationError: If the tool input is invalid.
+      109          """
+      110          jsonschema.validate(instance=tool_input, schema=self.input_schema)
+
+---------- IMPLEMENTER ii_agent.agents.base:BaseAgent  stubs=0/1 ----------
+        4  class BaseAgent(LLMTool):
+      (does not define: run_impl; inherited or absent)
+
+---------- IMPLEMENTER ii_agent.agents.fc_agent:FunctionCallingAgent  stubs=0/1 ----------
+       21  class FunctionCallingAgent(BaseAgent):
+      148      def run_impl(
+      149          self,
+      150          tool_input: dict[str, Any],
+      151          message_history: Optional[MessageHistory] = None,
+      152      ) -> ToolImplOutput:
+      153          instruction = tool_input["instruction"]
+      154          files = tool_input["files"]
+      155  
+      156          user_input_delimiter = "-" * 45 + " USER INPUT " + "-" * 45 + "\n" + instruction
+      157          self.logger_for_agent_logs.info(f"\n{user_input_delimiter}\n")
+      158  
+      159          # Add instruction to dialog before getting model response
+      160          image_blocks = []
+      161          if files:
+      162              # First, list all attached files
+      163              instruction = f"""{instruction}\n\nAttached files:\n"""
+      164              for file in files:
+      165                  relative_path = self.workspace_manager.relative_path(file)
+      166                  instruction += f" - {relative_path}\n"
+      167                  self.logger_for_agent_logs.info(f"Attached file: {relative_path}")
+      168  
+      169              # Then process images for image blocks
+      170              for file in files:
+      171                  ext = file.split(".")[-1]
+      172                  if ext == "jpg":
+      173                      ext = "jpeg"
+      174                  if ext in ["png", "gif", "jpeg", "webp"]:
+      175                      base64_image = encode_image(
+      176                          str(self.workspace_manager.workspace_path(file))
+      177                      )
+      178                      image_blocks.append(
+      179                          {
+      180                              "source": {
+      181                                  "type": "base64",
+      182                                  "media_type": f"image/{ext}",
+      183                                  "data": base64_image,
+      184                              }
+      185                          }
+      186                      )
+      187  
+      188          self.history.add_user_prompt(instruction, image_blocks)
+      189          self.interrupted = False
+      190  
+      191          remaining_turns = self.max_turns
+      192          while remaining_turns > 0:
+      193              remaining_turns -= 1
+      194  
+      195              delimiter = "-" * 45 + " NEW TURN " + "-" * 45
+      196              self.logger_for_agent_logs.info(f"\n{delimiter}\n")
+      197  
+      198              # Get tool parameters for available tools
+      199              all_tool_params = self._validate_tool_parameters()
+      200  
+      201              try:
+      202                  current_messages = self.history.get_messages_for_llm()
+      203                  current_tok_count = self.context_manager.count_tokens(current_messages)
+      204                  self.logger_for_agent_logs.info(
+      205                      f"(Current token count: {current_tok_count})\n"
+      206                  )
+      207  
+       ... truncated at 60 lines ...
+
+---------- IMPLEMENTER ii_agent.tools.advanced_tools.audio_tool:AudioTranscribeTool  stubs=0/1 ----------
+       31  class AudioTranscribeTool(LLMTool):
+       56      def run_impl(
+       57          self,
+       58          tool_input: dict[str, Any],
+       59          message_history: Optional[MessageHistory] = None,
+       60      ) -> ToolImplOutput:
+       61          relative_file_path = tool_input["file_path"]
+       62          full_file_path = self.workspace_manager.workspace_path(Path(relative_file_path))
+       63  
+       64          if not full_file_path.exists():
+       65              return ToolImplOutput(
+       66                  f"Error: File not found at {relative_file_path}",
+       67                  f"File not found at {relative_file_path}",
+       68                  {"success": False, "error": "File not found"},
+       69              )
+       70          if not full_file_path.is_file():
+       71              return ToolImplOutput(
+       72                  f"Error: Path {relative_file_path} is not a file.",
+       73                  f"Path {relative_file_path} is not a file.",
+       74                  {"success": False, "error": "Path is not a file"},
+       75              )
+       76          if full_file_path.suffix.lower() not in SUPPORTED_AUDIO_FORMATS:
+       77              return ToolImplOutput(
+       78                  f"Error: File format {full_file_path.suffix} is not supported for transcription.",
+       79                  f"Unsupported audio format: {full_file_path.suffix}",
+       80                  {"success": False, "error": "Unsupported audio format"},
+       81              )
+       82  
+       83          try:
+       84              with open(full_file_path, "rb") as audio_file:
+       85                  transcript = self.client.audio.transcriptions.create(
+       86                      model="gpt-4o-transcribe", file=audio_file
+       87                  )
+       88  
+       89              transcribed_text = transcript.text if transcript else ""
+       90  
+       91              return ToolImplOutput(
+       92                  transcribed_text,
+       93                  f"Successfully transcribed audio from {relative_file_path}",
+       94                  {"success": True, "transcribed_chars": len(transcribed_text)},
+       95              )
+       96          except APIError as e:
+       97              return ToolImplOutput(
+       98                  f"Error transcribing audio file {relative_file_path}: OpenAI API Error - {str(e)}",
+       99                  f"Failed to transcribe {relative_file_path} due to API error.",
+      100                  {"success": False, "error": f"OpenAI API Error: {str(e)}"},
+      101              )
+      102          except Exception as e:
+      103              return ToolImplOutput(
+      104                  f"Error transcribing audio file {relative_file_path}: {str(e)}",
+      105                  f"Failed to transcribe {relative_file_path}",
+      106                  {"success": False, "error": str(e)},
+      107              )
+
+---------- IMPLEMENTER ii_agent.tools.advanced_tools.audio_tool:AudioGenerateTool  stubs=0/1 ----------
+      116  class AudioGenerateTool(LLMTool):
+      181      def run_impl(
+      182          self,
+      183          tool_input: dict[str, Any],
+      184          message_history: Optional[MessageHistory] = None,
+      185      ) -> ToolImplOutput:
+      186          print("Initializing AudioGenerateTool $$$$$")
+      187          text_to_speak = tool_input["text"]
+      188          relative_output_filename = tool_input["output_filename"]
+      189          voice = tool_input.get("voice", "alloy")
+      190          temperature = tool_input.get("temperature", 0.8)
+      191          system_prompt = tool_input.get(
+      192              "system_prompt", "You are a helpful voice assistant."
+      193          )
+      194  
+      195          if not relative_output_filename.lower().endswith(".mp3"):
+      196              return ToolImplOutput(
+      197                  "Error: output_filename must end with .mp3",
+      198                  "Invalid output filename",
+      199                  {"success": False, "error": "Output filename must be .mp3"},
+      200              )
+      201  
+      202          output_mp3_path = self.workspace_manager.workspace_path(
+      203              Path(relative_output_filename)
+      204          )
+      205          # Ensure parent directory exists
+      206          output_mp3_path.parent.mkdir(parents=True, exist_ok=True)
+      207  
+      208          # Use a temporary, unique WAV filename based on hash like in the tutorial
+      209          m = hashlib.sha256()
+      210          m.update(f"{system_prompt}_{text_to_speak}_{temperature}_{voice}".encode())
+      211          temp_wav_filename = f"{m.hexdigest()[:16]}.wav"
+      212          temp_wav_path = self.workspace_manager.workspace_path(
+      213              Path("uploads") / temp_wav_filename
+      214          )  # Store temp in uploads
+      215          temp_wav_path.parent.mkdir(parents=True, exist_ok=True)  # Ensure uploads exists
+      216  
+      217          try:
+      218              completion = self.client.chat.completions.create(
+      219                  model="gpt-4o-audio-preview",
+      220                  modalities=["text", "audio"],
+      221                  audio={"voice": voice, "format": "wav"},  # API gives WAV
+      222                  messages=[
+      223                      {"role": "system", "content": system_prompt.strip()},
+      224                      {"role": "user", "content": text_to_speak.strip()},
+      225                  ],
+      226                  temperature=temperature,
+      227              )
+      228  
+      229              if not completion.choices or not completion.choices[0].message.audio:
+      230                  raise ValueError("No audio data received from API.")
+      231  
+      232              wav_bytes = base64.b64decode(completion.choices[0].message.audio.data)
+      233  
+      234              # 1. Save the temporary WAV file
+      235              with open(temp_wav_path, "wb") as f:
+      236                  f.write(wav_bytes)
+      237  
+      238              # 2. Convert WAV to MP3 using ffmpeg
+      239              try:
+      240                  subprocess.run(
+       ... truncated at 60 lines ...
+
+---------- IMPLEMENTER ii_agent.tools.advanced_tools.gemini.base:GeminiTool  stubs=0/1 ----------
+       14  class GeminiTool(LLMTool):
+      (does not define: run_impl; inherited or absent)
+
+---------- IMPLEMENTER ii_agent.tools.advanced_tools.image_gen_tool:ImageGenerateTool  stubs=0/1 ----------
+       27  class ImageGenerateTool(LLMTool):
+       93      def run_impl(
+       94          self,
+       95          tool_input: dict[str, Any],
+       96          message_history: Optional[MessageHistory] = None,
+       97      ) -> ToolImplOutput:
+       98          if not self.model:
+       99              return ToolImplOutput(
+      100                  "Error: Imagen model could not be initialized. Check Vertex AI setup and credentials.",
+      101                  "Imagen model initialization failed.",
+      102                  {"success": False, "error": "Model not initialized"},
+      103              )
+      104  
+      105          prompt = tool_input["prompt"]
+      106          relative_output_filename = tool_input["output_filename"]
+      107  
+      108          if not relative_output_filename.lower().endswith(".png"):
+      109              return ToolImplOutput(
+      110                  "Error: output_filename must end with .png for Imagen generation.",
+      111                  "Invalid output filename for image.",
+      112                  {"success": False, "error": "Output filename must be .png"},
+      113              )
+      114  
+      115          local_output_path = self.workspace_manager.workspace_path(
+      116              Path(relative_output_filename)
+      117          )
+      118          local_output_path.parent.mkdir(parents=True, exist_ok=True)
+      119  
+      120          generate_params = {
+      121              "number_of_images": tool_input.get("number_of_images", 1),
+      122              "language": "en",  # Explicitly setting, though API might default
+      123              "aspect_ratio": tool_input.get("aspect_ratio", "1:1"),
+      124              "safety_filter_level": tool_input.get("safety_filter_level", "block_some"),
+      125              "person_generation": tool_input.get("person_generation", "allow_adult"),
+      126          }
+      127  
+      128          seed = tool_input.get("seed")
+      129          add_watermark = tool_input.get("add_watermark", True)
+      130  
+      131          if seed is not None:
+      132              generate_params["seed"] = int(seed)
+      133              if add_watermark:
+      134                  print(
+      135                      "Warning: 'seed' is provided, 'add_watermark' will be ignored (or set to False)."
+      136                  )
+      137                  generate_params["add_watermark"] = False
+      138          elif "add_watermark" in tool_input:
+      139              generate_params["add_watermark"] = add_watermark
+      140  
+      141          try:
+      142              images = self.model.generate_images(prompt=prompt, **generate_params)
+      143  
+      144              if not images:  # Response could be None or empty list
+      145                  return ToolImplOutput(
+      146                      f"Image generation failed for prompt: {prompt}. No images returned.",
+      147                      "Image generation produced no output.",
+      148                      {"success": False, "error": "No images returned from API"},
+      149                  )
+      150  
+      151              if generate_params["number_of_images"] > 1:
+      152                  print(
+       ... truncated at 60 lines ...
+
+(19 further implementers not shown)

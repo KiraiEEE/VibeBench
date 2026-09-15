@@ -1,0 +1,242 @@
+row 26   thinking-machines-lab/tinker-cookbook#570
+============================================================================
+CONTRACT tinker_cookbook.rl.types:EnvGroupBuilder   kind=abc abstract_methods=1.0 implementers=13.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file tinker_cookbook/rl/types.py
+      211  class EnvGroupBuilder(ABC):
+      212      """
+      213      Builds a group of environments. The group will be used in the following way:
+      214  
+      215      - Algorithms like GRPO will center rewards across the group.
+      216      - The reward function (compute_group_rewards) has access to the trajectories from the
+      217        whole group, even though many reward functions will evaluate each one independently.
+      218  
+      219        - For example, this enables us to use pairwise reward models that look at a pair of
+      220          trajectories at a time. With such a reward model, we effectively have a multi-agent
+      221          environment, where the agents are playing a zero-sum game.
+      222  
+      223      Groups can be used in two ways, in practice:
+      224  
+      225      - To define a multi-agent environment
+      226      - As a part of the *algorithm* (e.g. GRPO), when dealing with single-agent tasks.
+      227  
+      228      **Picklability:** Implementations must be pickleable (via standard ``pickle``) to support
+      229      distributed rollout execution where builders are serialized and sent to remote workers.
+      230      Avoid storing live network connections, file handles, or other unpickleable objects as
+      231      fields. Use ``get_renderer()`` to create Renderers (which are automatically pickle-safe).
+      232      Store configuration strings (model names, connection params) and construct heavy objects
+      233      in ``make_envs()`` when possible. See ``HarborEnvGroupBuilder`` for a reference
+      234      implementation of the lazy-construction pattern.
+      235      """
+      236  
+      237      @abstractmethod
+      238      async def make_envs(self) -> Sequence[Env]:
+      239          """Create the environments for this group.
+      240  
+      241          Returns:
+      242              Sequence[Env]: The environments to run rollouts in.
+      243          """
+      244          pass
+      245  
+      246      async def compute_group_rewards(
+      247          self, trajectory_group: list[Trajectory], env_group: Sequence[Env]
+      248      ) -> list[tuple[float, Metrics]]:
+      249          """Compute a final reward for each trajectory that depends on the whole group.
+      250  
+      251          This is called after all rollouts in the group complete.  The total
+      252          reward for each trajectory is the sum of the per-timestep rewards
+      253          (from :meth:`Env.step`) plus the final group reward returned here.
+      254  
+      255          Override this when the reward depends on comparing trajectories within
+      256          the group (e.g., pairwise reward models).  The default implementation
+      257          returns ``(0.0, {})`` for every trajectory, so only per-timestep
+      258          rewards are used.
+      259  
+      260          Args:
+      261              trajectory_group (list[Trajectory]): The completed trajectories,
+      262                  one per environment in the group.
+      263              env_group (Sequence[Env]): The corresponding environments (same
+      264                  order as ``trajectory_group``).
+      265  
+      266          Returns:
+      267              list[tuple[float, Metrics]]: A list of ``(reward, metrics)`` pairs,
+      268                  one per trajectory.  The reward is added to the per-timestep
+      269                  total; the metrics dict is merged into training logs.
+      270          """
+      271          return [(0.0, {}) for _ in trajectory_group]
+      272  
+      273      async def cleanup(self) -> None:
+      274          """Clean up resources created by make_envs().
+      275  
+      276          Called after rollouts and reward computation complete, regardless
+      277          of success or failure. Override this to release expensive resources
+      278          like cloud sandboxes, remote browsers, etc.
+      279  
+      280          Default is a no-op. Implementations should be idempotent (safe to
+      281          call multiple times) and handle exceptions internally, as `do_group_rollout`
+      282          does not catch exceptions from this method.
+      283          """
+      284          pass
+      285  
+      286      def logging_tags(self) -> list[str]:
+      287          """Return tags used to aggregate metrics in training logs.
+      288  
+      289          Tags let the training loop group metrics (rewards, episode lengths,
+      290          etc.) by environment type.  Return a short list of names at different
+      291          levels of granularity.
+      292  
+      293          Returns:
+      294              list[str]: Tag strings for this environment group.  Default is
+      295                  an empty list.
+      296  
+      297          Example::
+      298  
+      299              def logging_tags(self) -> list[str]:
+      300                  return ["gsm", "math", "rlvr"]
+      301          """
+      302          return []
+
+---------- IMPLEMENTER tinker_cookbook.recipes.code_rl.code_env:DeepcoderEnvGroupBuilder  stubs=0/1 ----------
+      170  @chz.chz
+      171  class DeepcoderEnvGroupBuilder(EnvGroupBuilder):
+      186      async def make_envs(self) -> Sequence[Env]:
+      187          # Renderer is stateless, share across all envs in group
+      188          tokenizer = tokenizer_utils.get_tokenizer(self.model_name)
+      189          renderer_name = self.renderer_name or model_info.get_recommended_renderer_name(
+      190              self.model_name
+      191          )
+      192          renderer = get_renderer(renderer_name, tokenizer)
+      193  
+      194          envs = []
+      195          for _ in range(self.group_size):
+      196              tool = DeepcoderTool(self.task, self.sandbox_backend, self.timeout)
+      197              envs.append(
+      198                  build_agent_tool_env(
+      199                      renderer=renderer,
+      200                      tools=[tool.check_solution],
+      201                      initial_messages=_initial_messages(self.task, renderer, tool),
+      202                      reward_fn=DeepcoderReward(
+      203                          task=self.task,
+      204                          sandbox_backend=self.sandbox_backend,
+      205                          timeout=self.timeout,
+      206                          format_coef=self.format_coef,
+      207                      ),
+      208                      max_trajectory_tokens=self.max_trajectory_tokens,
+      209                      max_generation_tokens=self.max_generation_tokens,
+      210                      context_overflow_reward=self.context_overflow_reward,
+      211                      max_turns=self.max_turns,
+      212                  )
+      213              )
+      214          return envs
+
+---------- IMPLEMENTER tinker_cookbook.recipes.harbor_rl.harbor_env:HarborEnvGroupBuilder  stubs=0/1 ----------
+       83  class HarborEnvGroupBuilder(EnvGroupBuilder):
+      117      async def make_envs(self) -> Sequence[Env]:
+      118          self._sandboxes = []
+      119  
+      120          # Build Modal image from the task's Dockerfile
+      121          env_dir = self.task.task_dir / "environment"
+      122          dockerfile_path = env_dir / "Dockerfile"
+      123          image = modal.Image.from_dockerfile(path=str(dockerfile_path), context_dir=str(env_dir))
+      124  
+      125          # Create renderer (stateless, shared across envs)
+      126          tokenizer = tokenizer_utils.get_tokenizer(self.model_name)
+      127          renderer_name = self.renderer_name or model_info.get_recommended_renderer_name(
+      128              self.model_name
+      129          )
+      130          renderer = get_renderer(renderer_name, tokenizer)
+      131  
+      132          tests_dir = self.task.task_dir / "tests"
+      133  
+      134          envs = []
+      135          for _ in range(self.group_size):
+      136              sandbox = await self.sandbox_factory(image, self.sandbox_timeout)
+      137              self._sandboxes.append(sandbox)
+      138  
+      139              bash_tool = HarborBashTool(sandbox, command_timeout=self.command_timeout)
+      140              reward_fn = self.reward_fn or HarborReward(
+      141                  tests_dir=tests_dir,
+      142                  sandbox=sandbox,
+      143                  grader_timeout=self.grader_timeout,
+      144              )
+      145              envs.append(
+      146                  build_agent_tool_env(
+      147                      renderer=renderer,
+      148                      tools=[bash_tool.bash],
+      149                      initial_messages=_initial_messages(self.task, renderer, bash_tool),
+      150                      reward_fn=reward_fn,
+      151                      max_turns=self.max_turns,
+      152                      max_trajectory_tokens=self.max_trajectory_tokens,
+      153                      max_generation_tokens=self.max_generation_tokens,
+      154                      context_overflow_reward=self.context_overflow_reward,
+      155                  )
+      156              )
+      157          return envs
+
+---------- IMPLEMENTER tinker_cookbook.recipes.multiplayer_rl.guess_number.env:GuessNumberEnvGroupBuilder  stubs=0/1 ----------
+      103  @dataclass(frozen=True)
+      104  class GuessNumberEnvGroupBuilder(EnvGroupBuilder):
+      109      async def make_envs(self) -> Sequence[Env]:
+      110          return [GuessNumberEnv(self.answer, self.renderer) for _ in range(self.num_envs)]
+
+---------- IMPLEMENTER tinker_cookbook.recipes.multiplayer_rl.text_arena.env:TwoPlayerEnvGroupBuilder  stubs=0/1 ----------
+      191  @dataclass
+      192  class TwoPlayerEnvGroupBuilder(EnvGroupBuilder):
+      202      async def make_envs(self) -> Sequence[Env]:
+      203          """Create a group of environments sharing the same TextArena game."""
+      204          if self.num_envs % 2 != 0:
+      205              raise ValueError("this env requires an even number of environments (players)")
+      206  
+      207          def _construct_coordinator() -> TwoPlayerCoordinator:
+      208              """During training, the coordinator performs necessary blocking/synchronization, so that the policys can take turns to make moves on the shared environment, across different Environment objects"""
+      209              shared_env = ta.make(env_id=self.game_name)
+      210              shared_env.reset(num_players=self.num_players)
+      211              return TwoPlayerCoordinator(shared_env=shared_env)
+      212  
+      213          envs = []
+      214          for _ in range(self.num_envs // 2):
+      215              if self.self_play:
+      216                  coordinator = _construct_coordinator()
+      217                  # if self_play, then we need to share the same coordinator across all environments
+      218                  coordinators = [coordinator for _ in range(self.num_players)]
+      219              else:
+      220                  # if not self_play, we can just create a different coordinator for each environment
+      221                  coordinators = [_construct_coordinator() for _ in range(self.num_players)]
+      222  
+      223              envs += [
+      224                  TwoPlayerEnv(
+      225                      player_id=i,
+      226                      coordinator=coordinators[i],
+      227                      renderer=self.renderer,
+      228                      self_play=self.self_play,
+      229                      opponent_policy=self.opponent_policy,
+      230                  )
+      231                  for i in range(2)
+      232              ]
+      233          return envs
+
+---------- IMPLEMENTER tinker_cookbook.recipes.multiplayer_rl.twenty_questions.env:TwentyQuestionsEnvGroupBuilder  stubs=0/1 ----------
+      157  @dataclass(frozen=True)
+      158  class TwentyQuestionsEnvGroupBuilder(EnvGroupBuilder):
+      164      async def make_envs(self) -> Sequence[Env]:
+      165          return [
+      166              TwentyQuestionsEnv(self.answerer, self.answer, self.renderer)
+      167              for _ in range(self.num_envs)
+      168          ]
+
+---------- IMPLEMENTER tinker_cookbook.recipes.rubric.env:RubricGradedEnvGroupBuilder  stubs=0/1 ----------
+      173  @dataclass(frozen=True)
+      174  class RubricGradedEnvGroupBuilder(EnvGroupBuilder):
+      180      async def make_envs(self) -> Sequence[RubricGradedEnv]:
+      181          return [
+      182              RubricGradedEnv(
+      183                  renderer=self.renderer,
+      184                  datapoint=self.datapoint,
+      185                  grader_llm=self.grader_llm,
+      186              )
+      187              for _ in range(self.group_size)
+      188          ]
+
+(7 further implementers not shown)

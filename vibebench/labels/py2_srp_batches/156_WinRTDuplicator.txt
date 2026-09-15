@@ -1,0 +1,406 @@
+row 156   ra1nty/DXcam#136
+============================================================================
+CLASS WinRTDuplicator in dxcam/core/winrt_duplicator.py   loc=486 methods=34 wmc=120 lcom=0.1875
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       87  @dataclass
+       88  class WinRTDuplicator:
+       89      """Windows.Graphics.Capture wrapper for acquiring frame textures."""
+       90  
+       91      texture: Any = field(default_factory=lambda: ctypes.POINTER(ID3D11Texture2D)())
+       92      updated: bool = False
+       93      output: InitVar[Output | None] = None
+       94      device: InitVar[Device | None] = None
+       95      latest_frame_ticks: int = 0
+       96      accumulated_frames: int = 0
+       97      performance_frequency: int = 0
+       98  
+       99      _output: Output | None = field(default=None, init=False, repr=False)
+      100      _frame: Any | None = field(default=None, init=False, repr=False)
+      101      _frame_pool: Any | None = field(default=None, init=False, repr=False)
+      102      _session: Any | None = field(default=None, init=False, repr=False)
+      103      _capture_item: Any | None = field(default=None, init=False, repr=False)
+      104      _winrt_device: Any | None = field(default=None, init=False, repr=False)
+      105      _multithread: Any | None = field(default=None, init=False, repr=False)
+      106      _dxgi_surface: Any = field(
+      107          default_factory=lambda: ctypes.POINTER(IDXGISurface)(), init=False, repr=False
+      108      )
+      109      _get_dxgi_surface_from_object: Any | None = field(
+      110          default=None, init=False, repr=False
+      111      )
+      112      _frame_arrived_event: Event | None = field(default=None, init=False, repr=False)
+      113      _frame_arrived_token: Any | None = field(default=None, init=False, repr=False)
+      114      _frame_arrived_handler: Any | None = field(default=None, init=False, repr=False)
+      115      _frame_wait_seconds: float = field(default=0.0, init=False, repr=False)
+      116      _frame_pool_size: int = field(default=2, init=False, repr=False)
+      117      _min_update_interval_seconds: float | None = field(
+      118          default=None, init=False, repr=False
+      119      )
+      120      _dirty_region_setting: DirtyRegionSetting = field(
+      121          default=_DIRTY_REGION_DEFAULT, init=False, repr=False
+      122      )
+      123      _cursor_capture_enabled: bool | None = field(default=None, init=False, repr=False)
+      124      _border_required: bool | None = field(default=None, init=False, repr=False)
+      125      _pixel_format: Any | None = field(default=None, init=False, repr=False)
+      126      _dirty_region_mode_enum: Any | None = field(default=None, init=False, repr=False)
+      127  
+      128      def __post_init__(self, output: Output | None, device: Device | None) -> None:
+      129          if output is None or device is None:
+      130              raise ValueError("WinRTDuplicator requires valid output and device.")
+      131          self._output = output
+      132          self._frame_wait_seconds = self._resolve_frame_wait_seconds()
+      133          self._frame_pool_size = self._resolve_frame_pool_size()
+      134          self._min_update_interval_seconds = self._resolve_min_update_interval_seconds()
+      135          self._dirty_region_setting = self._resolve_dirty_region_setting()
+      136          self._cursor_capture_enabled = self._resolve_bool_env(
+      137              "DXCAM_WINRT_CURSOR_CAPTURE"
+      138          )
+      139          self._border_required = self._resolve_bool_env("DXCAM_WINRT_BORDER_REQUIRED")
+      140          self._configure_qpc_frequency()
+      141          self._configure_multithread_protection(device=device)
+      142          self._create_capture_session(output=output, device=device)
+      143  
+      144      def _resolve_frame_wait_seconds(self) -> float:
+      145          raw = os.getenv("DXCAM_WINRT_FRAME_WAIT_MS")
+      146          if raw is None:
+      147              return DEFAULT_FRAME_WAIT_SECONDS
+      148          try:
+      149              parsed = float(raw) / 1000.0
+      150          except ValueError:
+      151              logger.warning(
+      152                  "Invalid DXCAM_WINRT_FRAME_WAIT_MS=%r; using default %.3fms.",
+      153                  raw,
+      154                  DEFAULT_FRAME_WAIT_SECONDS * 1000.0,
+      155              )
+      156              return DEFAULT_FRAME_WAIT_SECONDS
+      157          return max(0.0, parsed)
+      158  
+      159      def _resolve_frame_pool_size(self) -> int:
+      160          raw = os.getenv("DXCAM_WINRT_FRAME_POOL_SIZE")
+      161          if raw is None:
+      162              return 2
+      163          try:
+      164              parsed = int(raw)
+      165          except ValueError:
+      166              logger.warning(
+      167                  "Invalid DXCAM_WINRT_FRAME_POOL_SIZE=%r; using default 2.", raw
+      168              )
+      169              return 2
+      170          if parsed < 2:
+      171              logger.warning(
+      172                  "DXCAM_WINRT_FRAME_POOL_SIZE=%d is too small; clamping to 2.",
+      173                  parsed,
+      174              )
+      175              return 2
+      176          return parsed
+      177  
+      178      def _resolve_min_update_interval_seconds(self) -> float | None:
+      179          raw = os.getenv("DXCAM_WINRT_MIN_UPDATE_INTERVAL_MS")
+      180          if raw is None:
+      181              return DEFAULT_MIN_UPDATE_INTERVAL_SECONDS
+      182          try:
+      183              parsed = float(raw) / 1000.0
+      184          except ValueError:
+      185              logger.warning(
+      186                  "Invalid DXCAM_WINRT_MIN_UPDATE_INTERVAL_MS=%r; ignoring.", raw
+      187              )
+      188              return None
+      189          if parsed < 0:
+      190              logger.warning(
+      191                  "DXCAM_WINRT_MIN_UPDATE_INTERVAL_MS=%r is negative; clamping to 0.",
+      192                  raw,
+      193              )
+      194              return 0.0
+      195          return parsed
+      196  
+      197      def _resolve_dirty_region_setting(self) -> DirtyRegionSetting:
+      198          raw = os.getenv("DXCAM_WINRT_DIRTY_REGION_MODE")
+      199          if raw is None:
+      200              return _DIRTY_REGION_DEFAULT
+      201          normalized = raw.strip().lower().replace("-", "_")
+      202          if normalized == _DIRTY_REGION_DEFAULT:
+      203              return _DIRTY_REGION_DEFAULT
+      204          if normalized == _DIRTY_REGION_REPORT_ONLY:
+      205              return _DIRTY_REGION_REPORT_ONLY
+      206          if normalized == _DIRTY_REGION_REPORT_AND_RENDER:
+      207              return _DIRTY_REGION_REPORT_AND_RENDER
+      208          logger.warning(
+      209              "Invalid DXCAM_WINRT_DIRTY_REGION_MODE=%r; using %s.",
+      210              raw,
+      211              _DIRTY_REGION_DEFAULT,
+      212          )
+      213          return _DIRTY_REGION_DEFAULT
+      214  
+      215      def _resolve_bool_env(self, name: str) -> bool | None:
+      216          raw = os.getenv(name)
+      217          if raw is None:
+      218              return None
+      219          normalized = raw.strip().lower()
+      220          if normalized in {"1", "true", "yes", "on"}:
+      221              return True
+      222          if normalized in {"0", "false", "no", "off"}:
+      223              return False
+      224          logger.warning("Invalid %s=%r; ignoring.", name, raw)
+      225          return None
+      226  
+      227      def _apply_session_options(self) -> None:
+      228          if self._session is None:
+      229              return
+      230          if self._min_update_interval_seconds is not None:
+      231              try:
+      232                  self._session.min_update_interval = timedelta(
+      233                      seconds=self._min_update_interval_seconds
+      234                  )
+      235              except Exception:
+      236                  logger.warning(
+      237                      "Failed to set session min_update_interval.", exc_info=True
+      238                  )
+      239          if self._dirty_region_mode_enum is not None and (
+      240              self._dirty_region_setting != _DIRTY_REGION_DEFAULT
+      241          ):
+      242              try:
+      243                  if self._dirty_region_setting == _DIRTY_REGION_REPORT_ONLY:
+      244                      mode = self._dirty_region_mode_enum.REPORT_ONLY
+      245                  else:
+      246                      mode = self._dirty_region_mode_enum.REPORT_AND_RENDER
+      247                  self._session.dirty_region_mode = mode
+      248              except Exception:
+      249                  logger.warning("Failed to set session dirty_region_mode.", exc_info=True)
+      250          if self._cursor_capture_enabled is not None:
+      251              try:
+      252                  self._session.is_cursor_capture_enabled = self._cursor_capture_enabled
+      253              except Exception:
+      254                  logger.warning(
+      255                      "Failed to set session is_cursor_capture_enabled.",
+      256                      exc_info=True,
+      257                  )
+      258          if self._border_required is not None:
+      259              try:
+      260                  self._session.is_border_required = self._border_required
+      261              except Exception:
+      262                  logger.warning("Failed to set session is_border_required.", exc_info=True)
+      263  
+      264      def _configure_qpc_frequency(self) -> None:
+      265          freq = ctypes.c_longlong()
+      266          kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+      267          kernel32.QueryPerformanceFrequency(ctypes.byref(freq))
+      268          self.performance_frequency = int(freq.value)
+      269  
+      270      def _create_capture_session(self, output: Output, device: Device) -> None:
+      271          bindings = _WinRTCaptureBindings.load()
+      272          self._get_dxgi_surface_from_object = bindings.get_dxgi_surface_from_object
+      273          self._dirty_region_mode_enum = bindings.dirty_region_mode_enum
+      274          self._pixel_format = bindings.directx_pixel_format.B8_G8_R8_A8_UINT_NORMALIZED
+      275  
+      276          dxgi_device = device.device.QueryInterface(IDXGIDevice)
+      277          dxgi_device_ptr = ctypes.cast(dxgi_device, ctypes.c_void_p).value
+      278          if dxgi_device_ptr is None:
+      279              raise RuntimeError("Failed to get IDXGIDevice pointer for WinRT backend.")
+      280          self._winrt_device = bindings.create_direct3d11_device_from_dxgi_device(
+      281              dxgi_device_ptr
+      282          )
+      283  
+      284          monitor = self._monitor_handle_to_int(output.hmonitor)
+      285          self._capture_item = bindings.create_for_monitor(monitor)
+      286  
+      287          self._frame_pool = bindings.frame_pool_cls.create_free_threaded(
+      288              self._winrt_device,
+      289              self._pixel_format,
+      290              self._frame_pool_size,
+      291              self._capture_item.size,
+      292          )
+      293          self._session = self._frame_pool.create_capture_session(self._capture_item)
+      294          self._apply_session_options()
+      295          self._register_frame_arrived_event()
+      296          self._session.start_capture()
+      297  
+      298      def _register_frame_arrived_event(self) -> None:
+      299          if self._frame_pool is None:
+      300              return
+      301          self._frame_arrived_event = Event()
+      302          self._frame_arrived_handler = self._on_frame_arrived
+      303          try:
+      304              self._frame_arrived_token = self._frame_pool.add_frame_arrived(
+      305                  self._frame_arrived_handler
+      306              )
+      307          except Exception:
+      308              logger.debug(
+      309                  "Failed to subscribe WinRT frame_arrived event.", exc_info=True
+      310              )
+      311              self._frame_arrived_event = None
+      312              self._frame_arrived_token = None
+      313              self._frame_arrived_handler = None
+      314  
+      315      def _unregister_frame_arrived_event(self) -> None:
+      316          if self._frame_pool is not None and self._frame_arrived_token is not None:
+      317              try:
+      318                  self._frame_pool.remove_frame_arrived(self._frame_arrived_token)
+      319              except Exception:
+      320                  logger.debug(
+      321                      "Ignoring exception while removing frame_arrived event.",
+      322                      exc_info=True,
+      323                  )
+      324          self._frame_arrived_event = None
+      325          self._frame_arrived_token = None
+      326          self._frame_arrived_handler = None
+      327  
+      328      def _on_frame_arrived(self, _sender: Any, _args: Any) -> None:
+      329          if self._frame_arrived_event is not None:
+      330              self._frame_arrived_event.set()
+      331  
+      332      def _configure_multithread_protection(self, device: Device) -> None:
+      333          try:
+      334              self._multithread = device.im_context.QueryInterface(ID3D11Multithread)
+      335          except comtypes.COMError:
+      336              logger.debug("ID3D11Multithread not available for WinRT backend.")
+      337              self._multithread = None
+      338              return
+      339          try:
+      340              self._multithread.SetMultithreadProtected(True)
+      341          except Exception:
+      342              logger.debug("Failed to enable multithread protection.", exc_info=True)
+      343  
+      344      def enter_multithread(self) -> None:
+      345          if self._multithread is None:
+      346              return
+      347          try:
+      348              self._multithread.Enter()
+      349          except Exception:
+      350              logger.debug("Failed to enter ID3D11Multithread lock.", exc_info=True)
+      351  
+      352      def leave_multithread(self) -> None:
+      353          if self._multithread is None:
+      354              return
+      355          try:
+      356              self._multithread.Leave()
+      357          except Exception:
+      358              logger.debug("Failed to leave ID3D11Multithread lock.", exc_info=True)
+      359  
+      360      def _monitor_handle_to_int(self, hmonitor: Any) -> int:
+      361          value = getattr(hmonitor, "value", hmonitor)
+      362          monitor = int(value or 0)
+      363          if monitor == 0:
+      364              raise RuntimeError("Invalid monitor handle for WinRT capture.")
+      365          return monitor
+      366  
+      367      def _close_winrt_object(self, obj: Any, name: str) -> None:
+      368          if obj is None:
+      369              return
+      370          close_fn = getattr(obj, "close", None)
+      371          if callable(close_fn):
+      372              try:
+      373                  close_fn()
+      374              except Exception:
+      375                  logger.debug("Ignoring exception while closing %s.", name, exc_info=True)
+      376  
+      377      def _release_dxgi_surface(self) -> None:
+      378          # The pointer returned by winrt interop behaves like a borrowed pointer in
+      379          # practice. Explicit Release() causes native aborts in stress loops.
+      380          clear_com_pointer(self._dxgi_surface)
+      381          self._dxgi_surface = ctypes.POINTER(IDXGISurface)()
+      382  
+      383      def _drop_texture_reference(self) -> None:
+      384          # WinRT interop ownership is nuanced; avoid explicit Release() here.
+      385          clear_com_pointer(self.texture)
+      386          self.texture = ctypes.POINTER(ID3D11Texture2D)()
+      387  
+      388      def _timedelta_to_ticks(self, value: timedelta) -> int:
+      389          if self.performance_frequency <= 0:
+      390              return 0
+      391          return int(value.total_seconds() * self.performance_frequency)
+      392  
+      393      def _frame_size_mismatch(self, frame: Any) -> bool:
+      394          if self._output is None:
+      395              return False
+      396          expected_width, expected_height = self._output.surface_size
+      397          actual_width = int(frame.content_size.width)
+      398          actual_height = int(frame.content_size.height)
+      399          return (actual_width, actual_height) != (expected_width, expected_height)
+      400  
+      401      def _try_get_next_frame(self) -> tuple[Any | None, bool]:
+      402          if self._frame_pool is None:
+      403              return None, True
+      404          try:
+      405              return self._frame_pool.try_get_next_frame(), False
+      406          except OSError as exc:
+      407              logger.warning("WinRT frame acquisition failed: %s", exc)
+      408              return None, True
+      409  
+      410      def _drain_to_latest_frame(self) -> tuple[Any | None, int, bool]:
+      411          latest = None
+      412          drained = 0
+      413          while True:
+      414              frame, failed = self._try_get_next_frame()
+      415              if failed:
+      416                  if latest is not None:
+      417                      self._close_winrt_object(latest, "dropped frame")
+      418                  return None, drained, True
+      419              if frame is None:
+      420                  break
+      421              drained += 1
+      422              if latest is not None:
+      423                  self._close_winrt_object(latest, "dropped frame")
+      424              latest = frame
+      425          return latest, drained, False
+      426  
+      427      def _wait_for_frame_arrival(self) -> bool:
+      428          if self._frame_arrived_event is None or self._frame_wait_seconds <= 0.0:
+      429              return False
+      430          signaled = self._frame_arrived_event.wait(timeout=self._frame_wait_seconds)
+      431          if signaled:
+      432              self._frame_arrived_event.clear()
+      433          return signaled
+      434  
+      435      def _recreate_frame_pool(self, size: Any) -> bool:
+      436          if (
+      437              self._frame_pool is None
+      438              or self._winrt_device is None
+      439              or self._pixel_format is None
+      440          ):
+      441              return False
+      442          try:
+      443              self._frame_pool.recreate(
+      444                  self._winrt_device,
+      445                  self._pixel_format,
+      446                  self._frame_pool_size,
+      447                  size,
+      448              )
+      449          except Exception:
+      450              logger.warning("WinRT frame pool recreate failed.", exc_info=True)
+      451              return False
+      452          return True
+      453  
+      454      def _handle_frame_size_change(self, frame: Any) -> bool:
+      455          logger.info("WinRT frame size changed; recreating frame pool.")
+      456          content_size = frame.content_size
+      457          self._close_winrt_object(frame, "frame")
+      458          if self._output is not None:
+      459              try:
+      460                  self._output.update_desc()
+      461              except Exception:
+      462                  logger.debug("Failed to refresh output description.", exc_info=True)
+      463          if not self._recreate_frame_pool(content_size):
+      464              self.updated = False
+      465              return False
+      466          self.updated = False
+      467          self.accumulated_frames = 0
+      468          return True
+      469  
+      470      def _update_frame(self, wait_for_frame: bool = False) -> bool:
+      471          if self._frame is not None or self._dxgi_surface:
+      472              if not self._release_frame():
+      473                  self.updated = False
+      474                  return False
+      475  
+      476          frame, drained, failed = self._drain_to_latest_frame()
+      477          if failed:
+      478              self.updated = False
+      479              return False
+      480  
+      481          if frame is None and wait_for_frame and self._wait_for_frame_arrival():
+      482              frame, extra_drained, failed = self._drain_to_latest_frame()
+      483              drained += extra_drained
+      484              if failed:
+      485                  self.updated = False
+      486                  return False
+       ... truncated at 400 lines ...

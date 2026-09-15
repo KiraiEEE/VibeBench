@@ -1,0 +1,406 @@
+row 79   letta-ai/letta#3183
+============================================================================
+CLASS VoiceAgent in letta/agents/voice_agent.py   loc=472 methods=11 wmc=50 lcom=0.1111111111111111
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       50  class VoiceAgent(BaseAgent):
+       51      """
+       52      A function-calling loop for streaming OpenAI responses with tool execution.
+       53      This agent:
+       54        - Streams partial tokens in real-time for low-latency output.
+       55        - Detects tool calls and invokes external tools.
+       56        - Gracefully handles OpenAI API failures (429, etc.) and streams errors.
+       57      """
+       58  
+       59      def __init__(
+       60          self,
+       61          agent_id: str,
+       62          openai_client: openai.AsyncClient,
+       63          message_manager: MessageManager,
+       64          agent_manager: AgentManager,
+       65          block_manager: BlockManager,
+       66          run_manager: RunManager,
+       67          passage_manager: PassageManager,
+       68          actor: User,
+       69      ):
+       70          super().__init__(
+       71              agent_id=agent_id, openai_client=openai_client, message_manager=message_manager, agent_manager=agent_manager, actor=actor
+       72          )
+       73  
+       74          # Summarizer settings
+       75          self.block_manager = block_manager
+       76          self.run_manager = run_manager
+       77          self.passage_manager = passage_manager
+       78          # TODO: This is not guaranteed to exist!
+       79          self.summary_block_label = "human"
+       80  
+       81          # Cached archival memory/message size
+       82          self.num_messages = None
+       83          self.num_archival_memories = None
+       84  
+       85      def init_summarizer(self, agent_state: AgentState) -> Summarizer:
+       86          if not agent_state.multi_agent_group:
+       87              raise ValueError("Low latency voice agent is not part of a multiagent group, missing sleeptime agent.")
+       88          if len(agent_state.multi_agent_group.agent_ids) != 1:
+       89              raise ValueError(
+       90                  f"None or multiple participant agents found in voice sleeptime group: {agent_state.multi_agent_group.agent_ids}"
+       91              )
+       92          voice_sleeptime_agent_id = agent_state.multi_agent_group.agent_ids[0]
+       93          summarizer = Summarizer(
+       94              mode=SummarizationMode.STATIC_MESSAGE_BUFFER,
+       95              summarizer_agent=VoiceSleeptimeAgent(
+       96                  agent_id=voice_sleeptime_agent_id,
+       97                  convo_agent_state=agent_state,
+       98                  message_manager=self.message_manager,
+       99                  agent_manager=self.agent_manager,
+      100                  actor=self.actor,
+      101                  block_manager=self.block_manager,
+      102                  run_manager=self.run_manager,
+      103                  passage_manager=self.passage_manager,
+      104                  target_block_label=self.summary_block_label,
+      105              ),
+      106              message_buffer_limit=agent_state.multi_agent_group.max_message_buffer_length,
+      107              message_buffer_min=agent_state.multi_agent_group.min_message_buffer_length,
+      108          )
+      109  
+      110          return summarizer
+      111  
+      112      async def step(self, input_messages: List[MessageCreate], max_steps: int = DEFAULT_MAX_STEPS) -> LettaResponse:
+      113          raise NotImplementedError("VoiceAgent does not have a synchronous step implemented currently.")
+      114  
+      115      async def step_stream(self, input_messages: List[MessageCreate], max_steps: int = DEFAULT_MAX_STEPS) -> AsyncGenerator[str, None]:
+      116          """
+      117          Main streaming loop that yields partial tokens.
+      118          Whenever we detect a tool call, we yield from _handle_ai_response as well.
+      119          """
+      120          if len(input_messages) != 1 or input_messages[0].role != MessageRole.user:
+      121              raise ValueError(f"Voice Agent was invoked with multiple input messages or message did not have role `user`: {input_messages}")
+      122  
+      123          user_query = input_messages[0].content[0].text
+      124  
+      125          agent_state = await self.agent_manager.get_agent_by_id_async(
+      126              agent_id=self.agent_id,
+      127              include_relationships=["tools", "memory", "tool_exec_environment_variables", "multi_agent_group"],
+      128              actor=self.actor,
+      129          )
+      130  
+      131          # TODO: Refactor this so it uses our in-house clients
+      132          # TODO: For now, piggyback off of OpenAI client for ease
+      133          if agent_state.llm_config.model_endpoint_type == "anthropic":
+      134              self.openai_client.api_key = model_settings.anthropic_api_key
+      135              self.openai_client.base_url = "https://api.anthropic.com/v1/"
+      136          elif agent_state.llm_config.model_endpoint_type != "openai":
+      137              raise ValueError("Letta voice agents are only compatible with OpenAI or Anthropic.")
+      138  
+      139          # Safety check
+      140          if agent_state.agent_type != AgentType.voice_convo_agent:
+      141              raise IncompatibleAgentType(expected_type=AgentType.voice_convo_agent, actual_type=agent_state.agent_type)
+      142  
+      143          summarizer = self.init_summarizer(agent_state=agent_state)
+      144  
+      145          in_context_messages = await self.message_manager.get_messages_by_ids_async(message_ids=agent_state.message_ids, actor=self.actor)
+      146          memory_edit_timestamp = get_utc_time()
+      147          in_context_messages[0].content[0].text = await PromptGenerator.compile_system_message_async(
+      148              system_prompt=agent_state.system,
+      149              in_context_memory=agent_state.memory,
+      150              in_context_memory_last_edit=memory_edit_timestamp,
+      151              timezone=agent_state.timezone,
+      152              previous_message_count=self.num_messages,
+      153              archival_memory_size=self.num_archival_memories,
+      154              sources=agent_state.sources,
+      155              max_files_open=agent_state.max_files_open,
+      156              llm_config=agent_state.llm_config,
+      157          )
+      158          letta_message_db_queue = await create_input_messages(
+      159              input_messages=input_messages, agent_id=agent_state.id, timezone=agent_state.timezone, run_id=None, actor=self.actor
+      160          )
+      161          in_memory_message_history = self.pre_process_input_message(input_messages)
+      162  
+      163          # TODO: Define max steps here
+      164          for _ in range(max_steps):
+      165              # Rebuild memory each loop
+      166              in_context_messages = await self._rebuild_memory_async(in_context_messages, agent_state)
+      167              openai_messages = convert_in_context_letta_messages_to_openai(in_context_messages, exclude_system_messages=True)
+      168              openai_messages.extend(in_memory_message_history)
+      169  
+      170              request = self._build_openai_request(openai_messages, agent_state)
+      171  
+      172              stream = await self.openai_client.chat.completions.create(**request.model_dump(exclude_unset=True))
+      173              streaming_interface = OpenAIChatCompletionsStreamingInterface(stream_pre_execution_message=True)
+      174  
+      175              # 1) Yield partial tokens from OpenAI
+      176              async for sse_chunk in streaming_interface.process(stream):
+      177                  yield sse_chunk
+      178  
+      179              # 2) Now handle the final AI response. This might yield more text (stalling, etc.)
+      180              should_continue = await self._handle_ai_response(
+      181                  user_query,
+      182                  streaming_interface,
+      183                  agent_state,
+      184                  in_memory_message_history,
+      185                  letta_message_db_queue,
+      186              )
+      187  
+      188              if not should_continue:
+      189                  break
+      190  
+      191          # Rebuild context window if desired
+      192          await self._rebuild_context_window(summarizer, in_context_messages, letta_message_db_queue)
+      193  
+      194          yield "data: [DONE]\n\n"
+      195  
+      196      async def _handle_ai_response(
+      197          self,
+      198          user_query: str,
+      199          streaming_interface: "OpenAIChatCompletionsStreamingInterface",
+      200          agent_state: AgentState,
+      201          in_memory_message_history: List[Dict[str, Any]],
+      202          letta_message_db_queue: List[Any],
+      203      ) -> bool:
+      204          """
+      205          Now that streaming is done, handle the final AI response.
+      206          This might yield additional SSE tokens if we do stalling.
+      207          At the end, set self._continue_execution accordingly.
+      208          """
+      209          # 1. If we have any leftover content from partial stream, store it as an assistant message
+      210          if streaming_interface.content_buffer:
+      211              content = "".join(streaming_interface.content_buffer)
+      212              in_memory_message_history.append({"role": "assistant", "content": content})
+      213  
+      214              assistant_msgs = create_assistant_messages_from_openai_response(
+      215                  response_text=content,
+      216                  agent_id=agent_state.id,
+      217                  model=agent_state.llm_config.model,
+      218                  timezone=agent_state.timezone,
+      219              )
+      220              letta_message_db_queue.extend(assistant_msgs)
+      221  
+      222          # 2. If a tool call was requested, handle it
+      223          if streaming_interface.tool_call_happened:
+      224              tool_call_name = streaming_interface.tool_call_name
+      225              tool_call_args_str = streaming_interface.tool_call_args_str or "{}"
+      226              try:
+      227                  tool_args = json.loads(tool_call_args_str)
+      228              except json.JSONDecodeError:
+      229                  tool_args = {}
+      230  
+      231              tool_call_id = streaming_interface.tool_call_id or f"call_{uuid.uuid4().hex[:8]}"
+      232              assistant_tool_call_msg = AssistantMessage(
+      233                  content=None,
+      234                  tool_calls=[
+      235                      ToolCall(
+      236                          id=tool_call_id,
+      237                          function=ToolCallFunction(
+      238                              name=tool_call_name,
+      239                              arguments=tool_call_args_str,
+      240                          ),
+      241                      )
+      242                  ],
+      243              )
+      244              in_memory_message_history.append(assistant_tool_call_msg.model_dump())
+      245  
+      246              tool_execution_result = await self._execute_tool(
+      247                  user_query=user_query,
+      248                  tool_name=tool_call_name,
+      249                  tool_args=tool_args,
+      250                  agent_state=agent_state,
+      251              )
+      252              tool_result = tool_execution_result.func_return
+      253              success_flag = tool_execution_result.success_flag
+      254  
+      255              # 3. Provide function_call response back into the conversation
+      256              # TODO: fix this tool format
+      257              tool_message = ToolMessage(
+      258                  content=json.dumps({"result": tool_result}),
+      259                  tool_call_id=tool_call_id,
+      260              )
+      261              in_memory_message_history.append(tool_message.model_dump())
+      262  
+      263              # 4. Insert heartbeat message for follow-up
+      264              heartbeat_user_message = UserMessage(
+      265                  content=f"{NON_USER_MSG_PREFIX} Tool finished executing. Summarize the result for the user."
+      266              )
+      267              in_memory_message_history.append(heartbeat_user_message.model_dump())
+      268  
+      269              # 5. Also store in DB
+      270              tool_call_messages = create_letta_messages_from_llm_response(
+      271                  agent_id=agent_state.id,
+      272                  model=agent_state.llm_config.model,
+      273                  function_name=tool_call_name,
+      274                  function_arguments=tool_args,
+      275                  tool_call_id=tool_call_id,
+      276                  function_response=tool_result,
+      277                  tool_execution_result=tool_execution_result,
+      278                  timezone=agent_state.timezone,
+      279                  continue_stepping=True,
+      280              )
+      281              letta_message_db_queue.extend(tool_call_messages)
+      282  
+      283              # Because we have new data, we want to continue the while-loop in `step_stream`
+      284              return True
+      285          else:
+      286              # If we got here, there's no tool call. If finish_reason_stop => done
+      287              return not streaming_interface.finish_reason_stop
+      288  
+      289      async def _rebuild_context_window(
+      290          self, summarizer: Summarizer, in_context_messages: List[Message], letta_message_db_queue: List[Message]
+      291      ) -> None:
+      292          new_letta_messages = await self.message_manager.create_many_messages_async(letta_message_db_queue, actor=self.actor)
+      293  
+      294          # TODO: Make this more general and configurable, less brittle
+      295          new_in_context_messages, updated = await summarizer.summarize(
+      296              in_context_messages=in_context_messages, new_letta_messages=new_letta_messages
+      297          )
+      298  
+      299          await self.agent_manager.update_message_ids_async(
+      300              agent_id=self.agent_id, message_ids=[m.id for m in new_in_context_messages], actor=self.actor
+      301          )
+      302  
+      303      async def _rebuild_memory_async(
+      304          self,
+      305          in_context_messages: List[Message],
+      306          agent_state: AgentState,
+      307      ) -> List[Message]:
+      308          if not self.num_messages:
+      309              self.num_messages = await self.message_manager.size_async(
+      310                  agent_id=agent_state.id,
+      311                  actor=self.actor,
+      312              )
+      313          if not self.num_archival_memories:
+      314              self.num_archival_memories = await self.passage_manager.agent_passage_size_async(
+      315                  agent_id=agent_state.id,
+      316                  actor=self.actor,
+      317              )
+      318  
+      319          return await super()._rebuild_memory_async(
+      320              in_context_messages, agent_state, num_messages=self.num_messages, num_archival_memories=self.num_archival_memories
+      321          )
+      322  
+      323      def _build_openai_request(self, openai_messages: List[Dict], agent_state: AgentState) -> ChatCompletionRequest:
+      324          tool_schemas = self._build_tool_schemas(agent_state)
+      325          tool_choice = "auto" if tool_schemas else None
+      326  
+      327          openai_request = ChatCompletionRequest(
+      328              model=agent_state.llm_config.model,
+      329              messages=openai_messages,
+      330              tools=self._build_tool_schemas(agent_state),
+      331              tool_choice=tool_choice,
+      332              user=self.actor.id,
+      333              max_completion_tokens=agent_state.llm_config.max_tokens,
+      334              temperature=agent_state.llm_config.temperature,
+      335              stream=True,
+      336          )
+      337          return openai_request
+      338  
+      339      def _build_tool_schemas(self, agent_state: AgentState, external_tools_only=True) -> List[Tool]:
+      340          if external_tools_only:
+      341              tools = [
+      342                  t
+      343                  for t in agent_state.tools
+      344                  if t.tool_type in {ToolType.CUSTOM, ToolType.LETTA_FILES_CORE, ToolType.LETTA_BUILTIN, ToolType.EXTERNAL_MCP}
+      345              ]
+      346          else:
+      347              tools = agent_state.tools
+      348  
+      349          # Special tool state
+      350          search_memory_utterance_description = (
+      351              "A lengthier message to be uttered while your memories of the current conversation are being re-contextualized."
+      352              "You MUST also include punctuation at the end of this message."
+      353              "For example: 'Let me double-check my notes—one moment, please.'"
+      354          )
+      355  
+      356          strict = agent_state.llm_config.strict
+      357          search_memory_json = Tool(
+      358              type="function",
+      359              function=enable_strict_mode(  # strict mode based on config
+      360                  add_pre_execution_message(  # injects pre_exec_msg   ✓
+      361                      {
+      362                          "name": "search_memory",
+      363                          "description": (
+      364                              "Look in long-term or earlier-conversation memory **only when** the "
+      365                              "user asks about something missing from the visible context. "
+      366                              "The user's latest utterance is sent automatically as the main query.\n\n"
+      367                              "Optional refinements (set unused fields to *null*):\n"
+      368                              "• `convo_keyword_queries`   – extra names/IDs if the request is vague.\n"
+      369                              "• `start_minutes_ago` / `end_minutes_ago` – limit results to a recent time window."
+      370                          ),
+      371                          "parameters": {
+      372                              "type": "object",
+      373                              "properties": {
+      374                                  "convo_keyword_queries": {
+      375                                      "type": ["array", "null"],
+      376                                      "items": {"type": "string"},
+      377                                      "description": (
+      378                                          "Extra keywords (e.g., order ID, place name). Use *null* when the utterance is already specific."
+      379                                      ),
+      380                                  },
+      381                                  "start_minutes_ago": {
+      382                                      "type": ["integer", "null"],
+      383                                      "description": (
+      384                                          "Newer bound of the time window, in minutes ago. Use *null* if no lower bound is needed."
+      385                                      ),
+      386                                  },
+      387                                  "end_minutes_ago": {
+      388                                      "type": ["integer", "null"],
+      389                                      "description": (
+      390                                          "Older bound of the time window, in minutes ago. Use *null* if no upper bound is needed."
+      391                                      ),
+      392                                  },
+      393                              },
+      394                              "required": [
+      395                                  "convo_keyword_queries",
+      396                                  "start_minutes_ago",
+      397                                  "end_minutes_ago",
+      398                              ],
+      399                              "additionalProperties": False,
+      400                          },
+      401                      },
+      402                      description=search_memory_utterance_description,
+      403                  ),
+      404                  strict=strict,
+      405              ),
+      406          )
+      407  
+      408          # TODO: Customize whether or not to have heartbeats, pre_exec_message, etc.
+      409          return [search_memory_json] + [
+      410              Tool(
+      411                  type="function",
+      412                  function=enable_strict_mode(add_pre_execution_message(remove_request_heartbeat(t.json_schema)), strict=strict),
+      413              )
+      414              for t in tools
+      415          ]
+      416  
+      417      async def _execute_tool(self, user_query: str, tool_name: str, tool_args: dict, agent_state: AgentState) -> "ToolExecutionResult":
+      418          """
+      419          Executes a tool and returns the ToolExecutionResult.
+      420          """
+      421          from letta.schemas.tool_execution_result import ToolExecutionResult
+      422  
+      423          # Special memory case
+      424          if tool_name == "search_memory":
+      425              tool_result = await self._search_memory(
+      426                  archival_query=user_query,
+      427                  convo_keyword_queries=tool_args["convo_keyword_queries"],
+      428                  start_minutes_ago=tool_args["start_minutes_ago"],
+      429                  end_minutes_ago=tool_args["end_minutes_ago"],
+      430                  agent_state=agent_state,
+      431              )
+      432              return ToolExecutionResult(
+      433                  func_return=tool_result,
+      434                  status="success",
+      435              )
+      436  
+      437          # Find the target tool
+      438          target_tool = next((x for x in agent_state.tools if x.name == tool_name), None)
+      439          if not target_tool:
+      440              return ToolExecutionResult(
+      441                  func_return=f"Tool {tool_name} not found",
+      442                  status="error",
+      443              )
+      444  
+      445          # Use ToolExecutionManager for modern tool execution
+      446          # Use pre-decrypted environment variable values (populated in from_orm_async)
+      447          sandbox_env_vars = {var.key: var.value or "" for var in agent_state.secrets}
+      448          tool_execution_manager = ToolExecutionManager(
+      449              agent_state=agent_state,
+       ... truncated at 400 lines ...

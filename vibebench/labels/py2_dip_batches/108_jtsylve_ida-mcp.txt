@@ -1,0 +1,259 @@
+row 108   jtsylve/ida-mcp#18
+============================================================================
+PR jtsylve/ida-mcp#18   cycles touched before=0.0 after=1.0
+QUESTION: does this PR make a module depend on a CONCRETE module in a
+          way that closes an import cycle, or otherwise invert the
+          dependency direction?
+
+NEWLY CYCLIC PAIRS involving a module this PR changed (1):
+    ida_mcp.helpers  <->  ida_mcp.session
+pre-existing cyclic pairs (NOT this PR): 0
+
+NEW IMPORT EDGES (absent from the before tree; target marked abstract or CONCRETE):
+  ida_mcp.helpers -> ida_mcp.session   [CONCRETE]
+
+---------- CHANGED MODULE ida_mcp.helpers (src/ida_mcp/helpers.py) ----------
+        1  # SPDX-FileCopyrightText: © 2026 Joe T. Sylve, Ph.D. <joe.sylve@gmail.com>
+        2  #
+        3  # SPDX-License-Identifier: MIT
+        4  
+        5  """Shared utilities for address parsing, formatting, and pagination."""
+        6  
+        7  from __future__ import annotations
+        8  
+        9  import logging
+       10  import re
+       11  from collections.abc import Iterable
+       12  from typing import TYPE_CHECKING, Annotated, Any
+       13  
+       14  import ida_bytes
+       15  import ida_funcs
+       16  import ida_hexrays
+       17  import ida_kernwin
+       18  import ida_lines
+       19  import ida_nalt
+       20  import ida_name
+       21  import ida_segment
+       22  import ida_typeinf
+       23  import ida_ua
+       24  import idautils
+       25  import idc
+       26  from pydantic import Field
+       27  
+       28  from ida_mcp.exceptions import IDAError, tool_timeout  # noqa: F401 — re-exported
+       29  
+       30  if TYPE_CHECKING:
+       31      from fastmcp.server.context import Context
+       32  
+       33  log = logging.getLogger(__name__)
+       34  
+       35  
+       36  # ---------------------------------------------------------------------------
+       37  # Reusable Annotated type aliases for tool parameters
+       38  # ---------------------------------------------------------------------------
+       39  
+       40  Address = Annotated[str, Field(description="Address (hex string, decimal, or symbol name).")]
+       41  Offset = Annotated[int, Field(description="Pagination offset.", ge=0)]
+       42  Limit = Annotated[int, Field(description="Maximum number of results.", ge=1)]
+       43  FilterPattern = Annotated[str, Field(description="Optional regex to filter results.")]
+       44  OperandIndex = Annotated[int, Field(description="Operand index (0-based).", ge=0)]
+       45  HexBytes = Annotated[str, Field(description="Hex string of bytes (e.g. '90 90 90' or '909090').")]
+       46  
+       47  # ---------------------------------------------------------------------------
+       48  # MCP tool annotation presets (readOnlyHint, destructiveHint, etc.)
+       49  # ---------------------------------------------------------------------------
+       50  
+       51  ANNO_READ_ONLY: dict[str, bool] = {
+       52      "readOnlyHint": True,
+       53      "destructiveHint": False,
+       54      "idempotentHint": True,
+       55      "openWorldHint": False,
+       56  }
+       57  ANNO_MUTATE: dict[str, bool] = {
+       58      "readOnlyHint": False,
+       59      "destructiveHint": False,
+       60      "idempotentHint": True,
+       61      "openWorldHint": False,
+       62  }
+       63  ANNO_MUTATE_NON_IDEMPOTENT: dict[str, bool] = {
+       64      "readOnlyHint": False,
+       65      "destructiveHint": False,
+       66      "idempotentHint": False,
+       67      "openWorldHint": False,
+       68  }
+       69  ANNO_DESTRUCTIVE: dict[str, bool] = {
+       70      "readOnlyHint": False,
+       71      "destructiveHint": True,
+       72      "idempotentHint": False,
+       73      "openWorldHint": False,
+       74  }
+       75  
+       76  # ---------------------------------------------------------------------------
+       77  # MCP tool meta presets — static metadata exposed to clients
+       78  # ---------------------------------------------------------------------------
+       79  
+       80  META_DECOMPILER: dict[str, object] = {"requires_decompiler": True}
+       81  META_BATCH: dict[str, object] = {"batch": True}
+       82  META_READS_FILES: dict[str, object] = {"reads_files": True}
+       83  META_WRITES_FILES: dict[str, object] = {"writes_files": True}
+       84  
+       85  _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+       86  
+       87  # Maximum number of extra items consumed after the requested page in
+       88  # paginate_iter / async_paginate_iter to determine *has_more* and
+       89  # approximate the total count without exhausting large iterators.
+       90  _COUNT_AHEAD = 10_000
+       91  
+       92  # IDA sentinel values for invalid addresses/IDs.  We check both 32-bit and
+       93  # 64-bit forms because some IDA APIs (enum IDs, struct IDs) return the 32-bit
+       94  # sentinel even in a 64-bit database.
+       95  _BADADDR32 = 0xFFFFFFFF
+       96  _BADADDR64 = 0xFFFFFFFFFFFFFFFF
+       97  
+       98  
+       99  def is_bad_addr(val: int) -> bool:
+      100      """Return True if *val* is an IDA BADADDR / invalid-ID sentinel."""
+      101      return val in (_BADADDR32, _BADADDR64)
+      102  
+      103  
+      104  class Cancelled(Exception):
+      105      """Raised by :func:`check_cancelled` when IDA's cancellation flag is set."""
+      106  
+      107      def __init__(self):
+      108          super().__init__("Operation cancelled")
+      109  
+      110  
+      111  def try_get_context() -> Context | None:
+      112      """Return the current FastMCP :class:`Context`, or ``None`` outside a request.
+      113  
+      114      Safe to call anywhere — never raises.  Use this in shared helpers that
+      115      want to report progress or log without requiring a context parameter.
+      116      """
+      117      try:
+      118          from fastmcp.server.dependencies import get_context  # noqa: PLC0415
+      119  
+      120          return get_context()
+       ... truncated at 120 lines ...
+
+---------- CHANGED MODULE ida_mcp.session (src/ida_mcp/session.py) ----------
+        1  # SPDX-FileCopyrightText: © 2026 Joe T. Sylve, Ph.D. <joe.sylve@gmail.com>
+        2  #
+        3  # SPDX-License-Identifier: MIT
+        4  
+        5  """Database session manager for idalib.
+        6  
+        7  Tracks whether a database is currently open and provides guards
+        8  for tools that require an open database.
+        9  """
+       10  
+       11  from __future__ import annotations
+       12  
+       13  import atexit
+       14  import functools
+       15  import inspect
+       16  import logging
+       17  import os
+       18  import signal
+       19  
+       20  import ida_auto
+       21  import ida_hexrays
+       22  import ida_idaapi
+       23  import ida_idp
+       24  import ida_kernwin
+       25  import idapro
+       26  
+       27  from ida_mcp.helpers import Cancelled, IDAError
+       28  
+       29  log = logging.getLogger(__name__)
+       30  
+       31  
+       32  class Session:
+       33      """Singleton managing the single idalib database session."""
+       34  
+       35      def __init__(self):
+       36          self._current_path: str | None = None
+       37          self.capabilities: dict[str, bool] = {}
+       38  
+       39      def is_open(self) -> bool:
+       40          return self._current_path is not None
+       41  
+       42      @property
+       43      def current_path(self) -> str | None:
+       44          return self._current_path
+       45  
+       46      def open(self, file_path: str, run_auto_analysis: bool = False) -> dict:
+       47          """Open a binary for analysis. Auto-closes any previously open database.
+       48  
+       49          Returns a status dict on success.  Raises :class:`IDAError` on failure.
+       50          """
+       51          path = os.path.abspath(os.path.expanduser(file_path))
+       52          if not os.path.isfile(path):
+       53              raise IDAError(f"File not found: {path}", error_type="FileNotFoundError")
+       54  
+       55          if self.is_open():
+       56              self.close(save=True)
+       57  
+       58          result = idapro.open_database(path, run_auto_analysis)
+       59          if result != 0:
+       60              raise IDAError(
+       61                  f"Failed to open database: error code {result}", error_type="RuntimeError"
+       62              )
+       63  
+       64          self._current_path = path
+       65          self.capabilities = self._probe_capabilities()
+       66          log.info("Opened database: %s (capabilities: %s)", path, self.capabilities)
+       67          return {"status": "ok", "path": path}
+       68  
+       69      def _probe_capabilities(self) -> dict[str, bool]:
+       70          """Detect which optional features are available for the current database."""
+       71          return {
+       72              "decompiler": bool(ida_hexrays.init_hexrays_plugin()),
+       73              # Only x86/x64 (metapc) has an assembler in IDA currently.
+       74              "assembler": ida_idp.get_idp_name() == "metapc",
+       75          }
+       76  
+       77      def close(self, save: bool = True) -> dict:
+       78          """Close the current database.
+       79  
+       80          Raises :class:`IDAError` on failure.
+       81          """
+       82          if not self.is_open():
+       83              return {"status": "no_database_open"}
+       84  
+       85          path = self._current_path
+       86          try:
+       87              # Disable auto-analysis and drain all queues so that
+       88              # close_database does not hang waiting for pending work.
+       89              ida_auto.enable_auto(False)
+       90              for name in dir(ida_auto):
+       91                  if name.startswith("AU_") and name != "AU_NONE":
+       92                      ida_auto.auto_unmark(0, ida_idaapi.BADADDR, getattr(ida_auto, name))
+       93              idapro.close_database(save)
+       94          except Exception as exc:
+       95              log.exception("Error closing database %s", path)
+       96              raise IDAError(f"Error closing database {path}", error_type="CloseFailed") from exc
+       97          finally:
+       98              self._current_path = None
+       99          log.info("Closed database: %s (saved=%s)", path, save)
+      100          return {"status": "closed", "path": path, "saved": save}
+      101  
+      102      def require_open(self, fn):
+      103          """Decorator that raises :class:`IDAError` if no database is open."""
+      104  
+      105          def _check():
+      106              if not self.is_open():
+      107                  raise IDAError(
+      108                      "No database is open. Use open_database first.",
+      109                      error_type="NoDatabase",
+      110                  )
+      111              ida_kernwin.clr_cancelled()
+      112  
+      113          if inspect.iscoroutinefunction(fn):
+      114  
+      115              @functools.wraps(fn)
+      116              async def async_wrapper(*args, **kwargs):
+      117                  _check()
+      118                  try:
+      119                      return await fn(*args, **kwargs)
+      120                  except Cancelled as exc:
+       ... truncated at 120 lines ...

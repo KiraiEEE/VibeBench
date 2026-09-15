@@ -1,0 +1,277 @@
+row 83   pollen-robotics/reachy_mini#534
+============================================================================
+CONTRACT reachy_mini.daemon.backend.abstract:Backend   kind=abc abstract_methods=3.0 implementers=2.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file src/reachy_mini/daemon/backend/abstract.py
+       50  class Backend:
+       51      """Base class for robot backends, simulated or real."""
+       52  
+       53      def __init__(
+       54          self,
+       55          log_level: str = "INFO",
+       56          check_collision: bool = False,
+       57          kinematics_engine: str = "AnalyticalKinematics",
+       58          use_audio: bool = True,
+       59          wireless_version: bool = False,
+       60      ) -> None:
+       61          """Initialize the backend."""
+       62          self.logger = logging.getLogger(__name__)
+       63          self.logger.setLevel(log_level)
+       64  
+       65          self.use_audio = use_audio
+       66  
+       67          self.should_stop = threading.Event()
+       68          self.ready = threading.Event()
+       69  
+       70          self.check_collision = (
+       71              check_collision  # Flag to enable/disable collision checking
+       72          )
+       73          self.kinematics_engine = kinematics_engine
+       74  
+       75          self.logger.info(f"Using {self.kinematics_engine} kinematics engine")
+       76  
+       77          if self.check_collision:
+       78              assert self.kinematics_engine == "Placo", (
+       79                  "Collision checking is only available with Placo Kinematics"
+       80              )
+       81  
+       82          self.gravity_compensation_mode = False  # Flag for gravity compensation mode
+       83  
+       84          if self.gravity_compensation_mode:
+       85              assert self.kinematics_engine == "Placo", (
+       86                  "Gravity compensation is only available with Placo kinematics"
+       87              )
+       88  
+       89          if self.kinematics_engine == "Placo":
+       90              from reachy_mini.kinematics import PlacoKinematics
+       91  
+       92              self.head_kinematics: AnyKinematics = PlacoKinematics(
+       93                  URDF_ROOT_PATH, check_collision=self.check_collision
+       94              )
+       95          elif self.kinematics_engine == "NN":
+       96              from reachy_mini.kinematics import NNKinematics
+       97  
+       98              self.head_kinematics = NNKinematics(MODELS_ROOT_PATH)
+       99          elif self.kinematics_engine == "AnalyticalKinematics":
+      100              from reachy_mini.kinematics import AnalyticalKinematics
+      101  
+      102              self.head_kinematics = AnalyticalKinematics()
+      103          else:
+      104              raise ValueError(
+      105                  f"Unknown kinematics engine: {self.kinematics_engine}. Use 'Placo', 'NN' or 'AnalyticalKinematics'."
+      106              )
+      107  
+      108          self.current_head_pose: Annotated[NDArray[np.float64], (4, 4)] | None = (
+      109              None  # 4x4 pose matrix
+      110          )
+      111          self.target_head_pose: Annotated[NDArray[np.float64], (4, 4)] | None = (
+      112              None  # 4x4 pose matrix
+      113          )
+      114          self.target_body_yaw: float | None = (
+      115              None  # Last body yaw used in IK computations
+      116          )
+      117  
+      118          self.target_head_joint_positions: (
+      119              Annotated[NDArray[np.float64], (7,)] | None
+      120          ) = None  # [yaw, 0, 1, 2, 3, 4, 5]
+      121          self.current_head_joint_positions: (
+      122              Annotated[NDArray[np.float64], (7,)] | None
+      123          ) = None  # [yaw, 0, 1, 2, 3, 4, 5]
+      124          self.target_antenna_joint_positions: (
+      125              Annotated[NDArray[np.float64], (2,)] | None
+      126          ) = None  # [0, 1]
+      127          self.current_antenna_joint_positions: (
+      128              Annotated[NDArray[np.float64], (2,)] | None
+      129          ) = None  # [0, 1]
+      130  
+      131          self.joint_positions_publisher: zenoh.Publisher | None = None
+      132          self.pose_publisher: zenoh.Publisher | None = None
+      133          self.recording_publisher: zenoh.Publisher | None = None
+      134          self.error: str | None = None  # To store any error that occurs during execution
+      135          self.is_recording = False  # Flag to indicate if recording is active
+      136          self.recorded_data: list[dict[str, Any]] = []  # List to store recorded data
+      137  
+      138          # variables to store the last computed head joint positions and pose
+      139          self._last_target_body_yaw: float | None = (
+      140              None  # Last body yaw used in IK computations
+      141          )
+      142          self._last_target_head_pose: Annotated[NDArray[np.float64], (4, 4)] | None = (
+      143              None  # Last head pose used in IK computations
+      144          )
+      145          self.target_head_joint_current: Annotated[NDArray[np.float64], (7,)] | None = (
+      146              None  # Placeholder for head joint torque
+      147          )
+      148          self.ik_required = False  # Flag to indicate if IK computation is required
+      149  
+      150          self.is_shutting_down = False
+      151  
+      152          # Tolerance for kinematics computations
+      153          # For Forward kinematics (around 0.25deg)
+      154          # - FK is calculated at each timestep and is susceptible to noise
+      155          self._fk_kin_tolerance = 1e-3  # rads
+      156          # For Inverse kinematics (around 0.5mm and 0.1 degrees)
+      157          # - IK is calculated only when the head pose is set by the user
+      158          self._ik_kin_tolerance = {
+      159              "rad": 2e-3,  # rads
+      160              "m": 0.5e-3,  # m
+      161          }
+      162  
+      163          # Recording lock to guard buffer swaps and appends
+      164          self._rec_lock = threading.Lock()
+      165  
+      166          self.audio: Optional[MediaManager] = None
+      167          if self.use_audio:
+      168              if wireless_version:
+      169                  self.logger.debug(
+      170                      "Initializing daemon audio backend for wireless version."
+      171                  )
+      172                  self.audio = MediaManager(
+      173                      backend=MediaBackend.GSTREAMER_NO_VIDEO, log_level=log_level
+      174                  )
+      175              else:
+      176                  self.logger.debug(
+      177                      "Initializing daemon audio backend for non-wireless version."
+      178                  )
+      179                  self.audio = MediaManager(
+      180                      backend=MediaBackend.DEFAULT_NO_VIDEO, log_level=log_level
+      181                  )
+      182  
+      183      # Life cycle methods
+      184      def wrapped_run(self) -> None:
+      185          """Run the backend in a try-except block to store errors."""
+      186          try:
+      187              self.run()
+      188          except Exception as e:
+      189              self.error = str(e)
+      190              self.close()
+      191              raise e
+      192  
+      193      def run(self) -> None:
+      194          """Run the backend.
+      195  
+      196          This method is a placeholder and should be overridden by subclasses.
+      197          """
+      198          raise NotImplementedError("The method run should be overridden by subclasses.")
+      199  
+      200      def close(self) -> None:
+      201          """Close the backend.
+      202  
+      203          This method is a placeholder and should be overridden by subclasses.
+      204          """
+      205          raise NotImplementedError(
+      206              "The method close should be overridden by subclasses."
+      207          )
+      208  
+      209      def get_status(self) -> "RobotBackendStatus | MujocoBackendStatus":
+      210          """Return backend statistics.
+      211  
+      212          This method is a placeholder and should be overridden by subclasses.
+      213          """
+      214          raise NotImplementedError(
+      215              "The method get_status should be overridden by subclasses."
+      216          )
+      217  
+      218      # Present/Target joint positions
+      219      def set_joint_positions_publisher(self, publisher: zenoh.Publisher) -> None:
+      220          """Set the publisher for joint positions.
+      221  
+      222          Args:
+      223              publisher: A publisher object that will be used to publish joint positions.
+      224  
+      225          """
+      226          self.joint_positions_publisher = publisher
+      227  
+      228      def set_pose_publisher(self, publisher: zenoh.Publisher) -> None:
+      229          """Set the publisher for head pose.
+      230  
+      231          Args:
+      232              publisher: A publisher object that will be used to publish head pose.
+      233  
+      234          """
+      235          self.pose_publisher = publisher
+      236  
+      237      def update_target_head_joints_from_ik(
+      238          self,
+      239          pose: Annotated[NDArray[np.float64], (4, 4)] | None = None,
+      240          body_yaw: float | None = None,
+      241      ) -> None:
+      242          """Update the target head joint positions from inverse kinematics.
+      243  
+      244          Args:
+      245              pose (np.ndarray): 4x4 pose matrix representing the head pose.
+      246              body_yaw (float): The yaw angle of the body, used to adjust the head pose.
+      247  
+      248          """
+      249          if pose is None:
+       ... truncated at 200 lines ...
+
+---------- IMPLEMENTER reachy_mini.daemon.backend.mujoco.backend:MujocoBackend  stubs=2/3 ----------
+       39  class MujocoBackend(Backend):
+      374      def get_motor_control_mode(self) -> MotorControlMode:
+      375          """Get the motor control mode."""
+      376          return MotorControlMode.Enabled
+      378      def set_motor_control_mode(self, mode: MotorControlMode) -> None:
+      379          """Set the motor control mode."""
+      380          pass
+      382      def set_motor_torque_ids(self, ids: list[str], on: bool) -> None:
+      383          """Set the motor torque state for specific motor names."""
+      384          pass
+
+---------- IMPLEMENTER reachy_mini.daemon.backend.robot.backend:RobotBackend  stubs=0/3 ----------
+       27  class RobotBackend(Backend):
+      468      def get_motor_control_mode(self) -> MotorControlMode:
+      469          """Get the motor control mode."""
+      470          return self.motor_control_mode
+      472      def set_motor_control_mode(self, mode: MotorControlMode) -> None:
+      473          """Set the motor control mode."""
+      474          # Check if the mode is already set
+      475          if mode == self.motor_control_mode:
+      476              return
+      477  
+      478          if mode == MotorControlMode.Enabled:
+      479              if self.motor_control_mode == MotorControlMode.GravityCompensation:
+      480                  # First, make sure we switch to position control
+      481                  self.disable_motors()
+      482                  self.set_head_operation_mode(3)
+      483                  self.set_antennas_operation_mode(3)
+      484  
+      485              self.gravity_compensation_mode = False
+      486              self.enable_motors()
+      487  
+      488          elif mode == MotorControlMode.Disabled:
+      489              self.gravity_compensation_mode = False
+      490              self.disable_motors()
+      491  
+      492          elif mode == MotorControlMode.GravityCompensation:
+      493              if self.kinematics_engine != "Placo":
+      494                  raise RuntimeError(
+      495                      "Gravity compensation mode is only supported with the Placo kinematics engine."
+      496                  )
+      497  
+      498              self.disable_motors()
+      499              self.set_head_operation_mode(0)
+      500              self.set_antennas_operation_mode(0)
+      501              self.gravity_compensation_mode = True
+      502              self.enable_motors()
+      503  
+      504          self.motor_control_mode = mode
+      506      def set_motor_torque_ids(self, ids: list[str], on: bool) -> None:
+      507          """Set the torque state for specific motor names.
+      508  
+      509          Args:
+      510              ids (list[int]): List of motor IDs to set the torque state for.
+      511              on (bool): True to enable torque, False to disable.
+      512  
+      513          """
+      514          assert self.c is not None, "Motor controller not initialized or already closed."
+      515  
+      516          assert ids is not None and len(ids) > 0, "IDs list cannot be empty or None."
+      517  
+      518          ids_int = [self.name2id[name] for name in ids]
+      519  
+      520          if on:
+      521              self.c.enable_torque_on_ids(ids_int)
+      522          else:
+      523              self.c.disable_torque_on_ids(ids_int)

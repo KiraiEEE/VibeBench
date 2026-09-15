@@ -1,0 +1,186 @@
+row 134   openakita/openakita#32
+============================================================================
+CHAIN in openakita.core.agent.Agent._chat_with_tools   kind=value_switch subject='block.type' branches=3
+QUESTION: is the set of variants OPEN (a new one is expected, and
+          would force editing this chain) or CLOSED by nature?
+SHOWING THE WHOLE ENCLOSING FUNCTION -- a branch count alone cannot answer this.
+>>> marks the first line of the dispatch chain itself.
+
+file src/openakita/core/agent.py
+     5456      async def _chat_with_tools(self, message: str) -> str:
+     5457          """
+     5458          DEPRECATED: 此方法已废弃，chat() 现已委托给 chat_with_session() + _chat_with_tools_and_context()。
+     5459          保留仅为向后兼容，后续版本将移除。
+     5460  
+     5461          对话处理，支持工具调用
+     5462  
+     5463          让 LLM 自己决定是否需要工具，不做硬编码判断
+     5464  
+     5465          Args:
+     5466              message: 用户消息
+     5467  
+     5468          Returns:
+     5469              最终响应文本
+     5470          """
+     5471          # 使用完整的对话历史（已包含当前用户消息）
+     5472          # 复制一份，避免工具调用的中间消息污染原始上下文
+     5473          messages = list(self._context.messages)
+     5474  
+     5475          # 检查并压缩上下文（如果接近限制）
+     5476          messages = await self._compress_context(messages)
+     5477  
+     5478          max_iterations = settings.max_iterations  # Ralph Wiggum 模式：永不放弃
+     5479  
+     5480          # === Plan 持久化：保存不含 Plan 的基础提示词，循环内动态追加 ===
+     5481          _base_system_prompt_cli = self._context.system
+     5482  
+     5483          def _build_effective_system_prompt_cli() -> str:
+     5484              """在基础提示词上动态追加活跃 Plan 段落（CLI 路径）"""
+     5485              from ..tools.handlers.plan import get_active_plan_prompt
+     5486  
+     5487              _cid = getattr(self, "_current_conversation_id", None) or getattr(
+     5488                  self, "_current_session_id", None
+     5489              )
+     5490              prompt = _base_system_prompt_cli
+     5491              if _cid:
+     5492                  plan_section = get_active_plan_prompt(_cid)
+     5493                  if plan_section:
+     5494                      prompt += f"\n\n{plan_section}\n"
+     5495              return prompt
+     5496  
+     5497          # 防止循环检测
+     5498          recent_tool_calls: list[str] = []
+     5499          max_repeated_calls = 3
+     5500  
+     5501          # 获取 cancel_event（用于 LLM 调用竞速取消）
+     5502          _cancel_event = (
+     5503              self.agent_state.current_task.cancel_event
+     5504              if self.agent_state and self.agent_state.current_task
+     5505              else asyncio.Event()
+     5506          )
+     5507  
+     5508          for iteration in range(max_iterations):
+     5509              # C8: 每轮迭代检查取消
+     5510              if self._task_cancelled:
+     5511                  logger.info(f"[StopTask] Task cancelled in _chat_with_tools: {self._cancel_reason}")
+     5512                  return "✅ 任务已停止。"
+     5513  
+     5514              try:
+     5515                  # 每次迭代前检查上下文大小（工具调用可能产生大量输出）
+     5516                  if iteration > 0:
+     5517                      messages = await self._compress_context(
+     5518                          messages, system_prompt=_build_effective_system_prompt_cli()
+     5519                      )
+     5520  
+     5521                  # 调用 Brain（可被 cancel_event 中断）
+     5522                  response = await self._cancellable_llm_call(
+     5523                      _cancel_event,
+     5524                      model=self.brain.model,
+     5525                      max_tokens=self.brain.max_tokens,
+     5526                      system=_build_effective_system_prompt_cli(),
+     5527                      tools=self._tools,
+     5528                      messages=messages,
+     5529                  )
+     5530              except UserCancelledError:
+     5531                  logger.info("[StopTask] LLM call interrupted by user cancel in _chat_with_tools")
+     5532                  return await self._handle_cancel_farewell(
+     5533                      messages, _build_effective_system_prompt_cli(), self.brain.model
+     5534                  )
+     5535  
+     5536              # 检测 max_tokens 截断
+     5537              _cli_stop = getattr(response, "stop_reason", "")
+     5538              if str(_cli_stop) == "max_tokens":
+     5539                  logger.warning(
+     5540                      f"[CLI] ⚠️ LLM output truncated (stop_reason=max_tokens, limit={self.brain.max_tokens})"
+     5541                  )
+     5542  
+     5543              # 处理响应
+     5544              tool_calls = []
+     5545              text_content = ""
+     5546  
+     5547              for block in response.content:
+     5548                  if block.type == "text":
+     5549                      text_content += block.text
+     5550                  elif block.type == "tool_use":
+     5551                      tool_calls.append(
+     5552                          {
+     5553                              "id": block.id,
+     5554                              "name": block.name,
+     5555                              "input": block.input,
+     5556                          }
+     5557                      )
+     5558  
+     5559              # 如果没有工具调用，直接返回文本
+     5560              if not tool_calls:
+     5561                  _cleaned = strip_thinking_tags(text_content)
+     5562                  _, _cleaned = parse_intent_tag(_cleaned)
+     5563                  return _cleaned
+     5564  
+     5565              # 循环检测
+     5566              call_signature = "|".join(
+     5567                  [f"{tc['name']}:{sorted(tc['input'].items())}" for tc in tool_calls]
+     5568              )
+     5569              recent_tool_calls.append(call_signature)
+     5570              if len(recent_tool_calls) > max_repeated_calls:
+     5571                  recent_tool_calls = recent_tool_calls[-max_repeated_calls:]
+     5572  
+     5573              if len(recent_tool_calls) >= max_repeated_calls and len(set(recent_tool_calls)) == 1:
+     5574                  logger.warning(
+     5575                      f"[Loop Detection] Same tool call repeated {max_repeated_calls} times, ending chat"
+     5576                  )
+     5577                  return "检测到重复操作，已自动结束。"
+     5578  
+     5579              # 有工具调用，需要执行
+     5580              logger.info(f"Chat iteration {iteration + 1}, {len(tool_calls)} tool calls")
+     5581  
+     5582              # 构建 assistant 消息
+     5583              # MiniMax M2.1 Interleaved Thinking 支持：
+     5584              # 必须完整保留 thinking 块以保持思维链连续性
+     5585              assistant_content = []
+     5586              for block in response.content:
+>>>  5587                  if block.type == "thinking":
+     5588                      # 保留 thinking 块（MiniMax M2.1 要求）
+     5589                      assistant_content.append(
+     5590                          {
+     5591                              "type": "thinking",
+     5592                              "thinking": block.thinking
+     5593                              if hasattr(block, "thinking")
+     5594                              else str(block),
+     5595                          }
+     5596                      )
+     5597                  elif block.type == "text":
+     5598                      assistant_content.append({"type": "text", "text": block.text})
+     5599                  elif block.type == "tool_use":
+     5600                      assistant_content.append(
+     5601                          {
+     5602                              "type": "tool_use",
+     5603                              "id": block.id,
+     5604                              "name": block.name,
+     5605                              "input": block.input,
+     5606                          }
+     5607                      )
+     5608  
+     5609              messages.append({"role": "assistant", "content": assistant_content})
+     5610  
+     5611              # 执行工具并收集结果（默认启用工具间中断检查；关闭中断检查时可并行）
+     5612              tool_results, _, _ = await self._execute_tool_calls_batch(
+     5613                  tool_calls,
+     5614                  task_monitor=None,
+     5615                  allow_interrupt_checks=self._interrupt_enabled,
+     5616                  capture_delivery_receipts=False,
+     5617              )
+     5618  
+     5619              messages.append({"role": "user", "content": tool_results})
+     5620  
+     5621              # === 统一处理 skip 反思 + 用户插入消息 ===
+     5622              if self.agent_state and self.agent_state.current_task:
+     5623                  await self.agent_state.current_task.process_post_tool_signals(messages)
+     5624  
+     5625              # 检查是否结束
+     5626              if response.stop_reason == "end_turn":
+     5627                  break
+     5628  
+     5629          # 返回最后一次的文本响应（过滤 thinking 标签 + 意图标记）
+     5630          _final = strip_thinking_tags(text_content)
+     5631          _, _final = parse_intent_tag(_final)
+     5632          return _final or "操作完成"

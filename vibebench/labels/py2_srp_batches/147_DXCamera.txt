@@ -1,0 +1,406 @@
+row 147   ra1nty/DXcam#118
+============================================================================
+CLASS DXCamera in dxcam/dxcam.py   loc=575 methods=31 wmc=100 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+       28  class DXCamera:
+       29      """High-level camera interface for one device/output pair."""
+       30  
+       31      def __init__(
+       32          self,
+       33          output: Output,
+       34          device: Device,
+       35          region: Region | None,
+       36          output_color: ColorMode = "RGB",
+       37          max_buffer_len: int = 8,
+       38      ) -> None:
+       39          self._output: Output = output
+       40          self._device: Device = device
+       41          self._stagesurf: StageSurface = StageSurface(
+       42              output=self._output, device=self._device
+       43          )
+       44          self._duplicator: Duplicator = Duplicator(
+       45              output=self._output, device=self._device
+       46          )
+       47          self._processor: Processor = Processor(output_color=output_color)
+       48          self._source_region: D3D11_BOX = D3D11_BOX()
+       49          self._source_region.front = 0
+       50          self._source_region.back = 1
+       51  
+       52          self.width, self.height = self._output.resolution
+       53          self.channel_size = len(output_color) if output_color != "GRAY" else 1
+       54          self.rotation_angle: int = self._output.rotation_angle
+       55  
+       56          self._region_set_by_user = region is not None
+       57          self.region: Region = (
+       58              region if region is not None else (0, 0, self.width, self.height)
+       59          )
+       60          self._validate_region(self.region)
+       61  
+       62          if max_buffer_len <= 1:
+       63              logger.warning(
+       64                  "max_buffer_len=%d is not supported for concurrent capture; clamping to 2.",
+       65                  max_buffer_len,
+       66              )
+       67              self.max_buffer_len = 2
+       68          else:
+       69              self.max_buffer_len = max_buffer_len
+       70          self.is_capturing = False
+       71          self._is_released = False
+       72  
+       73          self.__thread: Thread | None = None
+       74          self.__lock: LockType = Lock()
+       75          self.__stop_capture = Event()
+       76  
+       77          self.__frame_available = Event()
+       78          self.__frame_buffer: Frame | None = None
+       79          self.__frame_time_ticks: NDArray[np.int64] | None = None
+       80          self.__head = 0
+       81          self.__tail = 0
+       82          self.__full = False
+       83          self.__has_frame = False
+       84  
+       85          self.__timer_handle: Any | None = None
+       86  
+       87          self.__frame_count = 0
+       88          self.__capture_start_time = 0
+       89          self.__latest_frame_ticks: int | None = None
+       90  
+       91      def grab(self, region: Region | None = None) -> Frame | None:
+       92          self._ensure_not_released()
+       93          if region is None:
+       94              region = self.region
+       95          else:
+       96              self._validate_region(region)
+       97          frame = self._grab(region)
+       98          return frame
+       99  
+      100      def _grab(self, region: Region) -> Frame | None:
+      101          if not self._duplicator.update_frame():
+      102              self._on_output_change()
+      103              return None
+      104          if not self._duplicator.updated:
+      105              return None
+      106  
+      107          frame_width, frame_height = self._copy_region_to_stage(region)
+      108          frame = self._process_staging_frame(
+      109              frame_width=frame_width, frame_height=frame_height
+      110          )
+      111  
+      112          if not self.is_capturing:
+      113              self._duplicator.release_frame()
+      114              return np.array(frame, copy=True)
+      115          return frame
+      116  
+      117      def _grab_into(self, region: Region, dst: Frame) -> tuple[bool, int, int, int]:
+      118          """Capture into ``dst`` and return ``(captured, frame_ticks, width, height)``.
+      119  
+      120          Contract:
+      121          - ``captured`` is True only when ``dst`` has been fully written with a new frame.
+      122          - ``captured`` is False with ``width == height == 0`` when no new frame is available.
+      123          - ``captured`` is False with non-zero ``width``/``height`` when a new frame exists
+      124            but ``dst`` shape does not match, so caller should rebuild and retry.
+      125          """
+      126          if not self._duplicator.update_frame():
+      127              self._on_output_change()
+      128              return False, 0, 0, 0
+      129          if not self._duplicator.updated:
+      130              return False, 0, 0, 0
+      131  
+      132          frame_width, frame_height = self._copy_region_to_stage(region)
+      133          if frame_height != dst.shape[0] or frame_width != dst.shape[1]:
+      134              return False, self._duplicator.latest_frame_ticks, frame_width, frame_height
+      135          self._process_staging_frame_into(
+      136              frame_width=frame_width,
+      137              frame_height=frame_height,
+      138              dst=dst,
+      139          )
+      140          return True, self._duplicator.latest_frame_ticks, frame_width, frame_height
+      141  
+      142      def _copy_region_to_stage(self, region: Region) -> tuple[int, int]:
+      143          memory_region = self._region_to_memory_region(region)
+      144          memory_width = memory_region[2] - memory_region[0]
+      145          memory_height = memory_region[3] - memory_region[1]
+      146          if (
+      147              self._stagesurf.width != memory_width
+      148              or self._stagesurf.height != memory_height
+      149          ):
+      150              self._stagesurf.release()
+      151              self._stagesurf.rebuild(
+      152                  output=self._output,
+      153                  device=self._device,
+      154                  dim=(memory_width, memory_height),
+      155              )
+      156          self._update_source_region(memory_region)
+      157          self._device.im_context.CopySubresourceRegion(
+      158              self._stagesurf.texture,
+      159              0,
+      160              0,
+      161              0,
+      162              0,
+      163              self._duplicator.texture,
+      164              0,
+      165              ctypes.byref(self._source_region),
+      166          )
+      167          self._duplicator.release_frame()  #  See remarks in release_frame
+      168          return region[2] - region[0], region[3] - region[1]
+      169  
+      170      def _process_staging_frame(self, frame_width: int, frame_height: int) -> Frame:
+      171          rect = self._stagesurf.map()
+      172          try:
+      173              return self._processor.process(
+      174                  rect,
+      175                  frame_width,
+      176                  frame_height,
+      177                  (0, 0, frame_width, frame_height),
+      178                  self.rotation_angle,
+      179              )
+      180          finally:
+      181              self._stagesurf.unmap()
+      182  
+      183      def _process_staging_frame_into(
+      184          self,
+      185          frame_width: int,
+      186          frame_height: int,
+      187          dst: Frame,
+      188      ) -> None:
+      189          rect = self._stagesurf.map()
+      190          try:
+      191              self._processor.process_into(
+      192                  rect,
+      193                  frame_width,
+      194                  frame_height,
+      195                  (0, 0, frame_width, frame_height),
+      196                  self.rotation_angle,
+      197                  dst,
+      198              )
+      199          finally:
+      200              self._stagesurf.unmap()
+      201  
+      202      def _on_output_change(self) -> None:
+      203          time.sleep(0.1)  # Wait for Display mode change (Access Lost)
+      204          self._duplicator.release()
+      205          self._stagesurf.release()
+      206          self._output.update_desc()
+      207          self.width, self.height = self._output.resolution
+      208          if not self._region_set_by_user:
+      209              self.region = (0, 0, self.width, self.height)
+      210          self._validate_region(self.region)
+      211          if self.is_capturing:
+      212              self._rebuild_frame_buffer(self.region)
+      213          self.rotation_angle = self._output.rotation_angle
+      214          while True:
+      215              try:
+      216                  self._stagesurf.rebuild(output=self._output, device=self._device)
+      217                  self._duplicator = Duplicator(output=self._output, device=self._device)
+      218              except comtypes.COMError:
+      219                  continue
+      220              break
+      221  
+      222      def _allocate_frame_buffer_for_shape(
+      223          self, frame_height: int, frame_width: int
+      224      ) -> None:
+      225          frame_shape = (frame_height, frame_width, self.channel_size)
+      226          self.__frame_buffer = np.empty(
+      227              (self.max_buffer_len, *frame_shape), dtype=np.uint8
+      228          )
+      229          self.__frame_time_ticks = np.zeros(self.max_buffer_len, dtype=np.int64)
+      230          self.__head = 0
+      231          self.__tail = 0
+      232          self.__full = False
+      233          self.__has_frame = False
+      234  
+      235      def _handle_frame_size_change(
+      236          self, frame_height: int, frame_width: int, region: Region
+      237      ) -> Region:
+      238          """Rebuild frame buffers after a source size change.
+      239  
+      240          Caller must hold ``self.__lock``.
+      241          """
+      242          assert self.__frame_buffer is not None
+      243          logger.info(
+      244              "Frame size changed from %dx%d to %dx%d; rebuilding frame buffer.",
+      245              self.__frame_buffer.shape[2],
+      246              self.__frame_buffer.shape[1],
+      247              frame_width,
+      248              frame_height,
+      249          )
+      250          self.width, self.height = frame_width, frame_height
+      251          if not self._region_set_by_user:
+      252              self.region = (0, 0, self.width, self.height)
+      253              region = self.region
+      254          self._rebuild_frame_buffer_for_shape(
+      255              frame_height=frame_height,
+      256              frame_width=frame_width,
+      257          )
+      258          return region
+      259  
+      260      def start(
+      261          self,
+      262          region: Region | None = None,
+      263          target_fps: int = 60,
+      264          video_mode: bool = False,
+      265          delay: int = 0,
+      266      ) -> None:
+      267          self._ensure_not_released()
+      268          if delay != 0:
+      269              time.sleep(delay)
+      270              self._on_output_change()
+      271          if region is None:
+      272              region = self.region
+      273          self._validate_region(region)
+      274          self.is_capturing = True
+      275          frame_height = region[3] - region[1]
+      276          frame_width = region[2] - region[0]
+      277          self._allocate_frame_buffer_for_shape(
+      278              frame_height=frame_height,
+      279              frame_width=frame_width,
+      280          )
+      281          self.__frame_available.clear()
+      282          self.__thread = Thread(
+      283              target=self.__capture,
+      284              name="DXCamera",
+      285              args=(region, target_fps, video_mode),
+      286          )
+      287          self.__thread.daemon = True
+      288          self.__thread.start()
+      289  
+      290      def stop(self) -> None:
+      291          if self.is_capturing:
+      292              self.__stop_capture.set()
+      293              self.__frame_available.set()
+      294              if (
+      295                  self.__thread is not None
+      296                  and self.__thread.is_alive()
+      297                  and self.__thread is not current_thread()
+      298              ):
+      299                  self.__thread.join(timeout=10)
+      300          with self.__lock:
+      301              self.is_capturing = False
+      302              self.__frame_buffer = None
+      303              self.__frame_time_ticks = None
+      304              self.__frame_count = 0
+      305              self.__latest_frame_ticks = None
+      306              self.__head = 0
+      307              self.__tail = 0
+      308              self.__full = False
+      309              self.__has_frame = False
+      310          self.__frame_available.clear()
+      311          self.__stop_capture.clear()
+      312          self.__thread = None
+      313  
+      314      @property
+      315      def latest_frame_time(self) -> float | None:
+      316          with self.__lock:
+      317              if self.__latest_frame_ticks is None:
+      318                  return None
+      319              return self._duplicator.ticks_to_seconds(self.__latest_frame_ticks)
+      320  
+      321      @property
+      322      def latest_frame_ticks(self) -> int | None:
+      323          with self.__lock:
+      324              return self.__latest_frame_ticks
+      325  
+      326      @overload
+      327      def get_latest_frame(
+      328          self, copy: bool = True, with_timestamp: Literal[False] = False
+      329      ) -> Frame | None: ...
+      330  
+      331      @overload
+      332      def get_latest_frame(
+      333          self, copy: bool = True, with_timestamp: Literal[True] = True
+      334      ) -> tuple[Frame, float] | None: ...
+      335  
+      336      def get_latest_frame(
+      337          self, copy: bool = True, with_timestamp: bool = False
+      338      ) -> Frame | tuple[Frame, float] | None:
+      339          while True:
+      340              with self.__lock:
+      341                  if self.__frame_buffer is None:
+      342                      return None
+      343              if not self.__frame_available.wait(timeout=0.1):
+      344                  continue
+      345              with self.__lock:
+      346                  if self.__frame_buffer is None or self.__frame_time_ticks is None:
+      347                      self.__frame_available.clear()
+      348                      return None
+      349                  latest_idx = (self.__head - 1) % self.max_buffer_len
+      350                  ret = self.__frame_buffer[latest_idx]
+      351                  frame_ticks = int(self.__frame_time_ticks[latest_idx])
+      352                  self.__frame_available.clear()
+      353              frame = np.array(ret, copy=True) if copy else ret
+      354              if with_timestamp:
+      355                  return frame, self._duplicator.ticks_to_seconds(frame_ticks)
+      356              return frame
+      357  
+      358      @overload
+      359      def get_latest_frame_view(
+      360          self, with_timestamp: Literal[False] = False
+      361      ) -> Frame | None: ...
+      362  
+      363      @overload
+      364      def get_latest_frame_view(
+      365          self, with_timestamp: Literal[True] = True
+      366      ) -> tuple[Frame, float] | None: ...
+      367  
+      368      def get_latest_frame_view(
+      369          self, with_timestamp: bool = False
+      370      ) -> Frame | tuple[Frame, float] | None:
+      371          """Return a zero-copy view into the ring buffer for the latest frame."""
+      372          return self.get_latest_frame(copy=False, with_timestamp=with_timestamp)
+      373  
+      374      def __capture(
+      375          self,
+      376          region: Region,
+      377          target_fps: int = 60,
+      378          video_mode: bool = False,
+      379      ) -> None:
+      380          if target_fps != 0:
+      381              self.__timer_handle = create_high_resolution_timer()
+      382              set_periodic_timer(self.__timer_handle, target_fps)
+      383  
+      384          self.__capture_start_time = time.perf_counter()
+      385  
+      386          capture_error = None
+      387  
+      388          while not self.__stop_capture.is_set():
+      389              if self.__timer_handle:
+      390                  wait_for_timer(self.__timer_handle)
+      391              try:
+      392                  with self.__lock:
+      393                      if self.__frame_buffer is None:
+      394                          continue
+      395                      write_idx = self.__head
+      396                      write_slot = self.__frame_buffer[write_idx]
+      397                  captured, frame_ticks, frame_width, frame_height = self._grab_into(
+      398                      region=region,
+      399                      dst=write_slot,
+      400                  )
+      401                  if captured:
+      402                      with self.__lock:
+      403                          if (
+      404                              self.__frame_buffer is None
+      405                              or self.__frame_time_ticks is None
+      406                          ):
+      407                              continue
+      408                          if self.__full:
+      409                              self.__tail = (self.__tail + 1) % self.max_buffer_len
+      410                          self.__frame_time_ticks[write_idx] = frame_ticks
+      411                          self.__head = (write_idx + 1) % self.max_buffer_len
+      412                          self.__latest_frame_ticks = frame_ticks
+      413                          self.__frame_available.set()
+      414                          self.__frame_count += 1
+      415                          self.__full = self.__head == self.__tail
+      416                          self.__has_frame = True
+      417                  elif frame_width > 0 and frame_height > 0:
+      418                      frame = self._process_staging_frame(
+      419                          frame_width=frame_width,
+      420                          frame_height=frame_height,
+      421                      )
+      422                      with self.__lock:
+      423                          if (
+      424                              self.__frame_buffer is None
+      425                              or self.__frame_time_ticks is None
+      426                          ):
+      427                              continue
+       ... truncated at 400 lines ...

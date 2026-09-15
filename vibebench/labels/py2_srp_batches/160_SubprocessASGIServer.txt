@@ -1,0 +1,174 @@
+row 160   PrefectHQ/prefect#21308
+============================================================================
+CLASS SubprocessASGIServer in src/prefect/server/api/server.py   loc=169 methods=11 wmc=34 lcom=0.0
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      840  class SubprocessASGIServer:
+      841      _instances: dict[int | None, "SubprocessASGIServer"] = {}
+      842      _port_range: range = range(8000, 9000)
+      843  
+      844      def __new__(cls, port: int | None = None, *args: Any, **kwargs: Any) -> Self:
+      845          """
+      846          Return an instance of the server associated with the provided port.
+      847          Prevents multiple instances from being created for the same port.
+      848          """
+      849          if port not in cls._instances:
+      850              instance = super().__new__(cls)
+      851              cls._instances[port] = instance
+      852          return cls._instances[port]
+      853  
+      854      def __init__(self, port: Optional[int] = None):
+      855          # This ensures initialization happens only once
+      856          if not hasattr(self, "_initialized"):
+      857              self.port: Optional[int] = port
+      858              self.server_process: subprocess.Popen[Any] | None = None
+      859              self.running: bool = False
+      860              self._initialized = True
+      861  
+      862      def find_available_port(self) -> int:
+      863          max_attempts = 10
+      864          for _ in range(max_attempts):
+      865              port = random.choice(self._port_range)
+      866              if self.is_port_available(port):
+      867                  return port
+      868              time.sleep(random.uniform(0.1, 0.5))  # Random backoff
+      869          raise RuntimeError("Unable to find an available port after multiple attempts")
+      870  
+      871      @staticmethod
+      872      def is_port_available(port: int) -> bool:
+      873          with contextlib.closing(
+      874              socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      875          ) as sock:
+      876              try:
+      877                  sock.bind(("127.0.0.1", port))
+      878                  return True
+      879              except socket.error:
+      880                  return False
+      881  
+      882      @property
+      883      def address(self) -> str:
+      884          return f"http://127.0.0.1:{self.port}"
+      885  
+      886      @property
+      887      def api_url(self) -> str:
+      888          return f"{self.address}/api"
+      889  
+      890      def start(self, timeout: Optional[int] = None) -> None:
+      891          """
+      892          Start the server in a separate process. Safe to call multiple times; only starts
+      893          the server once.
+      894  
+      895          Args:
+      896              timeout: The maximum time to wait for the server to start
+      897          """
+      898          if not self.running:
+      899              if self.port is None:
+      900                  self.port = self.find_available_port()
+      901              assert self.port is not None, "Port must be provided or available"
+      902              help_message = (
+      903                  f"Starting temporary server on {self.address}\nSee "
+      904                  "https://docs.prefect.io/v3/concepts/server#how-to-guides "
+      905                  "for more information on running a dedicated Prefect server."
+      906              )
+      907              subprocess_server_logger.info(help_message)
+      908              try:
+      909                  self.running = True
+      910                  self.server_process = self._run_uvicorn_command()
+      911                  atexit.register(self.stop)
+      912                  with httpx.Client() as client:
+      913                      response = None
+      914                      elapsed_time = 0
+      915                      max_wait_time = (
+      916                          timeout
+      917                          or PREFECT_SERVER_EPHEMERAL_STARTUP_TIMEOUT_SECONDS.value()
+      918                      )
+      919                      while elapsed_time < max_wait_time:
+      920                          if self.server_process.poll() == 3:
+      921                              self.port = self.find_available_port()
+      922                              self.server_process = self._run_uvicorn_command()
+      923                              continue
+      924                          try:
+      925                              response = client.get(f"{self.api_url}/health")
+      926                          except httpx.ConnectError:
+      927                              pass
+      928                          else:
+      929                              if response.status_code == 200:
+      930                                  break
+      931                          time.sleep(0.1)
+      932                          elapsed_time += 0.1
+      933                      if response:
+      934                          response.raise_for_status()
+      935                      if not response:
+      936                          error_message = "Timed out while attempting to connect to ephemeral Prefect API server."
+      937                          if self.server_process.poll() is not None:
+      938                              error_message += f" Ephemeral server process exited with code {self.server_process.returncode}."
+      939                          if self.server_process.stdout:
+      940                              error_message += (
+      941                                  f" stdout: {self.server_process.stdout.read()}"
+      942                              )
+      943                          if self.server_process.stderr:
+      944                              error_message += (
+      945                                  f" stderr: {self.server_process.stderr.read()}"
+      946                              )
+      947                          raise RuntimeError(error_message)
+      948              except Exception:
+      949                  self.running = False
+      950                  raise
+      951  
+      952      def _run_uvicorn_command(self) -> subprocess.Popen[Any]:
+      953          # used to turn off serving the UI
+      954          server_env = {
+      955              "PREFECT_UI_ENABLED": "0",
+      956              "PREFECT__SERVER_EPHEMERAL": "1",
+      957              "PREFECT__SERVER_FINAL": "1",
+      958          }
+      959          return subprocess.Popen(
+      960              args=[
+      961                  sys.executable,
+      962                  "-m",
+      963                  "uvicorn",
+      964                  "--app-dir",
+      965                  str(prefect.__module_path__.parent),
+      966                  "--factory",
+      967                  "prefect.server.api.server:create_app",
+      968                  "--host",
+      969                  "127.0.0.1",
+      970                  "--port",
+      971                  str(self.port),
+      972                  "--log-level",
+      973                  "error",
+      974                  "--lifespan",
+      975                  "on",
+      976              ],
+      977              env={
+      978                  **os.environ,
+      979                  **server_env,
+      980                  **get_current_settings().to_environment_variables(exclude_unset=True),
+      981              },
+      982          )
+      983  
+      984      def stop(self) -> None:
+      985          if self.server_process:
+      986              subprocess_server_logger.info(
+      987                  f"Stopping temporary server on {self.address}"
+      988              )
+      989              self.server_process.terminate()
+      990              try:
+      991                  self.server_process.wait(timeout=5)
+      992              except subprocess.TimeoutExpired:
+      993                  self.server_process.kill()
+      994                  # Ensure the process is reaped to avoid ResourceWarning
+      995                  self.server_process.wait()
+      996              finally:
+      997                  self.server_process = None
+      998          if self.port in self._instances:
+      999              del self._instances[self.port]
+     1000          if self.running:
+     1001              self.running = False
+     1002  
+     1003      def __enter__(self) -> Self:
+     1004          self.start()
+     1005          return self
+     1006  
+     1007      def __exit__(self, *args: Any) -> None:
+     1008          self.stop()

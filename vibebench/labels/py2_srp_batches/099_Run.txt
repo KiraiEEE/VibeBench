@@ -1,0 +1,406 @@
+row 99   tum-ei-eda/mlonmcu#249
+============================================================================
+CLASS Run in mlonmcu/session/run.py   loc=1409 methods=78 wmc=384 lcom=0.0921052631578947
+QUESTION: does this class have MORE THAN ONE reason to change?
+
+      277  class Run:
+      278      """A run is single model/backend/framework/target combination with a given set of features and configs."""
+      279  
+      280      FEATURES = {"autotune", "target_optimized", "validate_new"}
+      281  
+      282      DEFAULTS = {
+      283          "export_optional": False,
+      284          "tune_enabled": False,
+      285          "target_to_backend": True,
+      286          "target_optimized_layouts": False,
+      287          "target_optimized_schedules": False,
+      288          "stage_subdirs": False,
+      289          "profile_stages": False,
+      290      }
+      291  
+      292      REQUIRED = set()
+      293      OPTIONAL = set()
+      294  
+      295      @classmethod
+      296      def from_file(cls, path):
+      297          """Restore a run object which was written to the disk."""
+      298          raise NotImplementedError
+      299  
+      300      def __init__(
+      301          self,
+      302          idx=None,
+      303          model=None,
+      304          framework=None,
+      305          frontends=None,
+      306          backend=None,
+      307          target=None,
+      308          platforms=None,  # TODO: rename
+      309          features=None,  # TODO: All features combined or explicit run-features -> postprocesses?
+      310          config=None,  # TODO: All config combined or explicit run-config?
+      311          postprocesses=None,
+      312          archived=False,
+      313          comment="",
+      314      ):
+      315          self.idx = idx
+      316          self.model = model  # Model name, not object?
+      317          self.frontends = frontends if frontends is not None else []
+      318          self.framework = framework  # ???
+      319          self.backend = backend
+      320          self.platforms = platforms if platforms is not None else []
+      321          self.artifacts_per_stage = {}
+      322          self.archived = archived
+      323          self.postprocesses = postprocesses if postprocesses else []
+      324          self.comment = comment
+      325          # self.stage = RunStage.NOP  # max executed stage
+      326          self.completed = {stage: stage == RunStage.NOP for stage in RunStage}
+      327  
+      328          self.directories = {}
+      329          self.target = target
+      330          self.cache_hints = []
+      331          self.config = config if config else {}
+      332          self.features = features if features else []
+      333          self.run_config = {}
+      334          self.run_features = self.process_features(features)
+      335          self.run_config = filter_config(self.config, "run", self.DEFAULTS, self.OPTIONAL, self.REQUIRED)
+      336          self.sub_names = []
+      337          self.sub_parents = {}
+      338          self.times = {}
+      339          self.failing = False  # -> RunStatus
+      340          self.reason = None
+      341          self.failed_stage = None
+      342          # self.lock = threading.Lock()  # FIXME: use mutex instead of boolean
+      343          self.locked = False
+      344          self.report = None
+      345          self.dir = None
+      346  
+      347      def process_features(self, features):
+      348          """Utility which handles postprocess_features."""
+      349          if features is None:
+      350              return []
+      351          features = get_matching_features(features, FeatureType.RUN)
+      352          for feature in features:
+      353              assert feature.name in self.FEATURES, f"Incompatible feature: {feature.name}"
+      354              feature.used = True
+      355              tmp_run_config = {f"run.{key}": value for key, value in self.run_config.items()}
+      356              feature.add_run_config(tmp_run_config)
+      357              self.run_config = filter_config(tmp_run_config, "run", self.DEFAULTS, self.OPTIONAL, self.REQUIRED)
+      358          return features
+      359  
+      360      def has_target(self):
+      361          return self.target is not None
+      362  
+      363      @property
+      364      def tune_enabled(self):
+      365          """Get tune_enabled property."""
+      366          value = self.run_config["tune_enabled"]
+      367          return str2bool(value)
+      368  
+      369      @property
+      370      def target_to_backend(self):
+      371          """Get target_to_backend property."""
+      372          value = self.run_config["target_to_backend"]
+      373          return str2bool(value)
+      374  
+      375      @property
+      376      def target_optimized_layouts(self):
+      377          """Get target_optimized_layouts property."""
+      378          value = self.run_config["target_optimized_layouts"]
+      379          return str2bool(value)
+      380  
+      381      @property
+      382      def target_optimized_schedules(self):
+      383          """Get target_optimized_schedules property."""
+      384          value = self.run_config["target_optimized_schedules"]
+      385          return str2bool(value)
+      386  
+      387      @property
+      388      def export_optional(self):
+      389          """Get export_optional property."""
+      390          value = self.run_config["export_optional"]
+      391          return str2bool(value)
+      392  
+      393      @property
+      394      def stage_subdirs(self):
+      395          value = self.run_config["stage_subdirs"]
+      396          return str2bool(value)
+      397  
+      398      @property
+      399      def profile_stages(self):
+      400          value = self.run_config["profile_stages"]
+      401          return str2bool(value)
+      402  
+      403      @property
+      404      def build_platform(self):
+      405          """Get platform for build stage."""
+      406          if self.backend is not None and (
+      407              hasattr(self.backend, "platform") and isinstance(self.backend.platform, BuildPlatform)
+      408          ):
+      409              return self.backend.platform
+      410          for platform in self.platforms:
+      411              if isinstance(platform, BuildPlatform):
+      412                  return platform
+      413          return None
+      414  
+      415      @property
+      416      def tune_platform(self):
+      417          """Get platform for tune stage."""
+      418          if self.backend is not None and (
+      419              hasattr(self.backend, "platform") and isinstance(self.backend.platform, TunePlatform)
+      420          ):
+      421              return self.backend.platform
+      422          for platform in self.platforms:
+      423              if isinstance(platform, TunePlatform):
+      424                  return platform
+      425          return None
+      426  
+      427      @property
+      428      def compile_platform(self):
+      429          """Get platform for compile stage."""
+      430          if self.target is not None and isinstance(self.target.platform, CompilePlatform):
+      431              return self.target.platform
+      432          for platform in self.platforms:
+      433              if isinstance(platform, CompilePlatform):
+      434                  return platform
+      435          return None
+      436  
+      437      @property
+      438      def target_platform(self):  # TODO: rename to run_stage?
+      439          """Get platform for run stage."""
+      440          if self.target:
+      441              assert isinstance(self.target.platform, TargetPlatform)
+      442              return self.target.platform
+      443          for platform in self.platforms:
+      444              if isinstance(platform, TargetPlatform):
+      445                  return platform
+      446          return None
+      447  
+      448      def has_stage(self, stage):
+      449          """Returns true if the given stage is available for this run."""
+      450          if stage == RunStage.NOP:
+      451              return True
+      452          if stage == RunStage.LOAD:
+      453              return self.model is not None and len(self.frontends) > 0
+      454          if stage == RunStage.TUNE:
+      455              return self.tune_enabled and self.backend is not None
+      456          if stage == RunStage.BUILD:
+      457              return self.backend is not None and self.framework is not None
+      458          if stage == RunStage.COMPILE:
+      459              return self.target is not None and len(self.platforms) > 0 and self.compile_platform is not None
+      460          if stage == RunStage.RUN:
+      461              return self.target is not None and len(self.platforms) > 0 and self.target_platform is not None
+      462          if stage == RunStage.POSTPROCESS:
+      463              return len(self.postprocesses) > 0
+      464          if stage == RunStage.DONE:
+      465              return False
+      466          return False  # TODO: Throw error instead?
+      467  
+      468      @property
+      469      def next_stage(self):
+      470          """Determines the next not yet completed stage. Returns RunStage.DONE if already completed."""
+      471          for stage in RunStage:
+      472              if not self.completed[stage.value] and self.has_stage(stage):
+      473                  return stage
+      474          return RunStage.DONE
+      475  
+      476      @property
+      477      def last_stage(self):
+      478          """Determines the next not yet completed stage. Returns RunStage.DONE if already completed."""
+      479          last = None
+      480          for stage in RunStage:
+      481              if self.has_stage(stage):
+      482                  if not self.completed[stage.value]:
+      483                      return last
+      484                  last = stage
+      485          return None
+      486  
+      487      def lock(self):
+      488          """Aquire a mutex to lock the current run."""
+      489          # ret = self.lock.acquire(timeout=0)
+      490          ret = not self.locked
+      491          self.locked = True
+      492          if not ret:
+      493              raise RuntimeError("Parallel processing of the same run is not allowed")
+      494  
+      495      def unlock(self):
+      496          """Release a mutex to unlock the current run."""
+      497          # self.lock.release()
+      498          self.locked = False
+      499  
+      500      def init_directory(self, session=None, parent=None):
+      501          """Initialize the temporary directory for this run."""
+      502          if parent is not None:
+      503              if not isinstance(parent, Path):
+      504                  assert isinstance(parent, str)
+      505                  parent = Path(parent)
+      506              assert parent.is_dir()
+      507              self.tempdir = None
+      508              self.dir = parent / str(self.idx)
+      509          elif session is not None:
+      510              logger.warning(
+      511                  "session argument of run.init_directory is deprecated. Please use parent argument in the future."
+      512              )
+      513              self.tempdir = None
+      514              self.dir = session.runs_dir / str(self.idx)
+      515          else:
+      516              assert not self.archived
+      517              self.tempdir = tempfile.TemporaryDirectory()
+      518              self.dir = Path(self.tempdir.name)
+      519          self.dir.mkdir(exist_ok=True)
+      520          # This is not a good idea, but else we would need a mutex/lock on the shared build_dir
+      521          # A solution would be to split up the framework runtime libs from the mlif...
+      522          for platform in self.platforms:  # TODO: only do this if needed! (not for every platform)
+      523              # The stage_subdirs setting is ignored here because platforms can be multi-stage!
+      524              # platform.init_directory(path=Path(self.dir) / platform.name)
+      525              if platform in self.directories:
+      526                  continue
+      527              platform_dir = Path(self.dir) / platform.name
+      528              if platform.init_directory(path=platform_dir):
+      529                  self.directories[platform.name] = platform_dir
+      530          # if target not in self.directories:
+      531          #     target_dir = Path(self.dir) /target.name
+      532          #     if target.init_directory(path=target_dir)
+      533          #         self.directories[target.name] = target_dir
+      534  
+      535          # TODO: other components
+      536  
+      537      def __deepcopy__(self, memo):
+      538          cls = self.__class__
+      539          result = cls.__new__(cls)
+      540          memo[id(self)] = result
+      541          for k, v in self.__dict__.items():
+      542              if k == "session":
+      543                  setattr(result, k, v)
+      544              else:
+      545                  setattr(result, k, copy.deepcopy(v, memo))
+      546          return result
+      547  
+      548      def copy(self, session=None):
+      549          """Create a new run based on this instance."""
+      550          new = copy.deepcopy(self)
+      551          assert session is not None, "Run.copy() needs session"
+      552          if session:
+      553              new_idx = session.request_run_idx()
+      554              new.idx = new_idx
+      555              # self.init_directory()
+      556          return new
+      557  
+      558      def init_component(self, component_cls, context=None):
+      559          """Helper function to create and configure a MLonMCU component instance for this run."""
+      560          required_keys = component_cls.REQUIRED
+      561          optional_keys = component_cls.OPTIONAL
+      562          self.config.update(
+      563              resolve_required_config(
+      564                  required_keys,
+      565                  optional=optional_keys,
+      566                  features=self.features,
+      567                  config=self.config,
+      568                  cache=context.cache if context else None,
+      569                  default_flags=context.environment.flags if context else None,
+      570                  hints=self.cache_hints,
+      571              )
+      572          )
+      573          component_config = self.config.copy()  # TODOL get rid of this
+      574          return component_cls(features=self.features, config=component_config)
+      575  
+      576      def add_model(self, model):
+      577          """Setter for the model instance."""
+      578          self.model = model
+      579          assert model is not None
+      580          self.model.config = filter_config(self.config, self.model.name, self.model.DEFAULTS, set(), set())
+      581          for platform in self.platforms:
+      582              self.model.add_platform_config(platform, platform.config)
+      583              self.model.add_platform_defs(platform, platform.definitions)
+      584          # TODO: update after load stage
+      585          # for platform in self.platforms:
+      586          #     self.add_platform_defs(platform.name, platform.definitions)
+      587  
+      588      def add_frontend(self, frontend, append=True):
+      589          """Setter for the frontend instance."""
+      590          self.frontends = add_any(frontend, self.frontends, append=append)
+      591          for frontend in self.frontends:
+      592              for platform in self.platforms:
+      593                  frontend.add_platform_config(platform, platform.config)
+      594                  frontend.add_platform_defs(platform.name, platform.definitions)
+      595  
+      596      def add_frontends(self, frontends, append=False):
+      597          """Setter for the list of frontends."""
+      598          self.frontends = add_any(frontends, self.frontends, append=append)
+      599          for frontend in self.frontends:
+      600              for platform in self.platforms:
+      601                  frontend.add_platform_config(platform, platform.config)
+      602                  frontend.add_platform_defs(platform.name, platform.definitions)
+      603  
+      604      def add_backend(self, backend):
+      605          """Setter for the backend instance."""
+      606          self.backend = backend
+      607          # assert len(self.platforms) > 0, "Add at least a platform before adding a backend."
+      608          if self.model is not None:
+      609              if not isinstance(self.model, Model):
+      610                  self.backend = None
+      611                  return
+      612              if not self.model.skip_check:
+      613                  assert self.backend.supports_model(self.model), (
+      614                      "The added backend does not support the chosen model. "
+      615                      "Add the backend before adding a model to find a suitable frontend."
+      616                  )
+      617          for platform in self.platforms:
+      618              self.backend.add_platform_config(platform.name, platform.config)
+      619              self.backend.add_platform_defs(platform.name, platform.definitions)
+      620  
+      621      def add_framework(self, framework):
+      622          """Setter for the framework instance."""
+      623          self.framework = framework
+      624          # assert len(self.platforms) > 0, "Add at least a platform before adding a framework."
+      625          for platform in self.platforms:
+      626              self.framework.add_platform_config(platform.name, platform.config)
+      627              self.framework.add_platform_defs(platform.name, platform.definitions)
+      628  
+      629      def add_target(self, target):
+      630          """Setter for the target instance."""
+      631          self.target = target
+      632          assert self.platforms is not None, "Add at least a platform before adding a target."
+      633          for platform in self.platforms:
+      634              self.target.add_platform_config(platform.name, platform.config)
+      635              self.target.add_platform_defs(platform.name, platform.definitions)
+      636          self.cache_hints = [self.target.get_arch()]
+      637          # self.resolve_chache_refs()
+      638  
+      639      def add_platform(self, platform, append=True):
+      640          """Setter for the platform instance."""
+      641          self.platforms = add_any(platform, self.platforms, append=append)
+      642          for frontend in self.frontends:
+      643              self.frontend.add_platform_config(platform.name, platform.config)
+      644              self.frontend.add_platform_defs(platform.name, platform.definitions)
+      645          if self.model:
+      646              self.model.add_platform_config(platform.name, platform.config)
+      647              self.model.add_platform_defs(platform.name, platform.definitions)
+      648          if self.backend:
+      649              self.backend.add_platform_config(platform.name, platform.config)
+      650              self.backend.add_platform_defs(platform.name, platform.definitions)
+      651          if self.framework:
+      652              self.framework.add_platform_config(platform.name, platform.config)
+      653              self.framework.add_platform_defs(platform.name, platform.definitions)
+      654  
+      655      def add_platforms(self, platforms, append=False):
+      656          """Setter for the list of platforms."""
+      657          self.platforms = add_any(platforms, self.platforms, append=append)
+      658          # TODO: check for duplicates?
+      659          for platform in platforms:
+      660              for frontend in self.frontends:
+      661                  self.frontend.add_platform_config(platform.name, platform.config)
+      662                  self.frontend.add_platform_defs(platform.name, platform.definitions)
+      663              if self.model:
+      664                  self.model.add_platform_config(platform.name, platform.config)
+      665                  self.model.add_platform_defs(platform.name, platform.definitions)
+      666              if self.backend:
+      667                  self.backend.add_platform_config(platform.name, platform.config)
+      668                  self.backend.add_platform_defs(platform.name, platform.definitions)
+      669              if self.framework:
+      670                  self.framework.add_platform_config(platform.name, platform.config)
+      671                  self.framework.add_platform_defs(platform.name, platform.definitions)
+      672  
+      673      def add_postprocess(self, postprocess, append=True):
+      674          """Setter for a postprocess instance."""
+      675          self.postprocesses = add_any(postprocess, self.postprocesses, append=append)
+      676  
+       ... truncated at 400 lines ...

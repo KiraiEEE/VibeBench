@@ -1,0 +1,203 @@
+row 20   NVIDIA-NeMo/Curator#1039
+============================================================================
+CONTRACT nemo_curator.backends.base:BaseExecutor   kind=abc abstract_methods=1.0 implementers=3.0
+QUESTION: are implementers or clients FORCED to depend on members
+          they do not use (a contract too wide for its users)?
+
+file nemo_curator/backends/base.py
+       46  class BaseExecutor(ABC):
+       47      """Executor for a pipeline."""
+       48  
+       49      def __init__(self, config: dict[str, Any] | None = None):
+       50          self.config = config or {}
+       51  
+       52      @abstractmethod
+       53      def execute(self, stages: list["ProcessingStage"], initial_tasks: list[Task] | None = None) -> None:
+       54          """Execute the pipeline."""
+
+---------- IMPLEMENTER nemo_curator.backends.experimental.ray_actor_pool.executor:RayActorPoolExecutor  stubs=0/1 ----------
+       40  class RayActorPoolExecutor(BaseExecutor):
+       53      def execute(self, stages: list["ProcessingStage"], initial_tasks: list[Task] | None = None) -> list[Task]:  # noqa: PLR0912
+       54          """Execute the pipeline stages using ActorPool.
+       55  
+       56          Args:
+       57              stages: List of processing stages to execute
+       58              initial_tasks: Initial tasks to process (can be None for empty start)
+       59  
+       60          Returns:
+       61              List of final processed tasks
+       62          """
+       63          if not stages:
+       64              return []
+       65  
+       66          session_id = uuid.uuid4().bytes
+       67  
+       68          try:
+       69              # Initialize Ray and register loguru serializer
+       70              register_loguru_serializer()
+       71              ray.init(ignore_reinit_error=True, runtime_env=self.config.get("runtime_env", None))
+       72  
+       73              # Execute setup on node for all stages BEFORE processing begins
+       74              execute_setup_on_node(stages)
+       75              logger.info(
+       76                  f"Setup on node complete for all stages. Starting Ray Actor Pool pipeline with {len(stages)} stages"
+       77              )
+       78              # Initialize with initial tasks
+       79              current_tasks = initial_tasks or [EmptyTask]
+       80              # Process through each stage with ActorPool
+       81              for i, stage in enumerate(stages):
+       82                  logger.info(f"\nProcessing stage {i + 1}/{len(stages)}: {stage}")
+       83                  logger.info(f"  Input tasks: {len(current_tasks)}")
+       84  
+       85                  if not current_tasks:
+       86                      msg = f"{stage} - No tasks to process, can't continue"
+       87                      raise ValueError(msg)  # noqa: TRY301
+       88  
+       89                  if stage.ray_stage_spec().get(RayStageSpecKeys.IS_LSH_STAGE, False):
+       90                      current_tasks = self._execute_lsh_stage(stage, current_tasks)
+       91                  else:
+       92                      # Create actor pool for this stage
+       93                      num_actors = calculate_optimal_actors_for_stage(
+       94                          stage,
+       95                          len(current_tasks),
+       96                          reserved_cpus=self.config.get("reserved_cpus", 0.0),
+       97                          reserved_gpus=self.config.get("reserved_gpus", 0.0),
+       98                      )
+       99                      logger.info(
+      100                          f" {stage} - Creating {num_actors} actors (CPUs: {stage.resources.cpus}, GPUs: {stage.resources.gpus})"
+      101                      )
+      102                      # TODO: Clean up branching logic and handling here
+      103                      # Check if this is a RAFT stage and create appropriate actor pool
+      104                      if stage.ray_stage_spec().get(RayStageSpecKeys.IS_RAFT_ACTOR, False):
+      105                          logger.info(f"  Creating RAFT actor pool for stage: {stage.name}")
+      106                          actor_pool = self._create_raft_actor_pool(stage, num_actors, session_id)
+      107                      elif stage.ray_stage_spec().get(RayStageSpecKeys.IS_SHUFFLE_STAGE, False):
+      108                          logger.info(f"  Creating Shuffle actors for stage: {stage.name}")
+      109                          actor_pool = self._create_rapidsmpf_actors(stage, num_actors, len(current_tasks))
+      110                      else:
+      111                          actor_pool = self._create_actor_pool(stage, num_actors)
+      112                      logger.info(f"Created actor pool for {stage.name} with {num_actors} actors")
+       ... truncated at 60 lines ...
+
+---------- IMPLEMENTER nemo_curator.backends.experimental.ray_data.executor:RayDataExecutor  stubs=0/1 ----------
+       32  class RayDataExecutor(BaseExecutor):
+       46      def execute(self, stages: list["ProcessingStage"], initial_tasks: list[Task] | None = None) -> list[Task]:
+       47          """Execute the pipeline stages using Ray Data.
+       48  
+       49          Args:
+       50              stages (list[ProcessingStage]): List of processing stages to execute
+       51              initial_tasks (list[Task], optional): Initial tasks to process (can be None for empty start)
+       52  
+       53          Returns:
+       54              list[Task]: List of final processed tasks
+       55          """
+       56          if not stages:
+       57              return []
+       58  
+       59          register_loguru_serializer()
+       60          # This prevents verbose logging from Ray Data about serialization of the dataclass
+       61          DataContext.get_current().enable_fallback_to_arrow_object_ext_type = True
+       62          # Initialize with initial tasks if provided, otherwise start with EmptyTask
+       63          tasks: list[Task] = initial_tasks if initial_tasks else [EmptyTask]
+       64          output_tasks: list[Task] = []
+       65          try:
+       66              # Initialize ray and explicitly set NOSET to empty
+       67              # This ensures if Xenna was used before which was setting NOSET, we end up overriding it.
+       68              ray.init(
+       69                  ignore_reinit_error=True, runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": ""}}
+       70              )
+       71  
+       72              # Convert tasks to dataset
+       73              current_dataset = self._tasks_to_dataset(tasks)
+       74  
+       75              # Execute setup on node for all stages
+       76              execute_setup_on_node(stages)
+       77              logger.info(f"Setup on node complete for all stages. Starting Ray Data pipeline with {len(stages)} stages")
+       78  
+       79              # Process through each stage
+       80              for i, stage in enumerate(stages):
+       81                  # TODO: add pipeline level config for verbosity
+       82                  logger.info(f"Processing stage {i + 1}/{len(stages)}: {stage}")
+       83                  logger.info(f"  CPU cores: {stage.resources.cpus}, GPU ratio: {stage.resources.gpus}")
+       84  
+       85                  # Create adapter for this stage
+       86                  adapter = RayDataStageAdapter(stage)
+       87  
+       88                  # Apply stage transformation
+       89                  current_dataset = adapter.process_dataset(current_dataset)
+       90          except Exception as e:
+       91              logger.error(f"Error during pipeline execution: {e}")
+       92              raise
+       93          else:
+       94              # Convert final dataset back to tasks
+       95              # TODO: add pipeline configuration to check if user wants to return last stages output to driver
+       96              output_tasks = self._dataset_to_tasks(current_dataset)
+       97              logger.info(f"Pipeline completed. Final results: {len(output_tasks)} tasks")
+       98          finally:
+       99              # This ensures we unset all the env vars set above during initialize and kill the pending actors.
+      100              ray.shutdown()
+      101          return output_tasks
+
+---------- IMPLEMENTER nemo_curator.backends.xenna.executor:XennaExecutor  stubs=0/1 ----------
+       29  class XennaExecutor(BaseExecutor):
+       56      def execute(self, stages: list[ProcessingStage], initial_tasks: list[Task] | None = None) -> list[Task]:
+       57          """Execute the pipeline using Cosmos-Xenna.
+       58  
+       59          Args:
+       60              stages (list[ProcessingStage]): The stages to run
+       61              initial_tasks (list[Task], optional): The initial tasks to run. Empty list of Task is used if not provided.
+       62  
+       63          Returns:
+       64              list[Task]: List of output tasks from the pipeline
+       65          """
+       66          # Convert stages to Xenna stage specs
+       67          stage_specs = []
+       68  
+       69          # Initialize with initial tasks if provided, otherwise start with EmptyTask
+       70          initial_tasks = initial_tasks if initial_tasks else [EmptyTask]
+       71  
+       72          for stage in stages:
+       73              # Get stage configuration
+       74              stage_config = stage.xenna_stage_spec()
+       75  
+       76              # Create Xenna stage adapter with the original stage's name
+       77              xenna_stage = create_named_xenna_stage_adapter(
+       78                  stage=stage,
+       79              )
+       80  
+       81              # Create stage spec with configuration from stage
+       82              stage_spec = pipelines_v1.StageSpec(
+       83                  stage=xenna_stage,
+       84                  num_workers=stage_config.get("num_workers"),
+       85                  num_workers_per_node=stage_config.get("num_workers_per_node"),
+       86                  num_setup_attempts_python=stage_config.get("num_setup_attempts_python"),
+       87                  num_run_attempts_python=stage_config.get("num_run_attempts_python"),
+       88                  ignore_failures=stage_config.get("ignore_failures"),
+       89                  reset_workers_on_failure=stage_config.get("reset_workers_on_failure"),
+       90                  slots_per_actor=stage_config.get("slots_per_actor"),
+       91                  worker_max_lifetime_m=stage_config.get("worker_max_lifetime_m"),
+       92                  worker_restart_interval_m=stage_config.get("worker_restart_interval_m"),
+       93                  max_setup_failure_percentage=stage_config.get("max_setup_failure_percentage"),
+       94              )
+       95  
+       96              stage_specs.append(stage_spec)
+       97  
+       98          # Determine execution mode
+       99          exec_mode = pipelines_v1.ExecutionMode.STREAMING
+      100          if self._get_pipeline_config("execution_mode") == "batch":
+      101              exec_mode = pipelines_v1.ExecutionMode.BATCH
+      102  
+      103          # Create streaming-specific configuration
+      104          streaming_config = None
+      105          if exec_mode == pipelines_v1.ExecutionMode.STREAMING:
+      106              streaming_config = pipelines_v1.StreamingSpecificSpec(
+      107                  autoscale_interval_s=self._get_pipeline_config("autoscale_interval_s"),
+      108                  autoscaler_verbosity_level=VerbosityLevel.INFO,  # TODO: Move this to pipeline config
+      109                  executor_verbosity_level=VerbosityLevel.INFO,
+      110              )
+      111  
+      112          # Create pipeline configuration
+      113          pipeline_config = pipelines_v1.PipelineConfig(
+      114              execution_mode=exec_mode,
+      115              logging_interval_s=self._get_pipeline_config("logging_interval"),
+       ... truncated at 60 lines ...

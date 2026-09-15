@@ -1,0 +1,194 @@
+row 137   exo-explore/exo#1085
+============================================================================
+CHAIN in exo.worker.runner.runner.main   kind=match_type subject='task' branches=5
+QUESTION: is the set of variants OPEN (a new one is expected, and
+          would force editing this chain) or CLOSED by nature?
+SHOWING THE WHOLE ENCLOSING FUNCTION -- a branch count alone cannot answer this.
+>>> marks the first line of the dispatch chain itself.
+
+file src/exo/worker/runner/runner.py
+       49  def main(
+       50      bound_instance: BoundInstance,
+       51      event_sender: MpSender[Event],
+       52      task_receiver: MpReceiver[Task],
+       53  ):
+       54      instance, runner_id, shard_metadata = (
+       55          bound_instance.instance,
+       56          bound_instance.bound_runner_id,
+       57          bound_instance.bound_shard,
+       58      )
+       59      try:
+       60          logger.info("hello from the runner")
+       61          if getattr(shard_metadata, "immediate_exception", False):
+       62              raise Exception("Fake exception - runner failed to spin up.")
+       63          if timeout := getattr(shard_metadata, "should_timeout", 0):
+       64              time.sleep(timeout)
+       65  
+       66          setup_start_time = time.time()
+       67  
+       68          model = None
+       69          tokenizer = None
+       70          sampler = None
+       71          group = None
+       72  
+       73          current_status: RunnerStatus = RunnerIdle()
+       74          logger.info("runner created")
+       75          event_sender.send(
+       76              RunnerStatusUpdated(runner_id=runner_id, runner_status=current_status)
+       77          )
+       78          with task_receiver as tasks:
+       79              for task in tasks:
+       80                  event_sender.send(
+       81                      TaskStatusUpdated(
+       82                          task_id=task.task_id, task_status=TaskStatus.Running
+       83                      )
+       84                  )
+       85                  event_sender.send(TaskAcknowledged(task_id=task.task_id))
+>>>    86                  match task:
+       87                      case ConnectToGroup() if isinstance(
+       88                          current_status, (RunnerIdle, RunnerFailed)
+       89                      ):
+       90                          logger.info("runner connecting")
+       91                          current_status = RunnerConnecting()
+       92                          event_sender.send(
+       93                              RunnerStatusUpdated(
+       94                                  runner_id=runner_id, runner_status=current_status
+       95                              )
+       96                          )
+       97                          group = initialize_mlx(bound_instance)
+       98  
+       99                          logger.info("runner connected")
+      100                          current_status = RunnerConnected()
+      101  
+      102                      # we load the model if it's connected with a group, or idle without a group. we should never tell a model to connect if it doesn't need to
+      103                      case LoadModel() if (
+      104                          isinstance(current_status, RunnerConnected)
+      105                          and group is not None
+      106                      ) or (isinstance(current_status, RunnerIdle) and group is None):
+      107                          current_status = RunnerLoading()
+      108                          logger.info("runner loading")
+      109                          event_sender.send(
+      110                              RunnerStatusUpdated(
+      111                                  runner_id=runner_id, runner_status=current_status
+      112                              )
+      113                          )
+      114  
+      115                          model, tokenizer, sampler = load_mlx_items(
+      116                              bound_instance, group
+      117                          )
+      118  
+      119                          current_status = RunnerLoaded()
+      120                          logger.info("runner loaded")
+      121                      case StartWarmup() if isinstance(current_status, RunnerLoaded):
+      122                          assert model
+      123                          assert tokenizer
+      124                          assert sampler
+      125                          current_status = RunnerWarmingUp()
+      126                          logger.info("runner warming up")
+      127                          event_sender.send(
+      128                              RunnerStatusUpdated(
+      129                                  runner_id=runner_id, runner_status=current_status
+      130                              )
+      131                          )
+      132  
+      133                          logger.info(f"warming up inference for instance: {instance}")
+      134                          toks = warmup_inference(
+      135                              model=model,
+      136                              tokenizer=tokenizer,
+      137                              sampler=sampler,
+      138                              # kv_prefix_cache=kv_prefix_cache,  # supply for warmup-time prefix caching
+      139                          )
+      140                          logger.info(f"warmed up by generating {toks} tokens")
+      141                          logger.info(
+      142                              f"runner initialized in {time.time() - setup_start_time} seconds"
+      143                          )
+      144                          current_status = RunnerReady()
+      145                          logger.info("runner ready")
+      146                      case ChatCompletion(
+      147                          task_params=task_params, command_id=command_id
+      148                      ) if isinstance(current_status, RunnerReady):
+      149                          assert model
+      150                          assert tokenizer
+      151                          assert sampler
+      152                          logger.info(f"received chat request: {str(task)[:500]}")
+      153                          current_status = RunnerRunning()
+      154                          logger.info("runner running")
+      155                          event_sender.send(
+      156                              RunnerStatusUpdated(
+      157                                  runner_id=runner_id, runner_status=current_status
+      158                              )
+      159                          )
+      160                          assert task_params.messages[0].content is not None
+      161                          _check_for_debug_prompts(task_params.messages[0].content)
+      162  
+      163                          # Generate responses using the actual MLX generation
+      164                          for response in mlx_generate(
+      165                              model=model,
+      166                              tokenizer=tokenizer,
+      167                              sampler=sampler,
+      168                              task=task_params,
+      169                          ):
+      170                              match response:
+      171                                  case GenerationResponse():
+      172                                      if shard_metadata.device_rank == 0:
+      173                                          event_sender.send(
+      174                                              ChunkGenerated(
+      175                                                  command_id=command_id,
+      176                                                  chunk=TokenChunk(
+      177                                                      idx=response.token,
+      178                                                      model=shard_metadata.model_meta.model_id,
+      179                                                      text=response.text,
+      180                                                      token_id=response.token,
+      181                                                      finish_reason=response.finish_reason,
+      182                                                      tool_calls=response.tool_calls,
+      183                                                  ),
+      184                                              )
+      185                                          )
+      186                                      # case TokenizedResponse():
+      187                                      # TODO: something here ig
+      188  
+      189                          current_status = RunnerReady()
+      190                          logger.info("runner ready")
+      191                      case Shutdown():
+      192                          current_status = RunnerShuttingDown()
+      193                          logger.info("runner shutting down")
+      194                          event_sender.send(
+      195                              RunnerStatusUpdated(
+      196                                  runner_id=runner_id, runner_status=current_status
+      197                              )
+      198                          )
+      199                          current_status = RunnerShutdown()
+      200                      case _:
+      201                          raise ValueError(
+      202                              f"Received {task.__class__.__name__} outside of state machine in {current_status=}"
+      203                          )
+      204                  event_sender.send(
+      205                      TaskStatusUpdated(
+      206                          task_id=task.task_id, task_status=TaskStatus.Complete
+      207                      )
+      208                  )
+      209                  event_sender.send(
+      210                      RunnerStatusUpdated(
+      211                          runner_id=runner_id, runner_status=current_status
+      212                      )
+      213                  )
+      214                  if isinstance(current_status, RunnerShutdown):
+      215                      break
+      216      except ClosedResourceError:
+      217          logger.warning("runner communication closed unexpectedly")
+      218      except Exception as e:
+      219          logger.opt(exception=e).warning(
+      220              f"Runner {runner_id} crashed with critical exception {e}"
+      221          )
+      222          event_sender.send(
+      223              RunnerStatusUpdated(
+      224                  runner_id=runner_id,
+      225                  runner_status=RunnerFailed(error_message=str(e)),
+      226              )
+      227          )
+      228      finally:
+      229          event_sender.close()
+      230          task_receiver.close()
+      231          event_sender.join()
+      232          task_receiver.join()
+      233          logger.info("bye from the runner")
