@@ -222,11 +222,34 @@ _isp_pop = _json.loads((C.LABELS_DIR / "py2_isp_labeling_sample.population.json"
                        .read_text(encoding="utf-8"))["population"]["True"]
 check("Python ISP census size", f"all {_isp_pop} flagged contracts")
 
+# PRESENT counts use the samplers' own population definition (distinct production
+# entities), in both languages. Added 2026-09-15: the thesis had carried Java
+# present counts (11,822 / 2,577 / 1,090 / 681) that no script produced and no
+# current definition reproduces, so they are now recomputed here, never typed.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "labels"))
+import make_java_labeling_sample as _MJ  # noqa: E402
+import make_py2_labeling_sample as _MP  # noqa: E402
+print("\n-- violations PRESENT in touched code (both languages) --")
+for _p, _unit in [("srp", "classes"), ("ocp", "chains"), ("isp", "contracts")]:
+    _path, _pred, _judge, _keys, _flt = _MJ.SPEC[_p]
+    _d = _flt(pd.read_parquet(_path))
+    _d = _d.assign(**{_pred: _d[_pred].fillna(False).astype(bool)}).drop_duplicates(
+        [k for k in _keys if k in _d.columns])
+    check(f"Java {_p.upper()} flagged {_unit} present", f"{int(_d[_pred].sum()):,} {_unit}")
+_jl = _MJ.SPEC["lsp"][4](pd.read_parquet(C.LSP_RESULTS_JAVA))
+_jrb = _jl[_jl.violation.fillna(False).astype(bool) & _jl.signals.fillna("").str.contains("refused_bequest")]
+check("Java refused-bequest relationships present",
+      f"{_jrb.drop_duplicates(['full_name', 'type_id', 'method']).shape[0]} refused-bequest relationships")
+_jpr = pr[pr.status == "ok"]
+_jrb_intro = int(_jpr[_jpr.lsp_risk.fillna(False).astype(bool)]
+                 .lsp_risk_reasons.fillna("").str.contains("refused_bequest").sum())
+check("Java pull requests introducing a refused bequest", f"{_jrb_intro} pull requests introduced one")
+
 _pl = pd.read_parquet(C.CORPUS_DIR / "lsp_results.parquet")
-_pl = _pl[_pl.pr_id.isin(_pok.pr_id)]
+_pl = _MP.prod_by_module(_pl[_pl.pr_id.isin(_pok.pr_id)])
 _rb = _pl.signals.fillna("").str.contains("refused_bequest") & _pl.violation.fillna(False).astype(bool)
 _rb_present = _pl[_rb].drop_duplicates(["full_name", "module", "qualname", "base_id", "method"]).shape[0]
-check("Python refused-bequest relationships present", f"{_rb_present} refused-bequest")
+check("Python refused-bequest relationships present", f"{_rb_present} refused-bequest relationships")
 _rb_intro = int(_pok[_pok.lsp_risk.fillna(False).astype(bool)]
                 .lsp_risk_reasons.fillna("").str.contains("refused_bequest").sum())
 _words = {5: "five"}
@@ -262,7 +285,9 @@ print("\n-- residue from the superseded study --")
 # coincidence with a V1 figure) left this list. What remains is unique to the
 # superseded study and must never reappear.
 STALE = ["546", "867", "147 repositories", "27 repositories", "0.455", "0.679",
-         "13/13", "five agents", "30,984", "6,618", "TypeScript", "JavaScript"]
+         "13/13", "five agents", "30,984", "6,618", "TypeScript", "JavaScript",
+         # unreproducible Java present counts and the ratio built on them (2026-09-15)
+         "681", "11,822", "2,577", "4,100", "forty to one", "116,000"]
 
 found = [t for t in STALE if stale_present(t)]
 if found:
