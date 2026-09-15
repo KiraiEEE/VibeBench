@@ -1,72 +1,55 @@
 # Thesis LaTeX project
 
-**Compile locally with MiKTeX and XeLaTeX** (XeLaTeX is required for `polyglossia` + Arabic
-script). The simplest way is `latexmk`, which ships with MiKTeX and runs under Perl:
+Compiled locally with **MiKTeX 25.12** and **XeLaTeX** (required for `fontspec`, `polyglossia` and the
+Arabic abstract). `latexmk` ships with MiKTeX and runs under Perl:
 
 ```
 latexmk -xelatex main.tex
 ```
 
-or by hand:
+or by hand: `xelatex main`, `bibtex main`, `xelatex main`, `xelatex main`.
 
-```
-xelatex main.tex
-bibtex main
-xelatex main.tex
-xelatex main.tex
-```
-
-MiKTeX installs missing packages on first use. The Arabic abstract uses `Amiri` or
-`Scheherazade New` when installed and otherwise falls back to `Sakkal Majalla`, which ships with
-Windows.
+The Arabic abstract uses `Amiri` or `Scheherazade New` when installed and otherwise `Sakkal
+Majalla`, which ships with Windows.
 
 ## Layout
 
 ```
-main.tex                  master file , preamble, metadata, \input order
+main.tex              preamble, metadata (title, author, supervisor, cover fields), \input order
+references.bib        every entry checked against its source on 15 September 2026
 front/
-  cover.tex                title page (edit \topiccode, \defencedate, jury names here or in main.tex)
-  dedication.tex           placeholder , personalise
-  acknowledgments.tex      placeholder , personalise
-  abstract_en.tex          English abstract + keywords
-  abstract_fr.tex          French résumé + mots-clés
-  abstract_ar.tex          Arabic ملخص + كلمات مفتاحية
-  acronyms.tex             list of acronyms
+  cover.tex           title page
+  dedication.tex
+  acknowledgments.tex
+  abstracts.tex       Arabic, English and French abstracts on one page
+  acronyms.tex
 chapters/
   chapter1_introduction.tex
   chapter2_literature.tex
   chapter3_methodology.tex
-  chapter4_results.tex
-  chapter5_conclusion.tex  (new , synthesises Chapters 3-4's findings; Chapter 5 did not exist before)
-  appendix.tex
-figures/                   one .tex per TikZ/pgfplots figure, \input by the chapters
-../references.bib          unchanged; only entries actually cited in the source chapters are used
+  chapter4_results.tex     Java setup and results; \input's chapter4_python.tex at the end
+  chapter4_python.tex      the Python replication (RQ4)
+  chapter5_conclusion.tex  answers, contributions, limitations, future work
+  appendix.tex             run order and the label judge
+figures/              one TikZ file per figure, also \input by the defence deck
 ```
 
-## Things to fill in before submission
+## Before submission
 
-Search for these placeholders (all in `main.tex` or `front/cover.tex`):
+The cover fields that are not yet known are blank lines, defined in `main.tex`:
 
-- `\topiccode` , topic code / ID, still unknown per your message
-- `\defencedate` , defence date, still unknown
-- jury president / examiner names in `front/cover.tex`
-- `front/dedication.tex` and `front/acknowledgments.tex` , personalise both
-- a real institutional crest, if you obtain one: replace the TikZ-drawn emblem at the top of
-  `front/cover.tex` with `\includegraphics[width=2.6cm]{front/emblem.pdf}`
+- `\jurypresident`
+- `\defencedate`
+- `\topiccode`
 
-## Notes on fidelity to the source chapters
+Replace `\blankfield{...}` with the real text once the department sets them. Do not put guessed
+values there.
 
-Chapters 1–4 are a structural conversion of `thesis/Chapter 1.md`–`Chapter 4.md`: section
-headings, tables, and inline citations were mapped onto `\citep`/`\citet` keys already present in
-`references.bib` (only entries that source text actually cites are pulled into the printed
-bibliography , three background entries, `perry2023security`, `vaithilingam2022usability`,
-`barke2023grounded`, are verified but uncited in the source, so they are left out rather than
-force-cited). Chapter 5 (Conclusion) did not exist before this conversion; it is new text that
-directly answers RQ1–RQ3 and states contributions/limitations/future work using only findings
-already established in Chapters 3–4 , no new claims or numbers were introduced.
+## Checks
 
-Nine original figures were added (none existed in the Markdown source): a tool-evolution timeline,
-a SOLID-principles wheel, the before/after delta-harness diagram, the five-stage pipeline diagram,
-Martin's abstractness/instability plane, the intra-unit-vs-inter-unit diagram for Finding 1, and
-three data charts (class availability by language, SRP rate by agent, validation precision/recall
-by principle) plotted directly from the tables already in Chapter 4.
+```
+python vibebench/07_verify/verify_thesis_numbers.py    # from the repository root: 53 checks, 0 FAIL
+```
+
+The review that produced the current text is recorded in `../JURY_REVIEW.md`. The defence deck is
+in `../presentation/` and builds the same way.
