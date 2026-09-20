@@ -8,7 +8,7 @@ Nothing is running and no experiment is in progress.
 Java study ............ finished   4,245 PRs, 1,495 judged entities
 Python replication .... finished   4,946 PRs, 980 judged entities
 Thesis ................ 95 pages, both languages, thesis/latex/main.pdf
-Defence deck .......... 23 slides, both languages, thesis/presentation/main.pdf
+Defence deck .......... 50 slides, both languages, thesis/presentation/main.pdf
 Verifier .............. 53 checks, 0 FAIL
 Branch ................ python-v2-replication (pushed); main is older
 ```

@@ -22,7 +22,7 @@ thesis once described Python detectors in a Java-only study, and on 2026-09-15 t
 | Agents | Claude_Code, Copilot, OpenAI_Codex in both languages |
 | Outcomes | merged, rejected, open, balanced on agent x outcome |
 | Thesis | `thesis/latex/`, **95 pages**, XeLaTeX only, 0 undefined refs |
-| Deck | `thesis/presentation/`, **23 slides**, XeLaTeX, figures `\input` from the thesis |
+| Deck | `thesis/presentation/`, **50 slides** (7 parts + backup), XeLaTeX, figures `\input` from the thesis |
 | Verifier | `verify_thesis_numbers.py`, **53 checks, 0 FAIL** |
 | Review | `thesis/JURY_REVIEW.md` lists every correction made on 2026-09-15 |
 | Summary | `FINDINGS.md`, results and conclusions for the topic |
