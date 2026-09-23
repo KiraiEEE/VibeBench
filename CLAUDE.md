@@ -21,7 +21,7 @@ thesis once described Python detectors in a Java-only study, and on 2026-09-15 t
 | Python | 7,050 curated -> **4,946 analysable** PRs, 2,921 repos (3,974 curated); 980 judged entities |
 | Agents | Claude_Code, Copilot, OpenAI_Codex in both languages |
 | Outcomes | merged, rejected, open, balanced on agent x outcome |
-| Thesis | `thesis/latex/`, **95 pages**, XeLaTeX only, 0 undefined refs |
+| Thesis | `thesis/latex/`, **96 pages**, XeLaTeX only, 0 undefined refs |
 | Deck | `thesis/presentation/`, **50 slides** (7 parts + backup), XeLaTeX, figures `\input` from the thesis |
 | Verifier | `verify_thesis_numbers.py`, **53 checks, 0 FAIL** |
 | Review | `thesis/JURY_REVIEW.md` lists every correction made on 2026-09-15 |
