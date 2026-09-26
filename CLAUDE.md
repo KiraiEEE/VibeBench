@@ -12,7 +12,7 @@ thesis once described Python detectors in a Java-only study, and on 2026-09-15 t
 
 ---
 
-## STATE (2026-09-15): both studies FINISHED, thesis and deck rebuilt
+## STATE (2026-09-26): both studies FINISHED, thesis and deck rebuilt
 
 | | |
 |---|---|
@@ -21,10 +21,10 @@ thesis once described Python detectors in a Java-only study, and on 2026-09-15 t
 | Python | 7,050 curated -> **4,946 analysable** PRs, 2,921 repos (3,974 curated); 980 judged entities |
 | Agents | Claude_Code, Copilot, OpenAI_Codex in both languages |
 | Outcomes | merged, rejected, open, balanced on agent x outcome |
-| Thesis | `thesis/latex/`, **96 pages**, XeLaTeX only, 0 undefined refs |
+| Thesis | `thesis/latex/`, **97 pages**, XeLaTeX only, 0 undefined refs |
 | Deck | `thesis/presentation/`, **50 slides** (7 parts + backup), XeLaTeX, figures `\input` from the thesis |
-| Verifier | `verify_thesis_numbers.py`, **53 checks, 0 FAIL** |
-| Review | `thesis/JURY_REVIEW.md` lists every correction made on 2026-09-15 |
+| Verifier | `verify_thesis_numbers.py`, **61 checks, 0 FAIL** |
+| Review | `thesis/JURY_REVIEW.md` lists every correction made on 2026-09-15 and 2026-09-26 |
 | Summary | `FINDINGS.md`, results and conclusions for the topic |
 | GitHub | https://github.com/KiraiEEE/VibeBench, PRIVATE. Work is on branch `python-v2-replication`. |
 
@@ -36,15 +36,19 @@ Precision / stratum-weighted recall:
 
 | principle | Java | Python |
 |---|---|---|
-| SRP | 0.350 / 0.875 | 0.110 / 1.000 |
-| OCP | 0.330 / 0.733 | 0.390 / 0.364 |
-| LSP | 0.420 / 0.352 | 0.510 / 0.545 |
-| ISP | 0.335 / 0.552 | 0.425 (census of 80) / 1.000 |
+| SRP | 0.350 / 0.828 | 0.110 / 1.000 |
+| OCP | 0.330 / 0.742 | 0.390 / 0.364 |
+| LSP | 0.420 / 0.386 | 0.510 / 0.545 |
+| ISP | 0.335 / 0.464 | 0.425 (census of 80) / 1.000 |
 | DIP | **0.892** census of 195 / 1.000 | 1.000 / 1.000 |
 
-**RECALL IS STRATUM-WEIGHTED.** Samples are 100 flagged + 100 unflagged; the corpus is not 50/50
-(Java LSP 1,546 flagged rows against 79,689 unflagged). Unweighted LSP recall would read 0.966
-instead of 0.352. Never quote a raw recall.
+**RECALL IS STRATUM-WEIGHTED, AND THE WEIGHTS ARE THE SAMPLED POPULATION.** Samples are 100 flagged +
+100 unflagged; the corpus is not 50/50. Weight by the population the sampler drew from, which is the
+deduplicated, filtered frame in `labels/make_java_labeling_sample.py:SPEC`, NOT the raw parquet rows
+(Java LSP 574 / 25,594, not 1,546 / 79,689). Using raw rows was a bug, corrected 2026-09-26; it moved
+every Java recall. Unweighted LSP recall would read 0.966 instead of 0.386. Never quote a raw recall.
+`labels/score_java_labels.py` and `labels/score_py2_labels.py` are the only sources for these figures;
+logs in `logs_archive/java_validation.txt`, `py2_validation.txt`.
 
 **Refinements:** LSP restricted to refused bequest 1.000 fitted, 1.000 holdout (64/64 pooled),
 0.857 (6/7) in Python. ISP >= 30 members 0.862 fitted, 0.704 holdout, 0.200 (1/5) in Python. A
@@ -70,9 +74,12 @@ against **16** PRs introducing. Python: SRP 8,208, OCP 2,580, ISP 80, LSP 2,069,
 0.3-3.5%. Authored vs edited SRP: Java 7.7% vs 13.5%, Python 8.9% vs 12.1% (pooled).
 
 **Cross-check (Java, 150 repos, production types):** ours~PMD kappa 0.574, ours~Designite 0.531,
-PMD~Designite 0.384; 68.0% of our flags corroborated. DesigniteJava 1.1.2 DOES have OCP-like smells
-(*Missing Hierarchy*, *Unexploited Encapsulation*); they were recorded but never compared with the
-OCP detector. Do not write that no tool has an OCP check.
+PMD~Designite 0.384; 68.0% of our flags corroborated. LSP kappa 0.000 (different unit: we flag the
+subclass, Designite the supertype). DIP 0.389 by compilation unit, 0.080 by package.
+**OCP vs Designite measured 2026-09-26** (`05_crosscheck/compare_ocp_designite.py`, 138 repos, 63,326
+types): kappa **0.122**, ours 886 flags (1.40%) against Designite 299 (0.47%), 76 shared. So OCP has
+no external corroboration and rests on the judge. Do not write that no tool has an OCP check, and do
+not write that the comparison was never run.
 
 ### Weaknesses that stay stated
 
@@ -132,7 +139,9 @@ python vibebench/labels/make_java_labeling_sample.py --principle X --n-per-strat
 python vibebench/labels/extract_java_label_batches.py --principle X --file <sample.csv> --only-missing
 python vibebench/07_verify/audit_label_batches.py          # GATE, must be 0 FAIL before judging
 python vibebench/labels/score_labels.py --file <sample.csv> --pred-col <col> --label-col llm_X_risk
+python vibebench/labels/score_java_labels.py               # THE source for Java precision/recall
 python vibebench/05_crosscheck/run_crosscheck_java.py --sample 150 --workers 6
+python vibebench/05_crosscheck/compare_ocp_designite.py    # OCP vs Designite, needs the tree cache
 python vibebench/07_verify/verify_v2_java.py
 python vibebench/07_verify/verify_thesis_numbers.py        # thesis text vs the data
 ```
@@ -178,6 +187,12 @@ runs separate shard processes. Per-shard parquets and pilots are gitignored; the
   outcome contrasts must be tier-matched.
 * `05_crosscheck/run_crosscheck_java.py`, `--sample N` is the seeded random draw; DesigniteJava
   heap 5g, concurrency 1 by default. No resume.
+* `05_crosscheck/compare_ocp_designite.py`, re-reads each head tree with
+  `gitsnap.src_tree(gitsnap.repo_dir(full), sha, ...)` and joins on `type_id` against
+  `04_report/java_crosscheck_classes.csv`. ~8 min for 138 repos. Writes
+  `04_report/ocp_designite_comparison.json`, which the verifier reads.
+* `labels/score_java_labels.py` and `labels/score_py2_labels.py`, the ONLY sources for precision and
+  weighted recall. Both weight by the sampler's population, not raw rows.
 * `logs_archive/py2_model.txt`, `py2_report.txt`, `py2_cross_language.txt` are tracked; the
   verifier parses the model log.
 

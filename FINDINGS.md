@@ -29,10 +29,10 @@ Precision / stratum-weighted recall:
 
 | Principle | Java | Python |
 |---|---|---|
-| SRP | 0.350 / 0.875 | 0.110 / 1.000 |
-| OCP | 0.330 / 0.733 | 0.390 / 0.364 |
-| LSP | 0.420 / 0.352 | 0.510 / 0.545 |
-| ISP | 0.335 / 0.552 | 0.425 / 1.000 (all 80 flags judged) |
+| SRP | 0.350 / 0.828 | 0.110 / 1.000 |
+| OCP | 0.330 / 0.742 | 0.390 / 0.364 |
+| LSP | 0.420 / 0.386 | 0.510 / 0.545 |
+| ISP | 0.335 / 0.464 | 0.425 / 1.000 (all 80 flags judged) |
 | DIP | **0.892** / 1.000 (all 195 flags judged) | **1.000** / 1.000 |
 
 * A new dependency cycle (DIP) is detected precisely in both languages.
@@ -42,6 +42,9 @@ Precision / stratum-weighted recall:
   rule (at least 30 members) fell from 0.862 to 0.704 on the Java holdout and scored 1 of 5 in Python.
 * Against published tools (Java, 82,553 types): our God Class rubric agrees with PMD at kappa 0.574
   and with DesigniteJava at 0.531, while PMD and DesigniteJava agree at 0.384.
+* The OCP detector, compared with DesigniteJava's *Missing Hierarchy* and *Unexploited
+  Encapsulation* over 63,326 types in 138 repositories, agrees at kappa 0.122 only, and fires three
+  times as often. It measures something narrower than the published smell.
 * The compiler matters: 46 of the 51 confirmed Python Liskov violations are faults `javac` rejects.
 
 ## Result 2: agent differences are mostly change size (RQ1)
@@ -107,6 +110,6 @@ change rarely writes, so they build up over many changes and authors.
 ## Main limitations
 
 SOLID adherence is not measured cost or defects. The judge is an LLM of the same family as one
-agent. Only Java has an independent-tool check, and OCP was not compared with DesigniteJava's
-type-conditional smells. Agents chose their own tasks, so results are associations. Reviewed
-rejections are few. Full list: thesis Section 5.5.
+agent. Only Java has an independent-tool check, and for OCP that check agrees at kappa 0.122 only.
+Agents chose their own tasks, so results are associations. Reviewed rejections are few. Full list:
+thesis Section 5.5.

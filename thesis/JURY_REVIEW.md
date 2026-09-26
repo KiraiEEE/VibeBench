@@ -55,3 +55,37 @@ pages, the corpus parquets and the model output, not against memory.
 3. **Figures.** Several were generic box-and-arrow diagrams and one printed log values as
    counts. Redesigned; every figure rendered and checked for collisions.
 4. **Defence deck.** Deleted by the author; rebuilt for both languages.
+
+---
+
+# Second pass (26 September 2026)
+
+Three defects found by re-deriving the figures from the scripts instead of reading
+the text, and two gaps closed.
+
+## D. Defects found and corrected
+
+| # | Where | Problem | Evidence | Fix |
+|---|---|---|---|---|
+| D1 | Ch4, Ch5, figures, deck | **Stratum-weighted recall was weighted by the wrong population.** The weights used raw parquet rows, but the samplers draw from a deduplicated, filtered frame. For Java LSP the raw set is 1,546 flagged / 79,689 unflagged; the sampled population is 574 / 25,594. | `labels/make_java_labeling_sample.py:SPEC` defines the frame the sample is drawn from; the weight must be that frame | Every Java recall recomputed: SRP 0.875 to 0.828, OCP 0.733 to 0.742, LSP 0.352 to 0.386, ISP 0.552 to 0.464. Python figures were already drawn from the sampler frame and did not move. |
+| D2 | Validation figures | **No script produced the Java validation numbers.** Python had `score_py2_labels.py`; Java did not, so its figures were only in prose. | Same class of defect as the 2026-09-15 "681" headline | `labels/score_java_labels.py` written as the Java twin: population from `SPEC`, Wilson precision intervals, seeded bootstrap for weighted recall, per-agent precision. Log kept at `logs_archive/java_validation.txt`. |
+| D3 | Ch4 | **The corpus is balanced on outcome, and the text did not say so.** | `all_pull_request.parquet`: the natural mix is 80.9% merged, 9.5% rejected, 9.6% open | Disclosed where outcome results are reported; outcome rates are conditional, not population rates. |
+
+## E. Gaps closed
+
+1. **A9 from the first pass is now resolved by measurement, not by withdrawal.** The
+   Open/Closed detector was compared with DesigniteJava's *Missing Hierarchy* and
+   *Unexploited Encapsulation* over the 63,326 production types of the 138 cross-check
+   repositories where both tools produced output: **kappa 0.122**, ours 886 flags (1.40%)
+   against DesigniteJava's 299 (0.47%), 76 shared. Reported in Section 4.7.2 as a negative
+   result, carried into the limitations and into future work. Script:
+   `05_crosscheck/compare_ocp_designite.py`; output `04_report/ocp_designite_comparison.json`.
+2. **Deduplication differs between the sampler and the report.** The sampler keeps the first
+   row per class (7,501), the report keeps the largest (7,608); any-row gives 7,624. The
+   123 classes involved are 1.6% of the total. Stated in Section 4.6.
+
+## F. Verifier
+
+`07_verify/verify_thesis_numbers.py` now runs **61 checks, 0 FAIL**, including the corrected
+recall population, the present counts, the OCP/DesigniteJava comparison, and a stale-text
+list that fails the build if a withdrawn figure reappears.

@@ -16,6 +16,7 @@ Exit: 1 if any claim in the thesis disagrees with the data.
 from __future__ import annotations
 
 import glob
+import json
 import re
 import sys
 from pathlib import Path
@@ -129,11 +130,24 @@ def _labels(p, col):
 
 
 def _population(p, col):
-    r = pd.read_parquet(C.CORPUS_DIR / POP[p])
-    if 'row_type' in r.columns:          # ISP mixes interface and implementer rows
-        r = r[r.row_type == 'interface']
-    v = r[col].fillna(False).astype(bool)
-    return int(v.sum()), int((~v).sum())
+    """The population the sample was DRAWN from, not the raw row set.
+
+    Corrected 2026-09-26. This used raw result rows, which count test and
+    generated code and repeat a class once per pull request that touched it,
+    while `make_java_labeling_sample.py` draws from production entities after
+    deduplication. Weighting recall with the row set moved four of the five
+    Java recalls, ISP by almost nine points (0.552 against 0.464).
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "labels"))
+    import make_java_labeling_sample as _MJ  # noqa: E402
+    path, pred, _judge, keys, flt = _MJ.SPEC[p]
+    d = pd.read_parquet(path)
+    if flt is not None:
+        d = flt(d)
+    d = d.copy()
+    d[pred] = d[pred].fillna(False).astype(bool)
+    d = d.drop_duplicates([k for k in keys if k in d.columns])
+    return int(d[pred].sum()), int((~d[pred]).sum())
 
 
 for p, col in PRED.items():
@@ -176,10 +190,11 @@ for name, stem, labcol, mask in [
 
 # ------------------------------------------------- proxy scope populations
 print("\n-- the populations the proxy sections quote --")
-_lsp = pd.read_parquet(C.CORPUS_DIR / "lsp_results_java.parquet")
-_lv = _lsp["violation"].fillna(False).astype(bool)
-check("LSP flagged override pairs", f"{int(_lv.sum()):,}")
-check("LSP unflagged override pairs", f"{int((~_lv).sum()):,}")
+# The LSP weighting example quotes the population the sample was drawn from
+# (production pairs, counted once), not the raw row set. Corrected 2026-09-26.
+_lspF, _lspU = _population("lsp", "violation")
+check("LSP flagged override pairs in the sampled population", f"{_lspF:,}")
+check("LSP unflagged override pairs in the sampled population", f"{_lspU:,}")
 
 _ocp = pd.read_parquet(C.CORPUS_DIR / "ocp_results_java.parquet")
 check("OCP in-scope dispatch chains", f"{len(_ocp):,}")
@@ -269,6 +284,24 @@ _per = _man.groupby("pr_id").extract_status.agg(
     else ("loss" if set(s) & {"fetch_failed", "diff_failed", "file_missing"} else "oos"))
 _loss = int((_per == "loss").sum())
 check("Python retrieval loss", f"{_loss} Python pull requests ({100 * _loss / len(_per):.1f}")
+
+# --------------------------------------------- OCP against DesigniteJava (2026-09-26)
+# The one principle with a tool counterpart that had never been compared. The
+# comparison is weak, which is the point: it is reported, not buried.
+_ocpdj = json.loads(Path("vibebench/04_report/ocp_designite_comparison.json")
+                    .read_text(encoding="utf-8"))
+check("OCP vs DesigniteJava kappa", f"{_ocpdj['kappa']:.3f}")
+check("OCP vs DesigniteJava types compared", f"{_ocpdj['n_classes']:,}")
+check("OCP vs DesigniteJava repositories", f"{_ocpdj['n_repositories']} cross-check repositories")
+check("OCP flags in the comparison",
+      f"{_ocpdj['tp'] + _ocpdj['fp']:,} types ({100 * _ocpdj['flag_rate_ours']:.2f}")
+check("Designite type-conditional flags in the comparison",
+      f"{_ocpdj['tp'] + _ocpdj['fn']:,} ({100 * _ocpdj['flag_rate_designite']:.2f}")
+check("OCP and Designite agreeing types", f"{_ocpdj['tp']} types are flagged by both")
+check("share of Designite flags this study also flags",
+      f"{100 * _ocpdj['recall_vs_designite']:.1f}\\% are also flagged here")
+check("share of this study's OCP flags Designite also flags",
+      f"{100 * _ocpdj['precision_vs_designite']:.1f}\\% are also flagged by")
 
 _mlog = Path("logs_archive/py2_model.txt").read_text(encoding="utf-8")
 _ocp_block = _mlog.split("OCP   n =")[1]

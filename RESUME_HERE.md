@@ -1,25 +1,40 @@
 # RESUME HERE
 
-## State (15 September 2026): both studies finished, thesis and deck rebuilt
+## State (26 September 2026): both studies finished, thesis and deck rebuilt
 
 Nothing is running and no experiment is in progress.
 
 ```
 Java study ............ finished   4,245 PRs, 1,495 judged entities
 Python replication .... finished   4,946 PRs, 980 judged entities
-Thesis ................ 95 pages, both languages, thesis/latex/main.pdf
+Thesis ................ 97 pages, both languages, thesis/latex/main.pdf
 Defence deck .......... 50 slides, both languages, thesis/presentation/main.pdf
-Verifier .............. 53 checks, 0 FAIL
+Verifier .............. 61 checks, 0 FAIL
 Branch ................ python-v2-replication (pushed); main is older
 ```
 
 Check it from the data, not from this file:
 
 ```
-python vibebench/07_verify/verify_thesis_numbers.py     # expect 53 checks, 0 FAIL
+python vibebench/07_verify/verify_thesis_numbers.py     # expect 61 checks, 0 FAIL
 cd thesis/latex && latexmk -xelatex main.tex            # expect 0 undefined references
 cd thesis/presentation && latexmk -xelatex main.tex
 ```
+
+## What the 26 September pass changed
+
+Recorded in `thesis/JURY_REVIEW.md`, sections D to F.
+
+* **Weighted recall was weighted by the wrong population.** The weights used raw parquet rows
+  instead of the frame the sampler draws from. Every Java recall moved: SRP 0.875 to 0.828,
+  OCP 0.733 to 0.742, LSP 0.352 to 0.386, ISP 0.552 to 0.464. Python was already correct.
+* **`labels/score_java_labels.py` written.** Java had no scoring script, so its validation
+  figures lived only in prose. It is now the single source, logged to
+  `logs_archive/java_validation.txt`.
+* **Open/Closed compared with DesigniteJava at last:** kappa 0.122 over 63,326 types in 138
+  repositories. A negative result, reported in Section 4.7.2 and in the limitations.
+* The balanced-outcome corpus and the sampler/report deduplication difference are now stated
+  in the text.
 
 ## Still open
 
