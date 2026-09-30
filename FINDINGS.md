@@ -5,8 +5,27 @@ Do autonomous coding agents write code that follows the five SOLID principles, a
 measured reliably at scale?
 
 Every number below is in the thesis (`thesis/latex/`) and the headline ones are recomputed from the
-data by `python vibebench/07_verify/verify_thesis_numbers.py` (53 checks, 0 FAIL on 15 September
+data by `python vibebench/07_verify/verify_thesis_numbers.py` (61 checks, 0 FAIL on 30 September
 2026). Nothing here is newer than the thesis.
+
+## The two short answers
+
+**Do agents violate SOLID, and is the rate high or low?** They do, and rarely. After precision
+correction, **0.4% to 4.1%** of Java pull requests and **0.3% to 3.5%** of Python pull requests
+introduce a violation of a given principle. The code they work in already holds 7,501 flagged
+classes, 2,343 flagged dispatch chains, 816 flagged contracts and 183 refused-bequest relationships
+in Java, against 16 pull requests that introduced a refused bequest, a ratio of about 11 to 1 (35 to
+1 in Python). So the rate of creation is low and the stock of existing problems is high. How large
+the change is matters more than which agent made it: each doubling of files touched multiplies the
+odds of a flag by 1.88 to 1.95 (Java) and 2.01 to 2.18 (Python).
+
+**Does the validation agree?** For two principles yes, for three no. Dependency Inversion reaches
+precision 0.892 in Java (census of all 195 flags) and 1.000 in Python, and Liskov restricted to
+refused bequest reaches 1.000 on 64 Java flags across a fitted sample and a holdout, 0.857 in
+Python. Single Responsibility, Open/Closed and Interface Segregation sit between 0.110 and 0.425, so
+they are screens, not measurements. Against published tools the God Class rubric agrees with PMD at
+kappa 0.574 and DesigniteJava at 0.531, while those two agree with each other at only 0.384. The
+exception is Open/Closed, kappa 0.122, which no published tool corroborates.
 
 ## What was measured
 
@@ -106,6 +125,20 @@ change rarely writes, so they build up over many changes and authors.
 5. **For an automated review check:** add refused bequest; in dynamic languages also check that an
    override accepts its base's calls; do not rely on interface-width thresholds; treat SRP and OCP
    flags as prompts for discussion.
+
+## Against the state of the art
+
+| Earlier finding | This study | Outcome |
+|---|---|---|
+| Volume-Quality Inverse Law (Zhu, Yuecai et al.) | Change size dominates: OR 1.88-1.95 Java, 2.01-2.18 Python | Confirmed, our strongest result |
+| Agent differences vanish after churn normalisation (Cynthia et al.) | Only Claude Code on OCP survives adjustment, in both languages | Confirmed, with one replicating exception |
+| Passing tests is not maintainer acceptance (Whitfill et al., METR) | Merged Java PRs are indistinguishable from those closed unreviewed | Consistent |
+| 91% correct yet thousands of design issues (Kashif et al.) | Present violations outnumber introduced ones ~11:1 Java, ~35:1 Python | Consistent; they build new projects, we edit existing ones |
+| Agents succeed at 4.3% of dependency-control tasks (Zhu, Haichao et al., NITR) | Agents seldom introduce dependency or responsibility violations | Different question: repair versus damage |
+| Erosion grows across 77% of long-horizon trajectories (SlopCodeBench) | Time coefficient inert for every delta principle | Not tested: our unit is one PR, not a trajectory |
+| SRP easiest to detect, DIP hardest (Pehlivan et al.) | Reversed for structural detectors: DIP 0.892/1.000 most precise, SRP 0.350/0.110 least | Different construct; the two approaches fail on opposite principles |
+
+Full version with citations: thesis Section 5.3, Table 5.1.
 
 ## Main limitations
 
