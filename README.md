@@ -117,12 +117,6 @@ python vibebench/07_verify/verify_thesis_numbers.py
 
 It should report 61 checks and 0 failures.
 
-## Limitations in short
-
-The detectors measure structures that violations tend to leave, not the principles themselves. The study is
-observational, so agent differences are associations. Both corpora come from one dataset. The thesis
-has a full limitations section.
-
 ## Licence
 
 [MIT](LICENSE): free to use, copy and modify, for research or anything else, as long as the
