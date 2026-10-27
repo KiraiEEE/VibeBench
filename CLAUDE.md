@@ -111,7 +111,7 @@ not write that the comparison was never run.
 * Tone: lead with the result. Bugs fixed are not results. The author is not a native English speaker
   and is under exam stress. Be concrete, never patronise.
 * Never mention TypeScript or the V1 Python study in the thesis or deck.
-* Commit only when asked; if on main, branch first.
+* Commit only when asked, directly on `main`. Never create a side branch.
 
 ## Setup
 

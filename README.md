@@ -126,5 +126,6 @@ has a full limitations section.
 
 ## Licence
 
-No licence has been chosen yet, so all rights are reserved for now. The AIDev dataset and the
-analysed repositories keep their own licences.
+[MIT](LICENSE): free to use, copy and modify, for research or anything else, as long as the
+copyright notice is kept. If you use VibeBench in a paper, please cite the thesis. The AIDev dataset
+and the analysed repositories keep their own licences.
