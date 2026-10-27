@@ -26,7 +26,7 @@ thesis once described Python detectors in a Java-only study, and on 2026-09-15 t
 | Verifier | `verify_thesis_numbers.py`, **61 checks, 0 FAIL** |
 | Review | `thesis/JURY_REVIEW.md` lists every correction made on 2026-09-15 and 2026-09-26 |
 | Summary | `FINDINGS.md`, results and conclusions for the topic |
-| GitHub | https://github.com/KiraiEEE/VibeBench, PRIVATE. Work is on branch `python-v2-replication`. |
+| GitHub | https://github.com/KiraiEEE/VibeBench, PRIVATE. One branch only: `main`. Do not create side branches. |
 
 Open items are in `RESUME_HERE.md` (cover fields left blank on purpose, merge to main).
 

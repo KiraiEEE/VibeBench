@@ -10,7 +10,7 @@ Python replication .... finished   4,946 PRs, 980 judged entities
 Thesis ................ 97 pages, both languages, thesis/latex/main.pdf
 Defence deck .......... 50 slides, both languages, thesis/presentation/main.pdf
 Verifier .............. 61 checks, 0 FAIL
-Branch ................ python-v2-replication (pushed); main is older
+Branch ................ main only (side branch merged and deleted 2026-10-27)
 ```
 
 Check it from the data, not from this file:
@@ -41,7 +41,7 @@ Recorded in `thesis/JURY_REVIEW.md`, sections D to F.
 1. **Cover fields.** Jury president, defence date and topic code are blank fill-in lines
    (`\jurypresident`, `\defencedate`, `\topiccode` in `thesis/latex/main.tex`). Fill them in when
    the department sets them; never put invented values there.
-2. **Merge.** All work is on `python-v2-replication`. Merge it into `main` when the author agrees.
+2. **Merge.** Done on 2026-10-27: everything is on `main`, the only branch.
 3. **Author's own read** of the thesis and deck before submission.
 
 ## What the 15 September review changed
