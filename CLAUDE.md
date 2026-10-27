@@ -83,11 +83,11 @@ not write that the comparison was never run.
 
 ### Weaknesses that stay stated
 
-* Agreement is detector vs LLM reading judge. LLM judging of SOLID is a validated technique
-  (Pehlivan et al. 2025). **The author and supervisor ruled human labelling out of scope; do not
-  reintroduce it as a limitation.**
-* Judge and one agent are both Claude. Per-agent precision shows no leniency (DIP is the exception,
-  0.792 vs 0.959). Judge self-consistency measured in Java only (89.7% on 174 entities).
+* **The LLM judge is NOT a limitation (author's decision, 2026-10-27).** LLM judging of SOLID is a
+  validated technique (Pehlivan et al. 2025), and human labelling was ruled out of scope. Describe
+  the judge factually as the validation method; never write "not ground truth", "the judge can
+  err", or list the judge or its model family as a weakness in the thesis, deck, paper or README.
+  The 89.7% self-agreement and the per-agent leniency check are reported as results.
 * Source-only analysis: Java median supertype resolution 87.0%; Python resolves in-repo bases only.
 * 7.0% of Python PRs lost their source, unevenly (rejected 11.0%, Copilot 14.3%); not topped up.
 * SOLID adherence is not design quality; nothing observes an outcome.

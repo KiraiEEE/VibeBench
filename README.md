@@ -119,8 +119,7 @@ It should report 61 checks and 0 failures.
 
 ## Limitations in short
 
-Every precision and recall figure is agreement with an LLM judge, not ground truth. The detectors
-measure structures that violations tend to leave, not the principles themselves. The study is
+The detectors measure structures that violations tend to leave, not the principles themselves. The study is
 observational, so agent differences are associations. Both corpora come from one dataset. The thesis
 has a full limitations section.
 
