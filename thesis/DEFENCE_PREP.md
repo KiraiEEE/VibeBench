@@ -133,8 +133,10 @@ Short answers. Say the first sentence, stop, and let them follow up.
 > Responsibility and openness are judgements about intent, and there my detectors
 > screen rather than measure. I report that instead of assuming all five work.
 
-**"Why is your corpus balanced when the real mix is 80/10/10?"**
-> Deliberately, to have enough rejected and open pull requests to compare. It
+**"Why does your corpus over-sample rejected and open PRs when the real mix is 80/10/10?"**
+> Deliberately, to have enough rejected and open pull requests to compare: per
+> agent I took every rejected PR and twice as many merged ones (Python: fixed
+> quotas of 1,400 / 700 / 250). It
 > means my outcome rates are conditional, not population rates, and that is stated
 > where they are reported.
 
